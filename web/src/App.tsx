@@ -159,7 +159,7 @@ type AdvisorFull = Advisor & {
   rosterVersion: number;
   imageProvenance: string;
 };
-type MeetingFull = Meeting & { brief: string };
+type MeetingFull = Meeting & { brief: string; boardId: string };
 const MEETING_STATES = [
   "Awaiting brief",
   "Active",
@@ -349,7 +349,14 @@ const navGroups: { label: string; items: [Tab, string][] }[] = [
       ["activity", "Activity"],
     ],
   },
-  { label: "", items: [["settings", "Settings"]] },
+  {
+    label: "",
+    items: [
+      ["settings", "Settings"],
+      ["profile", "Profile"],
+      ["help", "Help"],
+    ],
+  },
 ];
 const needsBoard: Tab[] = [
   "advisors",
@@ -359,6 +366,90 @@ const needsBoard: Tab[] = [
   "people",
   "activity",
 ];
+type NavRoute = {
+  tab: Tab;
+  board: string;
+  meeting: string;
+  mtab: "chat" | "takeaways" | "options" | "decision";
+  ctab: "members" | "context" | "decisions";
+  rec: string;
+};
+const ALL_TABS: Tab[] = [
+  "boards",
+  "wizard",
+  "profile",
+  "settings",
+  "roster",
+  "advisors",
+  "meet",
+  "sources",
+  "records",
+  "people",
+  "activity",
+  "help",
+];
+const MEET_VIEWS = ["chat", "takeaways", "options", "decision"] as const;
+const CTX_VIEWS = ["members", "context", "decisions"] as const;
+function emptyRoute(): NavRoute {
+  return {
+    tab: "boards",
+    board: "",
+    meeting: "",
+    mtab: "chat",
+    ctab: "context",
+    rec: "",
+  };
+}
+function parseHash(): NavRoute {
+  const fallback = emptyRoute();
+  try {
+    const raw = window.location.hash.replace(/^#/, "");
+    if (!raw) return fallback;
+    const qi = raw.indexOf("?");
+    const path = (qi >= 0 ? raw.slice(0, qi) : raw).replace(/\/+$/, "") || "/";
+    const params = new URLSearchParams(qi >= 0 ? raw.slice(qi + 1) : "");
+    const seg = path.split("/").filter(Boolean)[0] ?? "";
+    const tab = (ALL_TABS as string[]).includes(seg) ? (seg as Tab) : "boards";
+    const mraw = params.get("mtab") ?? "";
+    const mtab = (MEET_VIEWS as readonly string[]).includes(mraw)
+      ? (mraw as NavRoute["mtab"])
+      : "chat";
+    const craw = params.get("ctab") ?? "";
+    const ctab = (CTX_VIEWS as readonly string[]).includes(craw)
+      ? (craw as NavRoute["ctab"])
+      : "context";
+    return {
+      tab,
+      board: params.get("board") ?? "",
+      meeting: params.get("meeting") ?? "",
+      mtab,
+      ctab,
+      rec: params.get("rec") ?? "",
+    };
+  } catch {
+    return fallback;
+  }
+}
+function isNotFound(e: unknown): boolean {
+  return e instanceof Error && e.message.startsWith("404");
+}
+function buildHash(r: {
+  tab: Tab;
+  board: string;
+  meeting: string;
+  mtab: string;
+  ctab: string;
+  rec: string;
+}): string {
+  const q = new URLSearchParams();
+  if (r.board) q.set("board", r.board);
+  if (r.meeting) q.set("meeting", r.meeting);
+  if (r.tab === "meet" && r.mtab !== "chat") q.set("mtab", r.mtab);
+  if (r.tab === "meet" && r.ctab !== "context") q.set("ctab", r.ctab);
+  if (r.tab === "records" && r.rec) q.set("rec", r.rec);
+  const qs = q.toString();
+  return "#/" + r.tab + (qs ? "?" + qs : "");
+}
 function NavIcon({ name, size = 16 }: { name: string; size?: number }) {
   const paths: Record<string, JSX.Element> = {
     boards: (
@@ -562,17 +653,70 @@ function DossierView({ raw }: { raw: string }) {
 }
 export default function App() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>("boards");
-  const [boardId, setBoardId] = useState("");
-  const [meetingId, setMeetingId] = useState("");
-  useEffect(() => {
-    setMeetingId("");
+  const initialRoute = useRef<NavRoute | null>(null);
+  if (initialRoute.current === null) {
+    try {
+      initialRoute.current = parseHash();
+    } catch {
+      initialRoute.current = emptyRoute();
+    }
+  }
+  const route0: NavRoute = initialRoute.current ?? emptyRoute();
+  const [tab, setTab] = useState<Tab>(route0.tab);
+  const [boardId, setBoardId] = useState(route0.board);
+  const [meetingId, setMeetingId] = useState(route0.meeting);
+  const prevBoard = useRef<string | null>(null);
+  const prevMeeting = useRef<string | null>(null);
+  const navReplace = useRef(false);
+  // Board-owned UI state (advisor selection/test chat, participant picks,
+  // recall excerpts). URL context (board/meeting/record) is never cleared
+  // here; it comes from the route or the switch guards below.
+  const resetBoardOwnedState = () => {
     setMeetPicks([]);
     setSelAdv("");
     setChatAdv("");
     setChatHist([]);
+    setChatMsg("");
     setChatErr("");
+    setExcerpts([]);
+  };
+  // Meeting-owned UI state (composer reply target, note/briefing/direction
+  // drafts, message search, record review/compare state, setup form cache).
+  const resetMeetingOwnedState = () => {
     setReplyTo(null);
+    setSelItems([]);
+    setCmpVer("");
+    setRevText("");
+    setMLoaded("");
+    setMtitle("");
+    setMbrief("");
+    setSq("");
+    setHits([]);
+    setExcerpts([]);
+    setNtitle("");
+    setNbody("");
+    setBtopic("");
+    setDtext("");
+  };
+  useEffect(() => {
+    if (prevBoard.current === null) {
+      // Mount: keep any deep-linked board/meeting from the URL.
+      prevBoard.current = boardId;
+      return;
+    }
+    if (prevBoard.current !== boardId) {
+      prevBoard.current = boardId;
+      setMeetingId("");
+      resetBoardOwnedState();
+      setReplyTo(null);
+      setRecId("");
+      setSelItems([]);
+      setCmpVer("");
+      setRevText("");
+      setMLoaded("");
+      setSq("");
+      setHits([]);
+    }
   }, [boardId]);
   const [draft, setDraftState] = useState("");
   const draftKey = `simceo-draft:${boardId}:${meetingId}`;
@@ -633,6 +777,22 @@ export default function App() {
     queryKey: ["boards"],
     queryFn: () => get<Board[]>("/api/boards"),
   });
+  // Selected-board authority is the singular detail lookup, never the
+  // bounded (newest-100) board list. A 404 clears the route; absence from
+  // the list window means nothing. Non-404 errors gate without clearing.
+  const boardDetail = useQuery({
+    queryKey: ["board-detail", boardId],
+    queryFn: () => get<Board>(`/api/boards/${boardId}`),
+    enabled: !!boardId,
+    retry: false,
+  });
+  // Bounded board list (newest 100) never establishes absence: only a 404
+  // on the singular board lookup clears the route. Pending/non-404 errors
+  // gate downstream queries without clearing.
+  const boardMissing =
+    !!boardId && boardDetail.isError && isNotFound(boardDetail.error);
+  const boardValid = boardId === "" || boardDetail.isSuccess;
+  const boardOk = boardValid;
   const presets = useQuery({
     queryKey: ["presets"],
     queryFn: () => get<Preset[]>("/api/presets"),
@@ -641,7 +801,7 @@ export default function App() {
   const advisors = useQuery({
     queryKey: ["advisors", boardId],
     queryFn: () => get<AdvisorFull[]>(`/api/boards/${boardId}/advisors`),
-    enabled: !!boardId,
+    enabled: !!boardId && boardOk,
   });
   const meetings = useQuery({
     queryKey: ["meetings", boardId, mq, mstate],
@@ -649,18 +809,52 @@ export default function App() {
       get<MeetingFull[]>(
         `/api/boards/${boardId}/meetings?${new URLSearchParams({ ...(mq ? { q: mq } : {}), ...(mstate ? { state: mstate } : {}) })}`,
       ),
-    enabled: !!boardId,
+    enabled: !!boardId && boardOk,
   });
+  const allMeetings = useQuery({
+    queryKey: ["meetings", boardId, "all"],
+    queryFn: () => get<MeetingFull[]>(`/api/boards/${boardId}/meetings`),
+    enabled: !!boardId && boardOk,
+  });
+  // Selected-meeting authority is the scoped singular lookup, which also
+  // verifies the parent board. Absence from capped lists never clears.
+  const meetingDetail = useQuery({
+    queryKey: ["meeting-detail", boardId, meetingId],
+    queryFn: () =>
+      get<MeetingFull>(`/api/boards/${boardId}/meetings/${meetingId}`),
+    enabled: !!boardId && !!meetingId && boardValid,
+    retry: false,
+  });
+  // Bounded meeting windows (newest 200, filtered views) never establish
+  // absence. Only a 404 on the scoped lookup (unknown id or parent-board
+  // mismatch, which the server also reports as 404) clears the route.
+  const meetingParentMismatch =
+    meetingDetail.isSuccess &&
+    meetingDetail.data != null &&
+    meetingDetail.data.boardId !== boardId;
+  const meetingMissing =
+    (!!meetingId &&
+      !!boardId &&
+      boardValid &&
+      meetingDetail.isError &&
+      isNotFound(meetingDetail.error)) ||
+    (!!meetingId && !!meetingParentMismatch);
+  const meetingValid =
+    meetingId === "" ||
+    (meetingDetail.isSuccess &&
+      meetingDetail.data != null &&
+      meetingDetail.data.boardId === boardId);
+  const meetingOk = boardOk && meetingValid;
   const messages = useQuery({
     queryKey: ["messages", meetingId],
     queryFn: () => get<Msg[]>(`/api/meetings/${meetingId}/messages?take=60`),
-    enabled: !!meetingId,
+    enabled: !!meetingId && meetingOk,
     refetchInterval: 4000,
   });
   const hubRef = useRef<HubConnection | null>(null);
   const [live, setLive] = useState(false);
   useEffect(() => {
-    if (!meetingId) return;
+    if (!meetingId || !meetingOk) return;
     let cancelled = false;
     const conn = new HubConnectionBuilder()
       .withUrl("/hubs/board")
@@ -698,7 +892,7 @@ export default function App() {
       conn.stop();
       hubRef.current = null;
     };
-  }, [meetingId, qc]);
+  }, [meetingId, meetingOk, qc]);
   const msgParentRef = useRef<HTMLDivElement | null>(null);
   const msgList = messages.data ?? [];
   const rows = useMemo(() => {
@@ -752,13 +946,24 @@ export default function App() {
   });
   const [meetTab, setMeetTab] = useState<
     "chat" | "takeaways" | "options" | "decision"
-  >("chat");
+  >(route0.mtab);
   const [audience, setAudience] = useState("everyone");
   const [replyTo, setReplyTo] = useState<{ seq: number; who: string } | null>(
     null,
   );
   useEffect(() => {
-    setReplyTo(null);
+    if (prevMeeting.current === null) {
+      // Mount: keep any deep-linked record context from the URL.
+      prevMeeting.current = meetingId;
+    } else if (prevMeeting.current !== meetingId) {
+      prevMeeting.current = meetingId;
+      // A hash traversal pre-sets prevMeeting in apply(), so this branch
+      // only runs for user switches (which keep a Back entry via push).
+      setRecId("");
+      resetMeetingOwnedState();
+    } else {
+      setReplyTo(null);
+    }
     firstAuto.current = true;
     setAtBottom(true);
   }, [meetingId]);
@@ -828,7 +1033,94 @@ export default function App() {
   useEffect(() => {
     setNavOpen(false);
   }, [tab]);
+  // Mobile nav focus + inert: a closed drawer must be untabbable, Escape or
+  // the backdrop returns focus to the opener, and opening moves focus in.
+  // The breakpoint subscription keeps inert/aria-hidden correct when the
+  // viewport crosses 820px without a nav toggle (e.g. mobile to desktop).
+  const navOpenRef = useRef(navOpen);
+  navOpenRef.current = navOpen;
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const mq = window.matchMedia("(max-width: 820px)");
+    const focusFirst = (tries: number) => {
+      if (!navOpenRef.current) return;
+      const el = nav.querySelector("button") as HTMLElement | null;
+      el?.focus?.();
+      // inert removal is processed asynchronously by the browser; a single
+      // deferred focus() can still land while the subtree is inert (a silent
+      // no-op), so retry until focus sticks or the drawer closes.
+      if (el && document.activeElement !== el && tries < 12) {
+        window.setTimeout(() => focusFirst(tries + 1), 50);
+      }
+    };
+    const syncMode = (isMobile: boolean) => {
+      if (navOpenRef.current) {
+        nav.removeAttribute("inert");
+        nav.removeAttribute("aria-hidden");
+        const ae =
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+        // Preserve the external opener across breakpoint changes: never
+        // overwrite it with a rail child (which becomes inert on narrow).
+        if (!ae || !nav.contains(ae)) {
+          openerRef.current = ae;
+        }
+        if (isMobile) window.setTimeout(() => focusFirst(0), 0);
+      } else {
+        if (nav.contains(document.activeElement)) {
+          const opener =
+            openerRef.current ??
+            document.querySelector('[aria-label="Open navigation"]');
+          (opener as HTMLElement | null)?.focus();
+        }
+        if (isMobile) {
+          nav.setAttribute("inert", "");
+          nav.setAttribute("aria-hidden", "true");
+        } else {
+          nav.removeAttribute("inert");
+          nav.removeAttribute("aria-hidden");
+        }
+      }
+    };
+    syncMode(mq.matches);
+    const onChange = (e: MediaQueryListEvent) => syncMode(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [navOpen]);
   const railListRef = useRef<HTMLDivElement | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  // Arrow/Home/End travel between rail destinations; Escape is global.
+  const railKeys = (e: {
+    key: string;
+    preventDefault(): void;
+    target: EventTarget | null;
+  }) => {
+    if (
+      e.key !== "ArrowDown" &&
+      e.key !== "ArrowUp" &&
+      e.key !== "Home" &&
+      e.key !== "End"
+    )
+      return;
+    const btns = Array.from(
+      navRef.current?.querySelectorAll("button") ?? [],
+    ) as HTMLElement[];
+    const i = btns.indexOf(e.target as HTMLElement);
+    if (i < 0) return;
+    e.preventDefault();
+    const n =
+      e.key === "ArrowDown"
+        ? (i + 1) % btns.length
+        : e.key === "ArrowUp"
+          ? (i + btns.length - 1) % btns.length
+          : e.key === "Home"
+            ? 0
+            : btns.length - 1;
+    btns[n]?.focus();
+  };
   const listpanelRowsRef = useRef<HTMLDivElement | null>(null);
   const listpanelScroll = useRef<Record<string, number>>({});
   useEffect(() => {
@@ -868,7 +1160,7 @@ export default function App() {
   }, [tab, boardId, navOpen]);
   const [contextTab, setContextTab] = useState<
     "members" | "context" | "decisions"
-  >("context");
+  >(route0.ctab);
   const [contextCollapsed, setContextCollapsed] = useState(false);
   const [recordFlash, setRecordFlash] = useState(false);
   const prevRecordKey = useRef("");
@@ -901,6 +1193,11 @@ export default function App() {
   }, [density]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && navOpen) {
+        e.preventDefault();
+        setNavOpen(false);
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         if (tab === "meet" && draft.trim()) {
           e.preventDefault();
@@ -936,7 +1233,7 @@ export default function App() {
   const sources = useQuery({
     queryKey: ["sources", boardId],
     queryFn: () => get<Source[]>(`/api/boards/${boardId}/sources`),
-    enabled: !!boardId && tab === "sources",
+    enabled: !!boardId && boardOk && tab === "sources",
   });
   const jobs = useQuery({
     queryKey: ["jobs"],
@@ -949,7 +1246,7 @@ export default function App() {
       get<UsageRow[]>(
         `/api/usage?${new URLSearchParams({ ...(boardId ? { boardId } : {}), ...(uday ? { day: uday } : {}), ...(ufrom ? { from: ufrom } : {}), ...(uto ? { to: uto } : {}) })}`,
       ),
-    enabled: tab === "activity",
+    enabled: tab === "activity" && (!boardId || boardOk),
   });
   const lead = useQuery({
     queryKey: ["lead"],
@@ -961,7 +1258,7 @@ export default function App() {
   const setup = useQuery({
     queryKey: ["setup", boardId],
     queryFn: () => get<Setup>(`/api/boards/${boardId}/setup`),
-    enabled: !!boardId && tab === "boards",
+    enabled: !!boardId && boardOk && tab === "boards",
   });
   const [leadForm, setLeadForm] = useState({
     name: "",
@@ -1017,8 +1314,9 @@ export default function App() {
   }, [setup.data, boardLoaded]);
   const saveBoard = useMutation({
     mutationFn: () => patch<Board>(`/api/boards/${boardId}`, boardForm),
-    onSuccess: () => {
-      refresh("boards", "setup");
+    onSuccess: (r) => {
+      qc.setQueryData(["board-detail", boardId], r);
+      refresh("boards", "board-detail", "setup");
     },
   });
   const activate = useMutation({
@@ -1032,18 +1330,20 @@ export default function App() {
   });
   const saveBoardOpts = useMutation({
     mutationFn: (b: unknown) => patch<Board>(`/api/boards/${boardId}`, b),
-    onSuccess: () => {
-      refresh("setup", "boards");
+    onSuccess: (r) => {
+      qc.setQueryData(["board-detail", boardId], r as Board);
+      refresh("setup", "boards", "board-detail");
     },
   });
   const status = useQuery({
     queryKey: ["status", boardId],
     queryFn: () => get<BoardStatus>(`/api/boards/${boardId}/status`),
-    enabled: !!boardId && tab === "boards",
+    enabled: !!boardId && boardOk && tab === "boards",
   });
   const [wizId, setWizId] = useState(
     () => localStorage.getItem("simceo-wizard") ?? "",
   );
+  const [wizVersion, setWizVersion] = useState<number | null>(null);
   const [guide, setGuide] = useState<{
     suggestion: string;
     nextQuestion: string;
@@ -1056,8 +1356,9 @@ export default function App() {
   } | null>(null);
   const wizSave = useMutation({
     mutationFn: () =>
-      post<{ id: string }>("/api/wizard", {
+      post<{ id: string; version: number }>("/api/wizard", {
         id: wizId || undefined,
+        ...(wizVersion != null ? { version: wizVersion } : {}),
         accountId,
         step: wizard.step,
         presetKey,
@@ -1071,6 +1372,7 @@ export default function App() {
       }),
     onSuccess: (r) => {
       setWizId(r.id);
+      if (typeof (r as { version?: unknown }).version === "number") setWizVersion((r as { version: number }).version);
       localStorage.setItem("simceo-wizard", r.id);
       refresh("wizreview");
     },
@@ -1124,7 +1426,7 @@ export default function App() {
   const hydrateWizard = async () => {
     if (!wizId) return;
     try {
-      const d = await get<{ presetKey: string; step: number; fieldsJson: string; interviewJson: string }>(`/api/wizard/${wizId}`);
+      const d = await get<{ presetKey: string; step: number; fieldsJson: string; interviewJson: string; version: number }>(`/api/wizard/${wizId}`);
       const f = JSON.parse(d.fieldsJson || "{}");
       setWizard((w) => ({
         ...w,
@@ -1134,6 +1436,7 @@ export default function App() {
         seats: Array.isArray(f.advisors) ? f.advisors.map((s: { role: string; name: string }) => ({ role: s.role ?? "", name: s.name ?? "" })) : w.seats,
         lead: { ...w.lead, ...(f.lead ?? {}) },
       }));
+      if (typeof d.version === "number") setWizVersion(d.version);
       if (d.presetKey) setPresetKey(d.presetKey);
       try {
         const ij = JSON.parse(d.interviewJson || "{}");
@@ -1145,14 +1448,15 @@ export default function App() {
   useEffect(() => { if (wizId) { hydrateWizard(); } }, [wizId]);
   const askInterview = useMutation({
     mutationFn: (answer: string) =>
-      post<{ question: string; analysis: string; applied: string[]; turns: { question: string; answer: string; analysis: string }[]; checkpoints: { at: string; text: string }[] }>(
-        `/api/wizard/${wizId}/interview`, { answer },
+      post<{ question: string; analysis: string; applied: string[]; turns: { question: string; answer: string; analysis: string }[]; checkpoints: { at: string; text: string }[]; version: number }>(
+        `/api/wizard/${wizId}/interview`, { answer, ...(wizVersion != null ? { version: wizVersion } : {}) },
       ),
     onSuccess: (r) => {
       setIturns(r.turns ?? []);
       setIchecks(r.checkpoints ?? []);
       setIquestion(r.question ?? "");
       setIanswer("");
+      if (typeof (r as { version?: unknown }).version === "number") setWizVersion((r as { version: number }).version);
       hydrateWizard();
       refresh("wizreview");
     },
@@ -1175,9 +1479,48 @@ export default function App() {
         {},
       ),
     onSuccess: (r) => {
+      // Seed the new board into the list + detail caches before the
+      // invalidated list returns, so a delayed refresh never discards the
+      // just-created selection as "absent".
+      qc.setQueryData<Board[]>(["boards"], (old) =>
+        old
+          ? [...old.filter((b) => b.id !== r.board.id), r.board]
+          : [r.board],
+      );
+      qc.setQueryData(["board-detail", r.board.id], r.board);
       setBoardId(r.board.id);
       setMeetingId("");
-      refresh("boards", "advisors", "roster", "roster-count", "roster-names", "lead");
+      refresh("boards", "board-detail", "advisors", "roster", "roster-count", "roster-names", "lead");
+      // Consume the completed wizard draft only after success: retire the
+      // id, storage, fields and interview state so the next New board is a
+      // fresh Step 1 that creates a DISTINCT board. Unfinished drafts survive
+      // logo/ordinary navigation because this runs solely on success.
+      try { localStorage.removeItem("simceo-wizard"); } catch { /* private-mode */ }
+      setWizId("");
+      setWizVersion(null);
+      setWizard({
+        name: "",
+        mission: "",
+        stage: "",
+        step: 1,
+        seats: [],
+        lead: {
+          name: "",
+          roleLabel: "Board Lead",
+          background: "",
+          familiarTopics: "",
+          simplerTopics: "",
+          commPrefs: "",
+        },
+      });
+      setSeatRole("");
+      setSeatName("");
+      setPresetKey("strategy");
+      setGuide(null);
+      setIturns([]);
+      setIchecks([]);
+      setIquestion("");
+      setIanswer("");
       setTab("advisors");
       notify("Board created. Review and approve each advisor.");
     },
@@ -1461,7 +1804,12 @@ const tabCount = (k: Tab): number | null => {
   const [mtitle, setMtitle] = useState("");
   const [mbrief, setMbrief] = useState("");
   const [mLoaded, setMLoaded] = useState("");
-  const curMeeting = (meetings.data ?? []).find((m) => m.id === meetingId);
+  // Headings and forms use the authoritative selected-entity detail first,
+  // even when the meeting is outside every capped/filtered list window.
+  const curMeeting =
+    (meetingValid ? meetingDetail.data : undefined) ??
+    (allMeetings.data ?? []).find((m) => m.id === meetingId) ??
+    (meetings.data ?? []).find((m) => m.id === meetingId);
   useEffect(() => {
     if (curMeeting && mLoaded !== curMeeting.id + curMeeting.brief) {
       setMtitle(curMeeting.title);
@@ -1488,20 +1836,25 @@ const tabCount = (k: Tab): number | null => {
   }, [tab, meetingId, boardId, briefText]);
   const saveMeeting = useMutation({
     mutationFn: () =>
-      patch<Meeting>(`/api/meetings/${meetingId}`, {
+      patch<MeetingFull>(`/api/meetings/${meetingId}`, {
         title: mtitle,
         brief: mbrief,
       }),
-    onSuccess: () => refresh("meetings"),
+    onSuccess: (r) => {
+      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+      refresh("meetings", "meeting-detail", "delivery");
+    },
   });
   const closeMeeting = (withRecord: boolean) =>
-    post<Meeting>(`/api/meetings/${meetingId}/close`, { withRecord }).then(() =>
-      refresh("meetings"),
-    );
+    post<MeetingFull>(`/api/meetings/${meetingId}/close`, { withRecord }).then((r) => {
+      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+      refresh("meetings", "meeting-detail", "delivery");
+    });
   const reopenMeeting = () =>
-    post<Meeting>(`/api/meetings/${meetingId}/reopen`, {}).then(() =>
-      refresh("meetings"),
-    );
+    post<MeetingFull>(`/api/meetings/${meetingId}/reopen`, {}).then((r) => {
+      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+      refresh("meetings", "meeting-detail", "delivery");
+    });
   const delivery = useQuery({
     queryKey: ["delivery", meetingId],
     queryFn: () =>
@@ -1511,7 +1864,7 @@ const tabCount = (k: Tab): number | null => {
         messages: number;
         lastSequence: number;
       }>(`/api/meetings/${meetingId}/delivery`),
-    enabled: !!meetingId && tab === "meet",
+    enabled: !!meetingId && meetingOk && tab === "meet",
   });
   const [sq, setSq] = useState("");
   const [hits, setHits] = useState<
@@ -1536,7 +1889,7 @@ const tabCount = (k: Tab): number | null => {
   const notes = useQuery({
     queryKey: ["notes", meetingId],
     queryFn: () => get<Note[]>(`/api/meetings/${meetingId}/notes`),
-    enabled: !!meetingId && tab === "meet",
+    enabled: !!meetingId && meetingOk && tab === "meet",
   });
   const [ntitle, setNtitle] = useState("");
   const [nbody, setNbody] = useState("");
@@ -1566,7 +1919,7 @@ const tabCount = (k: Tab): number | null => {
   const directions = useQuery({
     queryKey: ["directions", boardId],
     queryFn: () => get<Note[]>(`/api/boards/${boardId}/directions`),
-    enabled: !!boardId && tab === "meet",
+    enabled: !!boardId && boardOk && tab === "meet",
   });
   const [dtext, setDtext] = useState("");
   const [dscope, setDscope] = useState("meeting");
@@ -1668,12 +2021,12 @@ const tabCount = (k: Tab): number | null => {
   const recs = useQuery({
     queryKey: ["records", meetingId],
     queryFn: () => get<RecordDraft[]>(`/api/meetings/${meetingId}/records`),
-    enabled: !!meetingId && (tab === "records" || tab === "meet"),
+    enabled: !!meetingId && meetingOk && (tab === "records" || tab === "meet"),
   });
   const latestDraft = (recs.data ?? [])
     .slice()
     .sort((a, b) => b.version - a.version)[0];
-  const [recId, setRecId] = useState("");
+  const [recId, setRecId] = useState(route0.rec);
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -1690,8 +2043,47 @@ const tabCount = (k: Tab): number | null => {
   const recDetail = useQuery({
     queryKey: ["record", recId],
     queryFn: () => get<RecordDraft>(`/api/records/${recId}`),
-    enabled: !!recId && tab === "records",
+    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records",
+    retry: false,
   });
+  // Record authority is the singular detail lookup plus a parent check: the
+  // draft must belong to the selected meeting and board. The newest-50 list
+  // window never establishes absence.
+  const recParentOk =
+    recId === "" ||
+    (!!boardId &&
+      !!meetingId &&
+      boardOk &&
+      meetingOk &&
+      recDetail.isSuccess &&
+      recDetail.data?.boardId === boardId &&
+      recDetail.data?.meetingId === meetingId);
+  const recOk = recParentOk;
+  // Bounded record window (newest 50) never establishes absence. Only a 404
+  // on the singular record lookup, or a verified parent mismatch, clears the
+  // selection. Validation runs on the records tab where the lookup is active;
+  // other tabs keep the id until records-tab validation runs.
+  const recParentMismatch =
+    recDetail.isSuccess &&
+    recDetail.data != null &&
+    (recDetail.data.boardId !== boardId ||
+      recDetail.data.meetingId !== meetingId);
+  const recMissing =
+    !!recId &&
+    !!boardId &&
+    !!meetingId &&
+    tab === "records" &&
+    boardOk &&
+    meetingOk &&
+    ((recDetail.isError && isNotFound(recDetail.error)) ||
+      !!recParentMismatch);
+  // Navigation keeps document scroll at top on destination/context change
+  // (tab/board/meeting/record); list-panel scroll is preserved separately
+  // via listpanelScroll and drafts are untouched.
+  useEffect(() => {
+    document.documentElement.scrollTop = 0;
+    try { window.scrollTo(0, 0); } catch { /* noop */ }
+  }, [tab, boardId, meetingId, recId]);
   const [selItems, setSelItems] = useState<string[]>([]);
   const [revText, setRevText] = useState("");
   useEffect(() => {
@@ -1708,8 +2100,10 @@ const tabCount = (k: Tab): number | null => {
     }
   }, [recDetail.data]);
   const approveRec = (all: boolean) => {
+    if (!recOk) return;
     const d = recDetail.data;
     if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     let ids = selItems;
     if (all) {
       try {
@@ -1726,15 +2120,24 @@ const tabCount = (k: Tab): number | null => {
       watermark: d.watermark,
       itemIds: ids,
     })
-      .then(() => {
+      .then((r) => {
+        const updated = r as unknown as RecordDraft | undefined;
+        if (updated && (updated as RecordDraft).id) {
+          qc.setQueryData(["record", (updated as RecordDraft).id], updated);
+          qc.setQueryData<RecordDraft[] | undefined>(["records", meetingId], (old) =>
+            old ? [...old.filter((x) => x.id !== (updated as RecordDraft).id), updated as RecordDraft] : [updated as RecordDraft],
+          );
+        }
         refresh("records", "record");
         notify(`Approved ${ids.length} item(s).`);
       })
       .catch((e) => alert(String(e)));
   };
   const reviseRec = (amend: boolean) => {
+    if (!recOk) return;
     const d = recDetail.data;
     if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     let items: unknown = [];
     try {
       items = JSON.parse(revText);
@@ -1746,37 +2149,59 @@ const tabCount = (k: Tab): number | null => {
       items,
     })
       .then((r) => {
+        // Seed the revised/amended draft into the list + singular caches so
+        // a delayed records refresh never discards the just-saved selection.
+        qc.setQueryData<RecordDraft[] | undefined>(
+          ["records", meetingId],
+          (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
+        );
+        qc.setQueryData(["record", r.id], r);
         setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => alert(String(e)));
   };
-  const discardRec = () =>
-    post<unknown>(`/api/records/${recDetail.data?.id}/discard`, {}).then(() =>
-      refresh("records", "record"),
-    );
+  const discardRec = () => {
+    if (!recOk || !recDetail.data) return Promise.resolve();
+    const d = recDetail.data;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
+    return post<unknown>(`/api/records/${d.id}/discard`, {}).then((r) => {
+      const updated = r as unknown as RecordDraft | undefined;
+      if (updated && (updated as RecordDraft).id) qc.setQueryData(["record", (updated as RecordDraft).id], updated);
+      refresh("records", "record");
+    });
+  };
   const [draftItems, setDraftItems] = useState(
     '[{"id":"1","text":"","detail":"","status":"proposed","scope":"meeting"}]',
   );
-  const prepareDraft = () =>
-    post<RecordDraft>(
+  const prepareDraft = () => {
+    if (!boardId || !meetingId || !boardOk || !meetingOk) return;
+    return post<RecordDraft>(
       `/api/meetings/${meetingId}/record/draft`,
       JSON.parse(draftItems),
     )
       .then((r) => {
+        // Seed the freshly drafted record before the invalidated list
+        // returns, so a delayed refresh never discards it as absent.
+        qc.setQueryData<RecordDraft[] | undefined>(
+          ["records", meetingId],
+          (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
+        );
+        qc.setQueryData(["record", r.id], r);
         setRecId(r.id);
-        refresh("records");
+        refresh("records", "record");
       })
       .catch((e) => alert(String(e)));
+  };
   const invites = useQuery({
     queryKey: ["invites", boardId],
     queryFn: () => get<Invite[]>(`/api/boards/${boardId}/invites`),
-    enabled: !!boardId && tab === "people",
+    enabled: !!boardId && boardOk && tab === "people",
   });
   const grants = useQuery({
     queryKey: ["grants", boardId],
     queryFn: () => get<Grant[]>(`/api/boards/${boardId}/grants`),
-    enabled: !!boardId && tab === "people",
+    enabled: !!boardId && boardOk && tab === "people",
   });
   const [iemail, setIemail] = useState("");
   const [irole, setIrole] = useState("collaborator");
@@ -2049,6 +2474,12 @@ const testModel = useMutation({
         participantIds: meetPicks,
       }),
     onSuccess: (m) => {
+      const full = { ...(m as Partial<MeetingFull>), brief: (m as Partial<MeetingFull>).brief ?? "" } as MeetingFull;
+      qc.setQueryData<MeetingFull[] | undefined>(
+        ["meetings", boardId, "all"],
+        (old) => (old ? [...old.filter((x) => x.id !== m.id), full] : [full]),
+      );
+      qc.setQueryData(["meeting-detail", boardId, m.id], full);
       refresh("meetings");
       setMeetingId(m.id);
     },
@@ -2099,9 +2530,10 @@ const testModel = useMutation({
     onError: (e) => alert(String(e)),
   });
   const meetingCtl = (op: string) =>
-    post<Meeting>(`/api/meetings/${meetingId}/${op}`, {}).then(() =>
-      refresh("meetings"),
-    );
+    post<MeetingFull>(`/api/meetings/${meetingId}/${op}`, {}).then((r) => {
+      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+      refresh("meetings", "meeting-detail", "delivery");
+    });
   const [toasts, setToasts] = useState<
     { id: number; text: string; err: boolean }[]
   >([]);
@@ -2123,14 +2555,152 @@ const testModel = useMutation({
       7000,
     );
   };
+  // ---- URL-addressable navigation (hash routes; Vite/static-safe) ----
+  const firstNav = useRef(true);
+  const lastSync = useRef({ board: route0.board, meeting: route0.meeting });
+  useEffect(() => {
+    // Effective ids: only an authoritative 404 (or a verified parent
+    // mismatch) proves an id invalid. Bounded lists (boards newest 100,
+    // meetings newest 200, records newest 50) and filtered views never
+    // establish absence, so they must not clear the route. Pending or
+    // non-404 lookup errors keep the id while gating downstream queries.
+    // Never publish the previous board/meeting's context under a new one
+    // while the switch-reset effects are still queued in this commit.
+    let vBoard = boardMissing ? "" : boardId;
+    let vMeeting = vBoard === "" ? "" : meetingMissing ? "" : meetingId;
+    let vRec = vMeeting === "" ? "" : recMissing ? "" : recId;
+    let effBoard = vBoard;
+    let effMeeting = vMeeting;
+    let effRec = vRec;
+    let switched = false;
+    if (lastSync.current.board !== vBoard) {
+      effMeeting = "";
+      effRec = "";
+      switched = true;
+    } else if (lastSync.current.meeting !== vMeeting) {
+      effRec = "";
+      switched = true;
+    }
+    const cleaned =
+      effBoard !== boardId || effMeeting !== meetingId || effRec !== recId;
+    // Authoritative detail lookups confirm the context, so the selection can
+    // publish immediately: a pending lookup keeps the id (never strips it),
+    // and only a confirmed 404/mismatch clears it above. Downstream data
+    // queries stay gated on boardOk/meetingOk/recOk until then.
+    const h = buildHash({
+      tab,
+      board: effBoard,
+      meeting: effMeeting,
+      mtab: meetTab,
+      ctab: contextTab,
+      rec: effRec,
+    });
+    if (window.location.hash === h) {
+      firstNav.current = false;
+      navReplace.current = false;
+      lastSync.current = { board: effBoard, meeting: effMeeting };
+      return;
+    }
+    // Push user switches so Back restores the prior board/meeting; replace
+    // mount/traversal dedup and silent invalid-id cleanups.
+    if (firstNav.current || navReplace.current || (cleaned && !switched)) {
+      window.history.replaceState(null, "", h);
+    } else {
+      window.history.pushState(null, "", h);
+    }
+    firstNav.current = false;
+    navReplace.current = false;
+    lastSync.current = { board: effBoard, meeting: effMeeting };
+  }, [
+    tab,
+    boardId,
+    meetingId,
+    meetTab,
+    contextTab,
+    recId,
+    boardMissing,
+    meetingMissing,
+    recMissing,
+  ]);
+  // Reconcile ids that no longer exist (authoritative 404 or verified parent
+  // mismatch): clear them without firing requests for the stale ids (queries
+  // above are gated on boardOk/meetingOk/recOk). Bounded-list absence never
+  // clears here.
+  useEffect(() => {
+    if (boardMissing) {
+      navReplace.current = true;
+      setBoardId("");
+      setMeetingId("");
+      setRecId("");
+    }
+  }, [boardMissing]);
+  useEffect(() => {
+    if (meetingMissing) {
+      navReplace.current = true;
+      setMeetingId("");
+      setRecId("");
+    }
+  }, [meetingMissing]);
+  useEffect(() => {
+    if (recMissing) {
+      navReplace.current = true;
+      setRecId("");
+    }
+  }, [recMissing]);
+  useEffect(() => {
+    const apply = () => {
+      // Document anchors (e.g. #main from the skip link) are not routes:
+      // leave every selection untouched instead of parsing Boards.
+      const raw = window.location.hash.replace(/^#/, "");
+      if (!raw.startsWith("/")) return;
+      const r = parseHash();
+      // Traversal restores URL context but must still reset the state owned
+      // by the board/meeting being left, mirroring the switch guards (the
+      // pre-set refs below keep those guards from double-clearing).
+      if (r.board !== boardId) resetBoardOwnedState();
+      if (r.meeting !== meetingId) resetMeetingOwnedState();
+      prevBoard.current = r.board;
+      prevMeeting.current = r.meeting;
+      lastSync.current = { board: r.board, meeting: r.meeting };
+      setTab((t) => (t === r.tab ? t : r.tab));
+      setBoardId((v) => (v === r.board ? v : r.board));
+      setMeetingId((v) => (v === r.meeting ? v : r.meeting));
+      setMeetTab((v) => (v === r.mtab ? v : r.mtab));
+      setContextTab((v) => (v === r.ctab ? v : r.ctab));
+      setRecId((v) => (v === r.rec ? v : r.rec));
+    };
+    window.addEventListener("hashchange", apply);
+    window.addEventListener("popstate", apply);
+    return () => {
+      window.removeEventListener("hashchange", apply);
+      window.removeEventListener("popstate", apply);
+    };
+  });
   return (
     <div className={"shell" + (navOpen ? " nav-open" : "") + (tab === "boards" || tab === "roster" || tab === "meet" ? "" : " no-panel")}>
       {" "}
-      <nav className="rail" aria-label="Board navigation">
+      <nav
+        className="rail"
+        aria-label="Board navigation"
+        ref={navRef}
+        onKeyDown={railKeys}
+      >
         {" "}
-        <h1 className="brand rail-logo" aria-label="Sim CEO">
+        <h1 className="brand rail-logo">
           {" "}
-          <img src="/logo.webp" alt="Sim CEO logo" width="32" height="32" className="brand-logo" />{" "}
+          <button
+            type="button"
+            className="rail-home"
+            onClick={() => {
+              setTab("boards");
+              setNavOpen(false);
+            }}
+            aria-label="Sim CEO — go to Boards"
+            title="Boards"
+          >
+            {" "}
+            <img src="/logo.webp" alt="" width="32" height="32" className="brand-logo" />{" "}
+          </button>{" "}
         </h1>{" "}
 
         <div className="rail-items" ref={railListRef}>
@@ -2144,13 +2714,13 @@ const testModel = useMutation({
             }}
             aria-hidden="true"
           />{" "}
-          {navGroups.map((g) => {
+          {navGroups.map((g, gi) => {
             const items = g.items.filter(
               ([k]) => boardId || !needsBoard.includes(k),
             );
             if (items.length === 0) return null;
             return (
-              <div key={g.label || "top"}>
+              <div key={g.label === "" ? `rail-group-${gi}` : g.label}>
                 {" "}
                 {g.label && (
                   <div className="navgroup" aria-hidden="true">
@@ -2268,7 +2838,7 @@ const testModel = useMutation({
                   : `${(meetings.data ?? []).length} meetings`}{" "}
               {tab !== "boards" && boardId && (
                 <>
-                  {" "}· {(boards.data ?? []).find((b) => b.id === boardId)?.name ?? "Board"}{" "}
+                  {" "}· {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? "Board"}{" "}
                 </>
               )}{" "}
             </div>{" "}
@@ -2360,11 +2930,26 @@ const testModel = useMutation({
         type="button"
         className="backdrop"
         aria-label="Close navigation"
-        onClick={() => setNavOpen(false)}
+        onClick={() => {
+          setNavOpen(false);
+          const opener = document.querySelector(
+            '[aria-label="Open navigation"]',
+          );
+          (opener as HTMLElement | null)?.focus();
+        }}
       />{" "}
       <div className="maincol">
         {" "}
-        <a href="#main" className="skip">
+        <a
+          href="#main"
+          className="skip"
+          onClick={(e) => {
+            // Move focus without touching the hash: the route owns the URL,
+            // so a "#main" fragment must never parse as a Boards navigation.
+            e.preventDefault();
+            document.getElementById("main")?.focus();
+          }}
+        >
           {" "}
           Skip to main content{" "}
         </a>{" "}
@@ -2393,7 +2978,7 @@ const testModel = useMutation({
           {boardId ? (
             <span className="boardname">
               {" "}
-              Open board: {(boards.data ?? []).find((b) => b.id === boardId)?.name ?? boardId.slice(0, 8)}{" "}
+              Open board: {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? boardId.slice(0, 8)}{" "}
               <button
                 type="button"
                 className="btn ghost"
@@ -2413,7 +2998,7 @@ const testModel = useMutation({
           )}{" "}
           {meetingId && live && <span className="badge live">live</span>}{" "}
         </div>{" "}
-        <main className="main" id="main">
+        <main className="main" id="main" tabIndex={-1}>
           {" "}
           {tab === "boards" && (
             <section aria-label="Boards">
@@ -2425,7 +3010,8 @@ const testModel = useMutation({
                   <h3>
                     {" "}
                     Open board:{" "}
-                    {(boards.data ?? []).find((b) => b.id === boardId)?.name ??
+                    {boardDetail.data?.name ??
+                      (boards.data ?? []).find((b) => b.id === boardId)?.name ??
                       boardId.slice(0, 8)}{" "}
                   </h3>{" "}
                   <div className="meetctl">
@@ -3973,9 +4559,17 @@ const testModel = useMutation({
                         </li>
                       ))}{" "}
                     </ol>{" "}
-                    {(meetings.data ?? []).length === 0 && (
-                      <p>No meetings yet — start one above.</p>
-                    )}{" "}
+                    {(meetings.data ?? []).length === 0 &&
+                      (allMeetings.data ?? []).length === 0 && (
+                        <p>No meetings yet — start one above.</p>
+                      )}{" "}
+                    {(meetings.data ?? []).length === 0 &&
+                      (allMeetings.data ?? []).length > 0 && (
+                        <p role="status">
+                          No meetings match this filter — the open meeting
+                          stays selected below.
+                        </p>
+                      )}{" "}
                   </div>{" "}
                   {meetingId && (
                     <>
@@ -5229,7 +5823,7 @@ const testModel = useMutation({
                       </span>{" "}
                     </div>
                   ))}{" "}
-                  {recDetail.data && (
+                  {recOk && recDetail.data && (
                     <div className="card key">
                       {" "}
                       <h3>

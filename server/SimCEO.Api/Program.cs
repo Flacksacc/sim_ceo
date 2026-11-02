@@ -349,6 +349,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Gui
 });
 
 app.MapExtended();
+app.MapNavigation();
 
 app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement body) =>
 {
