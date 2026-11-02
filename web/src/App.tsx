@@ -2059,6 +2059,8 @@ const tabCount = (k: Tab): number | null => {
     .slice()
     .sort((a, b) => b.version - a.version)[0];
   const [recId, setRecId] = useState(route0.rec);
+  const liveSelRef = useRef({ boardId, meetingId, recId });
+  liveSelRef.current = { boardId, meetingId, recId };
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -2191,6 +2193,7 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originDraftId = d.id;
     void originDraftId;
+    const originRecId = recId;
     post<RecordDraft>(`/api/records/${d.id}/${amend ? "amend" : "revise"}`, {
       items,
     })
@@ -2205,7 +2208,8 @@ const tabCount = (k: Tab): number | null => {
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        if (boardId === keyBoard && meetingId === keyMeeting) setRecId(r.id);
+        const live = liveSelRef.current;
+        if (live.boardId === keyBoard && live.meetingId === keyMeeting && live.recId === originRecId) setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => alert(String(e)));
@@ -2228,6 +2232,7 @@ const tabCount = (k: Tab): number | null => {
     if (!boardId || !meetingId || !boardOk || !meetingOk) return;
     const originBoardId = boardId;
     const originMeetingId = meetingId;
+    const originRecId = recId;
     return post<RecordDraft>(
       `/api/meetings/${originMeetingId}/record/draft`,
       JSON.parse(draftItems),
@@ -2243,7 +2248,8 @@ const tabCount = (k: Tab): number | null => {
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        if (boardId === keyBoard && meetingId === keyMeeting) setRecId(r.id);
+        const live = liveSelRef.current;
+        if (live.boardId === keyBoard && live.meetingId === keyMeeting && live.recId === originRecId) setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => alert(String(e)));

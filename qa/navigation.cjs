@@ -251,6 +251,50 @@ async function desktopSuite(browser) {
     await page.getByRole("heading", { name: /Review v2/ }).waitFor({ timeout: 15000 });
     await check(page, "Back restores review without compare state", async () => (await page.locator('main select').first().inputValue()) === "");
 
+    // P2 response-selection: delayed record prepare revise amend A to B must preserve B selection.
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-two", { waitUntil: "domcontentloaded" });
+    await section("Records").first().waitFor({ timeout: 15000 });
+    await page.getByRole("button", { name: "Prepare draft from items" }).click();
+    await page.waitForFunction(() => /rec=r-new-/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
+    const destHash = await hashOf(page);
+    await check(page, "delayed record setup B has own selection", async () => /rec=r-new-/.test(await hashOf(page)));
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await check(page, "delayed record setup B review renders", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await setDelay(page, "record-write", 1500);
+    await page.getByRole("button", { name: "Prepare draft from items" }).click();
+    await page.waitForTimeout(300);
+    await page.evaluate((h) => { window.location.hash = h; }, destHash);
+    await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
+    await check(page, "delayed prepare switch lands on B", async () => (await hashOf(page)) === destHash);
+    await page.waitForTimeout(2200);
+    await check(page, "delayed prepare preserves B hash", async () => (await hashOf(page)) === destHash);
+    await check(page, "delayed prepare preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed prepare preserves B content", () => page.getByText("QA draft item").first().isVisible());
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await setDelay(page, "record-write", 1500);
+    await page.getByRole("button", { name: "Request revision (new version)" }).click();
+    await page.waitForTimeout(300);
+    await page.evaluate((h) => { window.location.hash = h; }, destHash);
+    await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+    await check(page, "delayed revise preserves B hash", async () => (await hashOf(page)) === destHash);
+    await check(page, "delayed revise preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed revise preserves B actions", () => page.getByRole("button", { name: "Request revision (new version)" }).isVisible());
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await setDelay(page, "record-write", 1500);
+    await page.getByRole("button", { name: "Amend (name superseded IDs)" }).click();
+    await page.waitForTimeout(300);
+    await page.evaluate((h) => { window.location.hash = h; }, destHash);
+    await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+    await check(page, "delayed amend preserves B hash", async () => (await hashOf(page)) === destHash);
+    await check(page, "delayed amend preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed amend preserves B content", () => page.getByText("QA draft item").first().isVisible());
+
     // message-search isolation: owned search state resets on board switch,
     // while a Back traversal restores the URL without resurrecting it
     await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });

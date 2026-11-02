@@ -196,6 +196,8 @@ function fixtureHandler(reqLog, unhandled) {
       return J(store.drafts[m[1]] || []);
     }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/record\/draft$/)) && req.method() === "POST") {
+      const dwr = takeDelay("record-write");
+      if (dwr) await sleep(dwr);
       const found = meetingById(m[1]);
       if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
       const boardId = found ? found.boardId : "b-alpha";
@@ -207,6 +209,8 @@ function fixtureHandler(reqLog, unhandled) {
     }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/record\/approve$/)) && req.method() === "POST") {let bb={};try{bb=req.postDataJSON()||{};}catch{}const dd=store.byRecordId[bb.draftId];if(!dd)return V("unknown record");dd.decided=true;dd.status="approved";try{dd.approvedJson=JSON.stringify(bb.itemIds||[]);}catch{}return J({approved:bb.itemIds||[],draft:dd.id});}
     if ((m = p.match(/^\/api\/records\/([^/]+)\/(revise|amend)$/)) && req.method() === "POST") {
+      const dwr2 = takeDelay("record-write");
+      if (dwr2) await sleep(dwr2);
       const old = store.byRecordId[m[1]];
       if (!old) return V("unknown record");
       const n = store.nextRecord++;
