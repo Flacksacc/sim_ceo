@@ -148,6 +148,8 @@ type RosterRow = {
     researchedAt: string | null;
     researchRequested: boolean;
     evidenceCount: number;
+    researchJson?: string;
+    ownerKey?: string;
   };
   imageCount: number;
   complete: boolean;
@@ -627,27 +629,85 @@ function ProfileFields({ profileJson }: { profileJson: string }) {
     </div>
   );
 }
+function dossierIsSafeHttpUrl(u: string): boolean {
+  return /^https?:\/\//i.test(u.trim());
+}
+function dossierPick(o: Record<string, unknown>, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim() !== "") return v;
+  }
+  return "";
+}
 function DossierView({ raw }: { raw: string }) {
   let d: Record<string, unknown> = {};
   try {
     const p: unknown = JSON.parse(raw);
     if (p && typeof p === "object" && !Array.isArray(p)) d = p as Record<string, unknown>;
   } catch { return null; }
-  const claims = Array.isArray(d.claims) ? d.claims : [];
+  const claims: unknown[] = Array.isArray(d.claims) ? (d.claims as unknown[]) : (Array.isArray(d.Claims) ? (d.Claims as unknown[]) : []);
+  const subject = dossierPick(d, "subject", "Subject");
+  const note = dossierPick(d, "note", "Note");
+  const supported = typeof d.supported === "boolean" ? d.supported : (typeof d.Supported === "boolean" ? (d.Supported as boolean) : undefined);
   return (
     <div className="card">{" "}
       <h3>Latest dossier</h3>{" "}
-      {typeof d.subject === "string" && <p className="muted">{d.subject}</p>}{" "}
-      {d.supported === false && (<p role="note">Unverified research — treat claims as unsupported until cross-checked.</p>)}{" "}
+      {subject && <p className="muted">{subject}</p>}{" "}
+      {supported === false && (<p role="note">Unverified research — treat claims as unsupported until cross-checked.</p>)}{" "}
       <ul>{" "}
         {claims.map((c, ci) => {
           const cobj = (c && typeof c === "object" && !Array.isArray(c) ? c as Record<string, unknown> : {});
-          const ctext = typeof cobj.text === "string" ? cobj.text : JSON.stringify(c);
-          const angle = typeof cobj.angle === "string" ? cobj.angle : "";
-          return (<li key={ci}>{angle ? (<b>{angle}: </b>) : null}{ctext}</li>);
+          const ctextPicked = dossierPick(cobj, "text", "Text");
+          const ctext = ctextPicked ? ctextPicked : JSON.stringify(c);
+          const angle = dossierPick(cobj, "angle", "Angle");
+          const srcs: unknown[] = Array.isArray(cobj.sources) ? (cobj.sources as unknown[]) : (Array.isArray(cobj.Sources) ? (cobj.Sources as unknown[]) : []);
+          const refs: unknown[] = Array.isArray(cobj.refs) ? (cobj.refs as unknown[]) : (Array.isArray(cobj.Refs) ? (cobj.Refs as unknown[]) : []);
+          type DossierEv = { kind: string; ref: string; url: string; title: string; excerpt: string };
+          const seen = new Set<string>();
+          const evidence: DossierEv[] = [];
+          const pushEv = (kind: string, ref: string, url: string, title: string, excerpt: string) => {
+            const k = (kind.trim() || "source").toLowerCase();
+            const u = url.trim();
+            const key = u ? "u:" + u.toLowerCase() : "k:" + k + ":" + ref.trim().toLowerCase();
+            if (seen.has(key)) return;
+            seen.add(key);
+            evidence.push({ kind: k, ref: ref.trim(), url: u, title: title.trim(), excerpt });
+          };
+          for (const r of refs) {
+            const ro = (r && typeof r === "object" && !Array.isArray(r) ? r as Record<string, unknown> : {});
+            const kind = dossierPick(ro, "kind", "Kind") || "source";
+            const ref = dossierPick(ro, "ref", "Ref", "id", "Id");
+            const url = dossierPick(ro, "url", "Url");
+            const title = dossierPick(ro, "title", "Title");
+            const rawEx = typeof ro.excerpt === "string" ? (ro.excerpt as string) : (typeof ro.Excerpt === "string" ? (ro.Excerpt as string) : "");
+            pushEv(kind, ref || url, url, title, rawEx);
+          }
+          for (const s of srcs) {
+            const so = (s && typeof s === "object" && !Array.isArray(s) ? s as Record<string, unknown> : {});
+            const url = dossierPick(so, "url", "Url");
+            const title = dossierPick(so, "title", "Title");
+            if (!url && !title) continue;
+            pushEv("source", url, url, title, "");
+          }
+          const withExcerpt = evidence.filter((e) => e.excerpt.trim() !== "");
+          const withoutExcerpt = evidence.filter((e) => e.excerpt.trim() === "");
+          const labelFor = (e: DossierEv) => e.title ? e.title : (e.url ? e.url : (e.kind + ":" + (e.ref || "?")));
+          return (<li key={ci}>{angle ? (<b>{angle}: </b>) : null}{ctext}
+            {withExcerpt.length > 0 && (<ul>{withExcerpt.map((e, ei) => {
+              const label = labelFor(e);
+              const safe = !!e.url && dossierIsSafeHttpUrl(e.url);
+              return (<li key={ei}>{safe ? (<a href={e.url} target="_blank" rel="noreferrer">{label}</a>) : (<span>{label}</span>)}
+                <div className="excerpt"><div>{e.excerpt}</div></div></li>);
+            })}</ul>)}
+            {withoutExcerpt.length > 0 && (<ul>{withoutExcerpt.map((e, ei) => {
+              const label = labelFor(e);
+              const safe = !!e.url && dossierIsSafeHttpUrl(e.url);
+              return (<li key={"u" + ei} className="muted">{safe ? (<a href={e.url} target="_blank" rel="noreferrer">{label}</a>) : (<span>{label}</span>)}<span> (no excerpt)</span></li>);
+            })}</ul>)}
+            {withExcerpt.length === 0 && (<p role="note">Unsupported — no excerpt in cited evidence.</p>)}</li>);
         })}{" "}
       </ul>{" "}
-      {typeof d.note === "string" && <p className="muted">{d.note}</p>}{" "}
+      {note && <p className="muted">{note}</p>}{" "}
     </div>
   );
 }
@@ -1253,10 +1313,10 @@ export default function App() {
     enabled: tab === "activity" && (!boardId || boardOk),
   });
   const lead = useQuery({
-    queryKey: ["lead"],
-    queryFn: () => get<Lead>("/api/lead"),
+    queryKey: ["lead", boardId],
+    queryFn: () => get<Lead>(`/api/boards/${boardId}/lead`),
     enabled:
-      tab === "profile" || tab === "meet",
+      !!boardId && (tab === "profile" || tab === "meet"),
     retry: false,
   });
   const setup = useQuery({
@@ -1272,9 +1332,34 @@ export default function App() {
     simplerTopics: "",
     commPrefs: "",
   });
-  const [leadLoaded, setLeadLoaded] = useState(0);
+  const [leadLoaded, setLeadLoaded] = useState("");
+  const [leadBoard, setLeadBoard] = useState("");
   useEffect(() => {
-    if (lead.data && lead.data.version !== leadLoaded) {
+    if (!boardId) return;
+    // P2 #9: track board identity independently from fetched lead identity, so
+    // switching boards always clears the form synchronously, even when both
+    // boards have no saved lead (leadLoaded === "" on both sides).
+    if (leadBoard !== boardId) {
+      setLeadBoard(boardId);
+      setLeadLoaded("");
+      setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: "" });
+      return;
+    }
+    const key = lead.data ? boardId + ":" + lead.data.id + ":" + String(lead.data.version) : "";
+    if (!lead.data) {
+      if (leadLoaded !== "") {
+        setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: "" });
+        setLeadLoaded("");
+      }
+      return;
+    }
+    // Ignore a stale arrival from another board during refetch: the payload must
+    // belong to the current board or the global fallback. Same-board background
+    // refetch still cannot clobber unsaved edits unless the fetched
+    // identity/version actually changed (key check below).
+    const dataBoard: string = lead.data.boardId || "";
+    if (dataBoard !== "" && dataBoard !== boardId && dataBoard !== "00000000-0000-0000-0000-000000000000") return;
+    if (key !== leadLoaded) {
       setLeadForm({
         name: lead.data.name,
         roleLabel: lead.data.roleLabel,
@@ -1283,12 +1368,12 @@ export default function App() {
         simplerTopics: lead.data.simplerTopics,
         commPrefs: lead.data.commPrefs,
       });
-      setLeadLoaded(lead.data.version);
+      setLeadLoaded(key);
     }
-  }, [lead.data, leadLoaded]);
+  }, [lead.data, boardId, leadLoaded, leadBoard]);
   const saveLead = useMutation({
     mutationFn: () =>
-      post<Lead>("/api/lead", {
+      post<Lead>(`/api/boards/${boardId}/lead`, {
         ...leadForm,
         version: lead.data?.version ?? 0,
       }),
@@ -1362,6 +1447,37 @@ export default function App() {
     () => localStorage.getItem("simceo-wizard") ?? "",
   );
   const [wizVersion, setWizVersion] = useState<number | null>(null);
+  // P2 finding2: latest-value refs keep the wizard save/hydrate lifecycles
+  // auditable. Saves capture the fields/step visible at click time instead of
+  // a stale render closure; hydration compares late arrivals against newer
+  // local progress before applying them.
+  const wizIdRef = useRef(wizId);
+  wizIdRef.current = wizId;
+  const wizVersionRef = useRef<number | null>(wizVersion);
+  wizVersionRef.current = wizVersion;
+  const wizardRef = useRef(wizard);
+  wizardRef.current = wizard;
+  const presetKeyRef = useRef(presetKey);
+  presetKeyRef.current = presetKey;
+  // Exact payload of the last attempted save. Hydration still adopts the
+  // server version but keeps newer local fields/step when they differ from
+  // what was sent (typed during the save/GET flight). A rejected save stores
+  // a sentinel mismatch so the next hydration also keeps local progress
+  // until the user successfully saves again.
+  const wizLastSentRef = useRef<{ step: number; presetKey: string; fields: string } | null>(null);
+  // Version-only refresh after a rejected save: adopts the fresh strict
+  // version guard without touching local fields/step, so the next save
+  // retries with the current inputs instead of silently discarding them.
+  const refreshWizVersionOnly = (id?: string) => {
+    const target = id ?? wizIdRef.current;
+    if (!target) return;
+    get<{ version: number }>(`/api/wizard/${target}`).then((d) => {
+      if (wizIdRef.current !== target) return;
+      if (typeof d.version === "number") setWizVersion(d.version);
+    }).catch(() => { /* keep local edits; version stays for explicit retry */ }).finally(() => {
+      refresh("wizreview");
+    });
+  };
   const [guide, setGuide] = useState<{
     suggestion: string;
     nextQuestion: string;
@@ -1373,26 +1489,42 @@ export default function App() {
     };
   } | null>(null);
   const wizSave = useMutation({
-    mutationFn: () =>
-      post<{ id: string; version: number }>("/api/wizard", {
-        id: wizId || undefined,
-        ...(wizVersion != null ? { version: wizVersion } : {}),
+    // The optional argument persists the intended next step explicitly:
+    // Continue passes the step it advances to locally, so the server draft
+    // and the local progress agree even before the delayed hydration lands.
+    mutationFn: (nextStep?: number) => {
+      const w = wizardRef.current;
+      const stepToSave = typeof nextStep === "number" ? nextStep : w.step;
+      const presetToSave = presetKeyRef.current;
+      const fieldsJson = JSON.stringify({
+        name: w.name,
+        mission: w.mission,
+        stage: w.stage,
+        lead: w.lead,
+        advisors: w.seats,
+      });
+      wizLastSentRef.current = { step: stepToSave, presetKey: presetToSave, fields: fieldsJson };
+      return post<{ id: string; version: number }>("/api/wizard", {
+        id: wizIdRef.current || undefined,
+        ...(wizVersionRef.current != null ? { version: wizVersionRef.current } : {}),
         accountId,
-        step: wizard.step,
-        presetKey,
-        fieldsJson: JSON.stringify({
-          name: wizard.name,
-          mission: wizard.mission,
-          stage: wizard.stage,
-          lead: wizard.lead,
-          advisors: wizard.seats,
-        }),
-      }),
+        step: stepToSave,
+        presetKey: presetToSave,
+        fieldsJson,
+      });
+    },
     onSuccess: (r) => {
       setWizId(r.id);
-      if (typeof (r as { version?: unknown }).version === "number") setWizVersion((r as { version: number }).version);
+      if (typeof r.version === "number") setWizVersion(r.version);
       localStorage.setItem("simceo-wizard", r.id);
       refresh("wizreview");
+    },
+    onError: (e) => {
+      alert(String(e));
+      // Never auto-hydrate fields/step after a rejected save: that would
+      // silently overwrite the unsaved inputs the user just typed.
+      wizLastSentRef.current = { step: -1, presetKey: "\0", fields: "\0" };
+      refreshWizVersionOnly();
     },
   });
   const wizReview = useQuery({
@@ -1441,10 +1573,37 @@ export default function App() {
   const [iturns, setIturns] = useState<{ question: string; answer: string; analysis: string }[]>([]);
   const [ichecks, setIchecks] = useState<{ at: string; text: string }[]>([]);
   const [iquestion, setIquestion] = useState("");
-  const hydrateWizard = async () => {
-    if (!wizId) return;
+  const hydrateWizard = async (targetId?: string) => {
+    const id = targetId ?? wizIdRef.current;
+    if (!id) return;
+    const beforeSnap = JSON.stringify({ w: wizardRef.current, p: presetKeyRef.current });
     try {
-      const d = await get<{ presetKey: string; step: number; fieldsJson: string; interviewJson: string; version: number }>(`/api/wizard/${wizId}`);
+      const d = await get<{ presetKey: string; step: number; version: number; fieldsJson: string; interviewJson: string }>(`/api/wizard/${id}`);
+      // Discard late arrivals whose draft changed or was retired in flight
+      // (a new draft started, or create-board consumed the id and cleared it).
+      if (wizIdRef.current !== id) return;
+      if (typeof d.version === "number") setWizVersion(d.version);
+      // Discard stale hydration when newer local edits/progress changed
+      // during the GET flight; the version above is still adopted so the next
+      // save carries the strict guard without losing local inputs.
+      const afterSnap = JSON.stringify({ w: wizardRef.current, p: presetKeyRef.current });
+      if (afterSnap !== beforeSnap) return;
+      // Discard when local progress is newer than the last attempted save
+      // (typed during the save flight, before this GET even started). The
+      // first resume in a fresh session has no sent baseline, so real resume
+      // GETs still apply below.
+      const sent = wizLastSentRef.current;
+      if (sent) {
+        const w = wizardRef.current;
+        const currentFields = JSON.stringify({
+          name: w.name,
+          mission: w.mission,
+          stage: w.stage,
+          lead: w.lead,
+          advisors: w.seats,
+        });
+        if (currentFields !== sent.fields || w.step !== sent.step || presetKeyRef.current !== sent.presetKey) return;
+      }
       const f = JSON.parse(d.fieldsJson || "{}");
       setWizard((w) => ({
         ...w,
@@ -1456,14 +1615,17 @@ export default function App() {
       }));
       if (typeof d.version === "number") setWizVersion(d.version);
       if (d.presetKey) setPresetKey(d.presetKey);
+      if (typeof d.step === "number" && d.step >= 1 && d.step <= 4)
+        setWizard((w) => ({ ...w, step: d.step }));
       try {
         const ij = JSON.parse(d.interviewJson || "{}");
         if (Array.isArray(ij.turns)) setIturns(ij.turns);
         if (Array.isArray(ij.checkpoints)) setIchecks(ij.checkpoints);
+        if (typeof ij.pendingQuestion === "string" && ij.pendingQuestion) setIquestion(ij.pendingQuestion);
       } catch { /* keep current interview state */ }
     } catch { /* draft may be gone; keep local edits */ }
   };
-  useEffect(() => { if (wizId) { hydrateWizard(); } }, [wizId]);
+  useEffect(() => { if (wizId) { hydrateWizard(wizId); } }, [wizId]);
   const askInterview = useMutation({
     mutationFn: (answer: string) =>
       post<{ question: string; analysis: string; applied: string[]; turns: { question: string; answer: string; analysis: string }[]; checkpoints: { at: string; text: string }[]; version: number }>(
@@ -1473,12 +1635,18 @@ export default function App() {
       setIturns(r.turns ?? []);
       setIchecks(r.checkpoints ?? []);
       setIquestion(r.question ?? "");
+      if (typeof r.version === "number") setWizVersion(r.version);
       setIanswer("");
-      if (typeof (r as { version?: unknown }).version === "number") setWizVersion((r as { version: number }).version);
       hydrateWizard();
       refresh("wizreview");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e) => {
+      alert(String(e));
+      // Same 409 protection as wizSave: adopt the fresh version only, never
+      // overwrite unsaved inputs with a conflicting hydration.
+      wizLastSentRef.current = { step: -1, presetKey: "\0", fields: "\0" };
+      refreshWizVersionOnly();
+    },
   });
   const applyGuideRoles = (roles?: { role: string }[]) => {
     if (!roles || roles.length === 0) return;
@@ -1494,7 +1662,7 @@ export default function App() {
     mutationFn: () =>
       post<{ board: Board; advisors: { advisor: string; role: string }[] }>(
         `/api/wizard/${wizId}/create`,
-        {},
+        { ...(wizVersion != null ? { version: wizVersion } : {}) },
       ),
     onSuccess: (r) => {
       // Seed the new board into the list + detail caches before the
@@ -1516,6 +1684,10 @@ export default function App() {
       try { localStorage.removeItem("simceo-wizard"); } catch { /* private-mode */ }
       setWizId("");
       setWizVersion(null);
+      // Retire the save baseline with the completed draft: a late hydration
+      // for the old id is already discarded by the wizId check, and the next
+      // new draft starts with no sent baseline so its resume applies.
+      wizLastSentRef.current = null;
       setWizard({
         name: "",
         mission: "",
@@ -1540,7 +1712,7 @@ export default function App() {
       setIquestion("");
       setIanswer("");
       setTab("advisors");
-      notify("Board created. Review and approve each advisor.");
+      notify("Board created. Accept a portrait for each advisor, then approve.");
     },
     onError: (e) => alert(String(e)),
   });
@@ -1578,6 +1750,11 @@ export default function App() {
     setAq("");
     setAudResult("");
     setDossier("");
+    const row = (rosterRows ?? []).find((r) => r.entry.id === id);
+    const saved = row?.entry.researchJson;
+    if (saved && saved !== "{}") {
+      try { setDossier(JSON.stringify(JSON.parse(saved), null, 1)); } catch { setDossier(saved); }
+    }
   };
 const rosterNames = useQuery({
   queryKey: ["roster-names", accountId],
@@ -1966,6 +2143,36 @@ const tabCount = (k: Tab): number | null => {
       setDtext("");
       refresh("directions");
       notify("Direction adopted with the exact shown text.");
+    },
+    onError: (e) => alert(String(e)),
+  });
+  const fromDirection = useMutation({
+    mutationFn: (noteId: string) =>
+      post<RecordDraft>(`/api/meetings/${meetingId}/record/from-direction`, { noteId }),
+    onMutate: () => ({ originBoardId: boardId, originMeetingId: meetingId }),
+    onSuccess: (r, _v, ctx) => {
+      const origin = ctx as { originBoardId?: string; originMeetingId?: string } | undefined;
+      const keyMeeting = (r as RecordDraft)?.meetingId ?? origin?.originMeetingId ?? meetingId;
+      const keyBoard = (r as RecordDraft)?.boardId ?? origin?.originBoardId ?? boardId;
+      // Seed the staged draft by its returned identity before the invalidated
+      // list returns, and only render it under the origin parents: the live
+      // selection ref (not captured promise values) decides, so switching
+      // meetings while the request is in flight never redirects or poisons
+      // another selection's cache. setRecId + setTab batch into one render, so
+      // the hash effect publishes records+newId once (push) with no split
+      // invalid-parent entry under a stale review.
+      qc.setQueryData<RecordDraft[] | undefined>(
+        ["records", keyMeeting],
+        (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
+      );
+      qc.setQueryData(["record", r.id], r);
+      const live = liveSelRef.current;
+      if (live.boardId === keyBoard && live.meetingId === keyMeeting) {
+        setRecId(r.id);
+        setTab("records");
+      }
+      refresh("records", "record");
+      notify("Direction staged for review as draft " + r.id + ".");
     },
     onError: (e) => alert(String(e)),
   });
@@ -2461,7 +2668,10 @@ const testModel = useMutation({
   const [dossier, setDossier] = useState("");
   const research = (id: string) =>
     post<unknown>(`/api/roster/${id}/research`, {})
-      .then((r) => setDossier(JSON.stringify(r, null, 1)))
+      .then((r) => {
+        setDossier(JSON.stringify(r, null, 1));
+        refresh("roster", "roster-names");
+      })
       .catch((e) => alert(String(e)));
   const [recallQ, setRecallQ] = useState("");
   const [recallHits, setRecallHits] = useState<
@@ -2483,7 +2693,7 @@ const testModel = useMutation({
       })
       .catch((e) => alert(String(e)));
   const doImport = () =>
-    post<unknown>("/api/boards/import", { snapshot: expText, hash: expHash })
+    post<unknown>("/api/boards/import", { snapshot: expText, hash: expHash, accountId })
       .then(() => {
         refresh("boards");
         notify("Imported as a new board; advisors need re-approval.");
@@ -2809,7 +3019,7 @@ const testModel = useMutation({
             );
             if (items.length === 0) return null;
             return (
-              <div key={g.label === "" ? `rail-group-${gi}` : g.label}>
+              <div key={"nav-" + (g.label ? g.label : "top") + "-" + gi}>
                 {" "}
                 {g.label && (
                   <div className="navgroup" aria-hidden="true">
@@ -3520,7 +3730,7 @@ const testModel = useMutation({
                   </label>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate()}>
+                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
@@ -3529,7 +3739,7 @@ const testModel = useMutation({
                       className="primary"
                       disabled={!wizard.name.trim()}
                       onClick={() => {
-                        wizSave.mutate();
+                        wizSave.mutate(2);
                         setWizard({ ...wizard, step: 2 });
                       }}
                     >
@@ -3618,7 +3828,7 @@ const testModel = useMutation({
                   </div>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate()}>
+                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
@@ -3634,7 +3844,7 @@ const testModel = useMutation({
                       className="primary"
                       disabled={wizard.seats.length === 0}
                       onClick={() => {
-                        wizSave.mutate();
+                        wizSave.mutate(3);
                         setWizard({ ...wizard, step: 3 });
                       }}
                     >
@@ -3751,7 +3961,7 @@ const testModel = useMutation({
                   </label>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate()}>
+                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
@@ -3767,7 +3977,7 @@ const testModel = useMutation({
                       className="primary"
                       disabled={!wizard.lead.name.trim()}
                       onClick={() => {
-                        wizSave.mutate();
+                        wizSave.mutate(4);
                         setWizard({ ...wizard, step: 4 });
                       }}
                     >
@@ -4084,10 +4294,8 @@ const testModel = useMutation({
               </div>{" "}
 
               <p>
-                " "
-                One profile for every board " this is who you are in meetings.
-                " "
-              </p>" "
+                One lead profile per board — this is who you are in that board's meetings.
+              </p>
               <>
                 {" "}
                 <p role="status">
@@ -4189,13 +4397,24 @@ const testModel = useMutation({
                   />{" "}
                     <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "commPrefs") || "not saved yet"}{" "}</div>
                 </label>{" "}
-                <button
-                  onClick={() => saveLead.mutate()}
-                  disabled={!leadForm.name.trim()}
-                >
-                  {" "}
-                  Save profile{" "}
-                </button>{" "}
+                {!boardId ? (
+                  <p role="status">
+                    {" "}
+                    Select a board to save your lead profile for that board.{" "}
+                    <button type="button" onClick={() => setTab("boards")}>
+                      {" "}
+                      Select board{" "}
+                    </button>{" "}
+                  </p>
+                ) : (
+                  <button
+                    onClick={() => saveLead.mutate()}
+                    disabled={!leadForm.name.trim() || saveLead.isPending}
+                  >
+                    {" "}
+                    Save profile{" "}
+                  </button>
+                )}{" "}
               </>
             </section>
           )}{" "}
@@ -5366,6 +5585,16 @@ const testModel = useMutation({
                                 ) : (
                                   <span> {n.body}</span>
                                 )}{" "}
+                                <button
+                                  type="button"
+                                  className="btn ghost"
+                                  disabled={!meetingId || fromDirection.isPending}
+                                  onClick={() => fromDirection.mutate(n.id)}
+                                  title="Stage this exact direction text for record review"
+                                >
+                                  {" "}
+                                  Record this direction{" "}
+                                </button>{" "}
                               </div>
                             ))}{" "}
                             {(directions.data ?? []).length === 0 && (
@@ -5374,7 +5603,8 @@ const testModel = useMutation({
                             <label>
                               {" "}
                               Exact text{" "}
-                              <input
+                              <textarea
+                                rows={4}
                                 value={dtext}
                                 onChange={(e) => setDtext(e.target.value)}
                               />{" "}
@@ -5903,8 +6133,7 @@ const testModel = useMutation({
                       {" "}
                       <button onClick={() => setRecId(r.id)}>
                         {" "}
-                        v{r.version} · {r.status}{" "}
-                        {r.decided ? " · decided" : ""}{" "}
+                        v{r.version} · {r.status}{r.decided ? " · decided" : ""}{" "}
                       </button>{" "}
                       <span className="badge">
                         {" "}
@@ -6318,57 +6547,44 @@ const testModel = useMutation({
               <div className="table-scroll">
                 {" "}
                 <table className="grid">
-                  {" "}
                   <thead>
-                    {" "}
                     <tr>
-                      {" "}
-                      <th>Kind</th> <th>Model</th> <th className="num">In</th>{" "}
-                      <th>Note</th>{" "}
-                    </tr>{" "}
-                  </thead>{" "}
+                      <th>Kind</th><th>Model</th><th className="num">In</th>
+                      <th>Note</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {" "}
                     {(usage.data ?? []).map((u, i) => (
                       <tr key={i}>
-                        {" "}
-                        <td>{u.kind}</td> <td>{u.model}</td>{" "}
-                        <td className="num">{u.inputTokens}</td>{" "}
-                        <td>{u.note}</td>{" "}
+                        <td>{u.kind}</td><td>{u.model}</td>
+                        <td className="num">{u.inputTokens}</td>
+                        <td>{u.note}</td>
                       </tr>
-                    ))}{" "}
-                  </tbody>{" "}
+                    ))}
+                  </tbody>
                 </table>{" "}
               </div>{" "}
               <h3>Model calls</h3>{" "}
               <div className="table-scroll">
                 {" "}
                 <table className="grid">
-                  {" "}
                   <thead>
-                    {" "}
                     <tr>
-                      {" "}
-                      <th>Model</th> <th>Purpose</th>{" "}
-                      <th className="num">In/out</th>{" "}
-                      <th className="num">Latency</th> <th>Search</th>{" "}
-                    </tr>{" "}
-                  </thead>{" "}
+                      <th>Model</th><th>Purpose</th>
+                      <th className="num">In/out</th>
+                      <th className="num">Latency</th><th>Search</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {" "}
                     {(modelCalls.data ?? []).map((m, i) => (
                       <tr key={i}>
-                        {" "}
-                        <td>{m.model}</td> <td>{m.purpose}</td>{" "}
-                        <td className="num">
-                          {" "}
-                          {m.inputTokens}/{m.outputTokens}{" "}
-                        </td>{" "}
-                        <td className="num">{m.latencyMs}ms</td>{" "}
-                        <td>{m.ranSearch ? "grounded" : "—"}</td>{" "}
+                        <td>{m.model}</td><td>{m.purpose}</td>
+                        <td className="num">{m.inputTokens}/{m.outputTokens}</td>
+                        <td className="num">{m.latencyMs}ms</td>
+                        <td>{m.ranSearch ? "grounded" : "—"}</td>
                       </tr>
-                    ))}{" "}
-                  </tbody>{" "}
+                    ))}
+                  </tbody>
                 </table>{" "}
               </div>{" "}
               <div className="card">
@@ -6456,24 +6672,19 @@ const testModel = useMutation({
               <div className="table-scroll">
                 {" "}
                 <table className="grid">
-                  {" "}
                   <thead>
-                    {" "}
                     <tr>
-                      {" "}
-                      <th>Action</th> <th>Detail</th>{" "}
-                    </tr>{" "}
-                  </thead>{" "}
+                      <th>Action</th><th>Detail</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {" "}
                     {(audit.data ?? []).slice(0, 50).map((a, i) => (
                       <tr key={i}>
-                        {" "}
-                        <td>{a.action}</td>{" "}
-                        <td title={a.detail}>{a.detail.slice(0, 140)}</td>{" "}
+                        <td>{a.action}</td>
+                        <td title={a.detail}>{a.detail.slice(0, 140)}</td>
                       </tr>
-                    ))}{" "}
-                  </tbody>{" "}
+                    ))}
+                  </tbody>
                 </table>{" "}
               </div>{" "}
             </section>
