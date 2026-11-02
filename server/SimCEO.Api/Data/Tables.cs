@@ -17,16 +17,52 @@ public interface IPgBackend
   bool Remove<T>(Guid id) where T : class;
   void Clear<T>() where T : class;
   void AddMessage(Domain.Message m);
+  void AddMessages(IEnumerable<Domain.Message> ms);
   List<Domain.Message> MeetingMessages(Guid meetingId);
   List<Guid> MessageMeetings();
   void RemoveMeetingMessages(Guid meetingId);
   void ClearMessages();
   void Save();
+  /// <summary>True while inside a <see cref="Transact(Action)"/> unit; per-write Save calls defer.</summary>
+  bool IsTransacting { get; }
+  /// <summary>Run op inside one backend gate + DB transaction: single SaveChanges + commit once.</summary>
+  void Transact(Action op);
+  /// <summary>Run op inside one backend gate + DB transaction and return its result.</summary>
+  T Transact<T>(Func<T> op);
 }
 
 public static class Pg
 {
   public static IPgBackend? Backend { get; set; }
+}
+
+/// <summary>
+/// Explicit synchronous atomic storage unit. One backend gate + one DB
+/// transaction over the supplied mutation: table/message writes inside it
+/// defer individual Save calls; final SaveChanges + commit happens once.
+/// On exception the transaction rolls back and EF tracking is cleared.
+/// Reads inside the unit see staged additions (same-transaction visibility).
+/// In-memory mode has no transaction; callers must validate the full graph
+/// BEFORE any write so expected failures leave no partial state. Use this
+/// unit for wizard creation + created marker, complete snapshot import, and
+/// publication group + meeting revision + run outcome. No external async
+/// model call may run inside the unit (LLM calls stay outside the lock).
+/// Backend-related exceptions never silently become memory-mode success.
+/// </summary>
+public static class Atomic
+{
+  public static void Run(Action op)
+  {
+    var b = Pg.Backend;
+    if (b is null) { op(); return; }
+    b.Transact(op);
+  }
+
+  public static T Run<T>(Func<T> op)
+  {
+    var b = Pg.Backend;
+    return b is null ? op() : b.Transact(op);
+  }
 }
 
 /// <summary>Dictionary-like table: in-memory, or EF write-through when a backend is wired.</summary>
@@ -38,6 +74,11 @@ public sealed class Table<T> where T : class
 
   private static Guid KeyOf(T e) => (Guid)IdProp.GetValue(e)!;
 
+  private static void SaveDeferred(IPgBackend b)
+  {
+    if (!b.IsTransacting) b.Save();
+  }
+
   public T this[Guid id]
   {
     get => TryGetValue(id, out var v) && v is not null
@@ -48,7 +89,7 @@ public sealed class Table<T> where T : class
       if (b is null) { _mem[id] = value; return; }
       if (IdProp.CanWrite && KeyOf(value) != id) IdProp.SetValue(value, id);
       b.Upsert(value);
-      b.Save();
+      SaveDeferred(b);
     }
   }
 
@@ -82,7 +123,7 @@ public sealed class Table<T> where T : class
     value = b.Find<T>(id);
     if (value is null) return false;
     b.Remove<T>(id);
-    b.Save();
+    SaveDeferred(b);
     return true;
   }
 
@@ -90,13 +131,13 @@ public sealed class Table<T> where T : class
   {
     var b = Pg.Backend;
     if (b is null) _mem.Clear();
-    else { b.Clear<T>(); b.Save(); }
+    else { b.Clear<T>(); SaveDeferred(b); }
   }
 
   public void Flush()
   {
     var b = Pg.Backend;
-    b?.Save();
+    if (b is not null) SaveDeferred(b);
   }
 }
 
@@ -127,12 +168,16 @@ public sealed class MessageList : List<Domain.Message>
     if (_pg is null) return;
     m.MeetingId = _meeting;
     _pg.AddMessage(m);
-    _pg.Save();
+    if (!_pg.IsTransacting) _pg.Save();
   }
   public new void AddRange(IEnumerable<Domain.Message> items)
   {
-    foreach (var m in items) Add(m);
+    var b = _pg;
+    if (b is null) { base.AddRange(items); return; }
+    foreach (var m in items) { m.MeetingId = _meeting; base.Add(m); b.AddMessage(m); }
+    if (!b.IsTransacting) b.Save();
   }
+
 }
 
 /// <summary>Per-meeting message store: in-memory lists, or EF rows when a backend is wired.</summary>
@@ -153,8 +198,25 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
       }
       b.RemoveMeetingMessages(id);
       foreach (var m in value) { m.MeetingId = id; b.AddMessage(m); }
-      b.Save();
+      if (!b.IsTransacting) b.Save();
     }
+  }
+
+
+  public void AddRangeCommitted(Guid id, IEnumerable<Domain.Message> items)
+  {
+    var b = Pg.Backend;
+    var batch = items.ToList();
+    foreach (var m in batch) m.MeetingId = id;
+    if (b is null)
+    {
+      GetOrAdd(id, _ => new List<Domain.Message>()).AddRange(batch);
+      return;
+    }
+    var list = GetOrAdd(id, _ => new List<Domain.Message>());
+    foreach (var mm in batch) ((List<Domain.Message>)list).Add(mm);
+    b.AddMessages(batch);
+    if (!b.IsTransacting) b.Save();
   }
 
   public MessageList GetOrAdd(Guid id, Func<Guid, List<Domain.Message>> factory)
@@ -192,7 +254,7 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
   {
     var b = Pg.Backend;
     if (b is null) _mem.Clear();
-    else { b.ClearMessages(); b.Save(); }
+    else { b.ClearMessages(); if (!b.IsTransacting) b.Save(); }
   }
 
   public IEnumerator<KeyValuePair<Guid, List<Domain.Message>>> GetEnumerator()

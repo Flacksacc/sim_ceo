@@ -1,0 +1,173 @@
+{
+  "cases": [
+    {
+      "id": "chat-null-content-finish-length",
+      "kind": "chat",
+      "expect": "fail",
+      "expectMetered": true,
+      "doc": {
+        "id": "chatcmpl-obs1",
+        "choices": [
+          { "index": 0, "message": { "role": "assistant", "content": null }, "finish_reason": "length" }
+        ],
+        "usage": { "prompt_tokens": 120, "completion_tokens": 16, "total_tokens": 136 }
+      }
+    },
+    {
+      "id": "chat-empty-choices",
+      "kind": "chat",
+      "expect": "fail",
+      "expectMetered": true,
+      "doc": {
+        "id": "chatcmpl-obs2",
+        "choices": [],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10 }
+      }
+    },
+    {
+      "id": "chat-empty-content-stop",
+      "kind": "chat",
+      "expect": "fail",
+      "expectMetered": true,
+      "doc": {
+        "id": "chatcmpl-obs3",
+        "choices": [
+          { "index": 0, "message": { "role": "assistant", "content": "   " }, "finish_reason": "stop" }
+        ],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 16, "total_tokens": 116 }
+      }
+    },
+    {
+      "id": "chat-valid-stop-ok",
+      "kind": "chat",
+      "expect": "pass",
+      "expectMetered": true,
+      "expectText": "OK",
+      "doc": {
+        "id": "chatcmpl-obs4",
+        "choices": [
+          { "index": 0, "message": { "role": "assistant", "content": "OK" }, "finish_reason": "stop" }
+        ],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 159, "total_tokens": 259 }
+      }
+    },
+    {
+      "id": "responses-incomplete-commentary-search-resp_6ae8fd438488ff5989594abb",
+      "kind": "responses",
+      "expect": "fail",
+      "expectMetered": true,
+      "expectGrounded": false,
+      "doc": {
+        "id": "resp_6ae8fd438488ff5989594abb",
+        "status": "incomplete",
+        "incomplete_details": { "reason": "max_output_tokens" },
+        "output": [
+          {
+            "type": "web_search_call",
+            "results": [
+              { "type": "search_result", "url": "https://www.britannica.com/print/article/271591", "title": "Grace Hopper | Biography, Accomplishments, & Facts | Britannica", "SNIPPET": "Grace Hopper was a US Navy rear admiral and computer pioneer." },
+              { "type": "search_result", "url": "https://kids.britannica.com/comptons/article-9326636/Grace-Murray-Hopper", "title": "Grace Hopper - Students | Britannica Kids", "SNIPPET": "Hopper helped develop COBOL and the first compiler." },
+              { "type": "search_result", "url": "https://yalealumnimagazine.org/articles/4449-grace-hopper", "title": "Grace Hopper: Yale newest college namesake", "SNIPPET": "Yale named a residential college for Grace Hopper." }
+            ]
+          },
+          {
+            "type": "message",
+            "phase": "commentary",
+            "content": [{ "type": "output_text", "text": "Gathering verified Grace Hopper facts, one per line with sources." }]
+          },
+          { "type": "reasoning", "content": [{ "type": "reasoning_text", "text": "internal chain of thought must never leak" }] },
+          {
+            "type": "message",
+            "phase": "commentary",
+            "content": [{ "type": "output_text", "text": "Initial results look promising, now pulling detailed dates and contributions." }]
+          }
+        ],
+        "usage": { "input_tokens": 4000, "output_tokens": 1024 }
+      }
+    },
+    {
+      "id": "responses-completed-final-snippet-pass",
+      "kind": "responses",
+      "expect": "pass",
+      "expectMetered": true,
+      "expectGrounded": true,
+      "expectExcerpt": "Grace Hopper was a US Navy rear admiral and computer pioneer.",
+      "doc": {
+        "id": "resp_completed_001",
+        "status": "completed",
+        "output": [
+          {
+            "type": "web_search_call",
+            "results": [
+              { "type": "search_result", "url": "https://www.britannica.com/print/article/271591", "title": "Grace Hopper | Biography | Britannica", "SNIPPET": "Grace Hopper was a US Navy rear admiral and computer pioneer." },
+              { "type": "search_result", "url": "https://news.yale.edu/2015/12/09/happy-birthday-grace-hopper", "title": "Happy birthday Grace Hopper", "snippet": "Yale alumna Grace Hopper pioneered computer science." }
+            ]
+          },
+          {
+            "type": "message",
+            "phase": "commentary",
+            "content": [{ "type": "output_text", "text": "Gathering verified facts." }]
+          },
+          {
+            "type": "message",
+            "phase": "final_answer",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Grace Hopper: US Navy rear admiral; COBOL and compiler pioneer.",
+                "annotations": [
+                  { "type": "url_citation", "url": "https://www.britannica.com/print/article/271591", "title": "Grace Hopper | Biography | Britannica" }
+                ]
+              }
+            ]
+          }
+        ],
+        "usage": { "input_tokens": 4000, "output_tokens": 640 }
+      }
+    },
+    {
+      "id": "responses-completed-final-no-excerpt-unsupported",
+      "kind": "responses",
+      "expect": "pass",
+      "expectMetered": true,
+      "expectGrounded": false,
+      "doc": {
+        "id": "resp_completed_002",
+        "status": "completed",
+        "output": [
+          {
+            "type": "web_search_call",
+            "results": [
+              { "type": "search_result", "url": "https://example.com/a", "title": "A", "SNIPPET": "" }
+            ]
+          },
+          {
+            "type": "message",
+            "phase": "final_answer",
+            "content": [{ "type": "output_text", "text": "Some claim without evidence." }]
+          }
+        ],
+        "usage": { "input_tokens": 100, "output_tokens": 200 }
+      }
+    },
+    {
+      "id": "responses-progress-only-no-final",
+      "kind": "responses",
+      "expect": "fail",
+      "expectMetered": true,
+      "expectGrounded": false,
+      "doc": {
+        "id": "resp_progress_001",
+        "status": "completed",
+        "output": [
+          {
+            "type": "message",
+            "phase": "commentary",
+            "content": [{ "type": "output_text", "text": "Working on it." }]
+          }
+        ],
+        "usage": { "input_tokens": 50, "output_tokens": 60 }
+      }
+    }
+  ]
+}

@@ -43,4 +43,7 @@ public sealed class InMemoryStore
   public Bag<Work.ModelCall> ModelCalls { get; } = new();
   public object MessageLock { get; } = new();
   public object SetupLock { get; } = new();
+  public HashSet<Guid> RunningRuns { get; } = new();
+  public ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim> DraftLocks { get; } = new();
+  public string PgError { get; set; } = "";
 }

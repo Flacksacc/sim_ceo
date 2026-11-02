@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
 
@@ -12,7 +13,8 @@ namespace SimCEO.Api.Work;
 // the audit trail; full context blobs are never stored.
 public sealed record CuratorManifest(
   List<string> SourceIds, List<long> MessageSeqs, int LeadVersion,
-  string Policy, int TokenEstimate, long SnapshotRevision);
+  string Policy, int TokenEstimate, long SnapshotRevision,
+  List<EvidenceRef> Evidence);
 
 public static class ContextCurator
 {
@@ -20,7 +22,8 @@ public static class ContextCurator
     string prompt, Board? board)
   {
     var sb = new StringBuilder();
-    sb.AppendLine($"BOARD: {(board is null ? "?" : board.Name)} | BRIEF: {Truncate(m.Brief, 500)}");
+    var effName = board is null ? "?" : LeadSetup.EffectiveView(s, board).name;
+    sb.AppendLine($"BOARD: {effName} | BRIEF: {Truncate(m.Brief, 500)}");
     sb.AppendLine($"YOUR ROLE: {adv.BoardRole}");
     foreach (var msg in Recent(s, m.Id, 3))
       sb.AppendLine($"[{msg.Sequence}] {msg.Sender}: {Truncate(msg.Content, 300)}");
@@ -33,13 +36,21 @@ public static class ContextCurator
     Board? board, LeadProfile? lead, int draftTokens = 8000)
   {
     var sb = new StringBuilder();
-    sb.Append("BOARD: ").Append(board?.Name ?? "?");
-    sb.Append(" | MISSION: ").Append(Truncate(board?.Mission ?? "", 600));
-    sb.Append(" | STAGE: ").Append(Truncate(board?.Stage ?? "", 200)).AppendLine();
+    var eff = board is null ? (name: "?", mission: "", stage: "", policy: "balanced", dataUse: "contributor") : LeadSetup.EffectiveView(s, board);
+    sb.Append("BOARD: ").Append(eff.name);
+    sb.Append(" | MISSION: ").Append(Truncate(eff.mission, 600));
+    sb.Append(" | STAGE: ").Append(Truncate(eff.stage, 200)).AppendLine();
     if (lead is not null)
       sb.AppendLine($"LEAD: {lead.Name} ({lead.RoleLabel}). Familiar: {Truncate(lead.FamiliarTopics, 300)}. Explain simply: {Truncate(lead.SimplerTopics, 300)}. Prefs: {Truncate(lead.CommPrefs, 300)}");
     sb.AppendLine($"MEETING BRIEF: {Truncate(m.Brief, 800)}");
     sb.AppendLine($"YOUR ROLE: {adv.BoardRole} (roster v{adv.RosterVersion})");
+    sb.AppendLine($"QUESTION: {Truncate(prompt, 800)}");
+    if (s.Roster.TryGetValue(adv.RosterEntryId, out var rent) && rent is not null)
+    {
+      sb.AppendLine($"ADVISOR PROFILE (roster v{rent.Version}): {Truncate(rent.ProfileJson, 1500)}");
+      foreach (var claim in DossierClaims(rent).Take(5))
+        sb.AppendLine($"DOSSIER: {Truncate(claim, 400)}");
+    }
     var recent = Recent(s, m.Id, 12);
     foreach (var msg in recent)
       sb.AppendLine($"[{msg.Sequence}] {msg.Sender}{(msg.AdvisorName is null ? "" : "/" + msg.AdvisorName)}: {Truncate(msg.Content, 600)}");
@@ -47,11 +58,16 @@ public static class ContextCurator
       .Where(d => d.MeetingId == m.Id && d.Status == "approved")
       .OrderByDescending(d => d.Version).Take(3))
       sb.AppendLine($"APPROVED RECORD v{d.Version}: {Truncate(RecordsOps.BuildExport(d.ItemsJson, d.ApprovedJson, false), 1500)}");
+    var evidence = new List<EvidenceRef>();
     foreach (var n in s.Notes.Values
       .Where(n => n.BoardId == m.BoardId && n.Kind == "direction" && !n.Provisional
         && (n.Scope == "board" || n.MeetingId == m.Id))
       .OrderByDescending(n => n.CreatedAt).Take(5))
-      sb.AppendLine($"DIRECTION ({n.Scope}): {Truncate(n.Body, 500)}");
+    {
+      var nref = EvidenceRef.ForNote(n);
+      sb.AppendLine($"DIRECTION ({n.Scope} {nref.Ref}): {Truncate(n.Body, 500)}");
+      evidence.Add(nref);
+    }
     var words = Keywords(prompt);
     var ranked = s.Sources.Values
       .Where(x => x.BoardId == m.BoardId && x.Approved && !x.Excluded
@@ -70,15 +86,38 @@ public static class ContextCurator
       {
         sb.AppendLine($"[SOURCE:{doc.FileName} v{doc.Version}]: {Truncate(text, share)}");
         sourceIds.Add($"{doc.Id}:v{doc.Version}");
+        evidence.Add(EvidenceRef.ForSource(doc, Truncate(text, 200)));
       }
     }
     var packet = sb.ToString();
     var manifest = new CuratorManifest(sourceIds,
       recent.Select(x => x.Sequence).ToList(),
       board?.LeadProfileVersion ?? 0,
-      board?.DiscussionPolicy ?? "balanced",
-      packet.Length / 4, m.DeliveredRevision);
+      eff.policy,
+      packet.Length / 4, m.DeliveredRevision, evidence);
     return (packet, manifest);
+  }
+
+  private static List<string> DossierClaims(RosterEntry doc)
+  {
+    try
+    {
+      using var parsed = JsonDocument.Parse(string.IsNullOrWhiteSpace(doc.ResearchJson) ? "{}" : doc.ResearchJson);
+      var root = parsed.RootElement;
+      if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("claims", out var claims)
+          && claims.ValueKind == JsonValueKind.Array)
+      {
+        var list = new List<string>();
+        foreach (var c in claims.EnumerateArray())
+        {
+          var text = c.ValueKind == JsonValueKind.Object && c.TryGetProperty("text", out var t) ? (t.GetString() ?? "") : c.GetRawText();
+          if (!string.IsNullOrWhiteSpace(text)) list.Add(text.Trim());
+        }
+        if (list.Count > 0) return list;
+      }
+    }
+    catch (JsonException) { }
+    return new List<string>();
   }
 
   private static List<Message> Recent(InMemoryStore s, Guid meetingId, int take)
@@ -130,7 +169,7 @@ public static class ContextCurator
         hits.Add(new RecallHit("record", $"record v{d.Version}", Truncate(text, 600), Score(text, words) + 2));
     }
     foreach (var n in s.Notes.Values.Where(n => n.BoardId == boardId && n.Kind == "direction" && !n.Provisional))
-      hits.Add(new RecallHit("direction", n.Scope, Truncate(n.Body, 400), Score(n.Body, words) + 2));
+      hits.Add(new RecallHit("direction", n.Id.ToString(), Truncate(n.Body, 400), Score(n.Body, words) + 2));
     return hits.OrderByDescending(h => h.Score).Take(Math.Clamp(take, 1, 20)).ToList();
   }
 

@@ -97,3 +97,22 @@ public static class MessageTags
     return (StanceRx.Replace(content ?? "", "").Trim(), stance);
   }
 }
+
+// Owner-interruption detector for discussion runs. A run is interrupted only
+// by NEW lead-authored messages (Sequence > floor); the run's own advisor
+// publishes never count, so multi-round runs no longer self-interrupt.
+public static class MeetingTurns
+{
+  public static long LeadSeqAfter(InMemoryStore s, Guid meetingId, long floor)
+  {
+    lock (s.MessageLock)
+    {
+      if (!s.Messages.TryGetValue(meetingId, out var list) || list is null) return floor;
+      var top = floor;
+      foreach (var x in list)
+        if (x.Sequence > top && string.Equals(x.Sender, "lead", StringComparison.OrdinalIgnoreCase))
+          top = x.Sequence;
+      return top;
+    }
+  }
+}

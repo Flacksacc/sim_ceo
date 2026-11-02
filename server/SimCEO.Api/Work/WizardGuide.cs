@@ -28,6 +28,7 @@ public static class WizardGuide
 
     app.MapPost("/api/wizard/{id:guid}/suggest", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badS) return badS;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound("wizard draft");
       var step = body.TryGetProperty("step", out var st) && st.ValueKind == JsonValueKind.Number ? st.GetInt32() : d.Step;
       var input = body.TryGetProperty("input", out var q) ? (q.GetString() ?? "") : "";
@@ -47,100 +48,246 @@ public static class WizardGuide
 
     app.MapPost("/api/wizard/{id:guid}/interview", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
-      if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound("wizard draft");
-      var answer = body.TryGetProperty("answer", out var av) && av.ValueKind == JsonValueKind.String ? (av.GetString() ?? "") : "";
-      var turns = ReadTurns(d);
-      var before = new HashSet<int>(Blockers(d).Select(b => b.step));
-      var currentQ = NextQuestion(d);
-      string question;
-      string analysis;
-      var applied = new List<string>();
-      if (turns.Count == 0 && string.IsNullOrWhiteSpace(answer))
+      if (PeopleOps.BadToken(s, req) is { } badI) return badI;
+      if (!s.WizardDrafts.TryGetValue(id, out var dd)) return Results.NotFound("wizard draft");
+      var sem = s.DraftLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+      await sem.WaitAsync();
+      try
       {
-        question = currentQ;
-        analysis = "Starting the setup interview from the current draft.";
-      }
-      else
-      {
-        if (!string.IsNullOrWhiteSpace(answer))
-          turns.Add(new InterviewTurn(currentQ, answer.Trim(), DateTime.UtcNow, ""));
-        d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = ReadCheckpoints(d) });
-        d.UpdatedAt = DateTime.UtcNow;
-        var gw = new ModelGateway(s);
-        var gate = PeopleOps.Guard(gw, req);
-        if (gate is not null)
+        if (!s.WizardDrafts.TryGetValue(id, out var d) || d is null) return Results.NotFound("wizard draft");
+        if (!body.TryGetProperty("version", out var vw) || vw.ValueKind != JsonValueKind.Number || !vw.TryGetInt32(out var want) || want != d.Version)
+          return Results.Conflict("Stale wizard draft; refresh and re-apply your edit.");
+        var answer = body.TryGetProperty("answer", out var av) && av.ValueKind == JsonValueKind.String ? (av.GetString() ?? "") : "";
+        var turns = ReadTurns(d);
+        var before = new HashSet<int>(Blockers(d).Select(b => b.step));
+        var currentQ = ReadPendingQuestion(d) ?? NextQuestion(d);
+        string question;
+        string analysis;
+        var extractOk = true;
+        string? extractError = null;
+        var applied = new List<string>();
+        if (turns.Count == 0 && string.IsNullOrWhiteSpace(answer))
         {
-          analysis = "Recorded. The guide is paused by usage controls, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
-          question = NextQuestion(d);
+          question = currentQ;
+          analysis = "Starting the setup interview from the current draft.";
+          var after0 = Blockers(d);
+          var checkpoints0 = ReadCheckpoints(d);
+          d.Step = after0.Count == 0 ? 4 : after0.Min(b => b.step);
+          d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = checkpoints0, pendingQuestion = question, lastAnalysis = new { ok = true, at = DateTime.UtcNow, started = true } });
+          NormalizeInterview(d);
+          d.Version++;
+          d.UpdatedAt = DateTime.UtcNow;
+          s.WizardDrafts[d.Id] = d;
+          s.WizardDrafts.Flush();
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = d.Version, fields = FieldStates(d), blockers = after0, checkpoints = checkpoints0, turns, done = after0.Count == 0 });
         }
-        else try
+        else
         {
+          if (!string.IsNullOrWhiteSpace(answer))
+            turns.Add(new InterviewTurn(currentQ, answer.Trim(), DateTime.UtcNow, ""));
+          var jobId = Guid.NewGuid().ToString("N");
+          var pendingAt = DateTime.UtcNow;
+          var pendingCheckpoints = ReadCheckpoints(d);
+          d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = pendingCheckpoints, pendingQuestion = currentQ, lastAnalysis = new { ok = false, status = "pending", jobId, at = pendingAt, turn = turns.Count } });
+          NormalizeInterview(d);
+          d.Version++;
+          d.UpdatedAt = DateTime.UtcNow;
+          s.WizardDrafts[d.Id] = d;
+          s.WizardDrafts.Flush();
+          var pendingVersion = d.Version;
+          var gw = new ModelGateway(s);
+          var gate = PeopleOps.Guard(gw, req);
           InterviewParsed? parsed = null;
-          for (var attempt = 0; attempt < 2 && parsed is null; attempt++)
+          if (gate is not null)
           {
-            var iPrompt = attempt == 0 ? InterviewPrompt(d, turns) : InterviewPrompt(d, turns) + " Your previous reply was not valid JSON. Reply with a single JSON object only.";
-            var raw = await gw.CompleteAsync(ModelPolicy.SparkFor(s, null), "wizard-interview",
-              iPrompt, 2000, 2048, ownerOverride: PeopleOps.IsOwner(req));
-            parsed = ParseInterviewJson(raw);
-            if (parsed is null) s.Audit.Add(new AuditEvent { Action = "wizard.interview-unparsed", Detail = raw.Length > 500 ? raw.Substring(0, 500) : raw });
+            analysis = "Recorded. The guide is paused by usage controls, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
+            question = NextQuestion(d);
+            extractOk = false;
+            extractError = "usage-capped";
           }
-          analysis = parsed?.analysis ?? "Recorded.";
-          question = string.IsNullOrWhiteSpace(parsed?.nextQuestion) ? NextQuestion(d) : parsed!.nextQuestion;
-          foreach (var u in parsed?.updates ?? new Dictionary<string, string>())
-            if (ApplyFieldUpdate(d, u.Key, u.Value)) applied.Add(u.Key);
+          else
+          {
+            try
+            {
+              for (var attempt = 0; attempt < 2 && parsed is null; attempt++)
+              {
+                var iPrompt = attempt == 0 ? InterviewPrompt(d, turns) : InterviewPrompt(d, turns) + " Your previous reply was not valid JSON. Reply with a single JSON object only.";
+                var raw = await gw.CompleteAsync(ModelPolicy.SparkFor(s, null), "wizard-interview",
+                  iPrompt, 2000, 2048, ownerOverride: PeopleOps.IsOwner(req));
+                parsed = ParseInterviewJson(raw);
+                if (parsed is null) s.Audit.Add(new AuditEvent { Action = "wizard.interview-unparsed", Detail = raw.Length > 500 ? raw.Substring(0, 500) : raw });
+              }
+              if (parsed is null)
+              {
+                analysis = "Recorded.";
+                extractOk = false;
+                extractError = "unparsed-model-output";
+              }
+              else analysis = parsed.analysis;
+              question = string.IsNullOrWhiteSpace(parsed?.nextQuestion) ? NextQuestion(d) : parsed!.nextQuestion;
+            }
+            catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException or TaskCanceledException or HttpRequestException or JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
+            {
+              analysis = "Recorded. The guide model is unavailable, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
+              question = NextQuestion(d);
+              extractOk = false;
+              extractError = ex.GetType().Name;
+              s.Audit.Add(new AuditEvent { Action = "wizard.interview-fallback", Detail = ex.GetType().Name });
+            }
+          }
+          if (!s.WizardDrafts.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound("wizard draft");
+          string? freshJob = null;
+          try
+          {
+            using var pj = JsonDocument.Parse(string.IsNullOrWhiteSpace(fresh.InterviewJson) ? "{}" : fresh.InterviewJson);
+            if (pj.RootElement.TryGetProperty("lastAnalysis", out var la) && la.ValueKind == JsonValueKind.Object && la.TryGetProperty("jobId", out var jj) && jj.ValueKind == JsonValueKind.String)
+              freshJob = jj.GetString();
+          }
+          catch (JsonException) { }
+          if (fresh.Version != pendingVersion || !string.Equals(freshJob, jobId, StringComparison.Ordinal))
+            return Results.Conflict("Draft changed during interview; retry with the latest version.");
+          var pendingUpdates = parsed?.updates ?? new Dictionary<string, string>();
+          foreach (var u in pendingUpdates)
+            if (ApplyFieldUpdate(fresh, u.Key, u.Value)) applied.Add(u.Key);
+          if (turns.Count > 0) turns[^1] = turns[^1] with { analysis = analysis };
+          var after = Blockers(fresh);
+          var checkpoints = ReadCheckpoints(fresh);
+          foreach (var st in before.Except(after.Select(b => b.step)).OrderBy(x => x))
+            checkpoints.Add(new InterviewCheckpoint(DateTime.UtcNow, "Step " + st + " ready: " + StepLabel(st)));
+          fresh.Step = after.Count == 0 ? 4 : after.Min(b => b.step);
+          fresh.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints, pendingQuestion = question, lastAnalysis = new { ok = extractOk, at = DateTime.UtcNow, error = extractError, jobId } });
+          NormalizeInterview(fresh);
+          fresh.Version++;
+          fresh.UpdatedAt = DateTime.UtcNow;
+          s.WizardDrafts[fresh.Id] = fresh;
+          s.WizardDrafts.Flush();
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = fresh.Version, fields = FieldStates(fresh), blockers = after, checkpoints, turns, done = after.Count == 0 });
         }
-        catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException)
-        {
-          analysis = "Recorded. The guide model is unavailable, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
-          question = NextQuestion(d);
-          s.Audit.Add(new AuditEvent { Action = "wizard.interview-fallback", Detail = ex.GetType().Name });
-        }
-        if (turns.Count > 0) turns[^1] = turns[^1] with { analysis = analysis };
       }
-      var after = Blockers(d);
-      var checkpoints = ReadCheckpoints(d);
-      foreach (var st in before.Except(after.Select(b => b.step)).OrderBy(x => x))
-        checkpoints.Add(new InterviewCheckpoint(DateTime.UtcNow, "Step " + st + " ready: " + StepLabel(st)));
-      d.Step = after.Count == 0 ? 4 : after.Min(b => b.step);
-      d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints });
-      d.UpdatedAt = DateTime.UtcNow;
-      return Results.Ok(new { question, analysis, applied, fields = FieldStates(d), blockers = after, checkpoints, turns, done = after.Count == 0 });
+      finally { sem.Release(); }
     });
-    app.MapPost("/api/wizard/{id:guid}/create", (InMemoryStore s, Guid id) =>
+    app.MapPost("/api/wizard/{id:guid}/create", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound("wizard draft");
+      if (PeopleOps.BadToken(s, req) is { } badCreate) return badCreate;
+      if (!s.WizardDrafts.TryGetValue(id, out var wd)) return Results.NotFound("wizard draft");
+      var sem = s.DraftLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+      if (!sem.Wait(0)) return Results.Conflict("Draft is busy (interview running); retry.");
+      try
+      {
+        lock (s.SetupLock)
+        {
+          if (!s.WizardDrafts.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound("wizard draft");
+          return CreateFromDraft(s, id, fresh, PeopleOps.UserOf(s, req));
+        }
+      }
+      finally { sem.Release(); }
+    });
+  }
+
+  private static IResult CreateFromDraft(InMemoryStore s, Guid id, WizardDraft wd, string ownerKey)
+  {
+    {
+      var d = wd;
+      _ = id;
+      // Retry-safe: a completed draft replays the original board instead of duplicating it.
+      const string createdPrefix = "created:";
+      if (d.Status.StartsWith(createdPrefix, StringComparison.Ordinal)
+          && Guid.TryParse(d.Status.Substring(createdPrefix.Length), out var priorBoard)
+          && s.Boards.TryGetValue(priorBoard, out var prior))
+      {
+        var priorAdvisors = s.Advisors.Values.Where(a => a.BoardId == priorBoard && !a.Removed)
+          .Select(a => new { advisor = a.Id, role = a.BoardRole }).ToList<object>();
+        return Results.Ok(new
+        {
+          board = prior, advisors = priorAdvisors, resumed = true,
+          portraitReview = "pending: accept a portrait for each advisor before approval",
+        });
+      }
+      // Validate everything BEFORE any write: no partial boards on failure.
       var blockers = Blockers(d);
       if (blockers.Count > 0) return Results.Json(new { blockers }, statusCode: 409);
       var f = ReadFields(d);
+      var seats = f.Advisors.Where(seat => !string.IsNullOrWhiteSpace(seat.Role)).Take(11).ToList();
+      if (string.IsNullOrWhiteSpace(f.LeadName))
+        return Results.Json(new { error = "Lead name is required." }, statusCode: 409);
       var board = new Board { Id = Guid.NewGuid(), Name = f.Name, Mission = f.Mission, Stage = f.Stage, CreatedAt = DateTime.UtcNow };
-      s.Boards[board.Id] = board;
-      var (saved, leadError, leadStatus) = LeadSetup.SaveLead(s, Guid.Empty, new LeadProfile
-      {
-        BoardId = board.Id, Name = f.LeadName, RoleLabel = f.LeadRole, Background = f.LeadBackground,
-        FamiliarTopics = f.LeadFamiliar, SimplerTopics = f.LeadSimpler, CommPrefs = f.LeadComm,
-      });
-      if (saved is null) return Results.Json(new { error = leadError }, statusCode: leadStatus);
       var created = new List<object>();
-      foreach (var seat in f.Advisors.Take(10))
+      var createdAdvisors = new List<Guid>();
+      var createdRoster = new List<Guid>();
+      var createdImages = new List<Guid>();
+      Guid savedLeadId = Guid.Empty;
+      try
       {
-        if (string.IsNullOrWhiteSpace(seat.Role)) continue;
+        return Atomic.Run(() =>
+        {
+          s.Boards[board.Id] = board;
+          var (saved, leadError, _) = LeadSetup.SaveLead(s, board.Id, new LeadProfile
+          {
+            Name = f.LeadName, RoleLabel = f.LeadRole, Background = f.LeadBackground,
+            FamiliarTopics = f.LeadFamiliar, SimplerTopics = f.LeadSimpler, CommPrefs = f.LeadComm,
+          });
+          if (saved is null) throw new InvalidOperationException(leadError ?? "Lead save failed.");
+          savedLeadId = saved.Id;
+      // Fictional wizard advisors enter the explicit portrait review lifecycle
+      // with a clearly-marked pending placeholder: copy succeeds, but approval
+      // still requires an accepted portrait (same trust gate as every advisor).
+      foreach (var seat in seats)
+      {
         var seatName = string.IsNullOrWhiteSpace(seat.Name) ? seat.Role.Trim() : seat.Name.Trim();
         var entry = new RosterEntry
         {
-          Id = Guid.NewGuid(), AccountId = d.AccountId, Type = AdvisorType.FictionalCharacter,
+          Id = Guid.NewGuid(), AccountId = d.AccountId, OwnerKey = ownerKey, Type = AdvisorType.FictionalCharacter,
           Name = seatName, Description = seat.Role.Trim() + " helping with: " + f.Mission,
           ProfileJson = RosterOps.CharacterJson(seatName, seat.Role.Trim(), f.Mission),
           Version = 1, UpdatedAt = DateTime.UtcNow,
         };
         s.Roster[entry.Id] = entry;
-        var (copy, copyError, copyStatus) = RosterOps.TryCopy(s, entry.Id, board.Id, seat.Role.Trim());
-        if (copy is null) return Results.Json(new { error = copyError }, statusCode: copyStatus);
+        createdRoster.Add(entry.Id);
+        var placeholder = new AdvisorImage
+        {
+          Id = Guid.NewGuid(), RosterEntryId = entry.Id, Kind = "wizard-placeholder",
+          Review = "pending", Provenance = "wizard:placeholder-pending-explicit-review",
+          ContentType = "image/png", Data = WizardPlaceholderPng,
+        };
+        s.Images[placeholder.Id] = placeholder;
+        createdImages.Add(placeholder.Id);
+        var (copy, copyError, _) = RosterOps.TryCopy(s, entry.Id, board.Id, seat.Role.Trim());
+        if (copy is null) throw new InvalidOperationException(copyError ?? "Advisor copy failed.");
+        createdAdvisors.Add(copy.Id);
         created.Add(new { advisor = copy.Id, role = copy.BoardRole });
       }
-      s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "wizard.create", Detail = JsonSerializer.Serialize(new { board = board.Id, advisors = created.Count }) });
-      return Results.Created("/api/boards/" + board.Id, new { board, advisors = created });
-    });
+          d.Status = createdPrefix + board.Id;
+          d.Version++;
+          s.WizardDrafts[d.Id] = d;
+          s.WizardDrafts.Flush();
+          s.Boards.Flush();
+          s.Roster.Flush();
+          s.Images.Flush();
+          s.Advisors.Flush();
+          s.LeadProfiles.Flush();
+          s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "wizard.create", Detail = JsonSerializer.Serialize(new { board = board.Id, advisors = created.Count }) });
+          return Results.Created("/api/boards/" + board.Id, new
+          {
+            board, advisors = created,
+            portraitReview = "pending: accept a portrait for each advisor before approval",
+          });
+        });
+      }
+      catch (Exception ex)
+      {
+        foreach (var imgId in createdImages) s.Images.TryRemove(imgId, out _);
+        foreach (var rid in createdRoster) s.Roster.TryRemove(rid, out _);
+        foreach (var aid in createdAdvisors) s.Advisors.TryRemove(aid, out _);
+        if (savedLeadId != Guid.Empty) s.LeadProfiles.TryRemove(savedLeadId, out _);
+        s.Boards.TryRemove(board.Id, out _);
+        s.Audit.Add(new AuditEvent { Action = "wizard.create-rolled-back", Detail = ex.Message });
+        return Results.Json(new { error = "Board creation failed and was rolled back." }, statusCode: 500);
+      }
+    }
   }
+
+  private static readonly byte[] WizardPlaceholderPng = Convert.FromBase64String(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
 
   private sealed record WizardFields(string Name, string Mission, string Stage, string Preset, string LeadName, string LeadRole, string LeadBackground, string LeadFamiliar, string LeadSimpler, string LeadComm, List<Seat> Advisors);
   private sealed record Seat(string Role, string Name);
@@ -278,8 +425,39 @@ public static class WizardGuide
 
   public static void NormalizeInterview(WizardDraft d)
   {
-    var norm = JsonSerializer.Serialize(new { turns = ReadTurns(d), checkpoints = ReadCheckpoints(d) });
+    var root = new JsonObject
+    {
+      ["turns"] = JsonSerializer.SerializeToNode(ReadTurns(d)),
+      ["checkpoints"] = JsonSerializer.SerializeToNode(ReadCheckpoints(d)),
+    };
+    if (ReadPendingQuestion(d) is { } pq) root["pendingQuestion"] = pq;
+    if (ReadRawNode(d, "lastAnalysis") is { } la) root["lastAnalysis"] = la;
+    var norm = root.ToJsonString();
     if (!string.Equals(norm, d.InterviewJson, StringComparison.Ordinal)) d.InterviewJson = norm;
+  }
+  private static JsonNode? ReadRawNode(WizardDraft d, string prop)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.InterviewJson) ? "{}" : d.InterviewJson);
+      if (doc.RootElement.TryGetProperty(prop, out var el)) return JsonNode.Parse(el.GetRawText());
+    }
+    catch (JsonException) { }
+    return null;
+  }
+  private static string? ReadPendingQuestion(WizardDraft d)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.InterviewJson) ? "{}" : d.InterviewJson);
+      if (doc.RootElement.TryGetProperty("pendingQuestion", out var q) && q.ValueKind == JsonValueKind.String)
+      {
+        var s = q.GetString() ?? "";
+        if (!string.IsNullOrWhiteSpace(s)) return s;
+      }
+    }
+    catch (JsonException) { }
+    return null;
   }
   private static List<InterviewCheckpoint> ReadCheckpoints(WizardDraft d)
   {

@@ -53,10 +53,13 @@ public sealed class RosterEntry
   public int Version { get; set; } = 1;
   public bool Archived { get; set; }
   public string Tags { get; set; } = "";
+  public string OwnerKey { get; set; } = "";
   public string ResearchJson { get; set; } = "{}";
   public DateTime? ResearchedAt { get; set; }
   public bool ResearchRequested { get; set; }
   public int EvidenceCount { get; set; }
+  public string ResearchJobId { get; set; } = "";
+  public int ResearchBaseVersion { get; set; }
   public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
 
@@ -91,6 +94,7 @@ public sealed class Message
   public Guid BoardId { get; set; }
   public Guid MeetingId { get; set; }
   public long Sequence { get; set; }
+  public Guid AdvisorId { get; set; } = Guid.Empty;
   public string Sender { get; set; } = "";
   public string? AdvisorName { get; set; }
   public string Content { get; set; } = "";
@@ -135,6 +139,7 @@ public sealed class SourceDoc
 public sealed class WizardDraft
 {
   [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public int Version { get; set; } = 1;
   public Guid AccountId { get; set; }
   [MaxLength(50)] public string Status { get; set; } = "draft";
   public int Step { get; set; } = 1;
@@ -179,6 +184,7 @@ public sealed class Note
   public string Body { get; set; } = "";
   public string Scope { get; set; } = "";
   public bool Provisional { get; set; }
+  public string EvidenceJson { get; set; } = "[]";
   public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 

@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
+using Microsoft.EntityFrameworkCore.Storage;
 using SimCEO.Api;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
@@ -25,15 +26,15 @@ public sealed class PostgresDb : DbContext
   public DbSet<Grant> Grants => Set<Grant>();
   public DbSet<Invite> Invites => Set<Invite>();
   public DbSet<AdvisorImage> Images => Set<AdvisorImage>();
-  public DbSet<Account> AuthAccounts => Set<Account>();
+  public DbSet<SimCEO.Api.Account> AuthAccounts => Set<SimCEO.Api.Account>();
 
   protected override void OnModelCreating(ModelBuilder b)
   {
-    b.Entity<Message>().HasIndex(m => new { m.MeetingId, m.Sequence }).IsUnique();
+    b.Entity<Message>().HasKey(m => new { m.MeetingId, m.Sequence });
     b.Entity<SourceDoc>().HasIndex(x => x.BoardId);
     b.Entity<BoardAdvisor>().HasIndex(x => x.BoardId);
     b.Entity<Meeting>().HasIndex(x => x.BoardId);
-    b.Entity<Account>().HasIndex(a => a.Email).IsUnique();
+    b.Entity<SimCEO.Api.Account>().HasIndex(a => a.Email).IsUnique();
   }
 }
 
@@ -53,8 +54,48 @@ public sealed class PostgresBackend : IPgBackend
 {
   private readonly PostgresDb _db;
   private readonly object _gate = new();
+  private int _depth;
+  private IDbContextTransaction? _tx;
 
   public PostgresBackend(PostgresDb db) => _db = db;
+
+  public bool IsTransacting { get { lock (_gate) return _depth > 0; } }
+
+  public void Transact(Action op)
+  {
+    Transact(() => { op(); return true; });
+  }
+
+  public T Transact<T>(Func<T> op)
+  {
+    lock (_gate)
+    {
+      if (_depth > 0) return op();
+      IDbContextTransaction? tx = null;
+      try
+      {
+        tx = _db.Database.BeginTransaction();
+        _tx = tx;
+        _depth = 1;
+        var result = op();
+        _db.SaveChanges();
+        tx.Commit();
+        return result;
+      }
+      catch
+      {
+        try { tx?.Rollback(); } catch { }
+        try { _db.ChangeTracker.Clear(); } catch { }
+        throw;
+      }
+      finally
+      {
+        try { tx?.Dispose(); } catch { }
+        _tx = null;
+        _depth = 0;
+      }
+    }
+  }
 
   public T? Find<T>(Guid id) where T : class
   {
@@ -63,7 +104,28 @@ public sealed class PostgresBackend : IPgBackend
 
   public List<T> All<T>() where T : class
   {
-    lock (_gate) return _db.Set<T>().ToList();
+    lock (_gate)
+    {
+      var rows = _db.Set<T>().ToList();
+      if (_depth == 0) return rows;
+      // Union staged additions so reads inside the unit see staged rows.
+      var staged = _db.ChangeTracker.Entries<T>()
+        .Where(e => e.State == EntityState.Added).Select(e => e.Entity).ToList();
+      var removed = new HashSet<object>(_db.ChangeTracker.Entries<T>()
+        .Where(e => e.State == EntityState.Deleted).Select(e => (object)e.Entity));
+      if (staged.Count == 0 && removed.Count == 0) return rows;
+      var merged = rows.Where(r => !removed.Contains(r)).ToList();
+      if (staged.Count == 0) return merged;
+      var keyProp = typeof(T).GetProperty("Id");
+      if (keyProp is not null)
+      {
+        var keys = new HashSet<object?>(merged.Select(r => keyProp.GetValue(r)));
+        foreach (var s in staged)
+          if (keys.Add(keyProp.GetValue(s))) merged.Add(s);
+      }
+      else merged.AddRange(staged);
+      return merged;
+    }
   }
 
   public void Upsert<T>(T entity) where T : class
@@ -74,7 +136,18 @@ public sealed class PostgresBackend : IPgBackend
       var id = _db.Entry(entity).Property(keyName).CurrentValue;
       var existing = _db.Set<T>().Find(id);
       if (existing is null) _db.Set<T>().Add(entity);
-      else if (!ReferenceEquals(existing, entity)) _db.Entry(existing).CurrentValues.SetValues(entity);
+      else
+      {
+        var entry = _db.Entry(existing);
+        if (entry.State == EntityState.Deleted)
+        {
+          if (!ReferenceEquals(existing, entity))
+            entry.CurrentValues.SetValues(entity);
+          entry.State = EntityState.Modified;
+        }
+        else if (!ReferenceEquals(existing, entity))
+          entry.CurrentValues.SetValues(entity);
+      }
     }
   }
 
@@ -99,14 +172,39 @@ public sealed class PostgresBackend : IPgBackend
     lock (_gate) _db.Messages.Add(m);
   }
 
+  public void AddMessages(IEnumerable<Message> ms)
+  {
+    lock (_gate) _db.Messages.AddRange(ms);
+  }
+
   public List<Message> MeetingMessages(Guid meetingId)
   {
-    lock (_gate) return _db.Messages.Where(m => m.MeetingId == meetingId).OrderBy(m => m.Sequence).ToList();
+    lock (_gate)
+    {
+      var rows = _db.Messages.Where(m => m.MeetingId == meetingId).OrderBy(m => m.Sequence).ToList();
+      if (_depth == 0) return rows;
+      var staged = _db.ChangeTracker.Entries<Message>()
+        .Where(e => e.State == EntityState.Added && e.Entity.MeetingId == meetingId)
+        .Select(e => e.Entity).ToList();
+      if (staged.Count == 0) return rows;
+      var seqs = new HashSet<long>(rows.Select(r => r.Sequence));
+      foreach (var s in staged)
+        if (seqs.Add(s.Sequence)) rows.Add(s);
+      return rows.OrderBy(m => m.Sequence).ToList();
+    }
   }
 
   public List<Guid> MessageMeetings()
   {
-    lock (_gate) return _db.Messages.Select(m => m.MeetingId).Distinct().ToList();
+    lock (_gate)
+    {
+      var ids = _db.Messages.Select(m => m.MeetingId).Distinct().ToList();
+      if (_depth > 0)
+        foreach (var s in _db.ChangeTracker.Entries<Message>()
+          .Where(e => e.State == EntityState.Added).Select(e => e.Entity.MeetingId).Distinct())
+          if (!ids.Contains(s)) ids.Add(s);
+      return ids;
+    }
   }
 
   public void RemoveMeetingMessages(Guid meetingId)
@@ -121,7 +219,11 @@ public sealed class PostgresBackend : IPgBackend
 
   public void Save()
   {
-    lock (_gate) _db.SaveChanges();
+    lock (_gate)
+    {
+      if (_depth > 0) return; // deferred: single SaveChanges at Transact commit
+      _db.SaveChanges();
+    }
   }
 }
 
@@ -136,18 +238,24 @@ public static class PgBoot
       var db = new PostgresDb(options);
       if (!db.Database.CanConnect())
       {
-        error = "Postgres unreachable; running in-memory.";
+        error = "Postgres unreachable; refusing in-memory fallback for requested PG mode.";
         return false;
       }
       db.Database.EnsureCreated();
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"ParentSequence\" bigint");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"Stance\" character varying(30) NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"AdvisorId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Notes\" ADD COLUMN IF NOT EXISTS \"EvidenceJson\" text NOT NULL DEFAULT '[]'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WizardDrafts\" ADD COLUMN IF NOT EXISTS \"Version\" integer NOT NULL DEFAULT 1");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchJobId\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''");
       Pg.Backend = new PostgresBackend(db);
       return true;
     }
     catch (Exception ex)
     {
-      error = $"Postgres wire-up failed ({ex.GetType().Name}); running in-memory.";
+      error = $"Postgres wire-up failed ({ex.GetType().Name}); refusing in-memory fallback for requested PG mode.";
       return false;
     }
   }

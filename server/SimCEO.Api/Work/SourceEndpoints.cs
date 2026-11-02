@@ -21,6 +21,7 @@ public static class SourceEndpoints
     app.MapPost("/api/boards/{bid:guid}/sources/upload", async (
       InMemoryStore s, HttpRequest req, Guid bid, IFormFile file, string? scope, Guid? meetingId) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badUp) return badUp;
       if (!s.Boards.TryGetValue(bid, out var pboard)) return Results.NotFound("board");
       if (!PeopleOps.Can(s, req, bid, meetingId, "contribute")) return PeopleOps.Denied();
       if (file is null || file.Length == 0) return Results.BadRequest("No file.");
@@ -57,6 +58,7 @@ public static class SourceEndpoints
       {
         doc.ExtractionJson = Extraction.ToJson(new Extraction.Result("failed", null, ex.Message));
       }
+      s.Sources.Flush();
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "source.upload", Detail = JsonSerializer.Serialize(new { doc.Id, doc.FileName, doc.Version }) });
       return Results.Created($"/api/sources/{doc.Id}", doc);
     }).DisableAntiforgery(); // token-less API: no cookie auth, scope checks are explicit per request
@@ -68,6 +70,17 @@ public static class SourceEndpoints
       return Results.Ok(s.Sources.Values
         .Where(x => x.BoardId == doc.BoardId && x.FileName == doc.FileName)
         .OrderByDescending(x => x.Version));
+    });
+
+    app.MapPost("/api/sources/{id:guid}/approve", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (!s.Sources.TryGetValue(id, out var apd)) return Results.NotFound();
+      if (PeopleOps.BadToken(s, req) is { } badAp) return badAp;
+      if (!PeopleOps.Can(s, req, apd.BoardId, apd.MeetingId, "contribute")) return PeopleOps.Denied();
+      apd.Approved = true;
+      apd.Excluded = false;
+      s.Sources.Flush();
+      return Results.Ok(apd);
     });
 
     app.MapGet("/api/sources/{id:guid}/download", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -83,6 +96,7 @@ public static class SourceEndpoints
       if (!s.Sources.TryGetValue(id, out var doc)) return Results.NotFound();
       if (!PeopleOps.Can(s, req, doc.BoardId, doc.MeetingId, "contribute")) return PeopleOps.Denied();
       doc.Excluded = false;
+      s.Sources.Flush();
       s.Audit.Add(new AuditEvent { BoardId = doc.BoardId, Action = "source.restore", Detail = JsonSerializer.Serialize(new { id }) });
       return Results.Ok(doc);
     });
@@ -104,6 +118,7 @@ public static class SourceEndpoints
       if (body.TryGetProperty("excluded", out var ex)
           && (ex.ValueKind == JsonValueKind.True || ex.ValueKind == JsonValueKind.False))
         doc.Excluded = ex.ValueKind == JsonValueKind.True;
+      s.Sources.Flush();
       return Results.Ok(doc);
     });
 
@@ -115,6 +130,7 @@ public static class SourceEndpoints
       {
         var ext = await Extraction.ExtractAsync(doc.Original, doc.FileName);
         doc.ExtractionJson = Extraction.ToJson(ext);
+        s.Sources.Flush();
       }
       s.Audit.Add(new AuditEvent { BoardId = doc.BoardId, Action = "source.retry", Detail = JsonSerializer.Serialize(new { id }) });
       return Results.Ok(new { doc, extraction = doc.ExtractionJson });
@@ -131,7 +147,7 @@ public static class SourceEndpoints
     {
       if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
       var blocked = body.TryGetProperty("blockedTypes", out var b) ? (b.GetString() ?? "") : "";
-      if (s.Boards.TryGetValue(bid, out var pbb)) pbb.BlockedTypes = blocked;
+      if (s.Boards.TryGetValue(bid, out var pbb)) { pbb.BlockedTypes = blocked; s.Boards.Flush(); }
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "source.policy", Detail = JsonSerializer.Serialize(new { blocked }) });
       return Results.Ok(new { blockedTypes = blocked });
     });

@@ -68,7 +68,7 @@ public static class ModelSettingsEndpoints
       var sw = System.Diagnostics.Stopwatch.StartNew();
       try
       {
-        await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 16, ct, ownerOverride: true);
+        await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 512, ct, ownerOverride: true);
       }
       catch (Exception ex)
       {

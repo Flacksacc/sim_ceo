@@ -18,6 +18,21 @@ builder.Logging.AddConsole();
 var app = builder.Build();
 app.UseCors();
 app.UseAntiforgery();
+// Common invalid-bearer gate.
+app.Use(async (ctx, next) =>
+{
+  if (ctx.Request.Path.StartsWithSegments("/api"))
+  {
+    var store = ctx.RequestServices.GetRequiredService<InMemoryStore>();
+    if (PeopleOps.HasInvalidToken(store, ctx.Request))
+    {
+      ctx.Response.StatusCode = 401;
+      await ctx.Response.WriteAsJsonAsync(new { error = "Invalid or expired session token." });
+      return;
+    }
+  }
+  await next();
+});
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.MapFallbackToFile("index.html");
@@ -25,10 +40,15 @@ if (app.Environment.IsDevelopment()) { }
 
 
 
+var pgStore = app.Services.GetRequiredService<InMemoryStore>();
 if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
 {
   var cs = builder.Configuration.GetConnectionString("App");
-  if (string.IsNullOrWhiteSpace(cs)) Console.WriteLine("POSTGRES: no connection string; running in-memory.");
+  if (string.IsNullOrWhiteSpace(cs))
+  {
+    Console.Error.WriteLine("POSTGRES FATAL: USE_POSTGRES=1 but no connection string configured (ConnectionStrings:App). Refusing in-memory fallback.");
+    Environment.Exit(1);
+  }
   else
   {
     try
@@ -38,13 +58,19 @@ if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
       var boot = asm.GetType("SimCEO.Postgres.PgBoot");
       var argv = new object?[] { cs, "" };
       var ok = boot is not null && (bool)boot.GetMethod("TryWire")!.Invoke(null, argv)!;
-      Console.WriteLine(ok ? "POSTGRES: connected." : $"POSTGRES: {argv[1]}");
+      if (!ok)
+      {
+        Console.Error.WriteLine($"POSTGRES FATAL: {argv[1]}");
+        Environment.Exit(1);
+      }
+      Console.WriteLine("POSTGRES: connected.");
     }
     catch (Exception ex)
     {
       var inner = ex.InnerException;
       while (inner?.InnerException is not null) inner = inner.InnerException;
-      Console.WriteLine($"POSTGRES: backend unavailable ({ex.GetType().Name}: {inner?.Message ?? ex.Message}); running in-memory.");
+      Console.Error.WriteLine($"POSTGRES FATAL: backend unavailable ({ex.GetType().Name}: {inner?.Message ?? ex.Message}). Refusing in-memory fallback.");
+      Environment.Exit(1);
     }
   }
 }
@@ -107,9 +133,16 @@ if (args.Contains("--selftest"))
   var (noBoard, _, noBoardSt) = LeadSetup.Activate(store, board.Id, null);
   if (noBoard is not null) failures.Add("activate-without-advisor-should-fail");
   _ = noBoardSt;
-  foreach (var a in store.Advisors.Values.Where(a => a.BoardId == board.Id).Take(1)) a.Approved = true;
+  var actEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), Name = "Selftest", Description = "selftest advisor entry", ProfileJson = "a sufficiently long selftest profile json", Version = 1, UpdatedAt = DateTime.UtcNow };
+  store.Roster[actEntry.Id] = actEntry;
+  store.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = actEntry.Id, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 9 } };
+  var actAdv = store.Advisors.Values.First(a => a.BoardId == board.Id);
+  actAdv.RosterEntryId = actEntry.Id;
+  actAdv.RosterVersion = actEntry.Version;
+  actAdv.BoardRole = "Selftest Role";
+  actAdv.Approved = true;
   board.DraftJson = """{"name":"T1"}""";
-  var (activated, actErr, actSt) = LeadSetup.Activate(store, board.Id, Hashing.HashOf(board.DraftJson));
+  var (activated, actErr, actSt) = LeadSetup.Activate(store, board.Id, Hashing.HashOf(LeadSetup.CanonicalDraftJson(store, board)));
   if (activated is null || actErr is not null || actSt != 200 || !board.ActiveConfig) failures.Add("activate");
   var (rehash, rehashErr, rehashSt) = LeadSetup.Activate(store, board.Id, "deadbeefdeadbeef");
   if (rehash is not null || rehashSt != 409 || rehashErr is null) failures.Add("activate-hash-not-checked");
@@ -167,12 +200,54 @@ if (args.Contains("--selftest"))
     var guardReq = new DefaultHttpContext().Request;
     if (PeopleOps.Guard(gwCheck, guardReq) is null) failures.Add("provider-guard-missing");
   }
-  Console.WriteLine(failures.Count == 0 ? "SELFTEST PASS: advisor-cap, sequence, record-hash, policy, budgets, challenge, lead-version, setup-activate, roster-copy, record-export, grants, spend-cap, model-policy, provider-guard" : "SELFTEST FAIL: " + string.Join(";", failures));
+  var evOk = SimCEO.Api.Work.EvidenceRef.Parse(JsonDocument.Parse("{\"kind\":\"source\",\"ref\":\"abc\",\"version\":2}").RootElement);
+  if (evOk is null || evOk.Kind != "source" || evOk.Ref != "abc" || evOk.Version != 2) failures.Add("evidence-ref");
+  var evBad = SimCEO.Api.Work.EvidenceRef.Parse(JsonDocument.Parse("{\"kind\":\"nope\",\"ref\":\"x\"}").RootElement);
+  if (evBad is not null) failures.Add("evidence-ref-invalid-kind");
+  var evList = SimCEO.Api.Work.EvidenceRef.ParseList(JsonDocument.Parse("{\"evidence\":[{\"kind\":\"record\",\"ref\":\"r1\"}]}").RootElement, "evidence");
+  if (evList.Count != 1 || evList[0].Kind != "record") failures.Add("evidence-ref-list");
+  var board3 = new Board { Id = Guid.NewGuid(), Name = "T3", CreatedAt = DateTime.UtcNow };
+  store.Boards[board3.Id] = board3;
+  var dupEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), Name = "DupMe", Description = "dup role strategist", ProfileJson = "{\"selftest\":\"complete profile for dup-role gate\"}", Version = 1 };
+  store.Roster[dupEntry.Id] = dupEntry;
+  store.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = dupEntry.Id, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 2 } };
+  var (dup1, _, dupSt1) = RosterOps.TryCopy(store, dupEntry.Id, board3.Id, "Strategist");
+  if (dup1 is null || dupSt1 != 200) failures.Add("dup-role-first-copy");
+  var dupEntry2 = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), Name = "DupMe2", Description = "dup role analyst", ProfileJson = "{\"selftest\":\"complete profile for same role 2\"}", Version = 1 };
+  store.Roster[dupEntry2.Id] = dupEntry2;
+  store.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = dupEntry2.Id, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 3 } };
+  var (dup2, dupErr2, dupSt2) = RosterOps.TryCopy(store, dupEntry2.Id, board3.Id, "strategist");
+  if (dup2 is null || dupSt2 != 200 || dupErr2 is not null || dup2.Id == dup1!.Id) failures.Add("same-role-allowed");
+  var gate2 = RosterOps.ApprovalGate(store, dup2!);
+  if (gate2 is not null) failures.Add("approval-gate-clean");
+  var refExport = RecordsOps.BuildExport("""[{"id":"a","text":"Do X","refs":[{"kind":"source","ref":"s1"}]}]""", """["a"]""", detailed: true);
+  if (!refExport.Contains("refs: source:s1")) failures.Add("record-export-refs");
+  using (var dv = JsonDocument.Parse("[{\"id\":\"a\",\"text\":\"x\"}]"))
+    if (!RecordsOps.ValidateDraftItems(dv.RootElement, out _)) failures.Add("draft-items-valid");
+  using (var dd = JsonDocument.Parse("[{\"id\":\"a\",\"text\":\"x\"},{\"id\":\"a\",\"text\":\"y\"}]"))
+    if (RecordsOps.ValidateDraftItems(dd.RootElement, out _)) failures.Add("draft-items-dup");
+  using (var de = JsonDocument.Parse("[{\"id\":\"a\",\"text\":\"\"}]"))
+    if (RecordsOps.ValidateDraftItems(de.RootElement, out _)) failures.Add("draft-items-empty-text");
+  var isoA = new Board { Id = Guid.NewGuid(), Name = "IsoA", CreatedAt = DateTime.UtcNow };
+  store.Boards[isoA.Id] = isoA;
+  var isoB = new Board { Id = Guid.NewGuid(), Name = "IsoB", CreatedAt = DateTime.UtcNow };
+  store.Boards[isoB.Id] = isoB;
+  var (isoA1, _, _) = LeadSetup.SaveLead(store, isoA.Id, new LeadProfile { Name = "LeadA" });
+  var (isoB1, _, _) = LeadSetup.SaveLead(store, isoB.Id, new LeadProfile { Name = "LeadB" });
+  var (isoA2, _, _) = LeadSetup.SaveLead(store, isoA.Id, new LeadProfile { Version = isoA1!.Version, Name = "LeadA v2" });
+  if (isoA2 is null || isoA2.Version != 2) failures.Add("lead-iso-edit");
+  if ((LeadSetup.ResolveLeadFor(store, isoB.Id)?.Version ?? 0) != 1) failures.Add("lead-iso-scope");
+    Console.WriteLine(failures.Count == 0 ? "SELFTEST PASS: advisor-cap, sequence, record-hash, policy, budgets, challenge, lead-version, setup-activate, roster-copy, same-role, approval-gate, record-export, record-export-refs, evidence-ref, grants, spend-cap, model-policy, provider-guard" : "SELFTEST FAIL: " + string.Join(";", failures));
   Environment.Exit(failures.Count == 0 ? 0 : 1);
 }
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "simceo-api", time = DateTime.UtcNow }));
-app.MapGet("/ready", () => Results.Ok(new { ready = true, store = "inmemory" }));
+app.MapGet("/ready", (InMemoryStore s) => string.IsNullOrEmpty(s.PgError) ? Results.Ok(new { ready = true, store = Pg.Backend is null ? "inmemory" : "postgres" }) : Results.Json(new { ready = false, store = "unavailable", error = s.PgError }, statusCode: 503));
+app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
+{
+  mode = Pg.Backend is null ? "memory" : "postgres",
+  error = s.PgError,
+}));
 app.MapHub<BoardHub>("/hubs/board");
 
 app.MapGet("/api/boards", (InMemoryStore s) => Results.Ok(s.Boards.Values.Where(b => !b.Archived).OrderByDescending(b => b.CreatedAt).Take(100)));
@@ -181,6 +256,9 @@ app.MapPost("/api/boards", (InMemoryStore s, Board input) =>
 {
   input.Id = Guid.NewGuid();
   input.CreatedAt = DateTime.UtcNow;
+  input.ActiveConfig = false;
+  input.ActiveJson = "{}";
+  input.LeadProfileVersion = 0;
   s.Boards[input.Id] = input;
   s.Audit.Add(new AuditEvent { BoardId = input.Id, Action = "board.create", Detail = JsonSerializer.Serialize(new { input.Name }) });
   return Results.Created($"/api/boards/{input.Id}", input);
@@ -208,11 +286,17 @@ app.MapGet("/api/roster", (InMemoryStore s, Guid accountId, string? q, string? t
 app.MapGet("/api/roster/count", (InMemoryStore s, Guid accountId) =>
   Results.Ok(new { total = s.Roster.Values.Count(r => r.AccountId == accountId && !r.Archived) }));
 
-app.MapPost("/api/roster", (InMemoryStore s, RosterEntry input) =>
+app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input) =>
 {
+  if (PeopleOps.BadToken(s, req) is { } badRaw) return badRaw;
   input.Id = Guid.NewGuid();
+  input.OwnerKey = PeopleOps.UserOf(s, req);
   input.Version = 1;
   input.UpdatedAt = DateTime.UtcNow;
+  input.ResearchRequested = false;
+  input.ResearchedAt = null;
+  input.EvidenceCount = 0;
+  input.ResearchJson = "{}";
   if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest("Name is required.");
   if (string.IsNullOrWhiteSpace(input.Description)) return Results.BadRequest("Description is required.");
   if (string.IsNullOrWhiteSpace(input.ProfileJson) || input.ProfileJson.Trim().Length < 20) return Results.BadRequest("Profile is required (describe background, strengths, and limits).");
@@ -223,26 +307,27 @@ app.MapPost("/api/roster", (InMemoryStore s, RosterEntry input) =>
 app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, Guid boardId) =>
   Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).ToList()));
 
-app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, Guid boardId, BoardAdvisor input) =>
+app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>
 {
-  if (input.RosterEntryId == Guid.Empty || !s.Roster.TryGetValue(input.RosterEntryId, out _)) return Results.BadRequest("Advisors must be created in the roster first: supply a rosterEntryId.");
-  var (rok, rmissing) = RosterOps.Completeness(s, input.RosterEntryId);
-  if (!rok) return Results.Json(new { error = "Roster entry is incomplete: " + string.Join(", ", rmissing) + "." }, statusCode: 409);
-  if (s.Advisors.Values.Any(a => a.BoardId == boardId && a.RosterEntryId == input.RosterEntryId && !a.Removed))
-    return Results.Conflict("Advisor already attached to this board.");
-  if (s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed) >= 10)
-    return Results.Problem("Board already has 10 advisors. Remove an advisor to add another.", statusCode: 409);
-  input.Id = Guid.NewGuid();
-  input.BoardId = boardId;
-  input.CreatedAt = DateTime.UtcNow;
-  s.Advisors[input.Id] = input;
-  return Results.Created($"/api/boards/{boardId}/advisors/{input.Id}", input);
+  if (PeopleOps.BadToken(s, req) is { } badAttach) return badAttach;
+  if (!s.Boards.ContainsKey(boardId)) return Results.NotFound("Board not found.");
+  if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
+  var rosterId = body.TryGetProperty("rosterEntryId", out var re) && re.ValueKind == JsonValueKind.String
+    && Guid.TryParse(re.GetString(), out var rg) ? rg : Guid.Empty;
+  if (rosterId == Guid.Empty) return Results.BadRequest("Advisors must be created in the roster first: supply a rosterEntryId.");
+  var role = body.TryGetProperty("boardRole", out var br) ? (br.GetString() ?? "") : "";
+  var (copy, error, status) = RosterOps.TryCopy(s, rosterId, boardId, role);
+  return copy is not null ? Results.Created($"/api/boards/{boardId}/advisors/{copy.Id}", copy)
+    : status == 409 ? Results.Conflict(error ?? "Attach rejected.") : Results.Json(new { error }, statusCode: status);
 });
 
-app.MapDelete("/api/boards/{boardId:guid}/advisors/{advisorId:guid}", (InMemoryStore s, Guid boardId, Guid advisorId) =>
+app.MapDelete("/api/boards/{boardId:guid}/advisors/{advisorId:guid}", (InMemoryStore s, HttpRequest req, Guid boardId, Guid advisorId) =>
 {
+  if (PeopleOps.BadToken(s, req) is { } badDelAdv) return badDelAdv;
+  if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
   if (!s.Advisors.TryGetValue(advisorId, out var a) || a.BoardId != boardId) return Results.NotFound();
   a.Removed = true;
+  s.Advisors.Flush();
   return Results.NoContent();
 });
 
@@ -250,12 +335,18 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
 {
   if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
   if (!s.Advisors.TryGetValue(advisorId, out var a) || a.BoardId != boardId || a.Removed) return Results.NotFound();
-    if (!s.Roster.TryGetValue(a.RosterEntryId, out var rent)) return Results.Json(new { error = "Roster entry not found." }, statusCode: 409);
-    if (a.RosterVersion != rent.Version) return Results.Json(new { error = "Roster changed since this copy; update from roster, review, then approve." }, statusCode: 409);
-    if (rent.ResearchRequested && rent.ResearchedAt is null) return Results.Json(new { error = "Research is still running for this advisor." }, statusCode: 409);
-    if (rent.ResearchRequested && rent.EvidenceCount < 1) return Results.Json(new { error = "No supporting evidence yet; run research again or add sources first." }, statusCode: 409);
-    if (!s.Images.Values.Any(i => i.RosterEntryId == a.RosterEntryId && (string.IsNullOrEmpty(i.Review) || i.Review == "accepted"))) return Results.Json(new { error = "An accepted portrait is required before approving (upload one, then accept it)." }, statusCode: 409);
+  var gate = RosterOps.ApprovalGate(s, a);
+  if (gate is not null) return Results.Json(new { error = gate switch
+  {
+    "stale-version" => "Roster changed since this copy; update from roster, review, then approve.",
+    "research-pending" => "Research is still running for this advisor.",
+    "no-evidence" => "No supporting evidence yet; run research again or add sources first.",
+    "portrait-pending" => "An accepted portrait is required before approving (upload one, then accept it).",
+    "archived-entry" => "Roster entry is archived.",
+    _ => "Advisor is not eligible for approval.",
+  } }, statusCode: 409);
   a.Approved = true;
+  s.Advisors.Flush();
   s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = a.BoardRole }) });
   return Results.Ok(a);
 });
@@ -315,9 +406,15 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
   if (!PeopleOps.Can(s, req, meeting.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
   lock (s.MessageLock)
   {
+    Atomic.Run(() =>
+    {
     var list = s.Messages.GetOrAdd(meetingId, _ => new List<Message>());
     input.MeetingId = meetingId;
     input.BoardId = meeting.BoardId;
+    input.Sender = "lead";
+    input.AdvisorId = Guid.Empty;
+    input.AdvisorName = null;
+    input.Status = "committed";
     if (input.ParentSequence.HasValue && !list.Any(m => m.Sequence == input.ParentSequence.Value))
       input.ParentSequence = null;
     input.Stance = MessageTags.CanonicalStance(input.Stance);
@@ -329,14 +426,20 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
     meeting.DeliveredRevision = input.Sequence;
     if (string.Equals(input.Sender, "lead", StringComparison.OrdinalIgnoreCase))
       meeting.Generation++;
+    s.Meetings.Flush();
+    });
   }
   await hub.Clients.Group($"meeting:{meetingId}").SendAsync("message", new { input.MeetingId, input.Sequence, input.Sender, input.Content });
   return Results.Created($"/api/meetings/{meetingId}/messages/{input.Sequence}", input);
 });
 
-app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Guid meetingId, JsonElement items) =>
+app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement items) =>
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound();
+  if (PeopleOps.BadToken(s, req) is { } badRecDraft) return badRecDraft;
+  if (!PeopleOps.Can(s, req, meeting.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+  if (!RecordsOps.ValidateDraftItems(items, out var draftErr))
+    return Results.Json(new { error = draftErr }, statusCode: 422);
   var canon = items.GetRawText();
   var draft = new RecordDraft
   {
@@ -345,6 +448,44 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Gui
     ItemsJson = canon, Hash = Hashing.HashOf(canon),
   };
   s.Drafts[draft.Id] = draft;
+  return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", draft);
+});
+
+app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement body) =>
+{
+  if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
+  if (PeopleOps.BadToken(s, req) is { } badFromDir) return badFromDir;
+  if (!PeopleOps.Can(s, req, meeting.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+  var noteId = Guid.Empty;
+  var noteSupplied = false;
+  if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("noteId", out var nv))
+  {
+    if (nv.ValueKind == JsonValueKind.String && Guid.TryParse(nv.GetString(), out var parsedNote)) { noteId = parsedNote; noteSupplied = true; }
+    else if (nv.ValueKind == JsonValueKind.Object && nv.TryGetProperty("id", out var ni) && ni.ValueKind == JsonValueKind.String && Guid.TryParse(ni.GetString(), out var parsedRef)) { noteId = parsedRef; noteSupplied = true; }
+  }
+  if (!noteSupplied) return Results.BadRequest("noteId is required.");
+  if (!s.Notes.TryGetValue(noteId, out var note)) return Results.NotFound("direction note not found.");
+  if (!string.Equals(note.Kind, "direction", StringComparison.OrdinalIgnoreCase)) return Results.Json(new { error = "Only adopted direction notes can be recorded." }, statusCode: 422);
+  if (note.BoardId != meeting.BoardId) return Results.Conflict("Direction belongs to another board.");
+  if (string.IsNullOrWhiteSpace(note.Scope)) return Results.Json(new { error = "Direction scope is empty; re-adopt with meeting or board scope." }, statusCode: 422);
+  if (note.Scope is not ("meeting" or "board")) return Results.Json(new { error = "Direction scope must be meeting or board." }, statusCode: 422);
+  if (note.Scope == "meeting" && note.MeetingId != Guid.Empty && note.MeetingId != meetingId)
+    return Results.Conflict("Direction belongs to another meeting.");
+  if (string.IsNullOrWhiteSpace(note.Body)) return Results.Json(new { error = "Direction text is empty." }, statusCode: 422);
+  var itemId = "dir-" + note.Id.ToString("N").Substring(0, 8);
+  var items = new[] { new { id = itemId, text = note.Body, scope = note.Scope, refs = new[] { new { kind = "direction", @ref = note.Id.ToString() } } } };
+  var itemsJson = JsonSerializer.Serialize(items, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+  using var check = JsonDocument.Parse(itemsJson);
+  if (!RecordsOps.ValidateDraftItems(check.RootElement, out var fromDirErr))
+    return Results.Json(new { error = fromDirErr }, statusCode: 422);
+  var draft = new RecordDraft
+  {
+    BoardId = meeting.BoardId, MeetingId = meetingId,
+    Version = 1, Watermark = meeting.DeliveredRevision,
+    ItemsJson = itemsJson, Hash = Hashing.HashOf(itemsJson),
+  };
+  s.Drafts[draft.Id] = draft;
+  s.Audit.Add(new AuditEvent { BoardId = meeting.BoardId, Action = "record.from-direction", Detail = JsonSerializer.Serialize(new { draft = draft.Id, note = note.Id, item = itemId, watermark = draft.Watermark }) });
   return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", draft);
 });
 
@@ -357,17 +498,44 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
   var hash = body.GetProperty("hash").GetString() ?? "";
   var watermark = body.GetProperty("watermark").GetInt64();
   var itemIds = body.GetProperty("itemIds").EnumerateArray().Select(e => e.GetString()).ToList();
-  if (!s.Drafts.TryGetValue(draftId, out var draft) || draft.MeetingId != meetingId || draft.Decided)
-    return Results.Conflict("Stale or already-decided draft.");
-  if (!PeopleOps.Can(s, req, draft.BoardId, meetingId, "manage")) return PeopleOps.Denied();
-  if (!string.Equals(draft.Hash, hash, StringComparison.OrdinalIgnoreCase)) return Results.Conflict("Draft hash mismatch; refresh review.");
-  if (draft.Watermark != watermark) return Results.Conflict("Meeting moved on; refresh review.");
-  if (itemIds.Count == 0) return Results.BadRequest("No items selected.");
-  draft.Decided = true;
-  draft.Status = "approved";
-  draft.ApprovedJson = JsonSerializer.Serialize(itemIds);
-  s.Audit.Add(new AuditEvent { BoardId = draft.BoardId, Action = "record.approve", Detail = JsonSerializer.Serialize(new { draftId, itemIds }) });
-  return Results.Ok(new { approved = itemIds, draft = draft.Id });
+  if (!PeopleOps.Can(s, req, s.Drafts.TryGetValue(draftId, out var preDraft) ? preDraft.BoardId : Guid.Empty, meetingId, "manage")) return PeopleOps.Denied();
+  lock (s.MessageLock)
+  {
+    if (!s.Drafts.TryGetValue(draftId, out var draft) || draft.MeetingId != meetingId || draft.Decided)
+      return Results.Conflict("Stale or already-decided draft.");
+    if (!s.Meetings.TryGetValue(meetingId, out var mtg))
+      return Results.Conflict("Meeting moved on; refresh review.");
+    if (!string.Equals(draft.Hash, hash, StringComparison.OrdinalIgnoreCase)) return Results.Conflict("Draft hash mismatch; refresh review.");
+    if (draft.Watermark != watermark || draft.Watermark != mtg.DeliveredRevision || watermark != mtg.DeliveredRevision)
+      return Results.Conflict("Meeting moved on; refresh review.");
+    Dictionary<string, int> counts;
+    JsonDocument itemsDoc;
+    try { itemsDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(draft.ItemsJson) ? "[]" : draft.ItemsJson); }
+    catch (JsonException) { return Results.Conflict("Draft items unreadable; revise instead."); }
+    using (itemsDoc)
+    {
+      counts = new Dictionary<string, int>(StringComparer.Ordinal);
+      if (itemsDoc.RootElement.ValueKind == JsonValueKind.Array)
+        foreach (var el in itemsDoc.RootElement.EnumerateArray())
+        {
+          var id = el.ValueKind == JsonValueKind.Object && el.TryGetProperty("id", out var iv) ? (iv.GetString() ?? "") : "";
+          if (string.IsNullOrWhiteSpace(id)) continue;
+          counts[id] = counts.TryGetValue(id, out var c0) ? c0 + 1 : 1;
+        }
+    if (!RecordsOps.ValidateDraftItems(itemsDoc.RootElement, out var legacyErr))
+      return Results.Json(new { error = legacyErr }, statusCode: 422);
+    if (itemIds.Count == 0 || itemIds.Any(x => string.IsNullOrWhiteSpace(x)))
+      return Results.BadRequest("No items selected.");
+    if (itemIds.Distinct(StringComparer.Ordinal).Count() != itemIds.Count || itemIds.Any(x => !counts.TryGetValue(x!, out var cc) || cc != 1))
+      return Results.Json(new { error = "Selected items must be unique draft IDs matching exactly one non-empty item each." }, statusCode: 422);
+    draft.Decided = true;
+    draft.Status = "approved";
+    draft.ApprovedJson = JsonSerializer.Serialize(itemIds);
+    s.Drafts.Flush();
+    s.Audit.Add(new AuditEvent { BoardId = draft.BoardId, Action = "record.approve", Detail = JsonSerializer.Serialize(new { draftId, itemIds }) });
+    return Results.Ok(new { approved = itemIds, draft = draft.Id });
+    }
+  }
 });
 
 app.Run();

@@ -15,13 +15,15 @@ public static class OpsEndpoints
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
 
-    app.MapPost("/api/jobs/{id:guid}/retry", (InMemoryStore s, Guid id) =>
+    app.MapPost("/api/jobs/{id:guid}/retry", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badRetry) return badRetry;
       if (!s.Jobs.TryGetValue(id, out var job)) return Results.NotFound();
       if (job.State != "failed")
         return Results.Conflict("Only a failed step offers Retry; otherwise the last checkpoint stands.");
       job.State = "pending";
       job.UpdatedAt = DateTime.UtcNow;
+      s.Jobs.Flush();
       s.Audit.Add(new AuditEvent { Action = "job.retry", Detail = JsonSerializer.Serialize(new { id, job.Kind, job.IdempotencyKey }) });
       return Results.Ok(job);
     });
@@ -37,8 +39,8 @@ public static class OpsEndpoints
         active = b.ActiveConfig,
         dirty = !string.Equals(b.DraftJson, b.ActiveJson, StringComparison.Ordinal),
         name = !string.IsNullOrWhiteSpace(b.Name),
-        lead = LeadSetup.ResolveLead(s) is not null,
-        leadVersion = LeadSetup.ResolveLead(s)?.Version ?? 0,
+        lead = LeadSetup.ResolveLeadFor(s, bid) is not null,
+        leadVersion = LeadSetup.ResolveLeadFor(s, bid)?.Version ?? 0,
         advisors = new { total = advisors.Count, approved = advisors.Count(a => a.Approved) },
         meetings = new
         {
@@ -67,12 +69,21 @@ public static class OpsEndpoints
     {
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
       if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      var copies = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList();
+      var rosterIds = copies.Select(a => a.RosterEntryId).ToHashSet();
+      var ownLead = s.LeadProfiles.Values.Where(l => l.BoardId == bid).OrderByDescending(l => l.Version).FirstOrDefault();
+      var effLead = ownLead ?? LeadSetup.ResolveLead(s);
+      var rosterRows = s.Roster.Values.Where(r => rosterIds.Contains(r.Id)).ToList();
+      var topAccount = rosterRows.Where(r => r.AccountId != Guid.Empty).Select(r => r.AccountId).FirstOrDefault();
       var snapshot = new
       {
         version = 1,
+        accountId = topAccount == Guid.Empty ? "" : topAccount.ToString(),
         board = b,
-        lead = s.LeadProfiles.Values.Where(l => l.BoardId == bid).OrderByDescending(l => l.Version).FirstOrDefault(),
-        advisors = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList(),
+        lead = effLead,
+        leadSource = ownLead is not null ? "board" : effLead is not null ? "global" : "none",
+        advisors = copies,
+        roster = rosterRows,
         exportedAt = DateTime.UtcNow,
       };
       // Web (camelCase) casing: /api/boards/import reads lowercase property names.
@@ -80,8 +91,9 @@ public static class OpsEndpoints
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)) });
     });
 
-    app.MapPost("/api/boards/import", (InMemoryStore s, JsonElement body) =>
+    app.MapPost("/api/boards/import", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badImp) return badImp;
       var snapshot = body.TryGetProperty("snapshot", out var sn) ? sn.GetString() ?? "" : "";
       var hash = body.TryGetProperty("hash", out var h) ? h.GetString() ?? "" : "";
       if (string.IsNullOrWhiteSpace(snapshot)) return Results.BadRequest("snapshot is required.");
@@ -91,50 +103,211 @@ public static class OpsEndpoints
       try { doc = JsonDocument.Parse(snapshot); }
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
       var root = doc.RootElement;
-      if (!root.TryGetProperty("version", out var v) || v.GetInt32() != 1)
+      if (!root.TryGetProperty("exportedAt", out var xa) || xa.ValueKind != JsonValueKind.String
+          || !DateTime.TryParse(xa.GetString(), out _))
+        return Results.BadRequest("Snapshot is missing exportedAt; import the exact exported text.");
+      if (!root.TryGetProperty("version", out var v) || v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vv) || vv != 1)
         return Results.BadRequest("Unsupported snapshot version.");
-      var src = root.GetProperty("board");
+      if (!root.TryGetProperty("board", out var src) || src.ValueKind != JsonValueKind.Object
+          || !src.TryGetProperty("name", out var bn) || bn.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(bn.GetString()))
+        return Results.BadRequest("Snapshot board is missing a name.");
+      if (root.TryGetProperty("roster", out var rvx) && rvx.ValueKind != JsonValueKind.Array)
+        return Results.BadRequest("Snapshot roster must be an array.");
+      if (root.TryGetProperty("advisors", out var avx) && avx.ValueKind != JsonValueKind.Array)
+        return Results.BadRequest("Snapshot advisors must be an array.");
+      if (root.TryGetProperty("lead", out var lvx) && lvx.ValueKind != JsonValueKind.Object && lvx.ValueKind != JsonValueKind.Null)
+        return Results.BadRequest("Snapshot lead must be an object.");
+      foreach (var pn in new[] { "mission", "stage", "blockedTypes" })
+        if (src.TryGetProperty(pn, out var pvx) && pvx.ValueKind != JsonValueKind.String)
+          return Results.BadRequest("Snapshot board field must be a string.");
+      if (src.TryGetProperty("retainAudio", out var rax) && rax.ValueKind != JsonValueKind.True && rax.ValueKind != JsonValueKind.False)
+        return Results.BadRequest("Snapshot board.retainAudio must be a boolean.");
+      foreach (var pn in new[] { "discussionPolicy", "dataUse" })
+        if (src.TryGetProperty(pn, out var pvy) && pvy.ValueKind != JsonValueKind.String)
+          return Results.BadRequest("Snapshot board field must be a string.");
+      Guid? overrideAccount = null;
+      if (body.TryGetProperty("accountId", out var bac) && bac.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(bac.GetString())) {
+        if (!Guid.TryParse(bac.GetString(), out var bag) || bag == Guid.Empty)
+          return Results.BadRequest("accountId must be a non-empty GUID string.");
+        overrideAccount = bag;
+      } else if (body.TryGetProperty("accountId", out var bacBad) && bacBad.ValueKind != JsonValueKind.String && bacBad.ValueKind != JsonValueKind.Undefined && bacBad.ValueKind != JsonValueKind.Null) {
+        return Results.BadRequest("accountId must be a GUID string.");
+      }
+      Guid? snapshotAccount = null;
+      if (root.TryGetProperty("accountId", out var sac)) {
+        if (sac.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(sac.GetString())) {
+          if (!Guid.TryParse(sac.GetString(), out var sag) || sag == Guid.Empty)
+            return Results.BadRequest("Snapshot accountId must be a GUID string.");
+          snapshotAccount = sag;
+        } else if (sac.ValueKind != JsonValueKind.Null && sac.ValueKind != JsonValueKind.String) {
+          return Results.BadRequest("Snapshot accountId must be a GUID string.");
+        }
+      }
+      var targetAccount = overrideAccount ?? snapshotAccount;
+      var rosterIds = new HashSet<string>(StringComparer.Ordinal);
+      if (root.TryGetProperty("roster", out var rex2) && rex2.ValueKind == JsonValueKind.Array)
+        foreach (var r in rex2.EnumerateArray())
+        {
+          if (r.ValueKind != JsonValueKind.Object) return Results.BadRequest("Snapshot roster entries must be objects.");
+          if (!r.TryGetProperty("name", out var rn2) || rn2.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(rn2.GetString()))
+            return Results.BadRequest("Snapshot roster entries must carry a name.");
+          if (r.TryGetProperty("id", out var oi2x) && oi2x.ValueKind != JsonValueKind.String)
+            return Results.BadRequest("Snapshot roster id must be a string.");
+          var rid = r.TryGetProperty("id", out var oi2) && oi2.ValueKind == JsonValueKind.String ? oi2.GetString() ?? "" : "";
+          if (!string.IsNullOrWhiteSpace(rid) && !rosterIds.Add(rid))
+            return Results.BadRequest("Snapshot roster contains a duplicate id.");
+          foreach (var pn in new[] { "description", "profileJson", "tags", "researchJson" })
+            if (r.TryGetProperty(pn, out var rvx2) && rvx2.ValueKind != JsonValueKind.String)
+              return Results.BadRequest("Snapshot roster field must be a string.");
+          if (r.TryGetProperty("version", out var rver) && (rver.ValueKind != JsonValueKind.Number || !rver.TryGetInt32(out _)))
+            return Results.BadRequest("Snapshot roster version must be an integer.");
+          if (r.TryGetProperty("researchRequested", out var rrqx) && rrqx.ValueKind != JsonValueKind.True && rrqx.ValueKind != JsonValueKind.False)
+            return Results.BadRequest("Snapshot roster researchRequested must be a boolean.");
+          if (r.TryGetProperty("accountId", out var racx)) {
+            if (racx.ValueKind != JsonValueKind.String && racx.ValueKind != JsonValueKind.Null)
+              return Results.BadRequest("Snapshot roster accountId must be a GUID string.");
+            if (racx.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(racx.GetString()) && !Guid.TryParse(racx.GetString(), out _))
+              return Results.BadRequest("Snapshot roster accountId must be a GUID string.");
+          }
+        }
+      var advCount = 0;
+      var usedRoster = new HashSet<string>(StringComparer.Ordinal);
+      if (root.TryGetProperty("advisors", out var advs2) && advs2.ValueKind == JsonValueKind.Array)
+        foreach (var a in advs2.EnumerateArray())
+        {
+          if (a.ValueKind != JsonValueKind.Object) return Results.BadRequest("Snapshot advisors must be objects.");
+          advCount++;
+          if (a.TryGetProperty("rosterVersion", out var arvx) && (arvx.ValueKind != JsonValueKind.Number || !arvx.TryGetInt32(out _)))
+            return Results.BadRequest("Snapshot advisor rosterVersion must be an integer.");
+          if (a.TryGetProperty("boardRole", out var abrx) && abrx.ValueKind != JsonValueKind.String)
+            return Results.BadRequest("Snapshot advisor boardRole must be a string.");
+          if (!a.TryGetProperty("rosterEntryId", out var re2x) || re2x.ValueKind != JsonValueKind.String)
+            return Results.Json(new { error = "Snapshot advisor references a missing roster entry; import the exact exported text." }, statusCode: 422);
+          var oldRe = re2x.GetString() ?? "";
+          if (string.IsNullOrWhiteSpace(oldRe) || !rosterIds.Contains(oldRe))
+            return Results.Json(new { error = "Snapshot advisor references a missing roster entry; import the exact exported text." }, statusCode: 422);
+          if (!usedRoster.Add(oldRe))
+            return Results.Json(new { error = "Snapshot attaches the same roster entry twice." }, statusCode: 422);
+        }
+      if (advCount > 10)
+        return Results.Json(new { error = "Snapshot holds more than ten advisors; a board holds at most ten." }, statusCode: 422);
+      if (root.TryGetProperty("lead", out var leadChk) && leadChk.ValueKind == JsonValueKind.Object) {
+        if (!leadChk.TryGetProperty("name", out var lnChk) || lnChk.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(lnChk.GetString()))
+          return Results.BadRequest("Snapshot lead is missing a name.");
+        foreach (var pn in new[] { "roleLabel", "background", "familiarTopics", "simplerTopics", "commPrefs", "provenanceJson" })
+          if (leadChk.TryGetProperty(pn, out var lv2) && lv2.ValueKind != JsonValueKind.String)
+            return Results.BadRequest("Snapshot lead field must be a string.");
+      }
       var board = new Board
       {
-        Name = src.GetProperty("name").GetString() ?? "Imported",
+        Name = bn.GetString()!,
         Mission = src.TryGetProperty("mission", out var mi) ? mi.GetString() ?? "" : "",
         Stage = src.TryGetProperty("stage", out var st) ? st.GetString() ?? "" : "",
         ActiveConfig = false,
+        RetainAudio = src.TryGetProperty("retainAudio", out var ra) && ra.ValueKind == JsonValueKind.True,
+        DiscussionPolicy = src.TryGetProperty("discussionPolicy", out var dp) && dp.ValueKind == JsonValueKind.String
+          && (dp.GetString() is "focused" or "balanced" or "open") ? dp.GetString()! : "balanced",
+        DataUse = src.TryGetProperty("dataUse", out var du) && du.ValueKind == JsonValueKind.String
+          && (du.GetString() is "standard" or "contributor") ? du.GetString()! : "contributor",
+        BlockedTypes = src.TryGetProperty("blockedTypes", out var bt) && bt.ValueKind == JsonValueKind.String ? bt.GetString() ?? "" : "",
       };
-      s.Boards[board.Id] = board;
-      if (root.TryGetProperty("lead", out var lead) && lead.ValueKind == JsonValueKind.Object)
+      Dictionary<string, Guid> rosterMap = new();
+      var plannedRoster = new List<RosterEntry>();
+      var ownerKey = PeopleOps.UserOf(s, req);
+      if (root.TryGetProperty("roster", out var rex) && rex.ValueKind == JsonValueKind.Array)
+        foreach (var r in rex.EnumerateArray())
+        {
+          if (r.ValueKind != JsonValueKind.Object) return Results.BadRequest("Snapshot roster entries must be objects.");
+          var oldId = r.TryGetProperty("id", out var oi) && oi.ValueKind == JsonValueKind.String ? oi.GetString() ?? "" : "";
+          var researched = r.TryGetProperty("researchRequested", out var rrq) && rrq.ValueKind == JsonValueKind.True;
+          Guid entryAccount = Guid.Empty;
+          if (targetAccount.HasValue) entryAccount = targetAccount.Value;
+          else if (r.TryGetProperty("accountId", out var rac) && rac.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(rac.GetString()) && Guid.TryParse(rac.GetString(), out var rag) && rag != Guid.Empty) entryAccount = rag;
+          var entry = new RosterEntry
+          {
+            Id = Guid.NewGuid(),
+            AccountId = entryAccount,
+            OwnerKey = ownerKey,
+            Name = r.TryGetProperty("name", out var rn) && rn.ValueKind == JsonValueKind.String ? rn.GetString() ?? "Imported" : "Imported",
+            Description = r.TryGetProperty("description", out var rd) && rd.ValueKind == JsonValueKind.String ? rd.GetString() ?? "" : "",
+            ProfileJson = r.TryGetProperty("profileJson", out var rp) && rp.ValueKind == JsonValueKind.String ? rp.GetString() ?? "{}" : "{}",
+            Version = r.TryGetProperty("version", out var rv2) && rv2.ValueKind == JsonValueKind.Number && rv2.TryGetInt32(out var riv) ? riv : 1,
+            Tags = r.TryGetProperty("tags", out var rt) && rt.ValueKind == JsonValueKind.String ? rt.GetString() ?? "" : "",
+            ResearchRequested = researched,
+            ResearchJson = r.TryGetProperty("researchJson", out var rrj) && rrj.ValueKind == JsonValueKind.String ? rrj.GetString() ?? "{}" : "{}",
+            ResearchedAt = null,
+            EvidenceCount = 0,
+            UpdatedAt = DateTime.UtcNow,
+          };
+          if (!string.IsNullOrWhiteSpace(oldId)) rosterMap[oldId] = entry.Id;
+          plannedRoster.Add(entry);
+        }
+      LeadProfile? plannedLead = null;
+      if (root.TryGetProperty("lead", out var leadPre) && leadPre.ValueKind == JsonValueKind.Object)
       {
-        var lp = new LeadProfile
+        plannedLead = new LeadProfile
         {
+          Id = Guid.NewGuid(),
           BoardId = board.Id, Version = 1,
-          Name = lead.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
-          RoleLabel = "Board Lead",
-          Background = lead.TryGetProperty("background", out var bg) ? bg.GetString() ?? "" : "",
+          Name = leadPre.TryGetProperty("name", out var ln0) && ln0.ValueKind == JsonValueKind.String ? ln0.GetString() ?? "" : "",
+          RoleLabel = leadPre.TryGetProperty("roleLabel", out var rl0) && rl0.ValueKind == JsonValueKind.String ? rl0.GetString() ?? "Board Lead" : "Board Lead",
+          Background = leadPre.TryGetProperty("background", out var bg0) && bg0.ValueKind == JsonValueKind.String ? bg0.GetString() ?? "" : "",
+          FamiliarTopics = leadPre.TryGetProperty("familiarTopics", out var ft0) && ft0.ValueKind == JsonValueKind.String ? ft0.GetString() ?? "" : "",
+          SimplerTopics = leadPre.TryGetProperty("simplerTopics", out var st0) && st0.ValueKind == JsonValueKind.String ? st0.GetString() ?? "" : "",
+          CommPrefs = leadPre.TryGetProperty("commPrefs", out var cp0) && cp0.ValueKind == JsonValueKind.String ? cp0.GetString() ?? "" : "",
+          ProvenanceJson = leadPre.TryGetProperty("provenanceJson", out var pj0) && pj0.ValueKind == JsonValueKind.String ? pj0.GetString() ?? "{}" : "{}",
         };
-        s.LeadProfiles[lp.Id] = lp;
-        board.LeadProfileVersion = 1;
       }
-      var copied = 0;
-      if (root.TryGetProperty("advisors", out var advs) && advs.ValueKind == JsonValueKind.Array)
-        foreach (var a in advs.EnumerateArray())
+      var plannedAdvisors = new List<BoardAdvisor>();
+      if (root.TryGetProperty("advisors", out var advsPre) && advsPre.ValueKind == JsonValueKind.Array)
+        foreach (var a in advsPre.EnumerateArray())
         {
-          s.Advisors[Guid.NewGuid()] = new BoardAdvisor
+          if (a.ValueKind != JsonValueKind.Object) return Results.BadRequest("Snapshot advisors must be objects.");
+          var oldRe = a.TryGetProperty("rosterEntryId", out var re0) && re0.ValueKind == JsonValueKind.String ? re0.GetString() ?? "" : "";
+          if (string.IsNullOrWhiteSpace(oldRe) || !rosterMap.ContainsKey(oldRe))
+            return Results.Json(new { error = "Snapshot advisor references a missing roster entry; import the exact exported text." }, statusCode: 422);
+          plannedAdvisors.Add(new BoardAdvisor
           {
             Id = Guid.NewGuid(), BoardId = board.Id,
-            RosterEntryId = a.TryGetProperty("rosterEntryId", out var re) ? re.GetGuid() : Guid.Empty,
-            RosterVersion = a.TryGetProperty("rosterVersion", out var rv) ? rv.GetInt32() : 1,
-            BoardRole = a.TryGetProperty("boardRole", out var br) ? br.GetString() ?? "" : "",
+            RosterEntryId = rosterMap[oldRe],
+            RosterVersion = a.TryGetProperty("rosterVersion", out var rv0) && rv0.ValueKind == JsonValueKind.Number && rv0.TryGetInt32(out var rvv) ? rvv : 1,
+            BoardRole = a.TryGetProperty("boardRole", out var br0) && br0.ValueKind == JsonValueKind.String ? br0.GetString() ?? "" : "",
             Approved = false,
-          };
-          copied++;
+          });
         }
-      s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "setup.import", Detail = JsonSerializer.Serialize(new { advisors = copied, reReview = true }) });
+      int imported;
+      lock (s.SetupLock)
+      {
+        imported = Atomic.Run(() =>
+        {
+          s.Boards[board.Id] = board;
+          foreach (var pe in plannedRoster) s.Roster[pe.Id] = pe;
+          if (plannedLead is not null)
+          {
+            s.LeadProfiles[plannedLead.Id] = plannedLead;
+            board.LeadProfileVersion = 1;
+          }
+          var copied = 0;
+          foreach (var copy in plannedAdvisors)
+          {
+            s.Advisors[copy.Id] = copy;
+            copied++;
+          }
+          s.Boards.Flush();
+          s.Roster.Flush();
+          s.Advisors.Flush();
+          s.LeadProfiles.Flush();
+          s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "setup.import", Detail = JsonSerializer.Serialize(new { advisors = copied, reReview = true }) });
+          return copied;
+        });
+      }
       return Results.Created($"/api/boards/{board.Id}/setup",
-        new { board, advisors = copied, note = "Imported configuration needs review: advisors are unapproved and nothing is activated." });
+        new { board, advisors = imported, note = "Imported configuration needs review: advisors are unapproved and nothing is activated." });
     });
 
-    app.MapPost("/api/wizard/{id:guid}/extract", (InMemoryStore s, Guid id, JsonElement body) =>
+    app.MapPost("/api/wizard/{id:guid}/extract", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badExt) return badExt;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
       if (!body.TryGetProperty("sourceId", out var se) || se.ValueKind != JsonValueKind.String
         || !Guid.TryParse(se.GetString(), out var sourceId) || sourceId == Guid.Empty)
@@ -160,6 +333,7 @@ public static class OpsEndpoints
       log.Add(checkpoint);
       d.ProvenanceJson = JsonSerializer.Serialize(log);
       d.UpdatedAt = DateTime.UtcNow;
+      s.WizardDrafts.Flush();
       return Results.Ok(new { checkpoints = log.Count, latest = checkpoint });
     });
 
@@ -189,7 +363,7 @@ public static class OpsEndpoints
           wizardDrafts = s.WizardDrafts.Values.ToList(),
         grants = s.Grants.Values.ToList(),
         invites = s.Invites.Values.ToList(),
-        images = s.Images.Values.Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
+        images = s.Images.Values.Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
       };
       var json = JsonSerializer.Serialize(snapshot);
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)), bytes = json.Length });
@@ -238,7 +412,9 @@ public static class OpsEndpoints
           {
             Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
             Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
+            Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
             ContentType = img.contentType ?? "image/png", Data = data,
+            CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
           };
         }
         foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
@@ -293,7 +469,8 @@ public static class OpsEndpoints
 }
 
 public sealed record BackupImage(Guid id, Guid? rosterEntryId, Guid? boardAdvisorId,
-  string kind, string provenance, string contentType, string? data);
+  string kind, string provenance, string contentType, string? data,
+  string? review = null, DateTime createdAt = default);
 
 public sealed record BackupSnapshot(int version, DateTime at,
   List<Board> boards, List<RosterEntry> roster, List<BoardAdvisor> advisors,

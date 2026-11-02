@@ -9,6 +9,26 @@ namespace SimCEO.Api;
 
 public static class SimCEOEndpoints
 {
+  // P1 #5 helper: deterministic effective-lead identity/content fingerprint.
+  // ID + owning scope + version + full content; a missing lead is "lead:none".
+  // Captured BEFORE model work and compared against a fresh ResolveLeadFor
+  // immediately under the publication locks, so a same-version identity or
+  // content swap discards the stale reply instead of publishing it.
+  private static string LeadIdentityFingerprint(LeadProfile? lead) =>
+    lead is null ? "lead:none"
+    : JsonSerializer.Serialize(new
+    {
+      id = lead.Id,
+      boardId = lead.BoardId,
+      version = lead.Version,
+      name = lead.Name ?? "",
+      roleLabel = lead.RoleLabel ?? "",
+      background = lead.Background ?? "",
+      familiarTopics = lead.FamiliarTopics ?? "",
+      simplerTopics = lead.SimplerTopics ?? "",
+      commPrefs = lead.CommPrefs ?? "",
+    });
+
   public static void MapExtended(this WebApplication app)
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
@@ -20,11 +40,14 @@ public static class SimCEOEndpoints
     // ---- Board lead profile ("Your Profile"): explicit versioned save ----
     app.MapGet("/api/boards/{bid:guid}/lead", (InMemoryStore s, Guid bid) =>
     {
-      var cur = s.LeadProfiles.Values.Where(l => l.BoardId == bid).OrderByDescending(l => l.Version).FirstOrDefault();
+      // Lane B: board-owned else global fallback, consistent with ResolveLeadFor; never another board.
+      var cur = LeadSetup.ResolveLeadFor(s, bid);
       return cur is null ? Results.NotFound() : Results.Ok(cur);
     });
-    app.MapPost("/api/boards/{bid:guid}/lead", (InMemoryStore s, Guid bid, LeadProfile input) =>
+    app.MapPost("/api/boards/{bid:guid}/lead", (InMemoryStore s, HttpRequest req, Guid bid, LeadProfile input) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badLead) return badLead;
+      if (!PeopleOps.Can(s, req, bid, null, "contribute")) return PeopleOps.Denied();
       var (saved, error, status) = LeadSetup.SaveLead(s, bid, input);
       return saved is not null ? Results.Ok(saved) : Results.Json(new { error }, statusCode: status);
     });
@@ -33,16 +56,19 @@ public static class SimCEOEndpoints
       var cur = LeadSetup.ResolveLead(s);
       return cur is null ? Results.NotFound() : Results.Ok(cur);
     });
-    app.MapPost("/api/lead", (InMemoryStore s, LeadProfile input) =>
+    app.MapPost("/api/lead", (InMemoryStore s, HttpRequest req, LeadProfile input) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badGlead) return badGlead;
       var (gsaved, gerror, gstatus) = LeadSetup.SaveLead(s, Guid.Empty, input);
       return gsaved is not null ? Results.Ok(gsaved) : Results.Json(new { error = gerror }, statusCode: gstatus);
     });
 
     // ---- Board fields edit (stays a draft until setup activation) ----
-    app.MapPatch("/api/boards/{id:guid}", (InMemoryStore s, Guid id, JsonElement body) =>
+    app.MapPatch("/api/boards/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badBoard) return badBoard;
       if (!s.Boards.TryGetValue(id, out var b)) return Results.NotFound();
+      if (!PeopleOps.Can(s, req, id, null, "manage")) return PeopleOps.Denied();
       lock (s.SetupLock)
       {
         if (body.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) b.Name = n.GetString() ?? "";
@@ -56,6 +82,7 @@ public static class SimCEOEndpoints
         if (body.TryGetProperty("archived", out var ar)
             && (ar.ValueKind == JsonValueKind.True || ar.ValueKind == JsonValueKind.False)) b.Archived = ar.ValueKind == JsonValueKind.True;
         b.DraftJson = JsonSerializer.Serialize(new { b.Name, b.Mission, b.Stage, b.RetainAudio, b.DiscussionPolicy, at = DateTime.UtcNow });
+        s.Boards.Flush();
         return Results.Ok(b);
       }
     });
@@ -64,20 +91,24 @@ public static class SimCEOEndpoints
     app.MapGet("/api/boards/{bid:guid}/setup", (InMemoryStore s, Guid bid) =>
     {
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
-      var lead = LeadSetup.ResolveLead(s);
+      var lead = LeadSetup.ResolveLeadFor(s, bid);
       var total = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed);
       var approved = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed && a.Approved);
+      var canonical = LeadSetup.CanonicalDraftJson(s, b);
       return Results.Ok(new
       {
         board = new { b.Id, b.Name, b.Mission, b.Stage, b.ActiveConfig, b.LeadProfileVersion, b.RetainAudio, b.DiscussionPolicy, b.DataUse },
         draftJson = b.DraftJson, activeJson = b.ActiveJson,
-        draftHash = Hashing.HashOf(b.DraftJson),
-        dirty = !string.Equals(b.DraftJson, b.ActiveJson, StringComparison.Ordinal),
+        canonicalJson = canonical,
+        draftHash = Hashing.HashOf(canonical),
+        dirty = !string.Equals(canonical, b.ActiveJson, StringComparison.Ordinal),
         lead, advisors = new { total, approved },
       });
     });
-    app.MapPost("/api/boards/{bid:guid}/setup/activate", (InMemoryStore s, Guid bid, JsonElement body) =>
+    app.MapPost("/api/boards/{bid:guid}/setup/activate", (InMemoryStore s, HttpRequest req, Guid bid, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badAct) return badAct;
+      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
       string? hash = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("hash", out var h)
         ? h.GetString() : null;
       var (board, error, status) = LeadSetup.Activate(s, bid, hash);
@@ -85,24 +116,63 @@ public static class SimCEOEndpoints
     });
 
     // ---- Wizard drafts (resumable, autosaved) ----
-    app.MapPost("/api/wizard", (InMemoryStore s, WizardDraft d) =>
+    app.MapPost("/api/wizard", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
-      d.Id = d.Id == Guid.Empty ? Guid.NewGuid() : d.Id;
-      d.Status = "Saved";
-      d.UpdatedAt = DateTime.UtcNow;
-      s.WizardDrafts[d.Id] = d;
-      return Results.Ok(d);
+      if (PeopleOps.BadToken(s, req) is { } badWiz) return badWiz;
+      var id = body.TryGetProperty("id", out var wid) && wid.ValueKind == JsonValueKind.String
+        && Guid.TryParse(wid.GetString(), out var wg) && wg != Guid.Empty ? wg : Guid.NewGuid();
+      var sem = s.DraftLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+      if (!sem.Wait(0)) return Results.Conflict("Draft is busy (interview running); retry.");
+      try
+      {
+        var has = s.WizardDrafts.TryGetValue(id, out var d);
+        d ??= new WizardDraft { Id = id, Version = 1 };
+        // Lane B: existing saves require an explicitly present integer expected version.
+        if (has)
+        {
+          if (!body.TryGetProperty("version", out var vw) || vw.ValueKind != JsonValueKind.Number
+              || !vw.TryGetInt32(out var want) || want != d.Version)
+            return Results.Conflict("Stale wizard draft; refresh and re-apply your edit with the current version.");
+        }
+        if (!has)
+        {
+          if (body.TryGetProperty("accountId", out var ac)) d.AccountId = ac.ValueKind == JsonValueKind.String
+            && Guid.TryParse(ac.GetString(), out var ag) ? ag : Guid.Empty;
+          d.Status = "Saved";
+        }
+        if (body.TryGetProperty("step", out var st) && st.ValueKind == JsonValueKind.Number) d.Step = st.GetInt32();
+        if (body.TryGetProperty("presetKey", out var pk) && pk.ValueKind == JsonValueKind.String) d.PresetKey = pk.GetString() ?? "";
+        if (body.TryGetProperty("fieldsJson", out var fj) && fj.ValueKind == JsonValueKind.String) d.FieldsJson = fj.GetString() ?? "{}";
+        if (body.TryGetProperty("interviewJson", out var ij) && ij.ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(ij.GetString())) d.InterviewJson = ij.GetString()!;
+        if (body.TryGetProperty("provenanceJson", out var pj2) && pj2.ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(pj2.GetString())) d.ProvenanceJson = pj2.GetString()!;
+        WizardGuide.NormalizeInterview(d);
+        d.Version++;
+        d.UpdatedAt = DateTime.UtcNow;
+        s.WizardDrafts[d.Id] = d;
+        s.WizardDrafts.Flush();
+        return Results.Ok(d);
+      }
+      finally { sem.Release(); }
     });
     app.MapGet("/api/wizard/{id:guid}", (InMemoryStore s, Guid id) =>
     {
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
+      var before = d.InterviewJson;
       WizardGuide.NormalizeInterview(d);
+      if (!string.Equals(before, d.InterviewJson, StringComparison.Ordinal))
+      {
+        d.UpdatedAt = DateTime.UtcNow;
+        s.WizardDrafts.Flush();
+      }
       return Results.Ok(d);
     });
 
     // ---- Voice: draft-first, explicit send; voice never approves/grants ----
-    app.MapPost("/api/meetings/{id:guid}/voice", (InMemoryStore s, Guid id, JsonElement body) =>
+    app.MapPost("/api/meetings/{id:guid}/voice", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badVoice) return badVoice;
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       var t = new VoiceTurn
       {
@@ -132,8 +202,13 @@ public static class SimCEOEndpoints
           Sequence = (list.Count == 0 ? 0 : list.Max(m => m.Sequence)) + 1,
           Sender = "lead", Content = t.Transcript, Status = "committed",
         };
-        list.Add(msg);
-        if (s.Meetings.TryGetValue(t.MeetingId, out var mtg)) mtg.DeliveredRevision = msg.Sequence;
+        Atomic.Run(() =>
+        {
+          list.Add(msg);
+          if (s.Meetings.TryGetValue(t.MeetingId, out var mtg)) mtg.DeliveredRevision = msg.Sequence;
+          s.VoiceTurns.Flush();
+          s.Meetings.Flush();
+        });
         return Results.Ok(msg);
       }
     });
@@ -141,33 +216,34 @@ public static class SimCEOEndpoints
     // ---- Sources: approval inbox; excluded/replaced never current ----
     app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, Guid bid) =>
       Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid).OrderByDescending(x => x.Version)));
-    app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, Guid bid, SourceDoc d) =>
+    app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badSrc) return badSrc;
+      if (!s.Boards.ContainsKey(bid)) return Results.NotFound("Board not found.");
+      if (!PeopleOps.Can(s, req, bid, null, "contribute")) return PeopleOps.Denied();
       d.Id = Guid.NewGuid();
       d.BoardId = bid;
       d.Version = 1;
       d.Approved = false;
+      d.Excluded = false;
       s.Sources[d.Id] = d;
       return Results.Created($"/api/sources/{d.Id}", d);
     });
-    app.MapPost("/api/sources/{id:guid}/approve", (InMemoryStore s, Guid id) =>
+    app.MapPost("/api/sources/{id:guid}/exclude", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
-      d.Approved = true;
-      d.Excluded = false;
-      return Results.Ok(d);
-    });
-    app.MapPost("/api/sources/{id:guid}/exclude", (InMemoryStore s, Guid id) =>
-    {
-      if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
+      if (PeopleOps.BadToken(s, req) is { } badEx) return badEx;
+      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
       d.Excluded = true;
+      s.Sources.Flush();
       return Results.Ok(d);
     });
 
     // ---- Jobs with idempotency + safe retry ----
     app.MapGet("/api/activity/jobs", (InMemoryStore s) => Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100)));
-    app.MapPost("/api/jobs", (InMemoryStore s, JobRow j) =>
+    app.MapPost("/api/jobs", (InMemoryStore s, HttpRequest req, JobRow j) =>
     {
+      if (PeopleOps.BadToken(s, req) is { } badJob) return badJob;
       var existing = s.Jobs.Values.FirstOrDefault(x => x.IdempotencyKey == j.IdempotencyKey && j.IdempotencyKey != "");
       if (existing is not null) return Results.Ok(existing); // no duplicates
       j.Id = Guid.NewGuid();
@@ -195,11 +271,20 @@ public static class SimCEOEndpoints
 
     // ---- Meeting controls ----
     foreach (var (path, state) in new[] { ("pause", MeetingState.Paused), ("resume", MeetingState.Active), ("end", MeetingState.WrappingUp) })
-      app.MapPost($"/api/meetings/{{id:guid}}/{path}", (InMemoryStore s, Guid id) =>
+      app.MapPost($"/api/meetings/{{id:guid}}/{path}", (InMemoryStore s, HttpRequest req, Guid id) =>
       {
+        if (PeopleOps.BadToken(s, req) is { } badCtl) return badCtl;
         if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound();
-        m.State = state;
-        return Results.Ok(m);
+        if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
+        lock (s.MessageLock)
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound();
+          cur.State = state;
+          cur.Generation++;
+          s.Meetings.Flush();
+          s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting." + path, Detail = System.Text.Json.JsonSerializer.Serialize(new { meeting = id }) });
+          return Results.Ok(cur);
+        }
       });
 
     // ---- Discussion run: bids -> challenge -> drafts -> ordered publish ----
@@ -208,19 +293,29 @@ public static class SimCEOEndpoints
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
       if (PeopleOps.Guard(gw, req) is { } cappedRun) return cappedRun;
+      lock (s.MessageLock)
+      {
+        if (!s.RunningRuns.Add(id))
+          return Results.Conflict("A discussion run is already in progress for this meeting; wait for it to finish.");
+      }
+      try
+      {
       var policy = body.TryGetProperty("policy", out var p) ? (p.GetString() ?? "balanced") : "balanced";
       var prompt = body.TryGetProperty("prompt", out var q) ? (q.GetString() ?? "") : "";
-      var revisionBefore = m.DeliveredRevision;
       s.Boards.TryGetValue(m.BoardId, out var runBoard);
-    var lead = LeadSetup.ResolveLead(s);
+    var lead = LeadSetup.ResolveLeadFor(s, m.BoardId);
     var leadVersion = lead?.Version ?? 0;
+    // P1 #5: capture the full effective-lead identity/content fingerprint BEFORE
+    // model work; commit compares the fresh fingerprint under the publication
+    // locks. Version-only comparison would pass a same-version identity swap.
+    var leadFingerprint = LeadIdentityFingerprint(lead);
       if (body.TryGetProperty("leadVersion", out var lv) && lv.ValueKind == JsonValueKind.Number
           && lv.GetInt32() != leadVersion)
         return Results.Conflict("Lead profile changed; refresh and retry with the current version.");
       if (m.State == MeetingState.Paused)
         return Results.Conflict("Meeting is paused; resume to run discussion.");
-      var approved = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && a.Approved).ToList();
-      var eligible = approved;
+      var yielded = new List<object>();
+      var candidates = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && a.Approved).ToList();
       var pickedCount = 0;
       try
       {
@@ -230,16 +325,114 @@ public static class SimCEOEndpoints
           var picked = new HashSet<Guid>();
           foreach (var pe in pdoc.RootElement.EnumerateArray())
             if (pe.ValueKind == JsonValueKind.String && Guid.TryParse(pe.GetString(), out var pg)) picked.Add(pg);
-          if (picked.Count > 0) { pickedCount = picked.Count; eligible = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && picked.Contains(a.Id)).ToList(); }
+          if (picked.Count > 0) { pickedCount = picked.Count; candidates = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && picked.Contains(a.Id)).ToList(); }
         }
       }
       catch (JsonException) { }
+      var eligible = new List<BoardAdvisor>();
+      foreach (var cand in candidates)
+      {
+        var gate = RosterOps.ApprovalGate(s, cand);
+        if (gate is null) eligible.Add(cand);
+        else yielded.Add(new { advisor = cand.BoardRole, reason = gate });
+      }
       if (eligible.Count == 0)
-        return Results.Json(new { error = "No advisors available for discussion.", fixes = pickedCount > 0 ? new[] { "Re-pick participants from this board's current advisors." } : new[] { "Approve at least one advisor on this board before running discussion." } }, statusCode: 409);
+        return Results.Json(new { error = "No advisors available for discussion.", fixes = pickedCount > 0 ? new[] { "Re-pick participants from this board's current advisors." } : new[] { "Approve at least one advisor on this board before running discussion." }, yielded }, statusCode: 409);
       var ownerOverride = PeopleOps.IsOwner(req);
       var spark = ModelPolicy.SparkFor(s, m.BoardId);
       Board? board = runBoard;
-        var gen = m.Generation;
+      var gen = m.Generation;
+      var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
+      // Lane B: capture which candidates were explicitly invited; non-invited must stay Approved at commit.
+      var invitedIds = new HashSet<Guid>();
+      try
+      {
+        using var inviteDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(m.ParticipantIdsJson) ? "[]" : m.ParticipantIdsJson);
+        if (inviteDoc.RootElement.ValueKind == JsonValueKind.Array)
+          foreach (var inviteEl in inviteDoc.RootElement.EnumerateArray())
+            if (inviteEl.ValueKind == JsonValueKind.String && Guid.TryParse(inviteEl.GetString(), out var inviteGuid)) invitedIds.Add(inviteGuid);
+      }
+      catch (JsonException) { }
+      // Lane B: reviewed-input fingerprint per candidate via shared RosterOps.ReviewedInputFingerprint.
+      string LaneBFingerprint(BoardAdvisor laneBAdv) => RosterOps.ReviewedInputFingerprint(s, laneBAdv);
+      var laneBPrints = eligible.ToDictionary(a => a.Id, a => LaneBFingerprint(a));
+      // Lane B: per-lead cap cannot increase across runs. Persist the effective minimum selected cap
+      // in a durable run-cap note keyed to the actual lead sequence; a new human lead resets the turn.
+      var requestedCap = DiscussionPolicy.MaxReplies(policy);
+      var effectiveCap = requestedCap;
+      {
+        int? priorCap = null;
+        Guid priorCapNoteId = Guid.Empty;
+        foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
+        {
+          try
+          {
+            using var capDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(capNote.Body) ? "{}" : capNote.Body);
+            if (capDoc.RootElement.TryGetProperty("leadSeq", out var capSeq) && capSeq.ValueKind == JsonValueKind.Number
+              && capSeq.GetInt64() == leadFloor
+              && capDoc.RootElement.TryGetProperty("cap", out var capVal) && capVal.ValueKind == JsonValueKind.Number
+              && capVal.TryGetInt32(out var capInt))
+            {
+              priorCap = priorCap.HasValue ? Math.Min(priorCap.Value, capInt) : capInt;
+              if (priorCapNoteId == Guid.Empty) priorCapNoteId = capNote.Id;
+            }
+          }
+          catch (JsonException) { }
+        }
+        if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
+        var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
+        if (priorCapNoteId != Guid.Empty && s.Notes.TryGetValue(priorCapNoteId, out var priorCapNote))
+        {
+          priorCapNote.Body = capBody;
+          s.Notes[priorCapNoteId] = priorCapNote;
+        }
+        else
+        {
+          var freshCapNote = new Note { BoardId = m.BoardId, MeetingId = id, Kind = "run-cap", Scope = "meeting", Provisional = false, Title = "cap:" + leadFloor, Body = capBody };
+          s.Notes[freshCapNote.Id] = freshCapNote;
+        }
+        s.Notes.Flush();
+      }
+      int CommittedThisTurn()
+      {
+        lock (s.MessageLock)
+          return s.Messages.TryGetValue(id, out var cl) && cl is not null
+            ? cl.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor) : 0;
+      }
+      // Lane B: declared before bidding so every interruption path reports accurate yields/counts.
+      var published = new List<Message>();
+      var manifests = new List<object>();
+      var abstained = new List<string>();
+      var bidErrors = new List<object>();
+      object? overflow = null;
+      var outcome = new Note
+      {
+        BoardId = m.BoardId, MeetingId = id, Kind = "run-outcome", Scope = "meeting", Provisional = true,
+        Title = "Run in progress",
+        Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = 0, published = 0, leadSeq = leadFloor, cap = effectiveCap }),
+      };
+      s.Notes[outcome.Id] = outcome;
+      s.Notes.Flush();
+      var completedGroups = 0;
+      long LaneBRevision()
+      {
+        lock (s.MessageLock)
+        {
+          if (s.Messages.TryGetValue(id, out var laneBList) && laneBList is not null && laneBList.Count > 0)
+            return laneBList.Max(x => x.Sequence);
+          return m.DeliveredRevision;
+        }
+      }
+      // Lane B: every interrupted return updates the initial in-progress outcome into a terminal one.
+      IResult LaneBFail(string laneBReason, int laneBPlannedRounds, List<string> laneBRemaining)
+      {
+        var laneBRev = LaneBRevision();
+        outcome.Title = "Run interrupted: " + laneBReason;
+        outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = laneBRev, rounds = laneBPlannedRounds, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, status = "interrupted", reason = laneBReason, remaining = laneBRemaining });
+        s.Notes[outcome.Id] = outcome;
+        s.Notes.Flush();
+        return Results.Conflict("Interrupted: " + laneBReason + "; partial progress preserved in run outcome.");
+      }
       using var bidSem = new SemaphoreSlim(4);
       (BoardAdvisor adv, double score, string text, string? error)[] bidResults;
       try
@@ -255,27 +448,64 @@ public static class SimCEOEndpoints
             var yes = bidText.TrimStart().StartsWith("YES", StringComparison.OrdinalIgnoreCase);
             return (adv, score: yes ? 10.0 + (adv.BoardRole.Length % 7) : 0.0, text: bidText, error: (string?)null);
           }
-          catch (Exception ex) when (ex is CapExceededException or ProviderException)
+          catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
           {
             return (adv, score: 0.0, text: "", error: (string?)ex.Message);
           }
           finally { bidSem.Release(); }
         }));
       }
-      catch (Exception ex) when (ex is CapExceededException or ProviderException) { return PeopleOps.ModelError(ex); }
-      if (m.Generation != gen || m.DeliveredRevision != revisionBefore)
-        return Results.Conflict("Interrupted: new owner turn arrived; unsent drafts discarded.");
+      catch (Exception laneBEx) when (laneBEx is CapExceededException or ProviderException)
+      {
+        var laneBRemain = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+        LaneBFail("provider failure during bidding", 0, laneBRemain);
+        return PeopleOps.ModelError(laneBEx);
+      }
+      if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+      {
+        var laneBRemainStateAfterBid = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+        return LaneBFail("meeting state changed; unsent drafts discarded", 0, laneBRemainStateAfterBid);
+      }
+      if (m.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
+      {
+        var laneBRemainAfterBid = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+        return LaneBFail("new owner turn arrived; unsent drafts discarded", 0, laneBRemainAfterBid);
+      }
       var bidScores = bidResults.ToDictionary(b => b.adv.Id, b => b.score);
       var willing = eligible.Where(a => bidScores.TryGetValue(a.Id, out var sc) && sc > 0).ToList();
-      if (willing.Count == 0) willing = eligible;
-      var rounds = DiscussionPolicy.SelectRounds(policy, willing, a => bidScores.TryGetValue(a.Id, out var sc) ? sc : 0.0);
-      var abstained = bidResults.Where(b => b.score <= 0).Select(b => b.adv.BoardRole).ToList();
-      var bidErrors = bidResults.Where(b => b.error is not null).Select(b => new { advisor = b.adv.BoardRole, error = b.error }).ToList();
-      var yielded = new List<object>();
+      // Lane B: enforce the durable per-lead minimum before selection and again at commit.
+      var turnCap = effectiveCap;
+      var alreadyIds = new HashSet<Guid>();
+      lock (s.MessageLock)
+      {
+        if (s.Messages.TryGetValue(id, out var al) && al is not null)
+          foreach (var x in al.Where(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor))
+            alreadyIds.Add(x.AdvisorId);
+      }
+      foreach (var a in willing.Where(a => alreadyIds.Contains(a.Id)))
+        yielded.Add(new { advisor = a.BoardRole, reason = "already-replied-this-turn" });
+      var freshWilling = willing.Where(a => !alreadyIds.Contains(a.Id)).ToList();
+      var roundsAll = DiscussionPolicy.SelectRounds(policy, freshWilling, a => bidScores.TryGetValue(a.Id, out var sc) ? sc : 0.0);
+      var rounds = new List<List<BoardAdvisor>>();
+      {
+        var room = Math.Max(0, turnCap - CommittedThisTurn());
+        foreach (var grp in roundsAll)
+        {
+          if (room <= 0) break;
+          var take = grp.Take(room).ToList();
+          if (take.Count > 0) rounds.Add(take);
+          room -= take.Count;
+        }
+      }
+      var selectedIds = new HashSet<Guid>(rounds.SelectMany(r => r).Select(a => a.Id));
+      var omitted = freshWilling.Where(a => !selectedIds.Contains(a.Id)).Select(a => a.BoardRole).ToList();
+      overflow = omitted.Count == 0 ? null : new { omitted, cap = turnCap, policy };
+      foreach (var o in omitted) yielded.Add(new { advisor = o, reason = "cap-omitted" });
+      abstained.AddRange(bidResults.Where(b => b.score <= 0).Select(b => b.adv.BoardRole));
+      bidErrors.AddRange(bidResults.Where(b => b.error is not null).Select(b => new { advisor = b.adv.BoardRole, error = b.error }));
+      foreach (var b in bidResults.Where(b => b.error is not null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "provider-error" });
       foreach (var b in bidResults.Where(b => b.score <= 0 && b.error is null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "bid-declined" });
       var evSupported = body.TryGetProperty("evidenceSupported", out var e) && e.GetBoolean();
-      var published = new List<Message>();
-      var manifests = new List<object>();
       using var draftSem = new SemaphoreSlim(4);
       string? lastChallenged = null;
       foreach (var round in rounds)
@@ -291,53 +521,121 @@ public static class SimCEOEndpoints
               ContextBudget.DraftTokens, 4096, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id);
             return (adv, text: (string?)text, manifest: (CuratorManifest?)manifest, error: (string?)null);
           }
-          catch (Exception ex) when (ex is CapExceededException or ProviderException)
+          catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
           {
             return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)ex.Message);
           }
           finally { draftSem.Release(); }
         }));
-        if (m.Generation != gen || m.DeliveredRevision != revisionBefore)
-          return Results.Conflict("Interrupted: new owner turn arrived; unsent drafts discarded.");
+        if (m.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
+        {
+          var laneBRemainBetween = rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+          return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, laneBRemainBetween);
+        }
         if (drafts.Any(d => d.manifest is not null && d.manifest.SourceIds.Count > 0)) evSupported = true;
         var challenged = DiscussionPolicy.AssignChallenge(round, evSupported, a => (double)(a.BoardRole.Length % 5));
         lastChallenged = challenged?.BoardRole ?? lastChallenged;
-        lock (s.MessageLock)
+        // Lane B: final publication holds SetupLock THEN MessageLock (roster writers serialize on
+        // SetupLock; pause/resume/end/close use MessageLock only, so this order never inverts).
+        // Meeting, advisor and roster rows are fresh-fetched here; captured generation, lead sequence,
+        // allowed state and reviewed-input fingerprints are compared immediately before commit.
+        lock (s.SetupLock)
         {
-          var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
-          foreach (var (adv, text, manifest, error) in drafts)
+          lock (s.MessageLock)
           {
-            if (text is null || error is not null) { yielded.Add(new { advisor = adv.BoardRole, reason = "provider-error" }); continue; }
-            if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) { abstained.Add(adv.BoardRole); yielded.Add(new { advisor = adv.BoardRole, reason = "abstained" }); continue; }
-            if (list.Any(x => x.AdvisorName == adv.BoardRole && x.Sequence > revisionBefore))
-              { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // at most one reply per advisor per lead turn
+            List<string> LaneBRemaining() => rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+            if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+              return LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining());
+            if (cur.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
+              return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining());
+            var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
+            var curLeadVersion = curLead?.Version ?? 0;
+            if (curLeadVersion != leadVersion
+                || !string.Equals(LeadIdentityFingerprint(curLead), leadFingerprint, StringComparison.Ordinal))
+              return LaneBFail("lead profile changed; refresh and retry with the current version", rounds.Count, LaneBRemaining());
+            // Lane B: re-derive the durable minimum at commit; it can only stay equal or shrink.
+            var commitCap = effectiveCap;
+            foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
+            {
+              try
+              {
+                using var capDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(capNote.Body) ? "{}" : capNote.Body);
+                if (capDoc.RootElement.TryGetProperty("leadSeq", out var capSeq) && capSeq.ValueKind == JsonValueKind.Number
+                  && capSeq.GetInt64() == leadFloor
+                  && capDoc.RootElement.TryGetProperty("cap", out var capVal) && capVal.ValueKind == JsonValueKind.Number
+                  && capVal.TryGetInt32(out var capInt))
+                  commitCap = Math.Min(commitCap, capInt);
+              }
+              catch (JsonException) { }
+            }
+            var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
+            var next = list.Count == 0 ? 0 : list.Max(x => x.Sequence);
+            var room = Math.Max(0, commitCap - list.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor));
+            var batch = new List<Message>();
+            foreach (var (adv, text, manifest, error) in drafts)
+            {
+              if (text is null || error is not null) { yielded.Add(new { advisor = adv.BoardRole, reason = "provider-error" }); continue; }
+              if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) { abstained.Add(adv.BoardRole); yielded.Add(new { advisor = adv.BoardRole, reason = "abstained" }); continue; }
+              // Lane B: fresh-fetch; a sync or edit/review during generation yields/discards the stale response.
+              if (!s.Advisors.TryGetValue(adv.Id, out var freshAdv) || freshAdv.Removed || freshAdv.BoardId != m.BoardId)
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
+              if (!invitedIds.Contains(adv.Id) && !freshAdv.Approved)
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "reapproval-required" }); continue; }
+              if (RosterOps.ApprovalGate(s, freshAdv) is { } gate)
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
+              if (!laneBPrints.TryGetValue(adv.Id, out var laneBWanted) || !string.Equals(LaneBFingerprint(freshAdv), laneBWanted, StringComparison.Ordinal))
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "stale-profile" }); continue; }
+              if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // one reply per advisor per lead turn; stable advisor identity
+              if (room <= 0)
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "cap-omitted" }); continue; }
+              room--;
             var leadSeq = list.Where(x => x.Sender == "lead").OrderByDescending(x => x.Sequence).Select(x => (long?)x.Sequence).FirstOrDefault();
             var (clean, stance) = MessageTags.SplitStance(text);
             var msg = new Message
             {
-              MeetingId = id, BoardId = m.BoardId,
-              Sequence = (list.Count == 0 ? 0 : list.Max(x => x.Sequence)) + 1,
+              MeetingId = id, BoardId = m.BoardId, AdvisorId = adv.Id,
+              Sequence = ++next,
               Sender = "advisor", AdvisorName = adv.BoardRole,
               Content = clean + (adv == challenged ? " [challenge: evidence-supported]" : ""),
               ParentSequence = leadSeq,
               Stance = stance,
               Status = "committed",
             };
-            list.Add(msg);
-            m.DeliveredRevision = msg.Sequence;
+            batch.Add(msg);
             published.Add(msg);
             if (manifest is not null)
-              manifests.Add(new { advisor = adv.BoardRole, sources = manifest.SourceIds, seqs = manifest.MessageSeqs, tokens = manifest.TokenEstimate });
+              manifests.Add(new { advisor = adv.BoardRole, sources = manifest.SourceIds, seqs = manifest.MessageSeqs, tokens = manifest.TokenEstimate, evidence = manifest.Evidence });
+          }
+            Atomic.Run(() =>
+            {
+              // Lane B: revision set BEFORE the same atomic commit that inserts group messages.
+              if (batch.Count > 0) cur.DeliveredRevision = batch.Max(x => x.Sequence);
+              s.Messages.AddRangeCommitted(id, batch);
+              s.Meetings.Flush();
+              outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
+              outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = cur.DeliveredRevision, rounds = rounds.Count, completedGroups = completedGroups + 1, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = commitCap });
+              s.Notes[outcome.Id] = outcome;
+              s.Notes.Flush();
+            });
+            completedGroups++;
           }
         }
       }
       s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
       await hub.Clients.Group($"meeting:{id}").SendAsync("run-complete",
         new { meetingId = id, published = published.Count, revision = m.DeliveredRevision });
-      var selectedIds = new HashSet<Guid>(rounds.SelectMany(r => r).Select(a => a.Id));
-      var omitted = willing.Where(a => !selectedIds.Contains(a.Id)).Select(a => a.BoardRole).ToList();
-      object? overflow = omitted.Count == 0 ? null : new { omitted, cap = DiscussionPolicy.MaxReplies(policy), policy };
-      return Results.Ok(new { rounds = rounds.Select(r => r.Select(a => a.BoardRole)), published, challenged = lastChallenged, abstained, bidErrors, yielded, overflow });
+      outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
+      outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
+      s.Notes[outcome.Id] = outcome;
+      s.Notes.Flush();
+      s.Meetings.Flush();
+            return Results.Ok(new { rounds = rounds.Select(r => r.Select(a => a.BoardRole)), published, challenged = lastChallenged, abstained, bidErrors, yielded, overflow });
+      }
+      finally
+      {
+        lock (s.MessageLock) { s.RunningRuns.Remove(id); }
+      }
 
     });
 
@@ -347,8 +645,8 @@ public static class SimCEOEndpoints
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
       var setupFixes = new List<string>();
-      if (LeadSetup.ResolveLead(s) is null) setupFixes.Add("Save the board-lead profile.");
-      if (!s.Advisors.Values.Any(a => a.BoardId == m.BoardId && !a.Removed && a.Approved)) setupFixes.Add("Approve at least one advisor on this board.");
+      if (LeadSetup.ResolveLeadFor(s, m.BoardId) is null) setupFixes.Add("Save the board-lead profile.");
+      if (!s.Advisors.Values.Any(a => a.BoardId == m.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");
       if (setupFixes.Count > 0) return Results.Json(new { error = "Board setup is incomplete.", fixes = setupFixes }, statusCode: 409);
       if (PeopleOps.Guard(gw, req) is { } cappedSec) return cappedSec;
       var text = body.TryGetProperty("request", out var r) ? (r.GetString() ?? "") : "";

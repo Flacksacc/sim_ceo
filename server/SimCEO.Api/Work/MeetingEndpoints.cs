@@ -58,7 +58,9 @@ public static class MeetingEndpoints
         foreach (var e in parts.EnumerateArray())
           if (e.ValueKind == JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)
             && s.Advisors.TryGetValue(g, out var pa) && pa.BoardId == m.BoardId && !pa.Removed) ids.Add(g);
-        m.ParticipantIdsJson = JsonSerializer.Serialize(ids);
+        var nextParts = JsonSerializer.Serialize(ids);
+        // Lane B: participant-set change invalidates any in-flight generation so it discards.
+        if (!string.Equals(m.ParticipantIdsJson, nextParts, StringComparison.Ordinal)) { m.ParticipantIdsJson = nextParts; m.Generation++; }
       }
       if (body.TryGetProperty("brief", out var b) && b.ValueKind == JsonValueKind.String)
         {
@@ -67,26 +69,39 @@ public static class MeetingEndpoints
             m.State = MeetingState.Active;
         }
       }
+      s.Meetings.Flush();
       return Results.Ok(m);
     });
 
     app.MapPost("/api/meetings/{id:guid}/close", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
       var withRecord = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("withRecord", out var w) && w.GetBoolean();
-      m.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
-      s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "meeting.close", Detail = JsonSerializer.Serialize(new { meeting = id, withRecord }) });
-      return Results.Ok(m);
+      lock (s.MessageLock)
+      {
+        if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
+        cur.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
+        cur.Generation++;
+        s.Meetings.Flush();
+        s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting.close", Detail = JsonSerializer.Serialize(new { meeting = id, withRecord }) });
+        return Results.Ok(cur);
+      }
     });
 
     app.MapPost("/api/meetings/{id:guid}/reopen", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
-      m.State = MeetingState.Active;
-      s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "meeting.reopen", Detail = JsonSerializer.Serialize(new { meeting = id }) });
-      return Results.Ok(m);
+      if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
+      lock (s.MessageLock)
+      {
+        if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
+        cur.State = MeetingState.Active;
+        cur.Generation++;
+        s.Meetings.Flush();
+        s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting.reopen", Detail = JsonSerializer.Serialize(new { meeting = id }) });
+        return Results.Ok(cur);
+      }
     });
 
     app.MapGet("/api/meetings/{id:guid}/messages/search", (InMemoryStore s, HttpRequest req, Guid id, string q, int context = 3) =>
@@ -169,6 +184,7 @@ public static class MeetingEndpoints
       {
         BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
         Title = topic, Body = text, Scope = "meeting", Provisional = true,
+        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
       };
       s.Notes[note.Id] = note;
       return Results.Created($"/api/notes/{note.Id}", note);
@@ -211,6 +227,7 @@ public static class MeetingEndpoints
         BoardId = bid, MeetingId = meetingId, Kind = "direction", Scope = scope,
         Title = scope == "board" ? "Adopted board-wide" : "Adopted for meeting",
         Body = text, Provisional = false,
+        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
       };
       s.Notes[note.Id] = note;
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });

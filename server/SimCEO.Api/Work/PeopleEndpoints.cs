@@ -37,6 +37,17 @@ public static class PeopleOps
     return best >= 3 ? "manage" : best == 2 ? "contribute" : best == 1 ? "read" : "none";
   }
 
+  public static bool HasInvalidToken(InMemoryStore s, HttpRequest req)
+  {
+    if (!req.Headers.TryGetValue("Authorization", out var auth)) return false;
+    var t = auth.ToString().Trim();
+    if (!t.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return true;
+    return !AuthOps.TrySession(s, req, out _);
+  }
+
+  public static IResult? BadToken(InMemoryStore s, HttpRequest req) =>
+    HasInvalidToken(s, req) ? Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401) : null;
+
   public static bool IsOwner(HttpRequest req)
   {
     if (req.Headers.ContainsKey("Authorization")) return false;
@@ -74,6 +85,7 @@ public static class PeopleOps
 
   public static bool Can(InMemoryStore s, HttpRequest req, Guid boardId, Guid? meetingId, string need)
   {
+    if (HasInvalidToken(s, req)) return false;
     var have = AccessFor(s, boardId, meetingId, UserOf(s, req));
     if (have == "open") return true;
     return Rank(have) >= Rank(need);
@@ -118,6 +130,7 @@ public static class PeopleEndpoints
       var user = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("userKey", out var u)
         ? (u.GetString() ?? inv.Email) : inv.Email;
       inv.State = "accepted";
+    s.Invites.Flush();
       inv.UserKey = user;
       var grant = new Grant
       {
@@ -134,6 +147,7 @@ public static class PeopleEndpoints
       if (!s.Invites.TryGetValue(id, out var inv)) return Results.NotFound();
       if (!PeopleOps.Can(s, req, inv.BoardId, null, "manage")) return PeopleOps.Denied();
       inv.State = "revoked";
+    s.Invites.Flush();
       foreach (var g in s.Grants.Values.Where(g => g.BoardId == inv.BoardId
         && (string.Equals(g.UserKey, inv.Email, StringComparison.OrdinalIgnoreCase)
           || (!string.IsNullOrWhiteSpace(inv.UserKey) && string.Equals(g.UserKey, inv.UserKey, StringComparison.OrdinalIgnoreCase)))).ToList())
