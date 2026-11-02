@@ -454,6 +454,210 @@ async function desktopSuite(browser) {
     await page.waitForTimeout(1200);
     await check(page, "board rename restores heading", () => page.locator(".mobilebar .boardname").textContent().then((v) => (v || "").includes("Alpha Board")));
 
+
+    // P1: controlled delayed-write A->B — save must cache by returned identity, not selected IDs.
+    // Meeting case: save A (m-one) with delay, switch to B (m-two) before response.
+    await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
+    await page.locator("summary:has-text(\"Meeting setup\")").click();
+    const briefBox = page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)");
+    await briefBox.fill("A-DELAYED-P1-BOARD-CHECK");
+    await setDelay(page, "save-meeting", 1500);
+    await page.getByRole("button", { name: "Save title + brief" }).click();
+    // immediate user switch to B before A response returns (push semantics preserved)
+    await page.locator("ol.agenda button", { hasText: "Second session notes" }).click();
+    await page.waitForFunction(() => window.location.hash.includes("meeting=m-two"), null, { timeout: 8000 }).catch(() => {});
+    await check(page, "delayed save switch lands on B", async () => (await hashOf(page)).includes("meeting=m-two"));
+    await page.waitForTimeout(2200);
+    await check(page, "B form untouched by A delayed response", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => !v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
+    // second save on B must not carry A data
+    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Follow-up notes");
+    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.waitForTimeout(1200);
+    await check(page, "B second save keeps B data", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => v.includes("Follow-up notes") && !v.includes("A-DELAYED")).catch(() => false));
+    // switch back to A: A must carry its delayed update
+    await page.locator("ol.agenda button", { hasText: "Pricing move QA session" }).click();
+    await page.waitForFunction(() => window.location.hash.includes("meeting=m-one"), null, { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    await check(page, "A updated by its delayed save", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
+    // restore A brief for later suites
+    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Should we raise the starter tier?");
+    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.waitForTimeout(1200);
+
+    // P1 board case: save Alpha with delay, switch to Beta before response.
+    await page.goto(BASE + "#/boards?board=b-alpha", { waitUntil: "domcontentloaded" });
+    await section("Boards").first().waitFor({ timeout: 8000 });
+    await section("Boards").getByLabel("Board name").fill("Alpha Board P1-DELAYED");
+    await setDelay(page, "save-board", 1500);
+    await page.getByRole("button", { name: "Save draft" }).click();
+    await page.locator(".listpanel-rows button", { hasText: "Beta Board" }).click();
+    await page.waitForFunction(() => window.location.hash.includes("board=b-beta"), null, { timeout: 8000 }).catch(() => {});
+    await check(page, "board delayed switch lands on Beta", async () => (await hashOf(page)).includes("board=b-beta"));
+    await page.waitForTimeout(2200);
+    await check(page, "Beta heading untouched by Alpha delayed save", () => page.locator(".mobilebar .boardname").textContent().then((v) => !(v || "").includes("P1-DELAYED")).catch(() => false));
+    // Beta second save keeps Beta data
+    await section("Boards").first().waitFor({ timeout: 8000 });
+    await check(page, "Beta form untouched by Alpha delayed save", () => section("Boards").getByLabel("Board name").inputValue().then((v) => !v.includes("P1-DELAYED")).catch(() => false));
+    await page.locator(".listpanel-rows button", { hasText: "Alpha Board" }).click();
+    await page.waitForFunction(() => window.location.hash.includes("board=b-alpha"), null, { timeout: 8000 }).catch(() => {});
+    await section("Boards").first().waitFor({ timeout: 8000 });
+    await page.waitForTimeout(1500);
+    await check(page, "Alpha updated by its delayed save", () => page.locator(".mobilebar .boardname").textContent().then((v) => (v || "").includes("P1-DELAYED")).catch(() => false));
+    await check(page, "Alpha form reflects delayed save", () => section("Boards").getByLabel("Board name").inputValue().then((v) => v.includes("P1-DELAYED")).catch(() => false));
+    await section("Boards").getByLabel("Board name").fill("Alpha Board");
+    await page.getByRole("button", { name: "Save draft" }).click();
+    await page.waitForTimeout(1200);
+
+    // P2: invalid-parent cleanup must REPLACE, Back leaves, Forward cannot trap.
+    await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
+    const validHash = await hashOf(page);
+    await page.goto(BASE + "#/meet?board=NOPE&meeting=NOPE", { waitUntil: "domcontentloaded" });
+    await section("Boards").first().waitFor({ timeout: 15000 });
+    await check(page, "bogus parent cleanup lands on Boards (no transient meet)", async () => (await hashOf(page)) === "#/boards");
+    await page.goBack();
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 }).catch(() => {});
+    await check(page, "Back after bogus cleanup restores valid route", async () => (await hashOf(page)) === validHash);
+    await page.goForward();
+    await section("Boards").first().waitFor({ timeout: 15000 }).catch(() => {});
+    await check(page, "Forward after Back returns to Boards (no trap)", async () => (await hashOf(page)) === "#/boards");
+    // no transient boardless #/meet in history: second Back must not land on #/meet
+    await page.goBack();
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 }).catch(() => {});
+    const backAgain = await hashOf(page);
+    await check(page, "no transient boardless meet trapped in history", async () => backAgain !== "#/meet" && backAgain.includes("meeting=m-one"));
+    // meeting-invalid with valid board: replace, Back leaves, Forward clean
+    await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
+    await page.goto(BASE + "#/meet?board=b-alpha&meeting=NOPE-MEET", { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => window.location.hash === "#/meet?board=b-alpha", null, { timeout: 8000 }).catch(() => {});
+    await check(page, "bogus meeting cleanup keeps board, drops meeting (replace)", async () => (await hashOf(page)) === "#/meet?board=b-alpha");
+    await page.goBack();
+    await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 }).catch(() => {});
+    await check(page, "Back after meeting cleanup restores meeting", async () => (await hashOf(page)).includes("meeting=m-one"));
+    await page.goForward();
+    await page.waitForFunction(() => window.location.hash === "#/meet?board=b-alpha", null, { timeout: 8000 }).catch(() => {});
+    await check(page, "Forward after meeting Back returns clean (no trap)", async () => (await hashOf(page)) === "#/meet?board=b-alpha");
+
+    // Genuine SPA cached record -> wrong parent (no reload): no review/actions while unverified.
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await check(page, "SPA setup review visible before switch", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
+    await page.waitForFunction(() => !window.location.hash.includes("rec="), null, { timeout: 8000 }).catch(() => {});
+    await check(page, "SPA wrong-parent drops rec without reload", async () => !(await hashOf(page)).includes("rec="));
+    await check(page, "SPA wrong-parent hides review without reload", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "SPA wrong-parent hides approve action", () => page.getByRole("button", { name: /Approve/ }).isHidden().catch(() => true));
+    // SPA parent pending: delay meeting-detail, switch meeting, assert no review while pending
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await setDelay(page, "meeting-detail", 1500);
+    await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
+    await page.waitForTimeout(400);
+    await check(page, "SPA pending parent hides review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await page.waitForTimeout(1800);
+    await check(page, "SPA pending resolves without rec (still wrong parent)", async () => !(await hashOf(page)).includes("rec="));
+    // SPA parent error: inject 500 for meeting-detail, switch, assert no review/actions
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.evaluate(() => fetch("/api/__qa/fail?key=meeting-detail&status=500").then((r) => r.json()));
+    await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
+    await page.waitForTimeout(900);
+    await check(page, "SPA error parent hides review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "SPA error parent hides revise action", () => page.getByRole("button", { name: /Request revision/ }).isHidden().catch(() => true));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await section("Records").first().waitFor({ timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(600);
+
+    // P3: strict wizard fixture contracts + suggest->save/interview normal case.
+    const wizContracts = await page.evaluate(async () => {
+      const out = {};
+      const j = async (url, opts) => {
+        const r = await fetch(url, opts);
+        let b = null;
+        try { b = await r.json(); } catch { b = null; }
+        return { status: r.status, body: b };
+      };
+      // new draft must return version 2 (main POST /api/wizard starts 1 then ++)
+      const created = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, presetKey: "strategy", fieldsJson: "{}", accountId: "" }) });
+      out.newStatus = created.status;
+      out.newVersion = created.body && created.body.version;
+      const wid = created.body && created.body.id;
+      out.wid = !!wid;
+      if (!wid) return out;
+      const v0 = created.body.version;
+      // suggest must NOT bump version
+      const sug = await j("/api/wizard/" + wid + "/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, input: "hello" }) });
+      out.suggestStatus = sug.status;
+      const afterSug = await j("/api/wizard/" + wid, { method: "GET" });
+      out.suggestVersionUnchanged = afterSug.body && afterSug.body.version === v0;
+      // save with current version must succeed (no false stale after suggest)
+      const save = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: wid, version: v0, step: 1, presetKey: "strategy", fieldsJson: JSON.stringify({ name: "  QA Board  ", mission: "  QA mission  ", stage: "Seed", advisors: [{ role: "  Strategist  ", name: "" }], lead: { name: "  QA Lead  " } }), accountId: "" }) });
+      out.saveAfterSuggestStatus = save.status;
+      out.saveAfterSuggestVersion = save.body && save.body.version;
+      const v1 = save.body && save.body.version;
+      // interview missing version => 409
+      const miss = await j("/api/wizard/" + wid + "/interview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: "hi" }) });
+      out.interviewMissing409 = miss.status === 409;
+      // interview stale version => 409
+      const stale = await j("/api/wizard/" + wid + "/interview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: "hi", version: v0 }) });
+      out.interviewStale409 = stale.status === 409;
+      // interview correct version => 200 + version bump
+      const good = await j("/api/wizard/" + wid + "/interview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: "we decide pricing", version: v1 }) });
+      out.interviewGoodStatus = good.status;
+      out.interviewGoodBumps = good.body && good.body.version === v1 + 1;
+      // review trims + max 10: whitespace-only name/mission/lead must block
+      const w2 = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, fieldsJson: "{}", accountId: "" }) });
+      const wid2 = w2.body && w2.body.id;
+      const v2 = w2.body && w2.body.version;
+      await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: wid2, version: v2, fieldsJson: JSON.stringify({ name: "   ", mission: "   ", advisors: [{ role: "   " }], lead: { name: "   " } }) }) });
+      const revWhite = await j("/api/wizard/" + wid2 + "/review", { method: "GET" });
+      const wb = (revWhite.body && revWhite.body.blockers) || [];
+      out.reviewWhiteBlocks = wb.length >= 3;
+      // 11 advisors must block (max 10)
+      const many = [];
+      for (let i = 0; i < 11; i++) many.push({ role: "Role " + i, name: "" });
+      const w3 = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, fieldsJson: "{}", accountId: "" }) });
+      const wid3 = w3.body && w3.body.id;
+      const v3 = w3.body && w3.body.version;
+      await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: wid3, version: v3, fieldsJson: JSON.stringify({ name: "B", mission: "M", advisors: many, lead: { name: "L" } }) }) });
+      const revMany = await j("/api/wizard/" + wid3 + "/review", { method: "GET" });
+      out.reviewManyBlocksAdvisors = ((revMany.body && revMany.body.blockers) || []).some((b) => b.field === "advisors");
+      const createMany = await j("/api/wizard/" + wid3 + "/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      out.createMany409 = createMany.status === 409;
+      // invalid shape: advisors as string, lead as string => must block, not crash
+      const w4 = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, fieldsJson: "{}", accountId: "" }) });
+      const wid4 = w4.body && w4.body.id;
+      const v4 = w4.body && w4.body.version;
+      await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: wid4, version: v4, fieldsJson: JSON.stringify({ name: "B", mission: "M", advisors: "not-an-array", lead: "not-an-object" }) }) });
+      const revBad = await j("/api/wizard/" + wid4 + "/review", { method: "GET" });
+      out.reviewBadShapeBlocks = ((revBad.body && revBad.body.blockers) || []).length > 0;
+      const createBad = await j("/api/wizard/" + wid4 + "/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      out.createBadShape409 = createBad.status === 409;
+      // idempotent create replay: valid create twice returns same board
+      const w5 = await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: 1, fieldsJson: "{}", accountId: "" }) });
+      const wid5 = w5.body && w5.body.id;
+      const v5 = w5.body && w5.body.version;
+      await j("/api/wizard", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: wid5, version: v5, fieldsJson: JSON.stringify({ name: "Replay Board", mission: "Replay mission", advisors: [{ role: "Strategist", name: "" }], lead: { name: "Replay Lead" } }) }) });
+      const c1 = await j("/api/wizard/" + wid5 + "/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const c2 = await j("/api/wizard/" + wid5 + "/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      out.createReplayConsistent = c1.status === 200 && c2.status === 200 && c1.body && c2.body && c1.body.board && c2.body.board && c1.body.board.id === c2.body.board.id;
+      return out;
+    });
+    await check(page, "wizard new draft version is 2 (main contract)", async () => wizContracts.newStatus === 200 && wizContracts.newVersion === 2);
+    await check(page, "wizard suggest leaves version unchanged", async () => wizContracts.suggestStatus === 200 && wizContracts.suggestVersionUnchanged === true);
+    await check(page, "wizard save after suggest succeeds (no false stale)", async () => wizContracts.saveAfterSuggestStatus === 200 && wizContracts.saveAfterSuggestVersion === wizContracts.newVersion + 1);
+    await check(page, "wizard interview missing version 409", async () => wizContracts.interviewMissing409 === true);
+    await check(page, "wizard interview stale version 409", async () => wizContracts.interviewStale409 === true);
+    await check(page, "wizard interview good version bumps", async () => wizContracts.interviewGoodStatus === 200 && wizContracts.interviewGoodBumps === true);
+    await check(page, "wizard review trims whitespace required fields", async () => wizContracts.reviewWhiteBlocks === true);
+    await check(page, "wizard review max 10 advisors blocks", async () => wizContracts.reviewManyBlocksAdvisors === true);
+    await check(page, "wizard create max 10 advisors 409", async () => wizContracts.createMany409 === true);
+    await check(page, "wizard invalid shape blocked (review)", async () => wizContracts.reviewBadShapeBlocks === true);
+    await check(page, "wizard invalid shape 409 on create", async () => wizContracts.createBadShape409 === true);
+    await check(page, "wizard idempotent create replay consistent", async () => wizContracts.createReplayConsistent === true);
+
     await page.goto(BASE + "#/records?board=b-beta&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
     await section("Records").first().waitFor({ timeout: 15000 });
     await page.waitForFunction(() => !window.location.hash.includes("rec="), null, { timeout: 8000 }).catch(() => {});

@@ -791,7 +791,9 @@ export default function App() {
   // gate downstream queries without clearing.
   const boardMissing =
     !!boardId && boardDetail.isError && isNotFound(boardDetail.error);
-  const boardValid = boardId === "" || boardDetail.isSuccess;
+  const boardValid =
+    boardId === "" ||
+    (boardDetail.isSuccess && (boardDetail.data as Board | undefined)?.id === boardId);
   const boardOk = boardValid;
   const presets = useQuery({
     queryKey: ["presets"],
@@ -831,7 +833,8 @@ export default function App() {
   const meetingParentMismatch =
     meetingDetail.isSuccess &&
     meetingDetail.data != null &&
-    meetingDetail.data.boardId !== boardId;
+    (meetingDetail.data.boardId !== boardId ||
+      (meetingDetail.data as MeetingFull).id !== meetingId);
   const meetingMissing =
     (!!meetingId &&
       !!boardId &&
@@ -843,7 +846,8 @@ export default function App() {
     meetingId === "" ||
     (meetingDetail.isSuccess &&
       meetingDetail.data != null &&
-      meetingDetail.data.boardId === boardId);
+      meetingDetail.data.boardId === boardId &&
+      (meetingDetail.data as MeetingFull).id === meetingId);
   const meetingOk = boardOk && meetingValid;
   const messages = useQuery({
     queryKey: ["messages", meetingId],
@@ -1300,22 +1304,33 @@ export default function App() {
   });
   const [boardLoaded, setBoardLoaded] = useState("");
   useEffect(() => {
-    if (
-      setup.data &&
-      boardLoaded !== setup.data.board.id + setup.data.draftHash
-    ) {
+    if (!setup.data) return;
+    const key =
+      setup.data.board.id +
+      "|" +
+      setup.data.draftHash +
+      "|" +
+      setup.data.board.name +
+      "|" +
+      setup.data.board.mission +
+      "|" +
+      setup.data.board.stage;
+    if (boardLoaded !== key) {
       setBoardForm({
         name: setup.data.board.name,
         mission: setup.data.board.mission,
         stage: setup.data.board.stage,
       });
-      setBoardLoaded(setup.data.board.id + setup.data.draftHash);
+      setBoardLoaded(key);
     }
   }, [setup.data, boardLoaded]);
   const saveBoard = useMutation({
     mutationFn: () => patch<Board>(`/api/boards/${boardId}`, boardForm),
-    onSuccess: (r) => {
-      qc.setQueryData(["board-detail", boardId], r);
+    onMutate: () => ({ originBoardId: boardId }),
+    onSuccess: (r, _v, ctx) => {
+      const returned = r as Board | undefined;
+      const key = returned?.id ?? (ctx as { originBoardId?: string } | undefined)?.originBoardId ?? boardId;
+      qc.setQueryData(["board-detail", key], r);
       refresh("boards", "board-detail", "setup");
     },
   });
@@ -1330,8 +1345,11 @@ export default function App() {
   });
   const saveBoardOpts = useMutation({
     mutationFn: (b: unknown) => patch<Board>(`/api/boards/${boardId}`, b),
-    onSuccess: (r) => {
-      qc.setQueryData(["board-detail", boardId], r as Board);
+    onMutate: () => ({ originBoardId: boardId }),
+    onSuccess: (r, _v, ctx) => {
+      const returned = r as Board | undefined;
+      const key = returned?.id ?? (ctx as { originBoardId?: string } | undefined)?.originBoardId ?? boardId;
+      qc.setQueryData(["board-detail", key], r as Board);
       refresh("setup", "boards", "board-detail");
     },
   });
@@ -1840,21 +1858,35 @@ const tabCount = (k: Tab): number | null => {
         title: mtitle,
         brief: mbrief,
       }),
-    onSuccess: (r) => {
-      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+    onMutate: () => ({ originBoardId: boardId, originMeetingId: meetingId }),
+    onSuccess: (r, _v, ctx) => {
+      const returned = r as MeetingFull | undefined;
+      const keyBoard = returned?.boardId ?? (ctx as { originBoardId?: string } | undefined)?.originBoardId ?? boardId;
+      const keyMeeting = (returned as { id?: string } | undefined)?.id ?? (ctx as { originMeetingId?: string } | undefined)?.originMeetingId ?? meetingId;
+      qc.setQueryData(["meeting-detail", keyBoard, keyMeeting], r);
       refresh("meetings", "meeting-detail", "delivery");
     },
   });
-  const closeMeeting = (withRecord: boolean) =>
-    post<MeetingFull>(`/api/meetings/${meetingId}/close`, { withRecord }).then((r) => {
-      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+  const closeMeeting = (withRecord: boolean) => {
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    return post<MeetingFull>(`/api/meetings/${originMeetingId}/close`, { withRecord }).then((r) => {
+      const keyBoard = (r as MeetingFull)?.boardId ?? originBoardId;
+      const keyMeeting = (r as unknown as { id?: string })?.id ?? originMeetingId;
+      qc.setQueryData(["meeting-detail", keyBoard, keyMeeting], r);
       refresh("meetings", "meeting-detail", "delivery");
     });
-  const reopenMeeting = () =>
-    post<MeetingFull>(`/api/meetings/${meetingId}/reopen`, {}).then((r) => {
-      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+  };
+  const reopenMeeting = () => {
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    return post<MeetingFull>(`/api/meetings/${originMeetingId}/reopen`, {}).then((r) => {
+      const keyBoard = (r as MeetingFull)?.boardId ?? originBoardId;
+      const keyMeeting = (r as unknown as { id?: string })?.id ?? originMeetingId;
+      qc.setQueryData(["meeting-detail", keyBoard, keyMeeting], r);
       refresh("meetings", "meeting-detail", "delivery");
     });
+  };
   const delivery = useQuery({
     queryKey: ["delivery", meetingId],
     queryFn: () =>
@@ -2056,6 +2088,7 @@ const tabCount = (k: Tab): number | null => {
       boardOk &&
       meetingOk &&
       recDetail.isSuccess &&
+      recDetail.data?.id === recId &&
       recDetail.data?.boardId === boardId &&
       recDetail.data?.meetingId === meetingId);
   const recOk = recParentOk;
@@ -2066,7 +2099,8 @@ const tabCount = (k: Tab): number | null => {
   const recParentMismatch =
     recDetail.isSuccess &&
     recDetail.data != null &&
-    (recDetail.data.boardId !== boardId ||
+    (recDetail.data.id !== recId ||
+      recDetail.data.boardId !== boardId ||
       recDetail.data.meetingId !== meetingId);
   const recMissing =
     !!recId &&
@@ -2114,20 +2148,28 @@ const tabCount = (k: Tab): number | null => {
         ids = selItems;
       }
     }
-    post<unknown>(`/api/meetings/${meetingId}/record/approve`, {
-      draftId: d.id,
+    const originMeetingId = meetingId;
+    const originBoardId = boardId;
+    const originDraftId = d.id;
+    post<unknown>(`/api/meetings/${originMeetingId}/record/approve`, {
+      draftId: originDraftId,
       hash: d.hash,
       watermark: d.watermark,
       itemIds: ids,
     })
       .then((r) => {
-        const updated = r as unknown as RecordDraft | undefined;
-        if (updated && (updated as RecordDraft).id) {
-          qc.setQueryData(["record", (updated as RecordDraft).id], updated);
-          qc.setQueryData<RecordDraft[] | undefined>(["records", meetingId], (old) =>
-            old ? [...old.filter((x) => x.id !== (updated as RecordDraft).id), updated as RecordDraft] : [updated as RecordDraft],
-          );
-        }
+        const parsed = r as unknown as { approved?: string[]; draft?: string } | undefined;
+        const keyId = (parsed as { draft?: string } | undefined)?.draft ?? originDraftId;
+        const approvedJson = JSON.stringify((parsed as { approved?: string[] } | undefined)?.approved ?? ids);
+        qc.setQueryData<RecordDraft | undefined>(["record", keyId], (old) =>
+          old && old.id === keyId ? { ...old, decided: true, status: "approved", approvedJson } : old,
+        );
+        qc.setQueryData<RecordDraft[] | undefined>(["records", originMeetingId], (old) =>
+          old
+            ? old.map((x) => (x.id === keyId ? { ...x, decided: true, status: "approved", approvedJson } : x))
+            : old,
+        );
+        void originBoardId;
         refresh("records", "record");
         notify(`Approved ${ids.length} item(s).`);
       })
@@ -2145,18 +2187,25 @@ const tabCount = (k: Tab): number | null => {
       alert("Revision body must be JSON.");
       return;
     }
+    const originMeetingId = meetingId;
+    const originBoardId = boardId;
+    const originDraftId = d.id;
+    void originDraftId;
     post<RecordDraft>(`/api/records/${d.id}/${amend ? "amend" : "revise"}`, {
       items,
     })
       .then((r) => {
-        // Seed the revised/amended draft into the list + singular caches so
-        // a delayed records refresh never discards the just-saved selection.
+        // Seed the revised/amended draft by its returned identity so a delayed
+        // refresh never discards the just-saved selection, and never render it
+        // under the wrong parent if the user switched while saving.
+        const keyMeeting = (r as RecordDraft)?.meetingId ?? originMeetingId;
+        const keyBoard = (r as RecordDraft)?.boardId ?? originBoardId;
         qc.setQueryData<RecordDraft[] | undefined>(
-          ["records", meetingId],
+          ["records", keyMeeting],
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        setRecId(r.id);
+        if (boardId === keyBoard && meetingId === keyMeeting) setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => alert(String(e)));
@@ -2165,7 +2214,8 @@ const tabCount = (k: Tab): number | null => {
     if (!recOk || !recDetail.data) return Promise.resolve();
     const d = recDetail.data;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
-    return post<unknown>(`/api/records/${d.id}/discard`, {}).then((r) => {
+    const originDraftId = d.id;
+    return post<unknown>(`/api/records/${originDraftId}/discard`, {}).then((r) => {
       const updated = r as unknown as RecordDraft | undefined;
       if (updated && (updated as RecordDraft).id) qc.setQueryData(["record", (updated as RecordDraft).id], updated);
       refresh("records", "record");
@@ -2176,19 +2226,24 @@ const tabCount = (k: Tab): number | null => {
   );
   const prepareDraft = () => {
     if (!boardId || !meetingId || !boardOk || !meetingOk) return;
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
     return post<RecordDraft>(
-      `/api/meetings/${meetingId}/record/draft`,
+      `/api/meetings/${originMeetingId}/record/draft`,
       JSON.parse(draftItems),
     )
       .then((r) => {
-        // Seed the freshly drafted record before the invalidated list
-        // returns, so a delayed refresh never discards it as absent.
+        // Seed the freshly drafted record by its returned identity before the
+        // invalidated list returns, and never render it under the wrong parent
+        // if the user switched while saving.
+        const keyMeeting = (r as RecordDraft)?.meetingId ?? originMeetingId;
+        const keyBoard = (r as RecordDraft)?.boardId ?? originBoardId;
         qc.setQueryData<RecordDraft[] | undefined>(
-          ["records", meetingId],
+          ["records", keyMeeting],
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        setRecId(r.id);
+        if (boardId === keyBoard && meetingId === keyMeeting) setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => alert(String(e)));
@@ -2473,15 +2528,19 @@ const testModel = useMutation({
         brief: "",
         participantIds: meetPicks,
       }),
-    onSuccess: (m) => {
-      const full = { ...(m as Partial<MeetingFull>), brief: (m as Partial<MeetingFull>).brief ?? "" } as MeetingFull;
+    onMutate: () => ({ originBoardId: boardId }),
+    onSuccess: (m, _v, ctx) => {
+      const origin = (ctx as { originBoardId?: string } | undefined)?.originBoardId ?? boardId;
+      const returned = m as Partial<MeetingFull> & { id: string; boardId?: string };
+      const keyBoard = returned?.boardId ?? origin;
+      const full = { ...returned, brief: (returned as Partial<MeetingFull>).brief ?? "" } as MeetingFull;
       qc.setQueryData<MeetingFull[] | undefined>(
-        ["meetings", boardId, "all"],
+        ["meetings", keyBoard, "all"],
         (old) => (old ? [...old.filter((x) => x.id !== m.id), full] : [full]),
       );
-      qc.setQueryData(["meeting-detail", boardId, m.id], full);
+      qc.setQueryData(["meeting-detail", keyBoard, m.id], full);
       refresh("meetings");
-      setMeetingId(m.id);
+      if ((boardId ?? "") === keyBoard) setMeetingId(m.id);
     },
   });
   const send = useMutation({
@@ -2529,11 +2588,16 @@ const testModel = useMutation({
     onSuccess: (r) => notify(`Secretary (provisional): ${r.answer}`),
     onError: (e) => alert(String(e)),
   });
-  const meetingCtl = (op: string) =>
-    post<MeetingFull>(`/api/meetings/${meetingId}/${op}`, {}).then((r) => {
-      qc.setQueryData(["meeting-detail", boardId, meetingId], r);
+  const meetingCtl = (op: string) => {
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    return post<MeetingFull>(`/api/meetings/${originMeetingId}/${op}`, {}).then((r) => {
+      const keyBoard = (r as MeetingFull)?.boardId ?? originBoardId;
+      const keyMeeting = (r as unknown as { id?: string })?.id ?? originMeetingId;
+      qc.setQueryData(["meeting-detail", keyBoard, keyMeeting], r);
       refresh("meetings", "meeting-detail", "delivery");
     });
+  };
   const [toasts, setToasts] = useState<
     { id: number; text: string; err: boolean }[]
   >([]);
@@ -2583,12 +2647,18 @@ const testModel = useMutation({
     }
     const cleaned =
       effBoard !== boardId || effMeeting !== meetingId || effRec !== recId;
+    // Authoritative 404/mismatch cleanup must never publish a transient
+    // dependent route (for example boardless "#/meet"): fall back to Boards
+    // immediately when the board is gone, so the invalid entry is replaced
+    // once instead of pushing "#/meet" then "#/boards".
+    const effTab: Tab =
+      effBoard === "" && (needsBoard as Tab[]).includes(tab) ? "boards" : tab;
     // Authoritative detail lookups confirm the context, so the selection can
     // publish immediately: a pending lookup keeps the id (never strips it),
     // and only a confirmed 404/mismatch clears it above. Downstream data
     // queries stay gated on boardOk/meetingOk/recOk until then.
     const h = buildHash({
-      tab,
+      tab: effTab,
       board: effBoard,
       meeting: effMeeting,
       mtab: meetTab,
@@ -2601,9 +2671,22 @@ const testModel = useMutation({
       lastSync.current = { board: effBoard, meeting: effMeeting };
       return;
     }
-    // Push user switches so Back restores the prior board/meeting; replace
-    // mount/traversal dedup and silent invalid-id cleanups.
-    if (firstNav.current || navReplace.current || (cleaned && !switched)) {
+    // Push valid user context switches so Back restores the prior
+    // board/meeting; REPLACE mount/traversal dedup and authoritative
+    // invalid-parent cleanup. Replacing the invalid entry lets Back leave for
+    // the previous valid route; pushing would trap Forward/Back on a transient
+    // dependent route ("#/meet" then "#/boards"). A valid board switch that
+    // still carries the previous board\u2019s meeting (stale child) pushes once;
+    // only a board that is itself 404, or a child that is 404 without a board
+    // change, replaces.
+    const boardInvalid = vBoard !== boardId;
+    const boardChanged = lastSync.current.board !== vBoard;
+    const childInvalidWithoutBoardChange =
+      !boardInvalid && !boardChanged && (vMeeting !== meetingId || vRec !== recId);
+    const invalidCleanup = boardInvalid || childInvalidWithoutBoardChange;
+    void switched;
+    void cleaned;
+    if (firstNav.current || navReplace.current || invalidCleanup) {
       window.history.replaceState(null, "", h);
     } else {
       window.history.pushState(null, "", h);
