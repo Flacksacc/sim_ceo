@@ -1,0 +1,10 @@
+{
+	auto_https disable_redirects
+}
+
+localhost {
+	tls internal {
+		protocols tls1.2 tls1.3
+	}
+	reverse_proxy app:5080
+}

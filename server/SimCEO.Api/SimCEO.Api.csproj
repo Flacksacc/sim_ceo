@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SimCEO.Api</RootNamespace>
+  </PropertyGroup>
+
+  <!-- The Postgres backend ships alongside the API without a static reference
+       (SimCEO.Postgres references SimCEO.Api, so this target stages its DLL
+       after build instead of a ProjectReference, which would be circular). -->
+  <ItemGroup>
+    <PgSources Include="..\SimCEO.Postgres\**\*.cs" />
+  </ItemGroup>
+  <Target Name="StagePostgresBackend" AfterTargets="Build" Condition="'$(SkipStagePostgres)' != 'true'"
+          Inputs="@(PgSources)" Outputs="$(OutputPath)SimCEO.Postgres.dll">
+    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(MSBuildProjectDirectory)\$(OutputPath)pg-pub&quot; --nologo -v q" />
+    <ItemGroup>
+      <PgStagedDlls Include="$(OutputPath)pg-pub\*.dll" Exclude="$(OutputPath)pg-pub\SimCEO.Api.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PgStagedDlls)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <RemoveDir Directories="$(OutputPath)pg-pub" />
+  </Target>
+  <!-- Publish (Docker) output lands in PublishDir, not OutputPath: re-stage there. -->
+  <Target Name="StagePostgresBackendPublish" AfterTargets="Publish" Condition="'$(SkipStagePostgres)' != 'true'">
+    <ItemGroup>
+      <PgPubDlls Include="$(OutputPath)*.dll" Exclude="$(OutputPath)SimCEO.Api.dll;$(OutputPath)SimCEO.Api.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PgPubDlls)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

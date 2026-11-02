@@ -1,0 +1,45 @@
+bin/
+obj/
+out/
+node_modules/
+dist/
+.tmp/
+.nuget/
+watched/*
+!watched/.keep
+appdata/
+.env
+# Local Microsoft cache (e.g. Windows PowerShell ModuleAnalysisCache)
+Microsoft/
+.vs/
+*.user
+*.suo
+
+# Generated assets
+output/
+
+# Editor / merge backups
+*.bak
+
+# Logs
+*.log
+logs/
+
+# QA / test result caches (scoped; docs/ reference images stay tracked)
+TestResults/
+test-results/
+playwright-report/
+cypress/screenshots/
+cypress/videos/
+coverage/
+htmlcov/
+.pytest_cache/
+.hypothesis/
+
+# Secrets (keep .env.example tracked)
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12

@@ -1,0 +1,93 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: simceo
+      POSTGRES_USER: simceo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-simceo-dev-only}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simceo -d simceo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  hindsight-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: hindsight
+      POSTGRES_USER: hindsight
+      POSTGRES_PASSWORD: ${HINDSIGHT_PASSWORD:-hindsight-dev-only}
+    volumes:
+      - hspgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight -d hindsight"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Stub for Hindsight recall service (real implementation wires to hindsight-db).
+  hindsight:
+    image: python:3.12-slim
+    command: ["python", "-c", "from http.server import BaseHTTPRequestHandler, HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(b'{\"ok\":true,\"service\":\"hindsight-stub\"}')\n def log_message(self,*a): pass\nHTTPServer(('0.0.0.0',7680),H).serve_forever()"]
+    ports: ["7681:7680"]
+    depends_on:
+      hindsight-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:7680/').status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Stub for Docling Serve extraction (real implementation points at docling-serve).
+  extractor:
+    image: quay.io/docling-project/docling-serve-cpu:latest
+    ports: ["7690:5001"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:5001/docs').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  app:
+    build: .
+    environment:
+      USE_POSTGRES: ${USE_POSTGRES:-1}
+      CONNECTIONSTRINGS__APP: "Host=db;Port=5432;Database=simceo;Username=simceo;Password=${POSTGRES_PASSWORD:-simceo-dev-only}"
+      META_API_KEY: ${META_API_KEY:-}
+      META_API_BASE: ${META_API_BASE:-}
+      EXTRACTOR_URL: http://extractor:5001
+      HINDSIGHT_URL: ${HINDSIGHT_URL:-http://hindsight:7680}
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["5080:5080"]
+    volumes:
+      - appdata:/app/data
+      - ./watched:/watched:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  proxy:
+    image: caddy:2-alpine
+    depends_on:
+      - app
+    ports: ["8443:443", "8080:80"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  pgdata:
+  hspgdata:
+  appdata:
+  caddydata:
+  caddyconfig:

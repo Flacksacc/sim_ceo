@@ -1,0 +1,74 @@
+[
+  {
+    "file": "slack-thread.png",
+    "source_page": "https://slack.com/help/articles/115000769927-Use-threads-to-organize-discussions-",
+    "image_url": "https://slack.zendesk.com/hc/article_attachments/32816788692243",
+    "description": "A thread to keep discussion organized in Slack",
+    "width": 1400,
+    "height": 1063,
+    "bytes": 311547
+  },
+  {
+    "file": "discord-forum.png",
+    "source_page": "https://discord.com/blog/forum-channels-space-for-organized-conversation",
+    "image_url": "https://cdn.prod.website-files.com/5f9072399b2640f14d6a2bf4/6567ad1a4079a63f4ca5ab04_Forums%20-%20Example.png",
+    "description": "A Forum channel within Discord. There are different unique conversations shown that can be opened up from within the Forum channel. ",
+    "width": 1600,
+    "height": 1134,
+    "bytes": 941862
+  },
+  {
+    "file": "discord-layout.png",
+    "source_page": "https://discord.com/blog/how-to-navigate-discord-using-only-your-keyboard",
+    "image_url": "https://cdn.prod.website-files.com/5f9072399b2640f14d6a2bf4/673fdc73f8aba96ec2c48a5c_AD_4nXeZx5OpdeaK0nNUYK4WvXFgm8kAVFARjxzHR5J0AuaxUkQ1D3eHkuq35nNEWVsQk3EUpHy9klgfpOHm14fMdoNOzQJfVJxGAACdnNgEZHqS0t1_V6deQ0Ki2yZZ5nMw_tHkS9ku-A.png",
+    "description": "The four sections of the desktop app users can jump between using F6.",
+    "width": 1600,
+    "height": 1075,
+    "bytes": 452917
+  },
+  {
+    "file": "teams-recap.png",
+    "source_page": "https://support.microsoft.com/en-us/teams/meetings/recap-in-microsoft-teams",
+    "image_url": "https://support.microsoft.com/en-us/teams/media/recap-page.png",
+    "description": "Recap page",
+    "width": 4416,
+    "height": 2526,
+    "bytes": 566328
+  },
+  {
+    "file": "teams-ai-notes.png",
+    "source_page": "https://support.microsoft.com/en-us/teams/meetings/recap-in-microsoft-teams",
+    "image_url": "https://support.microsoft.com/en-us/teams/media/recap-ai-notes.png",
+    "description": "View AI generated notes in Teams meeting recap.",
+    "width": 350,
+    "height": 645,
+    "bytes": 120606
+  },
+  {
+    "file": "telegram-topic-tabs.png",
+    "source_page": "https://telegram.org/blog/direct-to-channel-trim-voice-and-more",
+    "image_url": "https://telegram.org/file/400780400741/5/vwRLM6o0vO4.2411329.mp4/80be12107a09f7c81e",
+    "description": "Frame at 6 seconds from Telegram Topic Tabs product demo",
+    "width": 1080,
+    "height": 1080,
+    "bytes": 456812
+  },
+  {
+    "file": "zulip-topics.webp",
+    "source_page": "https://zulip.com/help/introduction-to-topics",
+    "image_url": "https://zulip.com/help/_astro/channels-and-topics.q25zXrY7_1B49P2.webp",
+    "description": "Channels and topics",
+    "width": 1388,
+    "height": 770,
+    "bytes": 52238
+  },
+  {
+    "file": "linear-inbox.png",
+    "source_page": "https://linear.app/docs/inbox",
+    "image_url": "https://webassets.linear.app/images/ornj730p/production/b442b340278740de70919c868dce1afca4335fe7-3600x2080.png?w=1440&q=95&auto=format&dpr=2",
+    "description": "Linear Inbox in dark mode, showing Priority and Other tabs with several notifications about issue assignments, project updates, comments, and mentions.",
+    "width": 2880,
+    "height": 1664,
+    "bytes": 1735151
+  }
+]
