@@ -88,9 +88,15 @@ public sealed class ModelGateway
     Environment.GetEnvironmentVariable("META_API_BASE") is { Length: > 0 } b
       ? b.Trim().TrimEnd('/') : "https://api.meta.ai/v1";
 
-  private string EffectiveKey =>
-    !string.IsNullOrWhiteSpace(_store.ModelApiKeyOverride) ? _store.ModelApiKeyOverride
-    : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
+  private string EffectiveKey
+  {
+    get
+    {
+      var o = PolicyStore.ReadApiKey(_store);
+      return !string.IsNullOrWhiteSpace(o) ? o
+        : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
+    }
+  }
 
   public void EnsureAvailable()
   {
@@ -100,7 +106,10 @@ public sealed class ModelGateway
   public static (decimal known, int unknownCalls) MonthSpend(InMemoryStore store)
   {
     var now = DateTime.UtcNow;
-    var rows = store.Usage.Where(u => u.At.Year == now.Year && u.At.Month == now.Month).ToList();
+    // Coherent read: snapshot under the root gate so a concurrent ledger
+    // rollback (drain-and-refill) cannot hand us a partial month.
+    List<Domain.UsageRow> rows;
+    lock (store.RootGate) { rows = store.Usage.Where(u => u.At.Year == now.Year && u.At.Month == now.Month).ToList(); }
     return (rows.Where(u => u.Cost.HasValue).Sum(u => u.Cost!.Value),
       rows.Count(u => !u.Cost.HasValue));
   }
@@ -108,7 +117,8 @@ public sealed class ModelGateway
   public void ThrowIfCapped(bool ownerOverride)
   {
     if (ownerOverride) return;
-    if (_store.Spend.Mode != "block" || _store.Spend.MonthlyCapUsd is not decimal cap) return;
+    var (capN, mode) = PolicyStore.ReadSpend(_store);
+    if (mode != "block" || capN is not decimal cap) return;
     var (known, _) = MonthSpend(_store);
     if (known >= cap) throw new CapExceededException(cap, known);
   }
@@ -201,6 +211,12 @@ public sealed class ModelGateway
     return cost.HasValue ? cost.Value.ToString("F6") : "unknown";
   }
 
+  // Code-only ledger-append fault seam for rollback proofs (in-process QA
+  // only): when set, the next pair append fails before any write, proving the
+  // unit restores prior ledgers without erasing a concurrent pair. Never
+  // exposed via HTTP routes or environment.
+  internal static Func<bool>? FailNextAppend;
+
   // ONE ledger + ONE usage event per ACTUAL provider call. Callers pass a
   // fresh callId per HTTP attempt (each retry is its own billed call).
   // Never stores prompts, responses, keys, or chain-of-thought: only safe
@@ -236,37 +252,49 @@ public sealed class ModelGateway
       Status = status, ProviderCallId = providerCallId, CostBasis = costBasis, Cost = cost,
       BoardId = b, MeetingId = m, At = at, Note = note,
     };
-    // Ledger-scoped atomicity: PG mode commits both rows in one backend
-    // transaction; memory mode has no backend transaction, so capture just the
-    // two installation ledgers and restore them on failure. Ledgers are
-    // deliberately EXCLUDED from domain-unit snapshots (Ops billing boundary):
-    // a failing domain unit must never erase a concurrently finalized pair.
-    List<Domain.UsageRow>? usageSnap = null;
-    List<ModelCall>? callsSnap = null;
-    if (SimCEO.Api.Data.Pg.Backend is null)
-    {
-      usageSnap = _store.Usage.CaptureLive();
-      callsSnap = _store.ModelCalls.CaptureLive();
-    }
+    // Pair atomicity under ONE shared boundary: capture, both appends, and
+    // any rollback all happen inside the same store-bound unit (holding the
+    // root gate), so a concurrent pair can neither slip between capture and
+    // append nor be erased by this unit rollback. PG mode commits both rows
+    // in one backend transaction (no memory snapshot needed). Ledgers stay
+    // EXCLUDED from domain-unit snapshots (Ops billing boundary): a failing
+    // domain unit preserves an already-billed pair, and a failing pair
+    // append never touches domain rows.
     try
     {
       Atomic.Run(_store, () =>
       {
-        _store.ModelCalls.Add(call);
-        _store.Usage.Add(row);
-      });
-    }
-    catch (Exception ex)
-    {
-      if (usageSnap is not null)
-      {
+        List<Domain.UsageRow>? usageSnap = null;
+        List<ModelCall>? callsSnap = null;
+        if (SimCEO.Api.Data.Pg.Backend is null)
+        {
+          usageSnap = _store.Usage.CaptureLive();
+          callsSnap = _store.ModelCalls.CaptureLive();
+        }
         try
         {
-          _store.Usage.RestoreLive(usageSnap);
-          if (callsSnap is not null) _store.ModelCalls.RestoreLive(callsSnap);
+          if (FailNextAppend?.Invoke() == true) throw new InvalidOperationException("injected ledger append fault");
+          _store.ModelCalls.Add(call);
+          _store.Usage.Add(row);
         }
-        catch (Exception rex) { throw new AggregateException("usage ledger append failed and ledger rollback is uncertain", ex, rex); }
-      }
+        catch (Exception appendEx)
+        {
+          if (usageSnap is not null)
+          {
+            try
+            {
+              _store.Usage.RestoreLive(usageSnap);
+              if (callsSnap is not null) _store.ModelCalls.RestoreLive(callsSnap);
+            }
+            catch (Exception rex) { throw new AggregateException("usage ledger append failed and ledger rollback is uncertain", appendEx, rex); }
+          }
+          throw new UsageStorageException("usage ledger append failed; provider result not recorded", appendEx);
+        }
+      });
+    }
+    catch (UsageStorageException) { throw; }
+    catch (Exception ex)
+    {
       throw new UsageStorageException("usage ledger append failed; provider result not recorded", ex);
     }
   }

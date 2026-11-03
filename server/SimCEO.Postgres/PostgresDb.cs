@@ -34,6 +34,7 @@ public sealed class PostgresDb : DbContext
   public DbSet<Membership> Memberships => Set<Membership>();
   public DbSet<SecurityState> SecurityStates => Set<SecurityState>();
   public DbSet<UsageRow> UsageRows => Set<UsageRow>();
+  public DbSet<InstallationPolicy> InstallationPolicies => Set<InstallationPolicy>();
   public DbSet<SimCEO.Api.Work.ModelCall> ModelCalls => Set<SimCEO.Api.Work.ModelCall>();
 
   protected override void OnModelCreating(ModelBuilder b)
@@ -441,6 +442,11 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_BoardId\" ON \"ModelCalls\" (\"BoardId\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_MeetingId\" ON \"ModelCalls\" (\"MeetingId\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_At\" ON \"ModelCalls\" (\"At\")");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"InstallationPolicies\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"MonthlyCapUsd\" numeric NULL, \"Mode\" text NOT NULL DEFAULT 'warn', \"ModelApiKeyOverride\" text NOT NULL DEFAULT '', \"ModelChatOverride\" text NOT NULL DEFAULT '')");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"MonthlyCapUsd\" numeric NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"Mode\" text NOT NULL DEFAULT 'warn'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"ModelApiKeyOverride\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"ModelChatOverride\" text NOT NULL DEFAULT ''");
       Pg.Backend = new PostgresBackend(db);
       return true;
     }

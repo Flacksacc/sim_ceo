@@ -1,0 +1,31 @@
+{
+ "model": {
+  "configured": true,
+  "source": "env",
+  "model": "muse-spark-1.3",
+  "chatOverride": "muse-spark-1.3",
+  "keyHint": "...ummy",
+  "lastTestAt": null,
+  "lastTestOk": false,
+  "lastTestModel": "",
+  "lastTestError": ""
+ },
+ "spending": {
+  "month": "2026-11",
+  "monthlyCapUsd": null,
+  "mode": "warn",
+  "knownSpendUsd": 0.00088,
+  "unknownCostCalls": 0,
+  "overCap": false,
+  "enforced": false,
+  "note": "All recorded costs known. Costs are ESTIMATES, not provider invoices.",
+  "pricingBasis": {
+   "checkedDate": "2026-11-02",
+   "pricing": "https://dev.meta.ai/docs/pricing-rate-limits",
+   "searchGrounding": "https://dev.meta.ai/docs/search-grounding",
+   "speechToText": "https://dev.meta.ai/docs/speech-to-text",
+   "imageGeneration": "https://dev.meta.ai/docs/image-generation"
+  },
+  "storage": "postgres-durable"
+ }
+}

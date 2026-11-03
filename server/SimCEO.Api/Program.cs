@@ -218,9 +218,15 @@ if (args.Contains("--selftest"))
   actAdv.RosterVersion = actEntry.Version;
   actAdv.BoardRole = "Selftest Role";
   actAdv.Approved = true;
-  board.DraftJson = """{"name":"T1"}""";
-  var (activated, actErr, actSt) = LeadSetup.Activate(store, board.Id, Hashing.HashOf(LeadSetup.CanonicalDraftJson(store, board)));
-  if (activated is null || actErr is not null || actSt != 200 || !board.ActiveConfig) failures.Add("activate");
+  // Re-fetch the fixture row: the failed units above (stale lead save,
+  // null-hash activate) roll the store back to cloned rows, so the original
+  // `board` reference is detached. Set the draft on, hash from, and assert
+  // the LIVE stored row plus the returned row.
+  store.Boards.TryGetValue(board.Id, out var livePreAct);
+  if (livePreAct is not null) livePreAct.DraftJson = """{"name":"T1"}""";
+  var (activated, actErr, actSt) = LeadSetup.Activate(store, board.Id, Hashing.HashOf(LeadSetup.CanonicalDraftJson(store, livePreAct ?? board)));
+  store.Boards.TryGetValue(board.Id, out var livePostAct);
+  if (activated is null || actErr is not null || actSt != 200 || livePostAct is null || !livePostAct.ActiveConfig || !activated.ActiveConfig) failures.Add("activate");
   var (rehash, rehashErr, rehashSt) = LeadSetup.Activate(store, board.Id, "deadbeefdeadbeef");
   if (rehash is not null || rehashSt != 409 || rehashErr is null) failures.Add("activate-hash-not-checked");
   var board2 = new Board { Id = Guid.NewGuid(), Name = "T2", CreatedAt = DateTime.UtcNow };
@@ -395,8 +401,8 @@ app.MapGet("/api/admin/diag", (InMemoryStore s, HttpRequest req) =>
         usageRows = s.Usage.Count(),
         modelCalls = s.ModelCalls.Count(),
       },
-      spend = new { mode = s.Spend.Mode, hasMonthlyCap = s.Spend.MonthlyCapUsd.HasValue },
-      model = new { hasKeyOverride = !string.IsNullOrWhiteSpace(s.ModelApiKeyOverride), chatOverride = string.IsNullOrWhiteSpace(s.ModelChatOverride) ? "default" : "custom", lastTestOk = s.ModelLastTestOk, lastTestAt = s.ModelLastTestAt },
+      spend = new { mode = PolicyStore.ReadSpend(s).mode, hasMonthlyCap = PolicyStore.ReadSpend(s).cap.HasValue },
+      model = new { hasKeyOverride = !string.IsNullOrWhiteSpace(PolicyStore.ReadApiKey(s)), chatOverride = string.IsNullOrWhiteSpace(PolicyStore.ReadChatModel(s)) ? "default" : "custom", lastTestOk = s.ModelLastTestOk, lastTestAt = s.ModelLastTestAt },
       security = new { secure = PeopleOps.IsSecure(s), hasAdmin = !string.IsNullOrWhiteSpace(PeopleOps.AdminEmail(s)) },
     });
   }
@@ -421,9 +427,11 @@ static object ScopedBoardView(InMemoryStore s, SimCEO.Api.Domain.Board b)
   return new { id = b.Id, name = b.Name, mission = em, stage = es, discussionPolicy = ep, archived = b.Archived, createdAt = b.CreatedAt };
 }
 
-static List<object> BoardsFor(InMemoryStore s, HttpRequest req)
+static List<object> BoardsFor(InMemoryStore s, HttpRequest req, bool includeArchived)
 {
-  var all = s.Boards.Values.Where(b => !b.Archived).OrderByDescending(b => b.CreatedAt).Take(100).ToList();
+  var query = s.Boards.Values.AsEnumerable();
+  if (!includeArchived) query = query.Where(b => !b.Archived);
+  var all = query.OrderByDescending(b => b.CreatedAt).Take(100).ToList();
   if (!PeopleOps.IsSecure(s)) return all.Cast<object>().ToList();
   if (!AuthOps.TrySession(s, req, out var user)) return new List<object>();
   var admin = PeopleOps.AdminEmail(s);
@@ -433,7 +441,11 @@ static List<object> BoardsFor(InMemoryStore s, HttpRequest req)
   {
     if (!string.IsNullOrWhiteSpace(b.OwnerKey) && string.Equals(b.OwnerKey, user, StringComparison.OrdinalIgnoreCase)) { out_.Add(b); continue; }
     if (PeopleOps.Can(s, req, b.Id, null, "manage")) { out_.Add(b); continue; }
-    if (s.Grants.Values.Any(g => g.BoardId == b.Id && g.MeetingId == null && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase))) { out_.Add(ScopedBoardView(s, b)); continue; }
+    // Board-level grant visibility reuses fresh current authorization
+    // (Can/read): a deleted or revoked grant — or any grant the current
+    // revocation state no longer honors — never surfaces a private board.
+    // Raw grant-row existence alone is not visibility.
+    if (PeopleOps.Can(s, req, b.Id, null, "read")) { out_.Add(ScopedBoardView(s, b)); continue; }
     // Meeting-only guests: minimal scrubbed DTO only (no DraftJson/ActiveJson/OwnerKey/lead internals).
     var mids = PeopleOps.GuestMeetingIds(s, user, b.Id);
     if (mids.Count > 0) { var (lm, ls, lp) = EffectiveGuestView(s, b); out_.Add(new { id = b.Id, name = b.Name, mission = lm, stage = ls, discussionPolicy = lp, guest = true, meetingIds = mids }); continue; }
@@ -441,7 +453,7 @@ static List<object> BoardsFor(InMemoryStore s, HttpRequest req)
   return out_;
 }
 
-app.MapGet("/api/boards", (InMemoryStore s, HttpRequest req) => Results.Ok(BoardsFor(s, req)));
+app.MapGet("/api/boards", (InMemoryStore s, HttpRequest req, bool? includeArchived) => Results.Ok(BoardsFor(s, req, includeArchived == true)));
 
 app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
 {

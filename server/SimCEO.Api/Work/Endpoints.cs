@@ -118,6 +118,7 @@ public static class SimCEOEndpoints
       if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedLead) return deniedLead;
       LeadProfile saved = null; string error = null; int status = 200;
       try { var r = LeadSetup.SaveLead(s, bid, input, req, "contribute"); saved = r.saved; error = r.error; status = r.status; }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
       catch (Exception ex) { return Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return saved is not null ? Results.Ok(saved) : Results.Json(new { error }, statusCode: status);
@@ -223,6 +224,7 @@ public static class SimCEOEndpoints
         ? h.GetString() : null;
       Board actBoard = null; string actError = null; int actStatus = 200;
       try { var ar = LeadSetup.Activate(s, bid, hash, req); actBoard = ar.board; actError = ar.error; actStatus = ar.status; }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
       catch (Exception ex) { return Results.Json(new { error = "Activation failed; no state changed: " + ex.Message }, statusCode: 500); }
       return actBoard is not null ? Results.Ok(actBoard) : Results.Json(new { error = actError }, statusCode: actStatus);
@@ -362,6 +364,7 @@ public static class SimCEOEndpoints
     app.MapPost("/api/voice/{id:guid}/finalize", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.VoiceTurns.TryGetValue(id, out var t)) return Results.NotFound();
+      var finPin = PublicationGuard.Capture(s);
       if (PeopleOps.Check(s, req, t.BoardId, t.MeetingId, "discuss") is { } deniedFin) return deniedFin;
       { var __fu = PeopleOps.UserOf(s, req); var __fmgr = PeopleOps.Can(s, req, t.BoardId, null, "manage"); if (!__fmgr && !string.Equals(t.CreatorKey ?? "", __fu, System.StringComparison.OrdinalIgnoreCase)) return PeopleOps.Denied(); }
       lock (s.MessageLock)
@@ -375,6 +378,8 @@ public static class SimCEOEndpoints
         {
           if (!s.VoiceTurns.TryGetValue(id, out var vt) || vt is null) { gateErr = Results.NotFound(); return; }
           if (PeopleOps.BadToken(s, req) is { }) { gateErr = Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401); return; }
+          try { PublicationGuard.Check(s, finPin, req, vt.BoardId, vt.MeetingId, "discuss"); }
+          catch (Exception finPx) { var finPm = PublicationGuard.MapGuardFailure(finPx); if (finPm is not null) { gateErr = finPm; return; } throw; }
           string vu = "";
           if (PeopleOps.IsSecure(s))
           {
@@ -903,6 +908,11 @@ public static class SimCEOEndpoints
       // even if meeting generation numbers happen to coincide.
       var epochBefore = s.SourceEpoch;
       var restoreBefore = s.RestoreEpochId;
+      // Publication pin: every run bookkeeping write below (run-cap, outcome
+      // init/update/finalize, Lane B interruptions) rechecks this identity +
+      // fresh authority INSIDE its own unit, so a restore between dispatch
+      // and commit discards the stale bookkeeping instead of recreating it.
+      var publishPin = PublicationGuard.Capture(s);
       var dirBefore = DiscussionDirFingerprint(s, m.BoardId, id);
       var effBefore = DiscussionEffFingerprint(s, m.BoardId, id);
       var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
@@ -944,8 +954,11 @@ public static class SimCEOEndpoints
         }
         if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
         var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
+        try
+        {
         Atomic.Run(s, () =>
         {
+          PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss");
           var capBoard = m.BoardId;
           if (s.Meetings.TryGetValue(id, out var capMtg) && capMtg is not null) capBoard = capMtg.BoardId;
           if (priorCapNoteId != Guid.Empty && s.Notes.TryGetValue(priorCapNoteId, out var priorCapNote))
@@ -961,6 +974,8 @@ public static class SimCEOEndpoints
           }
           s.Notes.Flush();
         });
+        }
+        catch (Exception capEx) { var capMapped = PublicationGuard.MapGuardFailure(capEx); if (capMapped is not null) return capMapped; throw; }
       }
       int CommittedThisTurn()
       {
@@ -980,11 +995,16 @@ public static class SimCEOEndpoints
         Title = "Run in progress",
         Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = 0, published = 0, leadSeq = leadFloor, cap = effectiveCap }),
       };
+      try
+      {
       Atomic.Run(s, () =>
       {
+        PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss");
         s.Notes[outcome.Id] = outcome;
         s.Notes.Flush();
       });
+      }
+      catch (Exception initEx) { var initMapped = PublicationGuard.MapGuardFailure(initEx); if (initMapped is not null) return initMapped; throw; }
       var completedGroups = 0;
       long LaneBRevision()
       {
@@ -998,14 +1018,28 @@ public static class SimCEOEndpoints
       // Lane B: every interrupted return updates the initial in-progress outcome into a terminal one.
       IResult LaneBFail(string laneBReason, int laneBPlannedRounds, List<string> laneBRemaining)
       {
+        // Pin + authority BEFORE touching bookkeeping: a restore or a lost
+        // grant between dispatch and this interruption discards the stale
+        // outcome write instead of recreating it. The check runs under the
+        // root gate (and inside the outer publication unit when nested), so
+        // it is authoritative for the write below.
+        try { PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss"); }
+        catch (Exception laneBPreEx) { var laneBPreMapped = PublicationGuard.MapGuardFailure(laneBPreEx); if (laneBPreMapped is not null) return laneBPreMapped; throw; }
         var laneBRev = LaneBRevision();
         outcome.Title = "Run interrupted: " + laneBReason;
         outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = laneBRev, rounds = laneBPlannedRounds, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, status = "interrupted", reason = laneBReason, remaining = laneBRemaining });
+        IResult? laneBWriteErr = null;
+        try
+        {
         Atomic.Run(s, () =>
         {
+          PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss");
           s.Notes[outcome.Id] = outcome;
           s.Notes.Flush();
         });
+        }
+        catch (Exception laneBWEx) { laneBWriteErr = PublicationGuard.MapGuardFailure(laneBWEx); if (laneBWriteErr is null) throw; }
+        if (laneBWriteErr is not null) return laneBWriteErr;
         return Results.Conflict("Interrupted: " + laneBReason + "; partial progress preserved in run outcome.");
       }
       using var bidSem = new SemaphoreSlim(4);
@@ -1221,8 +1255,11 @@ public static class SimCEOEndpoints
       await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, id, "run-complete",
         new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) }, "read");
       outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
+      try
+      {
       Atomic.Run(s, () =>
       {
+        PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss");
         var finalRev = m.DeliveredRevision;
         if (s.Meetings.TryGetValue(id, out var finalMtg) && finalMtg is not null) finalRev = finalMtg.DeliveredRevision;
         outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = finalRev, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
@@ -1230,6 +1267,8 @@ public static class SimCEOEndpoints
         s.Notes.Flush();
         s.Meetings.Flush();
       });
+      }
+      catch (Exception finEx) { var finMapped = PublicationGuard.MapGuardFailure(finEx); if (finMapped is not null) return finMapped; throw; }
             return Results.Ok(new { rounds = rounds.Select(r => r.Select(a => a.BoardRole)), published, challenged = lastChallenged, abstained, bidErrors, yielded, overflow });
       }
       finally

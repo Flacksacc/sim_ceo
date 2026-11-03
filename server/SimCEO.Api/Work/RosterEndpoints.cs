@@ -734,6 +734,7 @@ public static class RosterEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
         RosterOps.MarkLiveResearchJob(jobId);
       }
+      var resPin = PublicationGuard.Capture(s);
       try
       {
       var subject = startSubject;
@@ -837,7 +838,10 @@ public static class RosterEndpoints
           Atomic.Run(s, () =>
           {
             if (!s.Roster.TryGetValue(id, out var fresh) || fresh is null || fresh.Archived) throw new InvalidOperationException("gone");
+            if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
             if (fresh.ResearchJobId != jobId) throw new InvalidOperationException("superseded");
+            if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("revoked");
+            if (!RosterOps.CanWriteRoster(s, req, fresh)) throw new UnauthorizedAccessException("denied");
           fresh.ResearchJson = JsonSerializer.Serialize(built);
           fresh.ResearchedAt = DateTime.UtcNow;
           fresh.EvidenceCount = citedExcerpts.Count;
@@ -854,6 +858,14 @@ public static class RosterEndpoints
           RosterOps.ClearLiveResearchJob(jobId);
           return Results.Conflict("A newer research request superseded this run; use its result.");
         }
+        catch (InvalidOperationException iox) when (iox.Message == "res-restored")
+        {
+          try { Atomic.Run(s, () => { if (s.Roster.TryGetValue(id, out var staleRs) && staleRs is not null && staleRs.ResearchJobId == jobId) { staleRs.ResearchJobId = ""; staleRs.ResearchRequested = true; staleRs.UpdatedAt = DateTime.UtcNow; s.Roster[staleRs.Id] = staleRs; } }); } catch { }
+          RosterOps.ClearLiveResearchJob(jobId);
+          return Results.Conflict("Domain was restored during research; rerun research on the current version.");
+        }
+        catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+        catch (UnauthorizedAccessException) { RosterOps.ClearLiveResearchJob(jobId); return PeopleOps.Denied(); }
         catch (InvalidOperationException) { RosterOps.ClearLiveResearchJob(jobId); return Results.NotFound(); }
         catch (Exception ex) { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Research completion failed; no state changed: " + ex.Message }, statusCode: 500); }
         dossier = built;

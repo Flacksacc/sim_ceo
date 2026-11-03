@@ -146,7 +146,7 @@ public static class LeadSetup
       {
         // Fresh authority INSIDE the mutation unit.
         if (req is not null && need == "admin") { if (PeopleOps.IsSecure(s)) { if (!AuthOps.TrySession(s, req, out var leIn)) throw new UnauthorizedAccessException("revoked"); var admIn = PeopleOps.AdminEmail(s); if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, leIn, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("denied"); } else if (!PeopleOps.IsOwner(req)) throw new UnauthorizedAccessException("denied"); }
-        if (req is not null && need == "contribute") { if (PeopleOps.Check(s, req, boardId, null, "contribute") is not null) throw new UnauthorizedAccessException("revoked"); }
+        if (req is not null && need == "contribute") { if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked"); if (!PeopleOps.Can(s, req, boardId, null, "contribute")) throw new UnauthorizedAccessException("denied"); }
         // Fresh fetch + version guard inside the unit: a concurrent save between
         // the route check and this commit cannot silently overwrite.
         Board? freshBoard = null;
@@ -202,7 +202,7 @@ public static class LeadSetup
     {
       Atomic.Run(s, () =>
       {
-        if (req is not null && PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("revoked");
+        if (req is not null) { if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked"); if (!PeopleOps.Can(s, req, boardId, null, "manage")) throw new UnauthorizedAccessException("denied"); }
         // Fresh fetch + full activation guard inside the unit: name, own lead,
         // eligible advisor, and exact reviewed hash are rechecked against
         // current rows so a concurrent edit cannot activate a stale draft.

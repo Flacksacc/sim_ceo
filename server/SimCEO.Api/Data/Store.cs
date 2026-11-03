@@ -101,11 +101,13 @@ public sealed class InMemoryStore
     public Dictionary<Guid, Domain.AdvisorImage> Images = new();
     public Dictionary<Guid, Account> Accounts = new();
     public List<Domain.AuditEvent> Audit = new();
-    // Installation ledgers (Usage/ModelCalls) and the global spend cap are
-    // intentionally EXCLUDED: a failing domain unit must never erase a
-    // concurrently finalized paid pair or rewind billing (Ops boundary).
-    // Pair atomicity belongs to the ledger writer itself (RecordFull).
+    // Installation ledgers (Usage/ModelCalls) are intentionally EXCLUDED:
+    // a failing domain unit must never erase a concurrently finalized paid
+    // pair or rewind billing (Ops boundary). Pair atomicity belongs to the
+    // ledger writer itself (RecordFull). The spend policy IS captured so a
+    // failing policy update rolls back instead of leaving a partial change.
     public Dictionary<string, Session> Sessions = new(StringComparer.Ordinal);
+    public Domain.SpendCap Spend = new();
     public Dictionary<string, List<DateTime>> AuthFails = new(StringComparer.Ordinal);
     public Dictionary<Guid, Work.ActiveIndexJob> ActiveIndexJobs = new();
     public HashSet<Guid> RunningRuns = new();
@@ -158,6 +160,7 @@ public sealed class InMemoryStore
       Images = Images.CaptureLive(),
       Accounts = Accounts.CaptureLive(),
       Audit = Audit.CaptureLive(),
+      Spend = Deep(Spend),
       Sessions = Sessions.ToDictionary(kv => kv.Key, kv => Deep(kv.Value), StringComparer.Ordinal),
       AuthFails = AuthFails.ToDictionary(kv => kv.Key, kv => kv.Value.ToList(), StringComparer.Ordinal),
       ActiveIndexJobs = ActiveIndexJobs.ToDictionary(kv => kv.Key, kv => kv.Value),
@@ -204,6 +207,7 @@ public sealed class InMemoryStore
     Images.RestoreLive(c.Images);
     Accounts.RestoreLive(c.Accounts);
     Audit.RestoreLive(c.Audit);
+    Spend = Deep(c.Spend);
     // Two-phase: fallible deep-clones first, infallible swaps after. The table
     // restores above already follow the same rule.
     var freshSessions = new Dictionary<string, Session>(StringComparer.Ordinal);

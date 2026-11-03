@@ -18,7 +18,7 @@ public static class MeetingEndpoints
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedTr) return deniedTr;
       if (PeopleOps.Guard(gw, req) is { } capped) return capped;
-      var restoreBeforeTr = s.RestoreEpochId;
+      var trPin = PublicationGuard.Capture(s);
       if (audio is null || audio.Length == 0) return Results.BadRequest("No audio.");
       if (audio.Length > 10 * 1024 * 1024) return Results.BadRequest("Audio exceeds 10 MB.");
       using var ms = new MemoryStream();
@@ -64,14 +64,16 @@ public static class MeetingEndpoints
           if (!s.Meetings.TryGetValue(id, out var curM) || curM is null) throw new InvalidOperationException("gone");
           if (!AuthOps.TrySession(s, req, out var tu) && PeopleOps.IsSecure(s)) throw new UnauthorizedAccessException("revoked");
           var tu2 = PeopleOps.IsSecure(s) ? tu! : PeopleOps.UserOf(s, req);
-          if (PeopleOps.Check(s, req, curM.BoardId, id, "discuss") is not null) throw new UnauthorizedAccessException("revoked");
-          if (s.RestoreEpochId != restoreBeforeTr) throw new InvalidOperationException("restored");
+          // Fresh epoch + authority INSIDE the commit unit: a restore or a
+          // lost grant between dispatch and commit discards the stale draft.
+          PublicationGuard.Check(s, trPin, req, curM.BoardId, id, "discuss");
           if (!string.Equals(tu2, trUser, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("session changed during transcription");
           turn.BoardId = curM.BoardId;
           turn.CreatorKey = tu2;
           s.VoiceTurns[turn.Id] = turn;
         });
       }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "denied") { return PeopleOps.Denied(); }
       catch (UnauthorizedAccessException) { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during transcription; retry."); }
       catch (InvalidOperationException) { return Results.NotFound("meeting"); }
@@ -239,6 +241,7 @@ public static class MeetingEndpoints
         try { gateErr = Atomic.Run<IResult?>(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur) || cur.BoardId != m.BoardId) throw new InvalidOperationException("meeting moved");
+          if (PeopleOps.BadToken(s, req) is not null) return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
           if (!PeopleOps.Can(s, req, cur.BoardId, id, "contribute")) return PeopleOps.Denied();
           var note = new Note { BoardId = cur.BoardId, MeetingId = id, Kind = kind, Title = string.IsNullOrWhiteSpace(title) ? (kind == "briefing" ? "Briefing" : "Working note") : title, Body = bodyIn, Scope = "meeting", Provisional = true, EvidenceJson = "[]", RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
           note.RootId = note.Id;
@@ -343,6 +346,7 @@ public static class MeetingEndpoints
               return Results.Json(new { error = SecretaryContext.SnapshotMismatchReason(snapBefore, nowSnap) }, statusCode: 409);
             if (s.RestoreEpochId != restoreBeforeB)
               return Results.Json(new { error = "Domain was restored during briefing; retry." }, statusCode: 409);
+            if (PeopleOps.BadToken(s, req) is not null) return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
             if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
             var bodyText = bout.Body;
             if (deliveredB.Count == 0) bodyText = bodyText + " [Limitation: No eligible approved sources, adopted directions, or approved records were available for this meeting.]";

@@ -7,6 +7,10 @@
     <RootNamespace>SimCEO.Api</RootNamespace>
   </PropertyGroup>
 
+  <!-- Code-only QA probe drives private ledger paths (RecordFull) in-process. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="EssBackendProbe" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="AngleSharp" Version="1.8.5" />
     <PackageReference Include="SkiaSharp" Version="4.154.0" />

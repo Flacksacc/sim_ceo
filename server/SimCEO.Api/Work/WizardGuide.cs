@@ -157,6 +157,7 @@ public static class WizardGuide
           catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(draftIdP, out var savedP) || savedP is null) return Results.NotFound("wizard draft");
           var pendingVersion = savedP.Version;
+          var wizPin = PublicationGuard.Capture(s);
           var gw = new ModelGateway(s);
           var gate = PeopleOps.Guard(gw, req);
           InterviewParsed? parsed = null;
@@ -216,6 +217,7 @@ public static class WizardGuide
             {
               if (!s.WizardDrafts.TryGetValue(completionId, out var cur) || cur is null) throw new InvalidOperationException("gone");
               if (!TryWizardUser(s, req, cur, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (s.RestoreEpochId != wizPin.epochId || s.RestoreEpochRev != wizPin.epochRev) throw new InvalidOperationException("restored");
               string? curJob = null;
               try
               {
@@ -245,6 +247,7 @@ public static class WizardGuide
           }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "changed") { return Results.Conflict("Draft changed during interview; retry with the latest version."); }
+          catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during interview; retry with the latest version."); }
           catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
           catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(completionId, out var doneIv) || doneIv is null) return Results.NotFound("wizard draft");

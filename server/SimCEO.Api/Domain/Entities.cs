@@ -355,6 +355,20 @@ public sealed class SpendCap
   public decimal? MonthlyCapUsd { get; set; }
 }
 
+/// <summary>Singleton installation policy row (PG durability for spending
+/// controls + model connection overrides). Exactly one row with the fixed
+/// PolicyStore.SingletonId exists per database; memory mode keeps the same
+/// fields on InMemoryStore. Never exported in backups, never replaced by
+/// restores: policy always reflects the CURRENT installation, not a snapshot.</summary>
+public sealed class InstallationPolicy
+{
+  [Key] public Guid Id { get; set; }
+  public decimal? MonthlyCapUsd { get; set; }
+  public string Mode { get; set; } = "warn";
+  public string ModelApiKeyOverride { get; set; } = "";
+  public string ModelChatOverride { get; set; } = "";
+}
+
 public sealed class AuditEvent
 {
   public Guid? BoardId { get; set; }

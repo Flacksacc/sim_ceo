@@ -70,6 +70,13 @@ public static class Pg
 /// model call may run inside the unit (LLM calls stay outside the lock).
 /// Backend-related exceptions never silently become memory-mode success.
 /// </summary>
+/// <summary>Deferred post-commit effects ran after a successful commit but at
+/// least one failed. The state IS committed; callers must not report that
+/// prior state was restored and must not report uncertain rollback.</summary>
+public sealed class PostCommitException : Exception
+{
+  public PostCommitException(string message, Exception inner) : base(message, inner) { }
+}
 public static class Atomic
 {
   public static void Run(Action op)
@@ -134,6 +141,8 @@ public static class Atomic
     bool outer;
     lock (UnitGate)
     {
+      if (st.Depth > 0 && st.OwnerThread != Environment.CurrentManagedThreadId)
+        throw new InvalidOperationException("Store-bound Atomic unit entered from a foreign execution while another unit owns this store; coordinate through the root gate instead of joining the unrelated unit.");
       if (st.Depth > 0) outer = false;
       else if (Pg.Backend?.IsTransacting == true)
         throw new InvalidOperationException("Store-bound Atomic unit entered inside a foreign active backend transaction; hoist it outermost so commit effects and rollback own the whole unit.");
@@ -192,9 +201,15 @@ public static class Atomic
         throw new InvalidOperationException("Store-bound nested unit aborted; failing upward without state surgery.");
       }
       // Commit already happened exactly once above; deferred live effects
-      // (staged audits, bumps, hub revocations) run only now. Their faults
-      // propagate instead of vanishing: the state change is durable.
-      if (fx is not null) foreach (var f in fx) f();
+      // (staged audits, bumps, hub revocations) run only now. The state
+      // change is durable: effect faults surface as PostCommitException so no
+      // caller can mistake them for a rolled-back unit.
+      if (fx is not null)
+      {
+        List<Exception>? fxErrs = null;
+        foreach (var f in fx) { try { f(); } catch (Exception fex) { fxErrs ??= new List<Exception>(); fxErrs.Add(fex); } }
+        if (fxErrs is not null) throw new PostCommitException("Store-bound unit committed, but a post-commit effect failed; prior state was NOT restored.", fxErrs.Count == 1 ? fxErrs[0] : new AggregateException(fxErrs));
+      }
       return result;
     }
     catch (Exception ex)
@@ -270,7 +285,14 @@ public static class Atomic
     UnitState st = UnitStates.GetOrCreateValue(s);
     bool inside;
     lock (UnitGate) { inside = st.Depth > 0 && st.OwnerThread == Environment.CurrentManagedThreadId; }
-    if (inside) Defer(s, effect); else effect();
+    if (inside) { Defer(s, effect); return; }
+    // Persistent foreign/outside-unit effects coordinate with the root gate
+    // instead of racing an owning unit: the gate is held for the whole
+    // effect, so a concurrent owning unit either completes (commit or
+    // rollback) first or queues behind this effect. The effect NEVER joins
+    // the foreign unit snapshot/deferred set, so an unrelated rollback
+    // cannot erase it and it cannot poison the foreign commit.
+    lock (s.RootGate) { effect(); }
   }
 
   // Rollback compensation for non-EF in-process state (e.g. session removal):

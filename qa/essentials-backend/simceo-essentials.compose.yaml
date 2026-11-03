@@ -1,0 +1,49 @@
+# Persistent HUMAN essentials stack (reviewable, NOT run by agents).
+# Project simceo-essentials with NEW volumes: the stopped production volume
+# sim_ceo_pgdata (unknown older user data) is never touched, mounted, or
+# overwritten by this stack. db + app ONLY: no optional services.
+name: simceo-essentials
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: simceo
+      POSTGRES_USER: simceo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}
+    volumes:
+      - simceo_essentials_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simceo -d simceo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  app:
+    # Context is the MAIN repo root (four hops from this file); the human
+    # persistent app builds from MAIN, not from any review worktree.
+    build:
+      context: ../../../..
+      dockerfile: Dockerfile
+    image: simceo-essentials-app:1.0.0
+    # Only the needed vars enter the container (values interpolated from
+    # MAIN .env via the helper --env-file flag; never committed).
+    environment:
+      USE_POSTGRES: "1"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}
+      META_API_KEY: ${META_API_KEY:-}
+      META_API_BASE: ${META_API_BASE:-}
+      CONNECTIONSTRINGS__APP: "Host=db;Port=5432;Database=simceo;Username=simceo;Password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}"
+      ASPNETCORE_ENVIRONMENT: Production
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["5080:5080"]
+    volumes:
+      - simceo_essentials_appdata:/app/data
+    # The image HEALTHCHECK (wget) was verified absent from the aspnet
+    # runtime (no wget/curl/python3); host-side polling in the helper script
+    # is the readiness gate until the Dockerfile proposal is accepted.
+    healthcheck:
+      disable: true
+volumes:
+  simceo_essentials_pgdata:
+  simceo_essentials_appdata:

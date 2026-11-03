@@ -484,6 +484,10 @@ public static class OpsEndpoints
       // round-trip byte-identically (modulo the fresh export timestamp).
       // Coherent capture: the whole graph is read under the shared serialization gate.
       object snapshot;
+      string json;
+      // Serialize INSIDE the shared serialization gate: the snapshot holds
+      // live entity references, so serializing after lock release could emit
+      // a mixed graph torn by a concurrent mutator.
       lock (s.SetupLock) { lock (s.MessageLock) {
       snapshot = new
       {
@@ -509,8 +513,8 @@ public static class OpsEndpoints
         secretaryRequests = s.SecretaryRequests.Values.OrderBy(x => x.Id).ToList(),
         noteHistories = s.NoteHistories.Values.OrderBy(x => x.Id).ToList(),
       };
+      json = JsonSerializer.Serialize(snapshot);
       } }
-      var json = JsonSerializer.Serialize(snapshot);
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)), bytes = json.Length });
     });
 
@@ -532,6 +536,9 @@ public static class OpsEndpoints
       JsonDocument doc;
       try { doc = JsonDocument.Parse(snapshot); }
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
+      // Controlled wrong-type root: an array/string/number/null root is a
+      // 400 here, never a 500 from TryGetProperty on a non-object.
+      if (doc.RootElement.ValueKind != JsonValueKind.Object) return Results.BadRequest("snapshot is not a JSON object.");
       if (!doc.RootElement.TryGetProperty("version", out var v) || v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vv) || vv is not (1 or 2 or 3 or 4))
         return Results.BadRequest("Unsupported backup version.");
       BackupSnapshot? restored;
@@ -620,10 +627,27 @@ public static class OpsEndpoints
           {
             restoredCount = Atomic.Run(s, () =>
             {
+              // Fresh authority INSIDE the unit, BEFORE any Clear: a logout
+              // or permission change during pre-validation fails closed here.
+              // There is no admin fallback for an invalid request: a blank
+              // or logged-out held request must never restore.
+              string restoreAdmin;
+              if (PeopleOps.IsSecure(s))
+              {
+                if (!AuthOps.TrySession(s, req, out var radmIn))
+                  throw new RestoreAuthException(401, "Authentication required.");
+                var admNow = PeopleOps.AdminEmail(s);
+                if (string.IsNullOrWhiteSpace(admNow) || !string.Equals(admNow, radmIn, StringComparison.OrdinalIgnoreCase))
+                  throw new RestoreAuthException(403, "Only the installation admin can restore backups.");
+                restoreAdmin = radmIn;
+              }
+              else
+              {
+                if (!PeopleOps.IsOwner(req))
+                  throw new RestoreAuthException(403, "Only the owner can restore backups.");
+                restoreAdmin = PeopleOps.UserOf(s, req);
+              }
               var priorBoards = s.Boards.Values.ToDictionary(b => b.Id, b => (b.OwnerKey, b.AccessEnforced));
-              string restoreAdmin = "";
-              try { if (PeopleOps.IsSecure(s)) { if (AuthOps.TrySession(s, req, out var radm)) restoreAdmin = radm; } else restoreAdmin = PeopleOps.UserOf(s, req); } catch { }
-              if (string.IsNullOrWhiteSpace(restoreAdmin)) { try { restoreAdmin = PeopleOps.AdminEmail(s) ?? ""; } catch { } }
               s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
               s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
               s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
@@ -739,6 +763,11 @@ public static class OpsEndpoints
             // No manual restore here: the store-bound unit above already
             // restored exact deep state (memory mode) or rolled back the PG
             // transaction. A shallow re-fill would reintroduce shared row refs.
+            // Honest outcome mapping: authority failures carry their own
+            // status; a post-commit effect failure means the restore COMMITTED
+            // (never claim prior state was restored for it).
+            if (__ex is RestoreAuthException rae) return Results.Json(new { error = rae.Message }, statusCode: rae.Status);
+            if (__ex is SimCEO.Api.Data.PostCommitException pce) return Results.Json(new { error = "Restore committed; a post-commit effect failed: " + pce.Message }, statusCode: 500);
             if (__ex is AggregateException) return Results.Json(new { error = "Restore failed and rollback is uncertain; prior state may be partial: " + __ex.Message }, statusCode: 500);
             return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
           }
@@ -945,17 +974,17 @@ public static class OpsEndpoints
       else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
       var now = DateTime.UtcNow;
       var (known, unknown) = ModelGateway.MonthSpend(s);
-      var cap = s.Spend.MonthlyCapUsd;
+      var (cap, spendMode) = PolicyStore.ReadSpend(s);
       var storageMode = Pg.Backend is null ? "memory-session-lifetime" : "postgres-durable";
       return Results.Ok(new
       {
         month = now.ToString("yyyy-MM"),
         monthlyCapUsd = cap,
-        mode = s.Spend.Mode,
+        mode = spendMode,
         knownSpendUsd = known,
         unknownCostCalls = unknown,
         overCap = cap.HasValue && known >= cap.Value,
-        enforced = s.Spend.Mode == "block" && cap.HasValue,
+        enforced = spendMode == "block" && cap.HasValue,
         note = unknown > 0
           ? "Some calls have unknown cost (unpriced models or unobservable units); enforcement counts known costs only. Costs are ESTIMATES, not provider invoices."
           : "All recorded costs known. Costs are ESTIMATES, not provider invoices.",
@@ -983,9 +1012,28 @@ public static class OpsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can change spending controls." }, statusCode: 403);
-      lock (s.SpendLock)
+      // Parse + type-validate the FULL payload first: a bad mode value
+      // or a non-numeric cap fails 400 with zero state change. Unknown mode
+      // wording is rejected honestly instead of silently keeping the old mode.
+      decimal? newCap = null; var capPresent = false;
+      string? newMode = null; var modePresent = false;
+      if (body.TryGetProperty("monthlyCapUsd", out var pc))
       {
-        IResult gateErrSp = null;
+        if (pc.ValueKind != JsonValueKind.Number && pc.ValueKind != JsonValueKind.Null)
+          return Results.BadRequest("monthlyCapUsd must be a number or null.");
+        capPresent = true;
+        newCap = pc.ValueKind == JsonValueKind.Number ? pc.GetDecimal() : null;
+      }
+      if (body.TryGetProperty("mode", out var pm))
+      {
+        if (pm.ValueKind != JsonValueKind.String)
+          return Results.BadRequest("mode must be \"warn\" or \"block\".");
+        var mv = (pm.GetString() ?? "").Trim();
+        if (mv != "warn" && mv != "block") return Results.BadRequest("Unknown spending mode.");
+        modePresent = true; newMode = mv;
+      }
+      {
+        IResult? gateErrSp = null;
         Atomic.Run(s, () =>
         {
           if (PeopleOps.IsSecure(s))
@@ -995,18 +1043,25 @@ public static class OpsEndpoints
             if (string.IsNullOrWhiteSpace(admSpIn) || !string.Equals(admSpIn, sppIn, StringComparison.OrdinalIgnoreCase)) { gateErrSp = Results.Json(new { error = "Only the installation admin can change spending controls." }, statusCode: 403); return; }
           }
           else if (!PeopleOps.IsOwner(req)) { gateErrSp = Results.Json(new { error = "Only the owner can change spending controls." }, statusCode: 403); return; }
-          if (body.TryGetProperty("monthlyCapUsd", out var c))
-          s.Spend.MonthlyCapUsd = c.ValueKind == JsonValueKind.Number ? c.GetDecimal()
-            : c.ValueKind == JsonValueKind.Null ? null : s.Spend.MonthlyCapUsd;
-        if (body.TryGetProperty("mode", out var m) && m.GetString() is { } mode
-            && (mode == "warn" || mode == "block"))
-          s.Spend.Mode = mode;
-          Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { s.Spend.MonthlyCapUsd, s.Spend.Mode }) });
+          var (curCap, curMode) = PolicyStore.ReadSpend(s);
+          var wantCap = capPresent ? newCap : curCap;
+          var wantMode = modePresent ? newMode! : (string.IsNullOrWhiteSpace(curMode) ? "warn" : curMode);
+          PolicyStore.WriteSpend(s, wantCap, wantMode);
+          Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { MonthlyCapUsd = wantCap, Mode = wantMode }) });
         });
         if (gateErrSp is not null) return gateErrSp;
-        return Results.Ok(new { s.Spend.MonthlyCapUsd, s.Spend.Mode });
+        var (finCap, finMode) = PolicyStore.ReadSpend(s);
+        return Results.Ok(new { MonthlyCapUsd = finCap, Mode = finMode });
       }
     });
+  }
+
+  // Thrown inside the restore unit when fresh authority fails: maps to 401
+  // (session dead) or 403 (not admin/owner) with NO admin fallback, so a
+  // blank or logged-out held request can never restore.
+  private sealed class RestoreAuthException(int status, string message) : Exception(message)
+  {
+    public int Status => status;
   }
 
   // Deep restore-graph validation: every collection entry present, IDs unique,

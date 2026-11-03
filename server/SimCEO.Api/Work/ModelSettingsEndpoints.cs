@@ -23,16 +23,18 @@ public static class ModelSettingsEndpoints
         var isAdmMs = !string.IsNullOrWhiteSpace(admMs) && string.Equals(admMs, ms, StringComparison.OrdinalIgnoreCase);
         if (!isAdmMs) return PeopleOps.Denied();
       }
-      var key = !string.IsNullOrWhiteSpace(s.ModelApiKeyOverride)
-        ? s.ModelApiKeyOverride
+      var storedKey = PolicyStore.ReadApiKey(s);
+      var storedChat = PolicyStore.ReadChatModel(s);
+      var key = !string.IsNullOrWhiteSpace(storedKey)
+        ? storedKey
         : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
-      var model = !string.IsNullOrWhiteSpace(s.ModelChatOverride) ? s.ModelChatOverride : ModelPolicy.SparkStandard;
+      var model = !string.IsNullOrWhiteSpace(storedChat) ? storedChat : ModelPolicy.SparkStandard;
       return Results.Ok(new
       {
         configured = !string.IsNullOrWhiteSpace(key),
-        source = !string.IsNullOrWhiteSpace(s.ModelApiKeyOverride) ? "settings" : (!string.IsNullOrWhiteSpace(key) ? "env" : "none"),
+        source = !string.IsNullOrWhiteSpace(storedKey) ? "settings" : (!string.IsNullOrWhiteSpace(key) ? "env" : "none"),
         model,
-        chatOverride = s.ModelChatOverride,
+        chatOverride = storedChat,
         keyHint = string.IsNullOrWhiteSpace(key) ? "" : (key.Length <= 4 ? "set" : string.Concat("...", key.Substring(key.Length - 4))),
         lastTestAt = s.ModelLastTestAt,
         lastTestOk = s.ModelLastTestOk,
@@ -54,24 +56,40 @@ public static class ModelSettingsEndpoints
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403);
       var allowed = new[] { ModelPolicy.SparkStandard, ModelPolicy.SparkContributor, ModelPolicy.Wonder };
-      lock (s.ModelLock)
+      // Parse + type-validate the FULL payload first: no partial mutation on
+      // bad input, and unknown wording fails honestly instead of silently
+      // keeping old values.
+      string? newKey = null; var keyPresent = false;
+      string? newChat = null; var chatPresent = false;
+      if (body.TryGetProperty("apiKey", out var k))
       {
-        if (body.TryGetProperty("apiKey", out var k) && k.ValueKind == JsonValueKind.String)
-        {
-          s.ModelApiKeyOverride = (k.GetString() ?? string.Empty).Trim();
-          Atomic.Audit(s, new AuditEvent { Action = "model.key-set", Detail = "override " + (string.IsNullOrWhiteSpace(s.ModelApiKeyOverride) ? "cleared" : "updated") });
-        }
-        if (body.TryGetProperty("chatModel", out var m) && m.ValueKind == JsonValueKind.String)
-        {
-          var v = (m.GetString() ?? string.Empty).Trim();
-          if (v.Length > 0 && !allowed.Contains(v)) return Results.BadRequest("Unknown chat model.");
-          s.ModelChatOverride = v;
-          Atomic.Audit(s, new AuditEvent { Action = "model.chat-set", Detail = string.IsNullOrWhiteSpace(v) ? "default" : v });
-        }
-        s.ModelLastTestAt = null;
-        s.ModelLastTestOk = false;
-        s.ModelLastTestError = string.Empty;
+        if (k.ValueKind != JsonValueKind.String) return Results.BadRequest("apiKey must be a string.");
+        keyPresent = true; newKey = (k.GetString() ?? string.Empty).Trim();
       }
+      if (body.TryGetProperty("chatModel", out var cm))
+      {
+        if (cm.ValueKind != JsonValueKind.String) return Results.BadRequest("chatModel must be a string.");
+        chatPresent = true; newChat = (cm.GetString() ?? string.Empty).Trim();
+        if (newChat.Length > 0 && !allowed.Contains(newChat)) return Results.BadRequest("Unknown chat model.");
+      }
+      IResult? setGuardErr = null;
+      Atomic.Run(s, () =>
+      {
+        // Fresh authority INSIDE the mutation unit (not just the outer check).
+        if (PeopleOps.IsSecure(s))
+        {
+          if (!AuthOps.TrySession(s, req, out var ssIn)) { setGuardErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+          var admIn = PeopleOps.AdminEmail(s);
+          if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, ssIn, StringComparison.OrdinalIgnoreCase)) { setGuardErr = Results.Json(new { error = "Only the installation admin can change model settings." }, statusCode: 403); return; }
+        }
+        else if (!PeopleOps.IsOwner(req)) { setGuardErr = Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403); return; }
+        var effKey = keyPresent ? newKey! : PolicyStore.ReadApiKey(s);
+        var effChat = chatPresent ? newChat! : PolicyStore.ReadChatModel(s);
+        PolicyStore.WriteConnection(s, effKey, effChat);
+        if (keyPresent) Atomic.Audit(s, new AuditEvent { Action = "model.key-set", Detail = "override " + (string.IsNullOrWhiteSpace(effKey) ? "cleared" : "updated") });
+        if (chatPresent) Atomic.Audit(s, new AuditEvent { Action = "model.chat-set", Detail = string.IsNullOrWhiteSpace(effChat) ? "default" : effChat });
+      });
+      if (setGuardErr is not null) return setGuardErr;
       return Results.Ok(new { ok = true });
     });
 
@@ -88,7 +106,8 @@ public static class ModelSettingsEndpoints
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can test the model connection." }, statusCode: 403);
       var gw = new ModelGateway(s);
-      var model = !string.IsNullOrWhiteSpace(s.ModelChatOverride) ? s.ModelChatOverride : ModelPolicy.SparkStandard;
+      var chatNow = PolicyStore.ReadChatModel(s);
+      var model = !string.IsNullOrWhiteSpace(chatNow) ? chatNow : ModelPolicy.SparkStandard;
       var sw = System.Diagnostics.Stopwatch.StartNew();
       try
       {
@@ -111,6 +130,10 @@ public static class ModelSettingsEndpoints
           s.ModelLastTestModel = model;
         }
         Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + kind + ")" });
+        // No client secret is ever returned; an unconfigured provider is 503
+        // (unavailable), not a silent 200-false.
+        if (ex is ProviderNotConfiguredException)
+          return Results.Json(new { ok = false, model, error = err }, statusCode: 503);
         return Results.Ok(new { ok = false, model, error = err });
       }
       sw.Stop();

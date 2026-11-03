@@ -35,7 +35,8 @@ public static class ModelPolicy
     if (boardId.HasValue && store.Boards.TryGetValue(boardId.Value, out var b)
         && string.Equals(LeadSetup.EffectiveDataUse(store, b), "standard", StringComparison.OrdinalIgnoreCase))
       return SparkStandard;
-    if (!string.IsNullOrWhiteSpace(store.ModelChatOverride)) return store.ModelChatOverride;
+    var chatOverride = PolicyStore.ReadChatModel(store);
+    if (!string.IsNullOrWhiteSpace(chatOverride)) return chatOverride;
     if (boardId.HasValue && store.Boards.TryGetValue(boardId.Value, out var b2)
         && string.Equals(LeadSetup.EffectiveDataUse(store, b2), "contributor", StringComparison.OrdinalIgnoreCase))
       return SparkContributor;

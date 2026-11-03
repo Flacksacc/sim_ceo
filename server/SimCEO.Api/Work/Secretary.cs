@@ -1122,6 +1122,7 @@ return null;
           if (fresh.AttemptId != myAttempt) return Results.Conflict("Secretary request moved on; retry.");
           if (fresh.Status != "inflight") return Results.Conflict("Secretary request moved on; retry.");
           if (!s.Meetings.TryGetValue(id, out var cur)) return Results.Conflict("Meeting moved on; draft discarded.");
+          if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) { fresh.Status = "failed"; fresh.Error = "Session expired during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
           if (!PeopleOps.Can(s, req, cur.BoardId, id, "contribute")) { fresh.Status = "failed"; fresh.Error = "Access revoked during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
           if (cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) { fresh.Status = "discarded"; fresh.Error = "Meeting state changed during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Meeting state changed during secretary work; draft discarded." }, statusCode: 409); }
           var nowSnap = SecretaryContext.CaptureSnapshot(s, cur, SecretaryDirect.RehydrateRawCallerRefs(fresh.CallerRefsJson));
@@ -1415,6 +1416,7 @@ return null;
           if (fresh2.AnswerAttemptId != myAnsAttempt) return Results.Conflict("Secretary request moved on; retry.");
           if (fresh2.Status != "answering") return Results.Conflict("Secretary request moved on; retry.");
           if (!s.Meetings.TryGetValue(id, out var cur2)) return Results.Conflict("Meeting moved on; draft discarded.");
+          if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) { fresh2.Status = "needs-clarification"; fresh2.Error = "Session expired during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
           if (!PeopleOps.Can(s, req, cur2.BoardId, id, "contribute")) { fresh2.Status = "needs-clarification"; fresh2.Error = "Access revoked during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
           if (cur2.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) { fresh2.Status = "discarded"; fresh2.Error = "Meeting state changed; draft discarded."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Meeting state changed; draft discarded." }, statusCode: 409); }
           var nowSnap2 = SecretaryContext.CaptureSnapshot(s, cur2, SecretaryDirect.RehydrateRawCallerRefs(fresh2.CallerRefsJson));
