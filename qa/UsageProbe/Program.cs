@@ -387,6 +387,107 @@ static class UsageProbe
       try { await gw.GenerateImagesAsync("QA-IMG-IDONLY probe", 1); } catch (ProviderException) { threw = true; }
       Check("img-idonly-id", threw && store.Usage.First().ProviderCallId == "qa-img-failed-7", store.Usage.First().ProviderCallId ?? "null");
     }
+    // Mixed malformed output preserves observed search with null total (all paths)
+    foreach (var tag in new[] { "QA-RESP-MIXED-AFTER", "QA-RESP-MIXED-BEFORE" })
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      string mtext = "";
+      bool threw = false;
+      try { var gr = await gw.CompleteGroundedAsync("muse-spark-1.3", "advisor-research", "probe " + tag + " prompt", 100, 512); mtext = gr.Text; }
+      catch (ProviderException) { threw = true; }
+      Check("mix-" + tag + "-success", !threw && mtext.Contains("QA line one"), "threw=" + threw + " text=" + mtext);
+      var row = store.Usage.First();
+      Check("mix-" + tag + "-observed-null", row.Cost == null && row.SearchCalls == 1 && row.RanSearch && row.Status == "succeeded", (row.Cost == null ? "null" : row.Cost.Value.ToString()) + "/s=" + row.SearchCalls + "/" + row.Status);
+    }
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      bool threw = false;
+      try { await gw.CompleteGroundedAsync("muse-spark-1.3", "advisor-research", "probe QA-RESP-INCOMPLETE-MIXED prompt", 100, 512); }
+      catch (ProviderException) { threw = true; }
+      var row = store.Usage.First();
+      Check("mix-inc-observed-null", threw && row.Cost == null && row.SearchCalls == 1 && row.RanSearch && row.Status == "incomplete", (row.Cost == null ? "null" : row.Cost.Value.ToString()) + "/s=" + row.SearchCalls + "/" + row.Status);
+    }
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      bool threw = false;
+      try { await gw.CompleteGroundedAsync("muse-spark-1.3", "advisor-research", "probe QA-RESEARCHERR-MIXED prompt", 100, 512); }
+      catch (ProviderException) { threw = true; }
+      var row = store.Usage.First();
+      Check("mix-err-observed-null", threw && row.Cost == null && row.SearchCalls == 1 && row.RanSearch && row.ProviderCallId == "qa-resp-errmix-1", (row.ProviderCallId ?? "null") + "/s=" + row.SearchCalls);
+    }
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      bool threw = false;
+      try { await gw.CompleteGroundedAsync("muse-spark-1.3", "advisor-research", "probe QA-RESEARCHERR-PREFIX-OVER prompt", 100, 512); }
+      catch (ProviderException) { threw = true; }
+      var row = store.Usage.First();
+      Check("prefix-over-unknown", threw && row.Cost == null && row.SearchCalls == 1 && row.RanSearch && row.ProviderCallId == "qa-resp-prefix-1", (row.ProviderCallId ?? "null") + "/s=" + row.SearchCalls);
+    }
+    // Realistic large images succeed with known cost and real bytes
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      var imgs = await gw.GenerateImagesAsync("QA-IMG-BIGPNG probe", 1);
+      Check("img-bigpng-ok", imgs.Count == 1 && imgs[0].Length > 131072, "count=" + imgs.Count);
+      var row = store.Usage.First();
+      Check("img-bigpng-known", row.Cost != null && row.Cost.Value == 0.01m && row.Status == "succeeded", (row.Cost == null ? "null" : row.Cost.Value.ToString()));
+    }
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      var imgs = await gw.GenerateImagesAsync("QA-IMG-BIGJPEG probe", 1);
+      Check("img-bigjpg-ok", imgs.Count == 1 && imgs[0].Length > 1000, "count=" + imgs.Count);
+      var row = store.Usage.First();
+      Check("img-bigjpg-known", row.Cost != null && row.Cost.Value == 0.01m && row.Status == "succeeded", (row.Cost == null ? "null" : row.Cost.Value.ToString()));
+    }
+    // Signature-only / truncated / bad-dims rejected with IDs
+    foreach (var tag in new[] { "QA-IMG-SIGONLY-PNG", "QA-IMG-TRUNC", "QA-IMG-BADDIMS" })
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      bool threw = false;
+      try { await gw.GenerateImagesAsync(tag + " probe", 1); } catch (ProviderException) { threw = true; }
+      var row = store.Usage.First();
+      Check("imgneg-" + tag + "-unknown", threw && row.Cost == null, "cost known");
+    }
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      bool threw = false;
+      try { await gw.GenerateImagesAsync("QA-IMG-OVER probe", 1); } catch (ProviderException ex) { threw = ex.Message.Contains("oversized"); }
+      Check("img-over-safe", threw, "no oversized failure");
+      Check("img-over-unknown", store.Usage.First().Cost == null, "cost known");
+    }
+    // ASR malformed JSON: canary-free ledger and error
+    {
+      AsrMode = "badjson";
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      string em = "";
+      bool threw = false;
+      try { await gw.TranscribeAsync(new byte[] { 1, 2, 3 }, "audio/webm", "mic.webm", CancellationToken.None); }
+      catch (ProviderException ex) { threw = true; em = ex.Message; }
+      Check("asr-badjson-throws", threw, "no throw");
+      Check("asr-badjson-redacted", !em.Contains("QA-CANARY"), em.Substring(0, Math.Min(200, em.Length)));
+      Check("asr-badjson-ledger-clean", !JsonSerializer.Serialize(store.Usage.First()).Contains("QA-CANARY"), "canary in ledger");
+      AsrMode = "absent";
+    }
+    // Duplicate/null billing names: unknown with successful text delivery
+    foreach (var tag in new[] { "QA-USAGE-DUP-PROMPT", "QA-USAGE-DUP-CACHED", "QA-USAGE-NULL-DETAILS", "QA-USAGE-NULL-INPUT-DETAILS" })
+    {
+      var store = new InMemoryStore();
+      var gw = new ModelGateway(store);
+      string txt = "";
+      bool threw = false;
+      try { txt = await gw.CompleteAsync("muse-spark-1.3", "model-test", "Reply with exactly: OK " + tag + " probe", 100, 512); }
+      catch (ProviderException) { threw = true; }
+      var row = store.Usage.First();
+      Check("dup2-" + tag + "-unknown", !threw && txt == "OK" && row.Cost == null && row.Status == "succeeded", "threw=" + threw);
+    }
     if (args.Contains("--pg"))
     {
       string pgCs = Environment.GetEnvironmentVariable("QA_PG_CS") ?? "Host=127.0.0.1;Port=5106;Database=simceo;Username=simceo;Password=simceo-dev-only";
@@ -444,8 +545,19 @@ static class UsageProbe
         Check("pg-fail2-no-new-calls", PgIdsC().SetEquals(cIdsBefore2), "call ids changed");
         Check("pg-fail2-rolled-back", realBackend.All<UsageRow>().Count == uIdsBefore2.Count && realBackend.All<ModelCall>().Count == cIdsBefore2.Count, "db changed");
         Pg.Backend = realBackend;
+        // Context usable BEFORE the real deferred COMMIT test (mutation allowed here; none after).
+        {
+          var uBeforeOk = PgIdsU();
+          var okStore = new InMemoryStore();
+          var okGw = new ModelGateway(okStore);
+          string okText = await okGw.CompleteAsync("muse-spark-1.3", "model-test", "Reply with exactly: OK pg-before-commit", 100, 512);
+          var okNew = realBackend.All<UsageRow>().Where(r => !uBeforeOk.Contains(r.Id)).ToList();
+          Check("pg-context-usable", okText == "OK" && okNew.Count == 1, okText + " new=" + okNew.Count);
+        }
         // REAL deferred COMMIT failure through actual ModelGateway RecordFull: one pair, one attempt, exact IDs, no ghosts.
         // Deferred constraint trigger fires at COMMIT (after successful SaveChanges), proving rollback of both rows.
+        // This is the LAST mutating-adjacent PG test: after it, only reads + evidence + trigger cleanup run in-process;
+        // the actual API-process restart and absence/preservation verification happen outside this process.
         Guid commitSentinel = Guid.NewGuid();
         try
         {
@@ -463,88 +575,85 @@ static class UsageProbe
         var uIdsBeforeC = PgIdsU();
         var cIdsBeforeC = PgIdsC();
         int hitsBeforeC = ChatHits;
-        // snapshot a previous row's exact bytes for restart-exactness
-        string prevRowJson = "";
-        Guid prevRowId = Guid.Empty;
+        string snapU = "";
+        string snapC = "";
         try
         {
-          var prevRow = realBackend.All<UsageRow>().OrderByDescending(r => r.At).FirstOrDefault();
-          if (prevRow is not null) { prevRowId = prevRow.Id; prevRowJson = JsonSerializer.Serialize(new { prevRow.Id, prevRow.Kind, prevRow.Model, prevRow.InputTokens, prevRow.OutputTokens, prevRow.CachedInputTokens, prevRow.SearchCalls, prevRow.Status, prevRow.ProviderCallId, prevRow.Cost, prevRow.CostBasis, prevRow.BoardId, prevRow.MeetingId }); }
+          var allU = realBackend.All<UsageRow>().OrderBy(r => r.Id).ToList();
+          var allC = realBackend.All<ModelCall>().OrderBy(c => c.Id).ToList();
+          snapU = JsonSerializer.Serialize(allU.Select(r => new { r.Id, r.Kind, r.Model, r.InputTokens, r.OutputTokens, r.CachedInputTokens, r.SearchCalls, r.LatencyMs, r.RanSearch, r.Status, r.ProviderCallId, r.Cost, r.CostBasis, r.BoardId, r.MeetingId, r.At, r.Note }));
+          snapC = JsonSerializer.Serialize(allC.Select(c => new { c.Id, c.Model, c.Purpose, c.InputTokens, c.OutputTokens, c.CachedInputTokens, c.LatencyMs, c.RanSearch, c.SearchCalls, c.ProviderCallId, c.Status, c.Cost, c.CostBasis, c.BoardId, c.MeetingId, c.SearchNote, c.At }));
         }
-        catch { }
-        var countCommit = new FailBackend(realBackend) { FailOnUpsert = -1 };
-        Pg.Backend = countCommit;
+        catch (Exception ex) { Check("pg-commit-snapshot", false, ex.GetType().Name + ": " + ex.Message); }
+        var recordCommit = new FailBackend(realBackend) { FailOnUpsert = -1 };
+        Pg.Backend = recordCommit;
         bool threwCommit = false;
         bool isStorageErr = false;
-        string commitInner = "";
+        string commitSqlState = "";
+        string commitTrigger = "";
+        string commitStage = "";
         try
         {
           var commitStore = new InMemoryStore();
           var commitGw = new ModelGateway(commitStore);
           await commitGw.CompleteAsync("muse-spark-1.3", "model-test", "Reply with exactly: OK pg-commit-real", 100, 512, CancellationToken.None, false, commitSentinel, null);
         }
-        catch (UsageStorageException ex) { threwCommit = true; isStorageErr = true; commitInner = (ex.InnerException?.ToString() ?? "") + "|" + ex.ToString(); }
-        catch (Exception ex) { Check("pg-commit-type", false, ex.GetType().Name + ": " + ex.Message); threwCommit = true; commitInner = ex.ToString(); }
+        catch (UsageStorageException ex)
+        {
+          threwCommit = true; isStorageErr = true;
+          for (var e = (Exception?)ex; e != null; e = e.InnerException)
+          {
+            if (e is Npgsql.PostgresException pg)
+            {
+              commitSqlState = pg.SqlState ?? "";
+              var m = pg.Message ?? "";
+              if (m.Contains("qa_usage_commit_fail") || m.Contains("qa injected commit failure")) commitTrigger = "qa_usage_commit_fail";
+            }
+          }
+          commitStage = commitSqlState == "P0001" && commitTrigger == "qa_usage_commit_fail" ? "commit" : "unknown";
+        }
+        catch (Exception ex) { Check("pg-commit-type", false, ex.GetType().Name + ": " + ex.Message); threwCommit = true; }
         Pg.Backend = realBackend;
         Check("pg-commit-fails", threwCommit && isStorageErr, "no UsageStorageException from deferred COMMIT");
-        Check("pg-commit-inner-cause", commitInner.Contains("COMMIT"), "inner missing deferred COMMIT stage: " + commitInner.Substring(0, Math.Min(200, commitInner.Length)));
-        Check("pg-commit-attempts", countCommit.Upserts == 2, "upserts=" + countCommit.Upserts + " want 2 (one pair, no retry/second finalization)");
+        Check("pg-commit-typed-cause", commitSqlState == "P0001" && commitTrigger == "qa_usage_commit_fail", "sqlState=" + commitSqlState + " trigger=" + commitTrigger);
+        Check("pg-commit-stage", commitStage == "commit", "stage=" + commitStage + " (want deferred-COMMIT, not SaveChanges)");
+        Check("pg-commit-attempts", recordCommit.Upserts == 2, "upserts=" + recordCommit.Upserts + " want 2 (one pair, no retry/second finalization)");
+        var attemptedIds = recordCommit.Attempted.Select(a => a.Id).Distinct().ToList();
+        Check("pg-commit-attempted-pair", recordCommit.Attempted.Count == 2 && attemptedIds.Count == 1 && attemptedIds[0] != Guid.Empty, "attempts=" + string.Join(",", recordCommit.Attempted.Select(a => a.Table + ":" + a.Id)));
         Check("pg-commit-single-dispatch", ChatHits == hitsBeforeC + 1, "hits delta=" + (ChatHits - hitsBeforeC) + " want exactly 1");
         var uIdsAfterC = PgIdsU();
         var cIdsAfterC = PgIdsC();
         Check("pg-commit-no-new-usage", uIdsAfterC.SetEquals(uIdsBeforeC), "usage ids changed");
         Check("pg-commit-no-new-calls", cIdsAfterC.SetEquals(cIdsBeforeC), "call ids changed");
         Check("pg-commit-no-ghost", uIdsAfterC.Count == uIdsBeforeC.Count && cIdsAfterC.Count == cIdsBeforeC.Count, "ghost rows visible");
-        // raw SQL absence by sentinel board id
+        // raw SQL absence by the exact attempted pair ID (parameterized), both tables
         try
         {
           using var rawConn = new Npgsql.NpgsqlConnection(pgCs);
           await rawConn.OpenAsync();
-          using var rawCmd = new Npgsql.NpgsqlCommand("SELECT count(*) FROM \"UsageRows\" WHERE \"BoardId\" = '" + commitSentinel.ToString() + "'; SELECT count(*) FROM \"ModelCalls\" WHERE \"BoardId\" = '" + commitSentinel.ToString() + "';", rawConn);
-          using var rawR = await rawCmd.ExecuteReaderAsync();
           int cu = -1, cm = -1;
-          if (await rawR.ReadAsync()) cu = rawR.GetInt32(0);
-          if (await rawR.NextResultAsync() && await rawR.ReadAsync()) cm = rawR.GetInt32(0);
-          Check("pg-commit-raw-absent", cu == 0 && cm == 0, "usage=" + cu + " calls=" + cm);
+          using (var rawCmd = new Npgsql.NpgsqlCommand("SELECT count(*) FROM \"UsageRows\" WHERE \"Id\" = @id", rawConn))
+          {
+            rawCmd.Parameters.AddWithValue("id", attemptedIds.Count == 1 ? attemptedIds[0] : Guid.Empty);
+            cu = Convert.ToInt32(await rawCmd.ExecuteScalarAsync());
+          }
+          using (var rawCmd2 = new Npgsql.NpgsqlCommand("SELECT count(*) FROM \"ModelCalls\" WHERE \"Id\" = @id", rawConn))
+          {
+            rawCmd2.Parameters.AddWithValue("id", attemptedIds.Count == 1 ? attemptedIds[0] : Guid.Empty);
+            cm = Convert.ToInt32(await rawCmd2.ExecuteScalarAsync());
+          }
+          Check("pg-commit-raw-absent", cu == 0 && cm == 0, "usage=" + cu + " calls=" + cm + " id=" + (attemptedIds.Count == 1 ? attemptedIds[0].ToString() : "none"));
         }
         catch (Exception ex) { Check("pg-commit-raw-absent", false, ex.GetType().Name + ": " + ex.Message); }
-        // Original backend usable BEFORE fresh rewire (no rewire needed for recovery).
+        // evidence for the out-of-process actual-restart verification (no rewire here)
         try
         {
-          var preStore = new InMemoryStore();
-          var preGw = new ModelGateway(preStore);
-          var preIds = PgIdsU();
-          string preText = await preGw.CompleteAsync("muse-spark-1.3", "model-test", "Reply with exactly: OK pg-before-rewire", 100, 512);
-          var postIds = PgIdsU();
-          var preNew = postIds.Except(preIds).ToList();
-          Check("pg-original-usable", preText == "OK" && preNew.Count == 1, preText + " new=" + preNew.Count);
-          // remove the pre-rewire row? No: keep it; record its id so restart expects it.
-          uIdsBeforeC = PgIdsU();
-          cIdsBeforeC = PgIdsC();
+          var ev = new { attemptedIds = attemptedIds.Select(g => g.ToString()).ToList(), sqlState = commitSqlState, trigger = commitTrigger, stage = commitStage, usageRows = snapU, modelCalls = snapC, usageCount = uIdsAfterC.Count, callCount = cIdsAfterC.Count, chatHits = ChatHits };
+          System.IO.Directory.CreateDirectory(".tmp/phase9");
+          System.IO.File.WriteAllText(".tmp/phase9/commit-proof.json", JsonSerializer.Serialize(ev));
+          Check("pg-commit-evidence", attemptedIds.Count == 1 && snapU.Length > 2 && snapC.Length > 2, "evidence incomplete");
         }
-        catch (Exception ex) { Check("pg-original-usable", false, ex.GetType().Name + ": " + ex.Message); }
-        // Restart (rewire) still absent failed IDs and keeps previous row bytes exact.
-        try
-        {
-          if (SimCEO.Postgres.PgBoot.TryWire(pgCs, out var werrC))
-          {
-            var freshC = new InMemoryStore();
-            var freshU = new System.Collections.Generic.HashSet<Guid>(freshC.Usage.Select(r => r.Id));
-            var freshM = new System.Collections.Generic.HashSet<Guid>(freshC.ModelCalls.Select(c => c.Id));
-            Check("pg-commit-restart-clean", !freshU.Contains(commitSentinel) && freshU.SetEquals(uIdsBeforeC) && freshM.SetEquals(cIdsBeforeC), "ghost after restart");
-            string afterJson = "";
-            try
-            {
-              var afterRow = prevRowId == Guid.Empty ? null : freshC.Usage.FirstOrDefault(r => r.Id == prevRowId);
-              if (afterRow is not null) afterJson = JsonSerializer.Serialize(new { afterRow.Id, afterRow.Kind, afterRow.Model, afterRow.InputTokens, afterRow.OutputTokens, afterRow.CachedInputTokens, afterRow.SearchCalls, afterRow.Status, afterRow.ProviderCallId, afterRow.Cost, afterRow.CostBasis, afterRow.BoardId, afterRow.MeetingId });
-            }
-            catch { }
-            Check("pg-restart-row-bytes", prevRowJson == "" || afterJson == prevRowJson, "previous row bytes changed: " + afterJson.Substring(0, Math.Min(120, afterJson.Length)));
-            realBackend = Pg.Backend!;
-          }
-          else Check("pg-commit-rewire", false, werrC);
-        }
-        catch (Exception ex) { Check("pg-commit-restart-harness", false, ex.GetType().Name + ": " + ex.Message); }
+        catch (Exception ex) { Check("pg-commit-evidence", false, ex.GetType().Name + ": " + ex.Message); }
         try
         {
           using var dropConn = new Npgsql.NpgsqlConnection(pgCs);
@@ -554,6 +663,14 @@ static class UsageProbe
           Check("pg-commit-trigger-cleanup", true, "");
         }
         catch (Exception ex) { Check("pg-commit-trigger-cleanup", false, ex.GetType().Name + ": " + ex.Message); }
+        // original backend still usable (read-only check; no mutation after the COMMIT test)
+        try
+        {
+          var rcU = realBackend.All<UsageRow>().Count;
+          var rcC = realBackend.All<ModelCall>().Count;
+          Check("pg-original-usable", rcU == uIdsAfterC.Count && rcC == cIdsAfterC.Count, "counts " + rcU + "/" + rcC);
+        }
+        catch (Exception ex) { Check("pg-original-usable", false, ex.GetType().Name + ": " + ex.Message); }
         // PG ledger read failure must surface, not return successful empty.
         {
           var failing = new FailReadBackend(realBackend);
@@ -564,24 +681,7 @@ static class UsageProbe
           Check("pg-read-fails", threwRead, "enumeration did not throw");
           Pg.Backend = realBackend;
         }
-        var uBeforeOk = PgIdsU();
-        var okStore = new InMemoryStore();
-        var okGw = new ModelGateway(okStore);
-        string okText = await okGw.CompleteAsync("muse-spark-1.3", "model-test", "Reply with exactly: OK pg-after-commit", 100, 512);
-        var okNew = realBackend.All<UsageRow>().Where(r => !uBeforeOk.Contains(r.Id)).ToList();
-        Check("pg-context-usable", okText == "OK" && okNew.Count == 1, okText + " new=" + okNew.Count);
-        Guid okId = okNew.Count == 1 ? okNew[0].Id : Guid.Empty;
-        decimal? okCost = okNew.Count == 1 ? okNew[0].Cost : null;
-        string cs2 = pgCs;
-        if (!SimCEO.Postgres.PgBoot.TryWire(cs2, out var werr2)) Check("pg-rewire", false, werr2);
-        else
-        {
-          var fresh = new InMemoryStore();
-          var got = fresh.Usage.FirstOrDefault(r => r.Id == okId);
-          var gotCall = fresh.ModelCalls.FirstOrDefault(c => c.Id == okId);
-          Check("pg-restart-pair", got is not null && gotCall is not null && got.Id == gotCall.Id, "missing after rewire");
-          Check("pg-restart-fields", got is not null && got.Model == "muse-spark-1.3" && got.Kind == "model-test" && got.Status == "succeeded" && got.Cost == okCost && gotCall is not null && gotCall.Purpose == "model-test" && gotCall.Cost == okCost, "field mismatch");
-        }
+
       }
     }
     try { cts.Cancel(); listener.Stop(); listener.Close(); } catch { }
@@ -610,6 +710,7 @@ static class UsageProbe
       if (AsrMode == "official") return "{ \"transcript\": \"qa probe transcript\", \"audioDurationMs\": 8240 }";
       if (AsrMode == "subsecond") return "{ \"transcript\": \"qa probe transcript\", \"audioDurationMs\": 500 }";
       if (AsrMode == "processed") return "{ \"transcript\": \"qa probe transcript\", \"audioProcessedMs\": 5000 }";
+      if (AsrMode == "badjson") return "{\"a\":truQA-CANARY-ASR}";
       return "{ \"transcript\": \"qa probe transcript\" }";
     }
     if (path.EndsWith("/images/generations"))
@@ -629,6 +730,12 @@ static class UsageProbe
       if (iprompt.Contains("QA-IMG-BADURL")) return "{ \"id\": \"qa-img-badurl-1\", \"data\": [ { \"url\": \"https://\" } ] }|200";
       if (iprompt.Contains("QA-IMG-IDONLY")) return "{ \"error\": \"qa img failure\", \"id\": \"qa-img-failed-7\" }|500";
       if (iprompt.Contains("QA-IMG-PNGURL")) return "{ \"id\": \"qa-img-pngurl-1\", \"data\": [ { \"b64_json\": \"" + one + "\" }, { \"url\": \"https://qa.example/img-valid.png\" } ] }|200";
+    if (iprompt.Contains("QA-IMG-BIGPNG")) { var bp = ProbeBigPng(); return "{ \"id\": \"qa-img-bigpng-1\", \"data\": [ { \"b64_json\": \"" + bp + "\" } ] }|200"; }
+    if (iprompt.Contains("QA-IMG-BIGJPEG")) { var bj = ProbeBigJpeg(); return "{ \"id\": \"qa-img-bigjpg-1\", \"data\": [ { \"b64_json\": \"" + bj + "\" } ] }|200"; }
+    if (iprompt.Contains("QA-IMG-SIGONLY-PNG")) return "{ \"id\": \"qa-img-sig-1\", \"data\": [ { \"b64_json\": \"iVBORw0KGgoAAAAAAAAAAAAA\" } ] }|200";
+    if (iprompt.Contains("QA-IMG-TRUNC")) { var tb = Convert.FromBase64String(one); var ts = new byte[40]; Array.Copy(tb, ts, 40); return "{ \"id\": \"qa-img-trunc-1\", \"data\": [ { \"b64_json\": \"" + Convert.ToBase64String(ts) + "\" } ] }|200"; }
+    if (iprompt.Contains("QA-IMG-BADDIMS")) { var bd = ProbeBadDimsPng(one); return "{ \"id\": \"qa-img-baddims-1\", \"data\": [ { \"b64_json\": \"" + bd + "\" } ] }|200"; }
+    if (iprompt.Contains("QA-IMG-OVER")) { var ob = ProbeBigPng(); var big = new System.Text.StringBuilder(); for (int k = 0; k < 100; k++) big.Append(ob); return "{ \"id\": \"qa-img-over-1\", \"data\": [ { \"b64_json\": \"" + big.ToString() + "\" } ] }|200"; }
       if (iprompt.Contains("QA-IMG-MALFORMED")) return "{ \"data\": [ { \"b64_json\": \"%%%\" } ] }";
       if (iprompt.Contains("QA-IMG-EMPTY")) return "{ \"data\": [] }";
       if (iprompt.Contains("QA-IMG-MIXED")) return "{ \"data\": [ { \"b64_json\": \"" + one + "\" }, { \"b64_json\": \"%%%\" }, { \"url\": \"https://qa.example/img3.png\" } ] }";
@@ -666,7 +773,30 @@ static class UsageProbe
         var rpad = new string((char)121, 2000);
         return "{ \"error\": \"qa long research failure " + rpad + "\", \"id\": \"qa-resp-long-1\", \"usage\": { \"input_tokens\": 30, \"output_tokens\": 5 }, \"output\": [ { \"type\": \"web_search_call\", \"results\": [] } ] }|500";
       }
-              if (rinput.Contains("QA-RESEARCHERR-EMPTY-OUTPUT"))
+              if (rinput.Contains("QA-RESP-MIXED-AFTER"))
+    {
+      Seq++;
+      return "{ \"id\": \"qa-resp-mixafter-" + Seq + "\", \"status\": \"completed\", \"usage\": { \"input_tokens\": 20, \"output_tokens\": 20 }, \"output\": [{ \"type\": \"web_search_call\", \"results\": [] }, \"bad\", { \"type\": \"message\", \"phase\": \"final_answer\", \"content\": [{ \"type\": \"output_text\", \"text\": \"QA line one.\" }] }] }|200";
+    }
+    if (rinput.Contains("QA-RESP-MIXED-BEFORE"))
+    {
+      Seq++;
+      return "{ \"id\": \"qa-resp-mixbefore-" + Seq + "\", \"status\": \"completed\", \"usage\": { \"input_tokens\": 20, \"output_tokens\": 20 }, \"output\": [\"bad\", { \"type\": \"web_search_call\", \"results\": [] }, { \"type\": \"message\", \"phase\": \"final_answer\", \"content\": [{ \"type\": \"output_text\", \"text\": \"QA line one.\" }] }] }|200";
+    }
+    if (rinput.Contains("QA-RESP-INCOMPLETE-MIXED"))
+    {
+      Seq++;
+      return "{ \"id\": \"qa-resp-incmix-" + Seq + "\", \"status\": \"incomplete\", \"incomplete_details\": { \"reason\": \"max_output_tokens\" }, \"usage\": { \"input_tokens\": 30, \"output_tokens\": 5 }, \"output\": [{ \"type\": \"web_search_call\", \"results\": [] }, \"bad\"] }|200";
+    }
+    if (rinput.Contains("QA-RESEARCHERR-MIXED"))
+      return "{ \"error\": \"qa mixed failure\", \"id\": \"qa-resp-errmix-1\", \"usage\": { \"input_tokens\": 40, \"output_tokens\": 10 }, \"output\": [{ \"type\": \"web_search_call\", \"results\": [] }, \"bad\"] }|500";
+    if (rinput.Contains("QA-RESEARCHERR-PREFIX-OVER"))
+    {
+      var prefix = "{ \"error\": \"qa prefix\", \"id\": \"qa-resp-prefix-1\", \"usage\": { \"input_tokens\": 40, \"output_tokens\": 10 }, \"output\": [{ \"type\": \"web_search_call\", \"results\": [] }] }";
+      var pad = new string((char)32, 200000);
+      return prefix + pad + "|500";
+    }
+    if (rinput.Contains("QA-RESEARCHERR-EMPTY-OUTPUT"))
         return "{ \"error\": \"qa empty-output failure\", \"id\": \"qa-resp-empty-1\", \"usage\": { \"input_tokens\": 40, \"output_tokens\": 10 }, \"output\": [] }|500";
       if (rinput.Contains("QA-RESEARCHERR-NULL-OUTPUT"))
         return "{ \"error\": \"qa null-output failure\", \"id\": \"qa-resp-null-1\", \"usage\": { \"input_tokens\": 40, \"output_tokens\": 10 }, \"output\": null }|500";
@@ -725,6 +855,12 @@ static class UsageProbe
     {
       return "{ \"error\": \"qa id-only failure\", \"id\": \"qa-only-id-9\" }|500";
     }
+    if (prompt.Contains("QA-HTTP500-PREFIX-OVER"))
+    {
+      var prefix = "{ \"error\": \"qa prefix\", \"id\": \"qa-prefix-1\", \"usage\": { \"prompt_tokens\": 120, \"completion_tokens\": 16 } }";
+      var pad = new string((char)32, 200000);
+      return prefix + pad + "|500";
+    }
     if (prompt.Contains("QA-HTTP500-CANARY"))
     {
       var canary = "QA-CANARY-PROMPT-abc123 QA-CANARY-KEY-sk-test-xyz";
@@ -766,6 +902,20 @@ static class UsageProbe
     {
       return "{ \"id\": \"qa-probe-" + Seq + "\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": 100, \"completion_tokens\": 10, \"prompt_tokens_details\": \"broken\", \"cached_tokens\": 20 } }|200";
     }
+    if (prompt.Contains("QA-USAGE-DUP-PROMPT"))
+      return "{ \"id\": \"qa-probe-dup-1\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": -1, \"prompt_tokens\": 100, \"completion_tokens\": 10 } }|200";
+    if (prompt.Contains("QA-USAGE-DUP-CACHED"))
+      return "{ \"id\": \"qa-probe-dup-2\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": 100, \"completion_tokens\": 10, \"cached_tokens\": -1, \"cached_tokens\": 20 } }|200";
+    if (prompt.Contains("QA-USAGE-NULL-DETAILS"))
+      return "{ \"id\": \"qa-probe-null-1\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": 100, \"completion_tokens\": 10, \"prompt_tokens_details\": null, \"cached_tokens\": 20 } }|200";
+    if (prompt.Contains("QA-USAGE-NULL-INPUT-DETAILS"))
+      return "{ \"id\": \"qa-probe-null-2\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": 100, \"completion_tokens\": 10, \"input_tokens_details\": null } }|200";
+    if (prompt.Contains("QA-HTTP500-PREFIX-OVER"))
+    {
+      var prefix = "{ \"error\": \"qa prefix\", \"id\": \"qa-prefix-1\", \"usage\": { \"prompt_tokens\": 120, \"completion_tokens\": 16 } }";
+      var pad = new string((char)32, 200000);
+      return prefix + pad + "|500";
+    }
     if (prompt.Contains("QA-USAGE-NEG"))
     {
       return "{ \"id\": \"qa-probe-" + Seq + "\", \"choices\": [ { \"message\": { \"role\": \"assistant\", \"content\": \"OK\" }, \"finish_reason\": \"stop\" } ], \"usage\": { \"prompt_tokens\": -5, \"completion_tokens\": 10 } }|200";
@@ -798,6 +948,88 @@ static class UsageProbe
     }
     return (200, raw);
   }
+  static uint[] ProbeCrcTable()
+  {
+    var table = new uint[256];
+    for (uint i = 0; i < 256; i++) { var c = i; for (var k = 0; k < 8; k++) c = (c & 1) != 0 ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); table[i] = c; }
+    return table;
+  }
+  static uint ProbeCrc(byte[] buf, int off, int len)
+  {
+    var table = ProbeCrcTable();
+    var c = 0xFFFFFFFFu;
+    for (var i = 0; i < len; i++) c = table[(c ^ buf[off + i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+  }
+  static uint ProbeAdler(byte[] data)
+  {
+    uint a = 1, b = 0;
+    foreach (var x in data) { a = (a + x) % 65521; b = (b + a) % 65521; }
+    return (b << 16) | a;
+  }
+  static void ProbePutU32(System.Collections.Generic.List<byte> l, uint v) { l.Add((byte)(v >> 24)); l.Add((byte)(v >> 16)); l.Add((byte)(v >> 8)); l.Add((byte)v); }
+  static void ProbeChunk(System.Collections.Generic.List<byte> l, string type, byte[] data)
+  {
+    ProbePutU32(l, (uint)data.Length);
+    foreach (var c in type) l.Add((byte)c);
+    l.AddRange(data);
+    var body = System.Text.Encoding.ASCII.GetBytes(type);
+    var all = new byte[body.Length + data.Length];
+    Array.Copy(body, all, body.Length);
+    Array.Copy(data, 0, all, body.Length, data.Length);
+    ProbePutU32(l, ProbeCrc(all, 0, all.Length));
+  }
+  static string ProbeBigPng()
+  {
+    const int W = 512, H = 256;
+    var raw = new System.Collections.Generic.List<byte>();
+    for (int y = 0; y < H; y++) { raw.Add(0); for (int x = 0; x < W; x++) { raw.Add((byte)((x + y) & 255)); raw.Add((byte)((x * 2) & 255)); raw.Add((byte)((y * 3) & 255)); } }
+    var rb = raw.ToArray();
+    var z = new System.Collections.Generic.List<byte> { 0x78, 0x01 };
+    int off = 0;
+    while (off < rb.Length)
+    {
+      int n = System.Math.Min(65535, rb.Length - off);
+      bool last = off + n >= rb.Length;
+      z.Add((byte)(last ? 1 : 0)); z.Add((byte)(n & 255)); z.Add((byte)((n >> 8) & 255)); z.Add((byte)(~n & 255)); z.Add((byte)((~n >> 8) & 255));
+      for (int i = 0; i < n; i++) z.Add(rb[off + i]);
+      off += n;
+    }
+    var ad = ProbeAdler(rb);
+    z.Add((byte)(ad >> 24)); z.Add((byte)(ad >> 16)); z.Add((byte)(ad >> 8)); z.Add((byte)ad);
+    var ihdr = new byte[13];
+    ihdr[0] = (byte)((W >> 24) & 255); ihdr[1] = (byte)((W >> 16) & 255); ihdr[2] = (byte)((W >> 8) & 255); ihdr[3] = (byte)(W & 255);
+    ihdr[4] = (byte)((H >> 24) & 255); ihdr[5] = (byte)((H >> 16) & 255); ihdr[6] = (byte)((H >> 8) & 255); ihdr[7] = (byte)(H & 255);
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    var png = new System.Collections.Generic.List<byte> { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    ProbeChunk(png, "IHDR", ihdr);
+    ProbeChunk(png, "IDAT", z.ToArray());
+    ProbeChunk(png, "IEND", new byte[0]);
+    return Convert.ToBase64String(png.ToArray());
+  }
+  static string ProbeBadDimsPng(string oneB64)
+  {
+    var raw = Convert.FromBase64String(oneB64);
+    raw[16] = 0; raw[17] = 0; raw[18] = 0; raw[19] = 0;
+    var body = new byte[4 + 13];
+    body[0] = (byte)'I'; body[1] = (byte)'H'; body[2] = (byte)'D'; body[3] = (byte)'R';
+    Array.Copy(raw, 16, body, 4, 13);
+    var nc = ProbeCrc(body, 0, body.Length);
+    raw[29] = (byte)(nc >> 24); raw[30] = (byte)(nc >> 16); raw[31] = (byte)(nc >> 8); raw[32] = (byte)nc;
+    return Convert.ToBase64String(raw);
+  }
+  static string ProbeBigJpeg()
+  {
+    var l = new System.Collections.Generic.List<byte> { 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00 };
+    for (int c = 0; c < 2; c++) { l.AddRange(new byte[] { 0xFF, 0xFE, 0xFF, 0xFD }); for (int i = 0; i < 65531; i++) l.Add((byte)(65 + c)); }
+    l.AddRange(new byte[] { 0xFF, 0xDB, 0x00, 0x43, 0x00 });
+    for (int i = 0; i < 64; i++) l.Add(8);
+    l.AddRange(new byte[] { 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00 });
+    l.AddRange(new byte[] { 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    l.AddRange(new byte[] { 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    l.AddRange(new byte[] { 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x2B, 0xFF, 0xD9 });
+    return Convert.ToBase64String(l.ToArray());
+  }
 }
 
 sealed class FailReadBackend : SimCEO.Api.Data.IPgBackend
@@ -826,10 +1058,21 @@ sealed class FailBackend : SimCEO.Api.Data.IPgBackend
   public SimCEO.Api.Data.IPgBackend Inner;
   public int Upserts;
   public int FailOnUpsert;
+  public System.Collections.Generic.List<(string Table, Guid Id)> Attempted = new();
   public FailBackend(SimCEO.Api.Data.IPgBackend inner) { Inner = inner; }
+  static Guid RowId<T>(T entity)
+  {
+    try
+    {
+      var p = typeof(T).GetProperty("Id");
+      if (p != null && p.GetValue(entity) is Guid g) return g;
+    }
+    catch { }
+    return Guid.Empty;
+  }
   public T? Find<T>(Guid id) where T : class => Inner.Find<T>(id);
   public List<T> All<T>() where T : class => Inner.All<T>();
-  public void Upsert<T>(T entity) where T : class { Upserts++; if (FailOnUpsert == Upserts) throw new InvalidOperationException("qa injected storage failure on append " + Upserts); Inner.Upsert(entity); }
+  public void Upsert<T>(T entity) where T : class { Upserts++; try { var gid = RowId(entity); if (gid != Guid.Empty) Attempted.Add((typeof(T).Name, gid)); } catch { } if (FailOnUpsert == Upserts) throw new InvalidOperationException("qa injected storage failure on append " + Upserts); Inner.Upsert(entity); }
   public bool Remove<T>(Guid id) where T : class => Inner.Remove<T>(id);
   public void Clear<T>() where T : class => Inner.Clear<T>();
   public void AddMessage(SimCEO.Api.Domain.Message m) => Inner.AddMessage(m);

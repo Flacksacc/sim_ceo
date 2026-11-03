@@ -97,8 +97,8 @@ let auditBase = 0;
   const row = (after?.rows || [])[0] || {};
   ok("audition-cost-known", row.cost != null && Number(row.cost) > 0, JSON.stringify(row).slice(0, 300));
   ok("audition-status-succeeded", row.status === "succeeded", String(row.status));
-  ok("audition-unallocated", (row.allocationLabel === "Unallocated" || row.boardId == null), JSON.stringify(row).slice(0, 300));
-  ok("audition-hidden", row.hiddenPurpose === true || row.kind === "audition", JSON.stringify(row).slice(0, 200));
+  ok("audition-unallocated", row.allocationLabel === "Unallocated", JSON.stringify(row).slice(0, 300));
+  ok("audition-hidden", row.hiddenPurpose === true && row.kind === "audition", JSON.stringify(row).slice(0, 200));
   ok("audition-no-prompt-leak", !JSON.stringify(row).includes(run + " audition ok"), "prompt must not be stored");
   const m = await modelRows("");
   const mrow = (m?.rows || [])[0] || {};
@@ -166,7 +166,7 @@ const mid = await makeMeeting(bid, "phase9 brief");
   ok("transcribe-allocated", row.allocationLabel === "Allocated" && String(row.boardId).toLowerCase() === String(bid).toLowerCase(), JSON.stringify(row).slice(0, 300));
   const mm = await modelRows("meetingId=" + mid);
   ok("transcribe-modelcall-one", (mm?.total || 0) === 1, "total=" + mm?.total);
-  ok("transcribe-ids-match", String(row.id) === String((mm?.rows || [])[0]?.id), row.id + " vs " + (mm?.rows || [])[0]?.id);
+  ok("transcribe-ids-match", typeof row.id === "string" && row.id.length === 36 && String(row.id) === String((mm?.rows || [])[0]?.id), row.id + " vs " + (mm?.rows || [])[0]?.id);
 }
 // 7b. official audioDurationMs file field bills floor seconds (8240ms -> 8s)
 {
@@ -259,7 +259,7 @@ const mid = await makeMeeting(bid, "phase9 brief");
   ok("image-one-modelcall", mafter === mbefore + 1, "before=" + mbefore + " after=" + mafter);
   const latest = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
   ok("image-cost-returned", Math.abs(Number(latest.cost) - 0.02) < 1e-9, "cost=" + latest.cost);
-  ok("image-unallocated", latest.allocationLabel === "Unallocated" || latest.boardId == null, JSON.stringify(latest).slice(0, 300));
+  ok("image-unallocated", latest.allocationLabel === "Unallocated", JSON.stringify(latest).slice(0, 300));
 }
 // 9b. undecodable payload: failed with unknown cost, never fabricated zero
 {
@@ -295,7 +295,7 @@ const mid = await makeMeeting(bid, "phase9 brief");
   const after = (await usageRows(""))?.total || 0;
   ok("image-mixed-one", after === before + 1, "before=" + before + " after=" + after);
   const row = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
-  ok("image-mixed-unknown-total", row.cost == null && (row.status === "failed" || row.status === "unknown"), JSON.stringify(row).slice(0, 300));
+  ok("image-mixed-unknown-total", row.cost == null && row.status === "failed" && (row.providerCallId || "") === "qa-img-mixed-1", JSON.stringify(row).slice(0, 300));
 }
 // 9e. requested-vs-returned mismatch: 4 requested, 1 returned
 {
@@ -588,7 +588,137 @@ const mid = await makeMeeting(bid, "phase9 brief");
   ok("allocation-exact", ["Allocated", "Unallocated", "Missing"].includes(u.allocationLabel), String(u.allocationLabel));
   ok("hidden-exact", typeof u.hiddenPurpose === "boolean", String(u.hiddenPurpose));
 }
+// 9l. realistic large PNG (>128KiB) succeeds with known cost and real bytes
+{
+  const q = await post("/api/roster/quick", { accountId: guid(), name: run + "-imgbigpng", description: "image helper for " + run });
+  const rid = q.json?.id || q.json?.Id;
+  const r = await post("/api/roster/" + rid + "/image/generate", { count: 1, prompt: "QA-IMG-BIGPNG " + run });
+  ok("img-bigpng-200", r.status === 200 && Array.isArray(r.json) && r.json.length === 1, r.status + " " + String(r.text).slice(0, 200));
+  const row = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
+  ok("img-bigpng-known", row.cost != null && Math.abs(Number(row.cost) - 0.01) < 1e-9 && row.status === "succeeded", JSON.stringify(row).slice(0, 300));
+  const imgId = (Array.isArray(r.json) && r.json[0]?.id) || (Array.isArray(r.json) && r.json[0]?.Id);
+  if (imgId) {
+    const gr = await req("GET", "/api/images/" + imgId, undefined, {});
+    ok("img-bigpng-bytes", gr.status === 200 && String(gr.text).length > 131072, "len=" + String(gr.text).length);
+  } else ok("img-bigpng-id", false, "no created id");
+}
+// 9m. realistic large JPEG (>128KiB) succeeds with known cost
+{
+  const q = await post("/api/roster/quick", { accountId: guid(), name: run + "-imgbigjpg", description: "image helper for " + run });
+  const rid = q.json?.id || q.json?.Id;
+  const r = await post("/api/roster/" + rid + "/image/generate", { count: 1, prompt: "QA-IMG-BIGJPEG " + run });
+  ok("img-bigjpg-200", r.status === 200 && Array.isArray(r.json) && r.json.length === 1, r.status + " " + String(r.text).slice(0, 200));
+  const row = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
+  ok("img-bigjpg-known", row.cost != null && Math.abs(Number(row.cost) - 0.01) < 1e-9 && row.status === "succeeded", JSON.stringify(row).slice(0, 300));
+}
+// 9n. signature-only/truncated/bad-dims payloads are unknown with IDs
+{
+  for (const [tag, id] of [["QA-IMG-SIGONLY-PNG", "qa-img-sig-1"], ["QA-IMG-TRUNC", "qa-img-trunc-1"], ["QA-IMG-BADDIMS", "qa-img-baddims-1"]]) {
+    const q = await post("/api/roster/quick", { accountId: guid(), name: run + "-imgneg", description: "image helper for " + run });
+    const rid = q.json?.id || q.json?.Id;
+    const r = await post("/api/roster/" + rid + "/image/generate", { count: 1, prompt: tag + " " + run });
+    ok("img-" + tag + "-502", r.status === 502, String(r.status));
+    const row = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
+    ok("img-" + tag + "-unknown", row.cost == null && (row.providerCallId || "") === id, JSON.stringify(row).slice(0, 300));
+  }
+}
+// 9o. true oversized image body: unknown total, safe error
+{
+  const q = await post("/api/roster/quick", { accountId: guid(), name: run + "-imgover", description: "image helper for " + run });
+  const rid = q.json?.id || q.json?.Id;
+  const before = (await usageRows(""))?.total || 0;
+  const r = await post("/api/roster/" + rid + "/image/generate", { count: 1, prompt: "QA-IMG-OVER " + run });
+  ok("img-over-502", r.status === 502, String(r.status));
+  ok("img-over-safe", String(r.text).includes("oversized") && !String(r.text).includes("base64"), String(r.text).slice(0, 200));
+  const after = (await usageRows(""))?.total || 0;
+  ok("img-over-one", (after || 0) === before + 1, "before=" + before + " after=" + after);
+  const row = (await usageRows("purpose=image-generate"))?.rows?.[0] || {};
+  ok("img-over-unknown", row.cost == null, JSON.stringify(row).slice(0, 300));
+}
+// 3g. valid-prefix oversized chat: fail closed to unknown with ID
+{
+  const before = (await usageRows(""))?.total || 0;
+  const r = await post("/api/auditions", { question: "QA-HTTP500-PREFIX-OVER " + run, profileJson: "{}" });
+  ok("prefix-over-502", r.status === 502, String(r.status));
+  ok("prefix-over-safe", String(r.text).includes("oversized"), String(r.text).slice(0, 200));
+  const after = (await usageRows(""))?.total || 0;
+  ok("prefix-over-one", (after || 0) === before + 1, "before=" + before);
+  const row = (await usageRows("purpose=audition"))?.rows?.[0] || {};
+  ok("prefix-over-unknown", row.cost == null && (row.providerCallId || "") === "qa-prefix-1", JSON.stringify(row).slice(0, 300));
+}
+// 10n. valid-prefix oversized research: unknown total, observed search kept
+{
+  const r = await post("/api/roster/ai-draft", { accountId: guid(), name: run + "-dpreover", role: "Strategist", focus: "QA-RESEARCHERR-PREFIX-OVER " + run });
+  ok("resp-prefix-over-502", r.status === 502, String(r.status));
+  const row = (await usageRows("purpose=advisor-research"))?.rows?.[0] || {};
+  ok("resp-prefix-over-unknown", row.cost == null && Number(row.searchCalls) === 1 && row.ranSearch === true && (row.providerCallId || "") === "qa-resp-prefix-1", JSON.stringify(row).slice(0, 400));
+}
+// 7g. ASR malformed JSON: canary-free ledger, diagnostics, error
+{
+  const midx = await makeMeeting(bid, "asr badjson");
+  const r = await postTranscribe(midx, "QA-ASR-BADJSON.webm");
+  ok("asr-badjson-502", r.status === 502, String(r.status));
+  ok("asr-badjson-redacted", !String(r.text).includes("QA-CANARY"), String(r.text).slice(0, 200));
+  const mu = await usageRows("meetingId=" + midx);
+  const row = (mu?.rows || [])[0] || {};
+  ok("asr-badjson-unknown", row.cost == null && !JSON.stringify(row).includes("QA-CANARY"), JSON.stringify(row).slice(0, 300));
+}
+// 3h. duplicate/null billing names: unknown with successful text delivery
+{
+  for (const tag of ["QA-USAGE-DUP-PROMPT", "QA-USAGE-DUP-CACHED", "QA-USAGE-NULL-DETAILS", "QA-USAGE-NULL-INPUT-DETAILS"]) {
+    const before = (await usageRows(""))?.total || 0;
+    const r = await post("/api/auditions", { question: tag + " " + run, profileJson: "{}" });
+    ok("dup-" + tag + "-200", r.status === 200, String(r.status) + " " + String(r.text).slice(0, 120));
+    const after = (await usageRows(""))?.total || 0;
+    ok("dup-" + tag + "-one", (after || 0) === before + 1, "before=" + before);
+    const row = (await usageRows("purpose=audition"))?.rows?.[0] || {};
+    ok("dup-" + tag + "-unknown", row.cost == null && row.status === "succeeded", JSON.stringify(row).slice(0, 300));
+  }
+}
+// 10o. malformed entries around valid search: observed search kept, total null
+{
+  const r = await post("/api/roster/ai-draft", { accountId: guid(), name: run + "-dmalorder", role: "Strategist", focus: "QA-RESEARCHERR-MALFORMED-OUTPUT " + run });
+  ok("mal-order-502", r.status === 502, String(r.status));
+  const row = (await usageRows("purpose=advisor-research"))?.rows?.[0] || {};
+  ok("mal-order-unknown", row.cost == null && (row.providerCallId || "") === "qa-resp-mal-1", JSON.stringify(row).slice(0, 300));
+}
+// 12b. non-ISO dates rejected on both routes; UTC day boundaries exact
+{
+  for (const bad of ["11/3/2026", "2026-1-2", "November 3, 2026", "2026-05-01T00:00:00Z"]) {
+    const ru = await get("/api/usage?summary=true&day=" + encodeURIComponent(bad));
+    ok("usage-noniso-400-" + bad, ru.status === 400, String(ru.status));
+    const rm = await get("/api/models/calls?summary=true&day=" + encodeURIComponent(bad));
+    ok("modelcalls-noniso-400-" + bad, rm.status === 400, String(rm.status));
+  }
+  const inc = await get("/api/usage?summary=true&from=2000-01-01&to=2000-01-01");
+  ok("usage-inclusive-day-200", inc.status === 200 && (inc.json?.total ?? -1) === 0, inc.status + " " + String(inc.text).slice(0, 120));
+  const incM = await get("/api/models/calls?summary=true&from=2000-01-01&to=2000-01-01");
+  ok("modelcalls-inclusive-day-200", incM.status === 200 && (incM.json?.total ?? -1) === 0, incM.status + " " + String(incM.text).slice(0, 120));
+}
+// 10p. mixed malformed output preserves observed search with null total (all paths)
+{
+  for (const [tag, focus] of [
+    ["mixafter", "QA-RESP-MIXED-AFTER"],
+    ["mixbefore", "QA-RESP-MIXED-BEFORE"],
+  ]) {
+    const r = await post("/api/roster/ai-draft", { accountId: guid(), name: run + "-d" + tag, role: "Strategist", focus: focus + " " + run });
+    ok(tag + "-201-success-unknown", r.status === 201, String(r.status));
+    const row = (await usageRows("purpose=advisor-research"))?.rows?.[0] || {};
+    ok(tag + "-observed-null", row.cost == null && Number(row.searchCalls) === 1 && row.ranSearch === true && row.status === "succeeded", JSON.stringify(row).slice(0, 400));
+  }
+  {
+    const r = await post("/api/roster/ai-draft", { accountId: guid(), name: run + "-dincmix", role: "Strategist", focus: "QA-RESP-INCOMPLETE-MIXED " + run });
+    ok("incmix-502", r.status === 502, String(r.status));
+    const row = (await usageRows("purpose=advisor-research"))?.rows?.[0] || {};
+    ok("incmix-observed-null", row.cost == null && Number(row.searchCalls) === 1 && row.ranSearch === true && row.status === "incomplete", JSON.stringify(row).slice(0, 400));
+  }
+  const re = await post("/api/roster/ai-draft", { accountId: guid(), name: run + "-derrmix", role: "Strategist", focus: "QA-RESEARCHERR-MIXED " + run });
+  ok("errmix-502", re.status === 502, String(re.status));
+  const erow = (await usageRows("purpose=advisor-research"))?.rows?.[0] || {};
+  ok("errmix-observed-null", erow.cost == null && Number(erow.searchCalls) === 1 && erow.ranSearch === true && (erow.providerCallId || "") === "qa-resp-errmix-1", JSON.stringify(erow).slice(0, 400));
+}
 // 11. capped/blocked provider calls are pre-dispatch: 402 adds no ledger/usage event
+
 {
   const put = await req("PUT", "/api/spending", { monthlyCapUsd: 0, mode: "block" });
   ok("spend-cap-set", put.status === 200, String(put.status));

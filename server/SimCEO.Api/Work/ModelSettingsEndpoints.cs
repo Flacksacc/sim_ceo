@@ -73,7 +73,12 @@ public static class ModelSettingsEndpoints
       catch (Exception ex)
       {
         sw.Stop();
-        var err = ex.Message.Length > 300 ? ex.Message[..300] : ex.Message;
+        var kind = ex is OperationCanceledException ? "cancelled"
+          : ex is ProviderException pex ? "provider HTTP " + pex.Status
+          : ex is ProviderNotConfiguredException ? "not configured"
+          : ex is CapExceededException ? "capped"
+          : "transport failure";
+        var err = "model test failed: " + kind + "; see usage ledger for billing; no upstream content retained";
         lock (s.ModelLock)
         {
           s.ModelLastTestAt = DateTime.UtcNow;
@@ -81,7 +86,7 @@ public static class ModelSettingsEndpoints
           s.ModelLastTestError = err;
           s.ModelLastTestModel = model;
         }
-        s.Audit.Add(new AuditEvent { Action = "model.test", Detail = "fail: " + model });
+        s.Audit.Add(new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + kind + ")" });
         return Results.Ok(new { ok = false, model, error = err });
       }
       sw.Stop();

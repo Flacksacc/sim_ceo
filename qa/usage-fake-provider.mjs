@@ -23,6 +23,77 @@
 // (zero results -> unsupported-dossier path).
 import http from "node:http";
 
+// ---- deterministic image fixture builders (no external libs) ----
+function crc32Table() {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+}
+const CRC_T = crc32Table();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = (CRC_T[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function adler32(bytes) {
+  let a = 1, b = 0;
+  for (let i = 0; i < bytes.length; i++) { a = (a + bytes[i]) % 65521; b = (b + a) % 65521; }
+  return ((b << 16) | a) >>> 0;
+}
+function u32be(v) { return [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; }
+function chunk(type, data) {
+  const td = [...type].map((c) => c.charCodeAt(0));
+  const body = [...td, ...data];
+  return [...u32be(data.length), ...body, ...u32be(crc32(body))];
+}
+function bigPngB64() {
+  const W = 512, H = 256, raw = [];
+  for (let y = 0; y < H; y++) {
+    raw.push(0);
+    for (let x = 0; x < W; x++) { raw.push((x + y) & 255, (x * 2) & 255, (y * 3) & 255); }
+  }
+  const z = [0x78, 0x01];
+  let off = 0;
+  while (off < raw.length) {
+    const n = Math.min(65535, raw.length - off);
+    const last = off + n >= raw.length ? 1 : 0;
+    z.push(last ? 1 : 0, n & 255, (n >>> 8) & 255, (~n) & 255, ((~n) >>> 8) & 255);
+    for (let i = 0; i < n; i++) z.push(raw[off + i]);
+    off += n;
+  }
+  const ad = adler32(raw);
+  z.push((ad >>> 24) & 255, (ad >>> 16) & 255, (ad >>> 8) & 255, ad & 255);
+  const ihdr = [...u32be(W), ...u32be(H), 8, 2, 0, 0, 0];
+  const png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    ...chunk("IHDR", ihdr), ...chunk("IDAT", z), ...chunk("IEND", [])];
+  return Buffer.from(png).toString("base64");
+}
+function bigJpegBytes() {
+  const out = [0xFF, 0xD8];
+  const app0 = [0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00];
+  out.push(0xFF, 0xE0, 0x00, 0x10, ...app0);
+  for (let c = 0; c < 2; c++) {
+    const data = new Array(65531).fill(65 + c);
+    out.push(0xFF, 0xFE, 0xFF, 0xFD, ...data);
+  }
+  const dqt = new Array(64).fill(8);
+  out.push(0xFF, 0xDB, 0x00, 0x43, 0x00, ...dqt);
+  out.push(0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00);
+  const dbits = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  out.push(0xFF, 0xC4, 0x00, 0x14, 0x00, ...dbits, 0x00);
+  const abits = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  out.push(0xFF, 0xC4, 0x00, 0x14, 0x10, ...abits, 0x00);
+  out.push(0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x2B, 0xFF, 0xD9);
+  return out;
+}
+let BIG_PNG = null, BIG_JPEG_B64 = null;
+function bigPng() { if (!BIG_PNG) BIG_PNG = bigPngB64(); return BIG_PNG; }
+function bigJpeg() { if (!BIG_JPEG_B64) BIG_JPEG_B64 = Buffer.from(bigJpegBytes()).toString("base64"); return BIG_JPEG_B64; }
+
 const argIdx = process.argv.indexOf("--port");
 const PORT = Number(argIdx >= 0 ? process.argv[argIdx + 1] : 5199);
 let seq = 0;
@@ -121,6 +192,14 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "qa id-only failure", id: "qa-only-id-9" }));
       return;
     }
+    if (prompt.includes("QA-HTTP500-PREFIX-OVER")) {
+      seq++;
+      const prefix = JSON.stringify({ error: "qa prefix", id: "qa-prefix-1", usage: { prompt_tokens: 120, completion_tokens: 16 } });
+      const pad = " ".repeat(200000);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(prefix + pad);
+      return;
+    }
     if (prompt.includes("QA-HTTP500-CANARY")) {
       seq++;
       const canary = "QA-CANARY-PROMPT-abc123 QA-CANARY-KEY-sk-test-xyz";
@@ -180,6 +259,26 @@ const server = http.createServer(async (req, res) => {
       id: "qa-chat-" + seq,
       choices: [{ message: { role: "assistant", content: out.content }, finish_reason: truncate ? "length" : "stop" }],
     };
+    if (prompt.includes("QA-USAGE-DUP-PROMPT")) {
+      seq++;
+      res.end('{"id":"qa-chat-dup-1","choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":-1,"prompt_tokens":100,"completion_tokens":10}}');
+      return;
+    }
+    if (prompt.includes("QA-USAGE-DUP-CACHED")) {
+      seq++;
+      res.end('{"id":"qa-chat-dup-2","choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"cached_tokens":-1,"cached_tokens":20}}');
+      return;
+    }
+    if (prompt.includes("QA-USAGE-NULL-DETAILS")) {
+      seq++;
+      res.end(JSON.stringify({ id: "qa-chat-null-1", choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: null, cached_tokens: 20 } }));
+      return;
+    }
+    if (prompt.includes("QA-USAGE-NULL-INPUT-DETAILS")) {
+      seq++;
+      res.end(JSON.stringify({ id: "qa-chat-null-2", choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 10, input_tokens_details: null } }));
+      return;
+    }
     if (prompt.includes("QA-USAGE-CONFLICT")) {
       doc.usage = { prompt_tokens: 100, input_tokens: 90, completion_tokens: 10 };
     } else if (prompt.includes("QA-USAGE-CACHED-CONFLICT")) {
@@ -222,6 +321,14 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "qa long research failure " + pad, id: "qa-resp-long-1", usage: { input_tokens: 30, output_tokens: 5 }, output: [{ type: "web_search_call", results: [] }] }));
       return;
     }
+    if (input.includes("QA-RESEARCHERR-PREFIX-OVER")) {
+      seq++;
+      const prefix = JSON.stringify({ error: "qa prefix", id: "qa-resp-prefix-1", usage: { input_tokens: 40, output_tokens: 10 }, output: [{ type: "web_search_call", results: [] }] });
+      const pad = " ".repeat(200000);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(prefix + pad);
+      return;
+    }
     if (input.includes("QA-RESEARCHERR-EMPTY-OUTPUT")) {
       seq++;
       res.writeHead(500, { "content-type": "application/json" });
@@ -232,6 +339,12 @@ const server = http.createServer(async (req, res) => {
       seq++;
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "qa null-output failure", id: "qa-resp-null-1", usage: { input_tokens: 40, output_tokens: 10 }, output: null }));
+      return;
+    }
+    if (input.includes("QA-RESEARCHERR-MIXED")) {
+      seq++;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "qa mixed failure", id: "qa-resp-errmix-1", usage: { input_tokens: 40, output_tokens: 10 }, output: [{ type: "web_search_call", results: [] }, "bad"] }));
       return;
     }
     if (input.includes("QA-RESEARCHERR-MALFORMED-OUTPUT")) {
@@ -267,12 +380,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (input.includes("QA-SLEEP")) await sleep(sleepMsOf(input));
-    if (input.includes("QA-RESP-INCOMPLETE")) {
+    if (input.includes("QA-RESP-INCOMPLETE") && !input.includes("MIXED")) {
       seq++;
       res.writeHead(200, { "content-type": "application/json" });
       const inc = { id: "qa-resp-" + seq, status: "incomplete", incomplete_details: { reason: "max_output_tokens" } };
       if (!input.includes("QA-RESP-NOUSAGE")) inc.usage = { input_tokens: 30, output_tokens: 5 };
       res.end(JSON.stringify(inc));
+      return;
+    }
+    if (input.includes("QA-RESP-MIXED-AFTER")) {
+      seq++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "qa-resp-mixafter-" + seq, status: "completed", usage: { input_tokens: 20, output_tokens: 20 }, output: [{ type: "web_search_call", results: [] }, "bad", { type: "message", phase: "final_answer", content: [{ type: "output_text", text: "QA line one." }] }] }));
+      return;
+    }
+    if (input.includes("QA-RESP-MIXED-BEFORE")) {
+      seq++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "qa-resp-mixbefore-" + seq, status: "completed", usage: { input_tokens: 20, output_tokens: 20 }, output: ["bad", { type: "web_search_call", results: [] }, { type: "message", phase: "final_answer", content: [{ type: "output_text", text: "QA line one." }] }] }));
+      return;
+    }
+    if (input.includes("QA-RESP-INCOMPLETE-MIXED")) {
+      seq++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "qa-resp-incmix-" + seq, status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 30, output_tokens: 5 }, output: [{ type: "web_search_call", results: [] }, "bad"] }));
       return;
     }
     if (input.includes("QA-RESP-EMPTY-OUTPUT-200")) {
@@ -308,6 +439,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "POST" && url.pathname === "/asr/transcribe") {
+    if (typeof raw === "string" && raw.includes("QA-ASR-BADJSON")) {
+      counts.transcribe++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"a":truQA-CANARY-ASR}');
+      return;
+    }
     if (typeof raw === "string" && raw.includes("QA-429")) {
       counts.transcribe++;
       res.writeHead(429, { "content-type": "application/json" });
@@ -339,6 +476,21 @@ const server = http.createServer(async (req, res) => {
     if (iprompt.includes("QA-IMG-BADURL")) { ok(); res.end(JSON.stringify({ id: "qa-img-badurl-1", data: [{ url: "https://" }] })); return; }
     if (iprompt.includes("QA-IMG-IDONLY")) { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "qa img failure", id: "qa-img-failed-7" })); return; }
     if (iprompt.includes("QA-IMG-PNGURL")) { ok(); res.end(JSON.stringify({ id: "qa-img-pngurl-1", data: [{ b64_json: one }, { url: "https://qa.example/img-valid.png" }] })); return; }
+    if (iprompt.includes("QA-IMG-BIGPNG")) { ok(); res.end(JSON.stringify({ id: "qa-img-bigpng-1", data: [{ b64_json: bigPng() }] })); return; }
+    if (iprompt.includes("QA-IMG-BIGJPEG")) { ok(); res.end(JSON.stringify({ id: "qa-img-bigjpg-1", data: [{ b64_json: bigJpeg() }] })); return; }
+    if (iprompt.includes("QA-IMG-SIGONLY-PNG")) { ok(); res.end(JSON.stringify({ id: "qa-img-sig-1", data: [{ b64_json: "iVBORw0KGgoAAAAAAAAAAAAA" }] })); return; }
+    if (iprompt.includes("QA-IMG-TRUNC")) { ok(); res.end(JSON.stringify({ id: "qa-img-trunc-1", data: [{ b64_json: Buffer.from(Buffer.from(one, "base64").slice(0, 40)).toString("base64") }] })); return; }
+    if (iprompt.includes("QA-IMG-BADDIMS")) {
+      ok();
+      const raw = Buffer.from(one, "base64");
+      raw.writeUInt32BE(0, 16);
+      const ihdrBody = [0x49, 0x48, 0x44, 0x52, ...[...raw.subarray(16, 29)]];
+      const nc = crc32(ihdrBody);
+      raw.writeUInt32BE(nc >>> 0, 29);
+      res.end(JSON.stringify({ id: "qa-img-baddims-1", data: [{ b64_json: raw.toString("base64") }] }));
+      return;
+    }
+    if (iprompt.includes("QA-IMG-OVER")) { ok(); res.end(JSON.stringify({ id: "qa-img-over-1", data: [{ b64_json: bigPng().repeat(100) }] })); return; }
     if (iprompt.includes("QA-IMG-MALFORMED")) { ok(); res.end(JSON.stringify({ id: "qa-img-mal-1", data: [{ b64_json: "%%%" }] })); return; }
     if (iprompt.includes("QA-IMG-EMPTY")) { ok(); res.end(JSON.stringify({ data: [] })); return; }
     if (iprompt.includes("QA-IMG-MIXED")) { ok(); res.end(JSON.stringify({ id: "qa-img-mixed-1", data: [{ b64_json: one }, { b64_json: "%%%" }, { url: "https://qa.example/img3.png" }] })); return; }

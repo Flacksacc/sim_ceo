@@ -272,17 +272,17 @@ public static class SimCEOEndpoints
       DateOnly? dayD = null, fromD = null, toD = null;
       if (day is not null)
       {
-        if (!DateOnly.TryParse(day, out var ddp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(day, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ddp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         dayD = ddp;
       }
       if (from is not null)
       {
-        if (!DateOnly.TryParse(from, out var ffp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(from, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ffp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         fromD = ffp;
       }
       if (to is not null)
       {
-        if (!DateOnly.TryParse(to, out var ttp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(to, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ttp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         toD = ttp;
       }
       if (fromD.HasValue && toD.HasValue && fromD.Value > toD.Value)
@@ -358,17 +358,17 @@ public static class SimCEOEndpoints
       DateOnly? dayDc = null, fromDc = null, toDc = null;
       if (day is not null)
       {
-        if (!DateOnly.TryParse(day, out var ddcp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(day, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ddcp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         dayDc = ddcp;
       }
       if (from is not null)
       {
-        if (!DateOnly.TryParse(from, out var ffcp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(from, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ffcp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         fromDc = ffcp;
       }
       if (to is not null)
       {
-        if (!DateOnly.TryParse(to, out var ttcp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        if (!DateOnly.TryParseExact(to, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ttcp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD (UTC date)." }, statusCode: 400);
         toDc = ttcp;
       }
       if (fromDc.HasValue && toDc.HasValue && fromDc.Value > toDc.Value)

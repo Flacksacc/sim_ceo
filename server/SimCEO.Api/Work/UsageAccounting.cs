@@ -161,6 +161,42 @@ public static class UsagePricing
     if (el.ValueKind != JsonValueKind.Number || !el.TryGetInt32(out value) || value < 0) return false;
     return true;
   }
+  private static readonly HashSet<string> RecognizedBillingNames = new(StringComparer.Ordinal)
+  {
+    "prompt_tokens", "input_tokens", "completion_tokens", "output_tokens",
+    "cached_tokens", "cached_input_tokens", "prompt_tokens_details", "input_tokens_details",
+  };
+  // Duplicate recognized billing fields at the same object level are invalid:
+  // System.Text.Json exposes one occurrence, so hidden duplicates must reject.
+  private static bool HasDuplicateBillingNames(JsonElement usage)
+  {
+    try
+    {
+      var raw = usage.GetRawText();
+      using var doc = JsonDocument.Parse(raw);
+      void Walk(JsonElement el)
+      {
+        if (el.ValueKind != JsonValueKind.Object) return;
+        var local = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var prop in el.EnumerateObject())
+        {
+          if (RecognizedBillingNames.Contains(prop.Name))
+          {
+            local.TryGetValue(prop.Name, out var c);
+            local[prop.Name] = c + 1;
+            if (local[prop.Name] > 1) throw new InvalidOperationException("duplicate billing field: " + prop.Name);
+          }
+          if (prop.Value.ValueKind == JsonValueKind.Object
+            && (prop.NameEquals("prompt_tokens_details") || prop.NameEquals("input_tokens_details")))
+            Walk(prop.Value);
+        }
+      }
+      Walk(doc.RootElement);
+      return false;
+    }
+    catch (InvalidOperationException) { return true; }
+    catch { return false; }
+  }
   public static bool TryReadUsage(JsonElement root, out int inTok, out int cachedTok, out int outTok)
   {
     inTok = 0; cachedTok = 0; outTok = 0;
@@ -216,7 +252,7 @@ public static class UsagePricing
       bool hasPtd = u.TryGetProperty("prompt_tokens_details", out var ptd);
       if (hasPtd)
       {
-        if (ptd.ValueKind == JsonValueKind.Null || ptd.ValueKind == JsonValueKind.Undefined) { }
+        if (ptd.ValueKind == JsonValueKind.Null || ptd.ValueKind == JsonValueKind.Undefined) return false;
         else if (ptd.ValueKind != JsonValueKind.Object) return false;
         else if (ptd.TryGetProperty("cached_tokens", out var ct))
         {
@@ -227,7 +263,7 @@ public static class UsagePricing
       bool hasItd = u.TryGetProperty("input_tokens_details", out var itd);
       if (hasItd)
       {
-        if (itd.ValueKind == JsonValueKind.Null || itd.ValueKind == JsonValueKind.Undefined) { }
+        if (itd.ValueKind == JsonValueKind.Null || itd.ValueKind == JsonValueKind.Undefined) return false;
         else if (itd.ValueKind != JsonValueKind.Object) return false;
         else if (itd.TryGetProperty("cached_tokens", out var ct2))
         {
@@ -245,6 +281,7 @@ public static class UsagePricing
         if (ct4.ValueKind != JsonValueKind.Number || !ct4.TryGetInt32(out var cti4) || cti4 < 0) return false;
         cachedVals.Add(cti4);
       }
+      if (HasDuplicateBillingNames(u)) return false;
       if (cachedVals.Count == 0) cachedTok = 0;
       else
       {
