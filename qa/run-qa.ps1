@@ -116,6 +116,12 @@ try {
   node qa/http-qa.mjs --tag mem; Check "http-mem" ($LASTEXITCODE -eq 0)
   Step "HTTP backup round-trip (memory)"
   node qa/http-qa.mjs --mode backup --tag mem-backup; Check "http-backup" ($LASTEXITCODE -eq 0)
+  Step "records review (memory)"
+  $recPresent = Need-File "qa/records-review-regression.mjs"
+  if ($recPresent) {
+    $env:QA_API = "http://127.0.0.1:5099"
+    node qa/records-review-regression.mjs --tag mem-records; Check "records-mem" ($LASTEXITCODE -eq 0)
+  }
   Step "provider envelope: real C-sharp gateway probe x8 (own loopback :5202, dummy key)"
   $provPresent = Need-File "qa/provider-envelope-regression.mjs"
   $provFix = Need-File "qa/provider-envelope-regression.fixtures.json"
@@ -228,6 +234,56 @@ try {
     if ($pendPresent) {
       node qa/pending-restart.mjs --verify; Check "pending-verify" ($LASTEXITCODE -eq 0)
     }
+    Step "records review PG (HTTP suite)"
+    $env:QA_API = "http://127.0.0.1:5100"
+    $env:QA_PG_CONTAINER = "simceo-qa-pg"
+    $env:QA_API_DLL = Join-Path $pubDir "SimCEO.Api.dll"
+    if ($recPresent) {
+      node qa/records-review-regression.mjs --tag pg-records; Check "records-pg" ($LASTEXITCODE -eq 0)
+    }
+    Step "records atomicity probe (code-only backend seam)"
+    $probeProj = Need-File "qa/RecordAtomicProbe/RecordAtomicProbe.csproj"
+    if ($probeProj) {
+      $probeOut = Join-Path $root ".tmp/qa/probe-records/"
+      dotnet build qa/RecordAtomicProbe/RecordAtomicProbe.csproj --nologo -v q -p:SkipStagePostgres=true "-p:OutputPath=$probeOut"
+      Check "records-probe-build" ($LASTEXITCODE -eq 0)
+      if ($LASTEXITCODE -eq 0) {
+        dotnet (Join-Path $probeOut "RecordAtomicProbe.dll") "Host=127.0.0.1;Port=15433;Database=simceo;Username=simceo;Password=qa-only"; Check "records-probe" ($LASTEXITCODE -eq 0)
+      }
+    }
+    Step "records legacy + commit-gate seed (before owned :5100 restart)"
+    if ($recPresent) {
+      $env:QA_API = "http://127.0.0.1:5100"
+      $env:QA_PERSIST_FILE = "$root/.tmp/qa-persist.json"
+      node qa/records-review-regression.mjs --tag pg-records-pre --pre-legacy; Check "records-pre-legacy" ($LASTEXITCODE -eq 0)
+      if ($LASTEXITCODE -ne 0) { throw "records legacy seed failed; refusing owned restart" }
+      node qa/records-review-regression.mjs --tag pg-records-pre --pre-commit; Check "records-pre-commit" ($LASTEXITCODE -eq 0)
+      if ($LASTEXITCODE -ne 0) { throw "records commit seed failed; refusing owned restart" }
+    } else { throw "records-review-regression.mjs missing; refusing records restart flow" }
+    Write-Host "  restarting owned :5100 for records (old pid check plus port-gone gate)"
+    $oldRecPid = $api5100b.Id
+    $entry5100r = $procs | Where-Object { $_.p -eq $api5100b } | Select-Object -First 1; Stop-Hidden $entry5100r
+    Check "records-api5100-exited" ($api5100b.HasExited) ("pid=" + $oldRecPid)
+    Check "records-api5100-port-closed" (Wait-PortClosed 5100 30) "owned :5100 port still open after kill"
+    $api5100c = Start-Hidden "dotnet" $pubApiArg ".tmp/qa-api5100c.log" ".tmp/qa-api5100c.err.log" $pgEnv
+    Check "records-restart-pid-changed" ($api5100c.Id -ne $oldRecPid) ("old=" + $oldRecPid + " new=" + $api5100c.Id)
+    Check "records-api5100c-up" (Wait-Http "http://127.0.0.1:5100/health" 90)
+    $beRec = (Invoke-WebRequest -Uri "http://127.0.0.1:5100/api/backend" -UseBasicParsing | ConvertFrom-Json)
+    Check "records-backend-still-postgres" ($beRec.mode -eq "postgres") (($beRec.mode) + " err=" + ($beRec.error))
+    $env:QA_API = "http://127.0.0.1:5100"
+    node qa/records-review-regression.mjs --tag pg-records-post1 --post-legacy; Check "records-post1-legacy" ($LASTEXITCODE -eq 0)
+    node qa/records-review-regression.mjs --tag pg-records-post1 --post-commit; Check "records-post1-commit" ($LASTEXITCODE -eq 0)
+    Write-Host "  restarting owned :5100 again for records double-restart stability"
+    $oldRecPid2 = $api5100c.Id
+    $entry5100r2 = $procs | Where-Object { $_.p -eq $api5100c } | Select-Object -First 1; Stop-Hidden $entry5100r2
+    Check "records-api5100c-exited" ($api5100c.HasExited) ("pid=" + $oldRecPid2)
+    Check "records-api5100c-port-closed" (Wait-PortClosed 5100 30) "owned :5100 port still open after kill"
+    $api5100d = Start-Hidden "dotnet" $pubApiArg ".tmp/qa-api5100d.log" ".tmp/qa-api5100d.err.log" $pgEnv
+    Check "records-restart2-pid-changed" ($api5100d.Id -ne $oldRecPid2) ("old=" + $oldRecPid2 + " new=" + $api5100d.Id)
+    Check "records-api5100d-up" (Wait-Http "http://127.0.0.1:5100/health" 90)
+    $env:QA_API = "http://127.0.0.1:5100"
+    node qa/records-review-regression.mjs --tag pg-records-post2 --post-legacy; Check "records-post2-legacy" ($LASTEXITCODE -eq 0)
+    node qa/records-review-regression.mjs --tag pg-records-post2 --post-commit; Check "records-post2-commit" ($LASTEXITCODE -eq 0)
   }
   if ($Browser) {
     Step "browser portable deps first (npm ci --prefix qa, never root scratch)"
@@ -275,6 +331,14 @@ try {
       $env:QA_API = "http://127.0.0.1:5099"
       $env:QA_WEB = "http://127.0.0.1:5174"
       node qa/navigation.cjs --base=http://127.0.0.1:5174/; Check "browser-navigation" ($LASTEXITCODE -eq 0)
+    }
+    Step "browser records review (strict UI proof)"
+    $recUiPresent = Need-File "qa/browser/records-review-ui.cjs"
+    if ($recUiPresent -and $depsOk) {
+      $env:QA_API = "http://127.0.0.1:5099"
+      $env:QA_WEB = "http://127.0.0.1:5174"
+      $env:QA_SHOTS = "$root/.tmp/records-qa-shots"
+      node qa/browser/records-review-ui.cjs; Check "browser-records-review" ($LASTEXITCODE -eq 0)
     }
   }
   if (-not $BrowserOnly) {

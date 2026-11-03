@@ -116,6 +116,11 @@ public sealed class RecordDraft
   public string ItemsJson { get; set; } = "[]";
   public string Hash { get; set; } = "";
   public string ApprovedJson { get; set; } = "[]";
+  public string DiscardedJson { get; set; } = "[]";
+  public int ReviewRevision { get; set; } = 1;
+  public string ReviewToken { get; set; } = "";
+  public string HistoryJson { get; set; } = "[]";
+  public string EvidenceSnapshotJson { get; set; } = "[]";
   public string SupersedesJson { get; set; } = "[]";
   public bool Decided { get; set; }
   public string Status { get; set; } = "open";

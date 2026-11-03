@@ -29,16 +29,21 @@ public sealed record EvidenceRef(
   public static EvidenceRef? Parse(JsonElement el)
   {
     if (el.ValueKind != JsonValueKind.Object) return null;
-    var kind = el.TryGetProperty("kind", out var k) ? (k.GetString() ?? "") : "";
-    var rf = el.TryGetProperty("ref", out var r) ? (r.GetString() ?? "")
-      : el.TryGetProperty("id", out var i) ? (i.GetString() ?? "") : "";
+    var kind = (el.TryGetProperty("kind", out var k) && k.ValueKind == JsonValueKind.String) ? (k.GetString() ?? "") : "";
+    var rf = (el.TryGetProperty("ref", out var r) && r.ValueKind == JsonValueKind.String) ? (r.GetString() ?? "")
+      : (el.TryGetProperty("id", out var i) && i.ValueKind == JsonValueKind.String) ? (i.GetString() ?? "") : "";
     if (!ValidKind(kind) || string.IsNullOrWhiteSpace(rf)) return null;
-    int? version = el.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.Number
-      ? v.GetInt32() : null;
+    int? version = null;
+    if (el.TryGetProperty("version", out var v))
+    {
+      if (v.ValueKind == JsonValueKind.Null) version = null;
+      else if (v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vi) || vi < 0) return null;
+      else version = vi;
+    }
     return new EvidenceRef(kind.Trim().ToLowerInvariant(), rf.Trim(), version,
-      el.TryGetProperty("url", out var u) ? u.GetString() : null,
-      el.TryGetProperty("title", out var t) ? t.GetString() : null,
-      el.TryGetProperty("excerpt", out var e) ? e.GetString() : null);
+      (el.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String) ? u.GetString() : null,
+      (el.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String) ? t.GetString() : null,
+      (el.TryGetProperty("excerpt", out var e) && e.ValueKind == JsonValueKind.String) ? e.GetString() : null);
   }
 
   public static List<EvidenceRef> ParseList(JsonElement el, string prop)

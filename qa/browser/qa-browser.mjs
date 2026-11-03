@@ -180,7 +180,9 @@ try {
   const items = [{ id: "a", text: "Browser exact item $5 [keep]" }, { id: "b", text: "Skip me" }];
   const d1 = await api("POST", "/api/meetings/" + mid + "/record/draft", items);
   const dh = d1.json.hash ?? d1.json.Hash, dw = d1.json.watermark ?? d1.json.Watermark;
-  await api("POST", "/api/meetings/" + mid + "/record/approve", { draftId: d1.json.id, hash: dh, watermark: dw, itemIds: ["a"] });
+  const dver = d1.json.version ?? d1.json.Version, dtok = d1.json.reviewToken ?? d1.json.ReviewToken;
+  const apRes = await api("POST", "/api/meetings/" + mid + "/record/approve", { draftId: d1.json.id, version: dver, hash: dh, reviewToken: dtok, watermark: dw, itemIds: ["a"] });
+  ok("records-approve-200", apRes.status === 200, String(apRes.status));
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => document.body && document.body.innerText.length > 50, null, { timeout: 60000 });
   // reload drops board/meeting selection: reselect both deterministically
@@ -194,10 +196,11 @@ try {
   await page.waitForTimeout(1500);
   await gotoTab("Records");
   await shot("records-approved");
-  const draftRow = page.getByRole("button", { name: /approved \u00b7 decided/ }).first();
+  const draftRow = page.getByRole("button", { name: /partially-approved/ }).first();
   await draftRow.waitFor({ timeout: 15000 }).catch(() => null);
   if (await draftRow.count() > 0) { await draftRow.click({ timeout: 15000 }); await page.waitForTimeout(1500); }
   ok("records-approved-item", await bodyHas("Browser exact item $5 [keep]"), "approved item not rendered");
+  ok("records-pending-item", await bodyHas("Skip me"), "pending item missing in partial review");
 
   // ---- Settings + Activity tabs smoke ----
   await gotoTab("Settings");
@@ -266,7 +269,7 @@ try {
   const newRec = (recList.json || []).find((r) => (r.id ?? r.Id) === newRecId);
   const oldRec = (recList.json || []).find((r) => (r.id ?? r.Id) === d1.json.id);
   ok("ui-fromdir-draft-unapproved", !!newRec && !(newRec.decided ?? newRec.Decided) && (newRec.status ?? newRec.Status) !== "approved", JSON.stringify(newRec).slice(0, 300));
-  ok("ui-fromdir-old-approved", !!oldRec && !!(oldRec.decided ?? oldRec.Decided) && (oldRec.status ?? oldRec.Status) === "approved", JSON.stringify(oldRec).slice(0, 300));
+  ok("ui-fromdir-old-partial", !!oldRec && !(oldRec.decided ?? oldRec.Decided) && (oldRec.status ?? oldRec.Status) === "partially-approved", JSON.stringify(oldRec).slice(0, 300));
   ok("tabs-smoke", true);
 
   await page.close(); await ctx.close(); // never close the shared browser

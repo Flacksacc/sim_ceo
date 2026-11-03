@@ -296,6 +296,46 @@ public static class PgBoot
       Ddl(conn, "ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"AccessEnforced\" boolean NOT NULL DEFAULT false", 35);
       Ddl(conn, "ALTER TABLE \"Grants\" ADD COLUMN IF NOT EXISTS \"MeetingId\" uuid", 36);
       Ddl(conn, "ALTER TABLE \"Invites\" ADD COLUMN IF NOT EXISTS \"MeetingId\" uuid", 37);
+      db.Database.EnsureCreated();
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"ParentSequence\" bigint");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"Stance\" character varying(30) NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"AdvisorId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Notes\" ADD COLUMN IF NOT EXISTS \"EvidenceJson\" text NOT NULL DEFAULT '[]'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WizardDrafts\" ADD COLUMN IF NOT EXISTS \"Version\" integer NOT NULL DEFAULT 1");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchJobId\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"DiscardedJson\" text NOT NULL DEFAULT '[]'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"ReviewRevision\" integer NOT NULL DEFAULT 1");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"ReviewToken\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"HistoryJson\" text NOT NULL DEFAULT '[]'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"EvidenceSnapshotJson\" text NOT NULL DEFAULT '[]'");
+      // Compatibility-only initialization for legacy rows: fill blank
+      // columns with deterministic/stable values. Never touch Decided or a
+      // non-blank Status, so previously finalized or discarded reviews stay
+      // terminal with only their original selections.
+      foreach (var d in db.Drafts.ToList())
+      {
+        if (string.IsNullOrWhiteSpace(d.ReviewToken)) { d.ReviewToken = SimCEO.Api.Work.Hashing.HashOf("legacy-review:" + d.Id.ToString("N") + ":" + d.Version + ":" + (d.Hash ?? "")); }
+        if (d.ReviewRevision < 1) { d.ReviewRevision = 1; }
+        if (string.IsNullOrWhiteSpace(d.ApprovedJson)) { d.ApprovedJson = "[]"; }
+        if (string.IsNullOrWhiteSpace(d.DiscardedJson)) { d.DiscardedJson = "[]"; }
+        if (string.IsNullOrWhiteSpace(d.HistoryJson)) { d.HistoryJson = "[]"; }
+        if (string.IsNullOrWhiteSpace(d.SupersedesJson)) { d.SupersedesJson = "[]"; }
+        if (string.IsNullOrWhiteSpace(d.EvidenceSnapshotJson)) { d.EvidenceSnapshotJson = "[]"; }
+        if (string.IsNullOrWhiteSpace(d.Status))
+        {
+          var legacyApprovals = 0;
+          try
+          {
+            using var doc = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(d.ApprovedJson) ? "[]" : d.ApprovedJson);
+            if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Array) legacyApprovals = doc.RootElement.GetArrayLength();
+          }
+          catch (System.Text.Json.JsonException) { }
+          d.Status = (d.Decided && legacyApprovals > 0) ? "approved" : (d.Decided ? "discarded" : "open");
+        }
+      }
+      db.SaveChanges();
       Pg.Backend = new PostgresBackend(db);
       return true;
     }
