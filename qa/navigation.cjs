@@ -156,7 +156,7 @@ async function desktopSuite(browser) {
     await page.goto(BASE + "#/meet?board=b-alpha", { waitUntil: "domcontentloaded" });
     await page.locator("ol.agenda button", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
     await setDelay(page, "meetings", 1200);
-    await page.getByRole("button", { name: "Start meeting" }).click();
+    await page.getByRole("button", { name: "New meeting" }).click();
     await page.waitForFunction(() => /meeting=m-new-/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
     await check(page, "created meeting navigates to m-new", async () => /meeting=m-new-/.test(await hashOf(page)));
     const createdHash = await hashOf(page);
@@ -475,7 +475,7 @@ async function desktopSuite(browser) {
     await page.getByRole("button", { name: "Save title + brief" }).click();
     await page.waitForTimeout(1200);
     await check(page, "meeting brief save updates detail", () => page.locator("section[aria-label=\"Meetings and conversation\"] div.meet-head").getByText("Updated brief for QA run enables discussion").isVisible());
-    await check(page, "saved brief enables Run", () => page.getByRole("button", { name: "Run discussion" }).isEnabled());
+    await check(page, "saved brief enables Run", () => page.getByRole("button", { name: "Request advisor responses" }).isEnabled());
     await page.getByRole("button", { name: "Pause" }).click();
     await page.waitForTimeout(1200);
     await check(page, "pause enables Resume", () => page.getByRole("button", { name: "Resume" }).isEnabled());
