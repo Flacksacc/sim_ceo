@@ -7,12 +7,19 @@
 //   1. GET {cdp}/json/list (readonly) and match ONLY explicitly allowlisted
 //      existing target IDs (never discovers/owns all targets).
 //   2. Opens ONE WebSocket per allowlisted target, checks the live page origin
-//      is localhost/127.x loopback :5173, then runs READONLY Runtime.evaluate
-//      captures (route + nonsecret params, scoped draft/recovery localStorage
-//      keys, visible unsent field metadata). No DOM mutation, no navigation,
-//      no clicks/keys/resize/activation, no Browser.close / Target.close /
-//      createPage. Only its own WS connections are closed.
-//   3. Writes ONE private UTF-8 (no BOM) JSON file to an explicit --out path
+//      is an explicitly allowed local project dev-app origin
+//      (localhost/127.x loopback :5173 or :5174), then runs READONLY
+//      Runtime.evaluate captures (sanitized route + safe params only, full
+//      exact draft/recovery localStorage keys/values, full visible unsent
+//      field values). No DOM mutation, no navigation, no clicks/keys/resize,
+//      no activation, no Browser.close / Target.close / Target.createTarget /
+//      Page.navigate. Only its own WS connections are closed.
+//   3. Non-app targets (edge://newtab, chrome://, about:, blank, non-page
+//      types) are explicitly marked skipped-non-app (ok, no capture needed).
+//      Actual app capture errors, missing expected app targets, incomplete
+//      captures, or zero valid app captures fail closed: console top-level
+//      ok:false with native nonzero exit.
+//   4. Writes ONE private UTF-8 (no BOM) JSON file to an explicit --out path
 //      that must live under a `.tmp` segment (ignored scratch). Prints ONLY
 //      public console fields: out path, allowlisted count, per-target status,
 //      draft/field counts, error summary. Never prints secret or draft values.
@@ -34,16 +41,23 @@ const ALLOWLISTED_IDS = [
   "0A36D2AB172DF5B20D9843DDA9834293",
 ];
 const ALLOW = new Set(ALLOWLISTED_IDS);
-const ALLOWED_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+]);
 const HTTP_TIMEOUT_MS = 6000;
 const WS_TIMEOUT_MS = 6000;
 const EVAL_TIMEOUT_MS = 9000;
 const PER_TARGET_BUDGET_MS = 25000;
 const MAX_STORAGE_KEYS = 50;
-const MAX_VALUE_CHARS = 2000;
 const MAX_FIELDS = 100;
-const MAX_FIELD_VALUE_CHARS = 1000;
 const MAX_LABEL_CHARS = 120;
+const MAX_SAFE_PARAMS = 10;
+const MAX_TOTAL_CAPTURE_CHARS = 500000;
+const MAX_TOTAL_JSON_CHARS = 1000000;
+const MAX_ROUTE_CHARS = 500;
 
 function argValue(name, dflt) {
   const i = process.argv.indexOf(name);
@@ -129,47 +143,105 @@ function closeOwnedWs(ws) {
   try { if (ws && ws.readyState === 1) ws.close(); } catch {}
 }
 
+function isNonAppTarget(entry, origin) {
+  const url = String((entry && entry.url) || "");
+  const type = String((entry && entry.type) || "");
+  if (url.startsWith("edge://") || url.startsWith("chrome://") || url.startsWith("about:") ||
+      url.startsWith("chrome-") || url === "about:blank" || url.startsWith("data:")) return true;
+  if (!origin || origin === "null" || origin === "about:blank") return true;
+  if (type && type !== "page") return true;
+  return false;
+}
+
 // Readonly origin probe: no storage/DOM access, location only.
 const ORIGIN_PROBE = "(() => ({ href: String(location.href), origin: String(location.origin) }))()";
 
-// Readonly draft capture. No mutation, no events, no navigation. Bounded.
+// Readonly draft capture. No mutation, no events, no navigation. Full exact
+// draft/recovery key names + full values and full visible nonsecret field
+// values; bounded by key/field counts plus a shared total-char budget with
+// fail-closed incomplete reporting (never silently drops keys/fields).
+// Query AND hash parameters are sanitized: only the pre-existing safe set is
+// kept, raw hash is never stored, credentials never saved as raw hash.
 const DRAFT_CAPTURE = `(() => {
-  const trunc = (s, n) => { s = String(s ?? ""); return { text: s.slice(0, n), len: s.length, truncated: s.length > n }; };
   const SAFE_PARAMS = new Set(["boardId","board","meetingId","meeting","recordId","record","step","tab","view"]);
   const SECRET_RE = /token|session|api[_-]?key|apikey|secret|password|auth|credential|bearer|code|state/i;
   const DRAFT_RE = /draft|recover|unsent|autosave|auto-save|backup/i;
   const SECRET_KEY_RE = /token|session|api[_-]?key|apikey|credential|secret|auth|password|bearer|simceo-token/i;
   const SECRET_FIELD_RE = /token|api[_-]?key|apikey|secret|password|passwd|pwd|auth|credential|session|bearer/i;
   const out = { url: "", route: "", paramsKept: {}, paramsDropped: 0,
-    storageScanned: 0, storageSkippedSecret: 0, storageKeys: [], fieldScanned: 0, fields: [] };
+    storageScanned: 0, storageSkippedSecret: 0, storageKeys: [], fieldScanned: 0, fields: [],
+    incomplete: false, incompleteReason: "", totalChars: 0, draftMatchCount: 0, fieldMatchCount: 0 };
+  const markIncomplete = (reason) => { out.incomplete = true; if (!out.incompleteReason) out.incompleteReason = reason; };
+  let pathName = "";
   try { out.url = String(location.origin) + String(location.pathname); } catch {}
-  try { out.route = String(location.pathname) + String(location.hash || ""); } catch {}
-  try {
-    const sp = new URLSearchParams(location.search || "");
-    for (const [k, v] of sp) {
+  try { pathName = String(location.pathname || ""); } catch {}
+  const keepSafe = (sp) => {
+    for (const kv of sp) {
+      const k = kv[0], v = kv[1];
       if (SAFE_PARAMS.has(k) && !SECRET_RE.test(k)) {
-        if (Object.keys(out.paramsKept).length < 10) out.paramsKept[k] = String(v).slice(0, ${MAX_LABEL_CHARS});
+        if (Object.keys(out.paramsKept).length < ${MAX_SAFE_PARAMS}) out.paramsKept[k] = String(v).slice(0, ${MAX_LABEL_CHARS});
       } else out.paramsDropped++;
     }
+  };
+  try {
+    const sp = new URLSearchParams(location.search || "");
+    keepSafe(sp);
   } catch {}
+  let cleanHash = "";
+  try {
+    const h = String(location.hash || "");
+    if (h) {
+      const qIdx = h.indexOf("?");
+      let hPath = qIdx >= 0 ? h.slice(0, qIdx) : h;
+      let hQuery = qIdx >= 0 ? h.slice(qIdx + 1) : "";
+      if (qIdx < 0 && h.indexOf("=") >= 0) { hPath = ""; hQuery = h.slice(1); }
+      hPath = String(hPath || "").slice(0, ${MAX_ROUTE_CHARS});
+      const kept = [];
+      if (hQuery) {
+        let hsp = null;
+        try { hsp = new URLSearchParams(hQuery); } catch { hsp = null; }
+        if (hsp) {
+          for (const kv of hsp) {
+            const k = kv[0], v = kv[1];
+            if (SAFE_PARAMS.has(k) && !SECRET_RE.test(k)) {
+              if (Object.keys(out.paramsKept).length < ${MAX_SAFE_PARAMS}) {
+                out.paramsKept[k] = String(v).slice(0, ${MAX_LABEL_CHARS});
+                kept.push(k + "=" + String(v).slice(0, ${MAX_LABEL_CHARS}));
+              }
+            } else out.paramsDropped++;
+          }
+        } else out.paramsDropped++;
+      }
+      cleanHash = hPath + (kept.length ? "?" + kept.join("&") : "");
+    }
+  } catch {}
+  try { out.route = (String(pathName || "") + String(cleanHash || "")).slice(0, ${MAX_ROUTE_CHARS}); } catch {}
   try {
     const keys = Object.keys(localStorage || {});
     out.storageScanned = keys.length;
+    const matched = [];
     for (const k of keys) {
-      if (out.storageKeys.length >= ${MAX_STORAGE_KEYS}) break;
       if (!DRAFT_RE.test(k)) continue;
       if (SECRET_KEY_RE.test(k)) { out.storageSkippedSecret++; continue; }
+      matched.push(String(k));
+    }
+    out.draftMatchCount = matched.length;
+    if (matched.length > ${MAX_STORAGE_KEYS}) markIncomplete("storage-key-limit:" + matched.length + ">" + ${MAX_STORAGE_KEYS});
+    const take = matched.slice(0, ${MAX_STORAGE_KEYS});
+    for (const k of take) {
       let raw = "";
       try { raw = localStorage.getItem(k) ?? ""; } catch { continue; }
-      const t = trunc(raw, ${MAX_VALUE_CHARS});
-      out.storageKeys.push({ k: String(k).slice(0, ${MAX_LABEL_CHARS}), len: t.len, truncated: t.truncated, preview: t.text });
+      const full = String(raw);
+      if ((out.totalChars + full.length) > ${MAX_TOTAL_CAPTURE_CHARS}) { markIncomplete("total-capture-limit-storage"); break; }
+      out.totalChars += full.length;
+      out.storageKeys.push({ k: k, len: full.length, truncated: false, preview: full });
     }
   } catch {}
   try {
     const els = document.querySelectorAll("textarea, input, select, [contenteditable='true'], [contenteditable='']");
     out.fieldScanned = els.length;
+    const cands = [];
     for (const el of els) {
-      if (out.fields.length >= ${MAX_FIELDS}) break;
       const tag = (el.tagName || "").toLowerCase();
       const type = String(el.getAttribute ? (el.getAttribute("type") || "") : "").toLowerCase();
       if (["password","hidden","file","submit","button"].includes(type)) continue;
@@ -197,8 +269,16 @@ const DRAFT_CAPTURE = `(() => {
         else { val = String(el.value ?? ""); }
       } catch {}
       if (!val) continue;
-      const t = trunc(val, ${MAX_FIELD_VALUE_CHARS});
-      out.fields.push({ kind: kind.slice(0, 32), label, len: t.len, truncated: t.truncated, preview: t.text });
+      cands.push({ kind: String(kind).slice(0, 32), label: label, val: String(val) });
+    }
+    out.fieldMatchCount = cands.length;
+    if (cands.length > ${MAX_FIELDS}) markIncomplete("field-limit:" + cands.length + ">" + ${MAX_FIELDS});
+    const takeF = cands.slice(0, ${MAX_FIELDS});
+    for (const c of takeF) {
+      const full = String(c.val);
+      if ((out.totalChars + full.length) > ${MAX_TOTAL_CAPTURE_CHARS}) { markIncomplete("total-capture-limit-fields"); break; }
+      out.totalChars += full.length;
+      out.fields.push({ kind: c.kind, label: c.label, len: full.length, truncated: false, preview: full });
     }
   } catch {}
   return out;
@@ -216,11 +296,21 @@ async function backupOneTarget(list, targetId) {
     const originInfo = await cdpEvaluate(ws, ORIGIN_PROBE);
     const origin = originInfo && originInfo.origin;
     if (!ALLOWED_ORIGINS.has(origin)) {
+      if (isNonAppTarget(entry, origin)) {
+        return { id: targetId, ok: true, status: "skipped-non-app", route: "", draftKeys: 0, fields: 0, error: "", _cap: null, skipped: true };
+      }
       return { id: targetId, ok: false, status: "blocked-origin", route: "", draftKeys: 0, fields: 0,
-        error: "origin-not-loopback-5173", _cap: null };
+        error: "origin-not-allowed", _cap: null };
     }
     const cap = await cdpEvaluate(ws, DRAFT_CAPTURE);
     if (Date.now() - started > PER_TARGET_BUDGET_MS) throw new Error("per-target-budget-exceeded");
+    if (!cap || typeof cap !== "object") throw new Error("empty-capture");
+    if (cap.incomplete) {
+      return { id: targetId, ok: false, status: "incomplete-capture", route: String(cap.route || ""),
+        paramsKept: (cap && cap.paramsKept) || {}, draftKeys: (cap && cap.storageKeys ? cap.storageKeys.length : 0),
+        fields: (cap && cap.fields ? cap.fields.length : 0),
+        error: String(cap.incompleteReason || "incomplete-capture").slice(0, 160), _cap: cap };
+    }
     return { id: targetId, ok: true, status: "backed-up", route: String((cap && cap.route) || ""),
       paramsKept: (cap && cap.paramsKept) || {}, draftKeys: (cap && cap.storageKeys ? cap.storageKeys.length : 0),
       fields: (cap && cap.fields ? cap.fields.length : 0), error: "", _cap: cap };
@@ -241,42 +331,73 @@ for (const id of requestedIds) {
   results.push(await backupOneTarget(list, id));
 }
 
-const okOnes = results.filter((r) => r.ok);
+const backedUp = results.filter((r) => r.ok && r.status === "backed-up");
+const skippedNonApp = results.filter((r) => r.status === "skipped-non-app");
+const failures = results.filter((r) => !r.ok);
+let overallOk = failures.length === 0 && backedUp.length > 0;
+let overallError = "";
+if (backedUp.length === 0) {
+  overallOk = false;
+  overallError = "missing-expected-app-page: no valid app capture";
+}
+
 const payload = {
   tool: "preserve-browser-drafts.mjs",
   readonly: true, backupOnly: true, neverReapplies: true,
   cdp: CDP, allowlistedIds: requestedIds,
   capturedAt: new Date().toISOString(),
   originAllowlist: [...ALLOWED_ORIGINS],
-  limits: { maxStorageKeys: MAX_STORAGE_KEYS, maxValueChars: MAX_VALUE_CHARS, maxFields: MAX_FIELDS,
-    maxFieldValueChars: MAX_FIELD_VALUE_CHARS, maxLabelChars: MAX_LABEL_CHARS,
+  limits: { maxStorageKeys: MAX_STORAGE_KEYS, maxFields: MAX_FIELDS,
+    maxLabelChars: MAX_LABEL_CHARS, maxSafeParams: MAX_SAFE_PARAMS,
+    maxTotalCaptureChars: MAX_TOTAL_CAPTURE_CHARS, maxTotalJsonChars: MAX_TOTAL_JSON_CHARS,
+    maxRouteChars: MAX_ROUTE_CHARS,
     httpTimeoutMs: HTTP_TIMEOUT_MS, wsTimeoutMs: WS_TIMEOUT_MS, evalTimeoutMs: EVAL_TIMEOUT_MS },
-  note: "Scoped human draft/recovery backup only. Credential/token/session/API-key keys and secret fields excluded at capture. Run only against operator-owned loopback :5173 pages.",
+  note: "Scoped human draft/recovery backup only: full exact nonsecret draft/recovery keys+values and visible unsent field values; credential/token/session/API-key keys and secret fields excluded at capture; query+hash sanitized to safe board/meeting/record/step/tab/view params only (raw hash never stored); non-app/newtab targets skipped; total capture bounded with fail-closed incomplete reporting. Run only against operator-owned loopback :5173/:5174 pages.",
+  requireAppCapture: true,
+  skippedNonAppCount: skippedNonApp.length,
+  incompleteCount: results.filter((r) => r.status === "incomplete-capture").length,
   targets: results.map((r) => ({
     id: r.id, ok: r.ok, status: r.status, route: r.route,
     paramsKept: r.paramsKept || {}, draftKeys: r.draftKeys, fields: r.fields, error: r.error || "",
     ...(r.ok && r._cap ? { storage: r._cap.storageKeys, storageScanned: r._cap.storageScanned,
-      storageSkippedSecret: r._cap.storageSkippedSecret, fieldScanned: r._cap.fieldScanned, capturedFields: r._cap.fields,
+      storageSkippedSecret: r._cap.storageSkippedSecret, draftMatchCount: r._cap.draftMatchCount,
+      fieldScanned: r._cap.fieldScanned, fieldMatchCount: r._cap.fieldMatchCount,
+      capturedFields: r._cap.fields, totalChars: r._cap.totalChars,
+      incomplete: !!r._cap.incomplete, incompleteReason: String(r._cap.incompleteReason || ""),
       url: r._cap.url, paramsDropped: r._cap.paramsDropped } : {}),
+    ...(!r.ok && r._cap ? { storageScanned: r._cap.storageScanned, draftMatchCount: r._cap.draftMatchCount,
+      fieldScanned: r._cap.fieldScanned, fieldMatchCount: r._cap.fieldMatchCount,
+      totalChars: r._cap.totalChars, incomplete: !!r._cap.incomplete,
+      incompleteReason: String(r._cap.incompleteReason || "") } : {}),
   })),
 };
 
+let payloadJson = JSON.stringify(payload, null, 2);
+if (payloadJson.length > MAX_TOTAL_JSON_CHARS) {
+  overallOk = false;
+  overallError = "total-json-limit-exceeded:" + payloadJson.length + ">" + MAX_TOTAL_JSON_CHARS;
+  payload.incomplete = true;
+  payload.incompleteReason = overallError;
+  payloadJson = JSON.stringify(payload, null, 2);
+}
+
 fs.mkdirSync(path.dirname(resolvedOut), { recursive: true });
-fs.writeFileSync(resolvedOut, JSON.stringify(payload, null, 2), { encoding: "utf8" });
+fs.writeFileSync(resolvedOut, payloadJson, { encoding: "utf8" });
 
 const totalDrafts = results.reduce((n, r) => n + (r.draftKeys || 0), 0);
 const totalFields = results.reduce((n, r) => n + (r.fields || 0), 0);
+const errors = results.filter((r) => !r.ok).map((r) => r.id + ":" + (r.error || r.status));
+if (!overallOk && overallError && !errors.some((e) => e.includes(overallError.split(":")[0]))) errors.push(overallError);
 console.log(JSON.stringify({
-  ok: true, out: resolvedOut, cdp: CDP,
+  ok: overallOk, out: resolvedOut, cdp: CDP,
   allowlistedTargetCount: requestedIds.length,
-  okCount: okOnes.length,
+  okCount: backedUp.length,
+  skippedNonAppCount: skippedNonApp.length,
   missingCount: results.filter((r) => r.status === "missing").length,
   blockedOriginCount: results.filter((r) => r.status === "blocked-origin").length,
+  incompleteCount: results.filter((r) => r.status === "incomplete-capture").length,
   totalDraftKeys: totalDrafts, totalFields,
   targets: results.map((r) => ({ id: r.id, status: r.status, route: r.route, draftKeys: r.draftKeys, fields: r.fields, error: r.error || "" })),
-  errors: results.filter((r) => !r.ok).map((r) => r.id + ":" + (r.error || r.status)),
+  errors,
 }));
-process.exit(0);
-
-
-
+process.exit(overallOk ? 0 : 3);
