@@ -200,40 +200,174 @@ try {
   // in the rail only after a board is picked.
   const openedBoard = await clickAny(page, [{ text: run + "-board" }], "board-select");
   if (openedBoard) await page.waitForTimeout(1200);
-  // --- P2 navigation: tabs, deep link, back/forward, reload, invalid routes ---
-  const tabs = ["Records", "People", "Help", "Profile", "Boards"];
-  for (const t of tabs) {
-    const ok = await clickAny(page, [{ role: "button", name: t }, { role: "link", name: t }], "nav-tab-" + t);
-    if (ok) {
-      await page.waitForTimeout(800);
-      const h = await page.evaluate(() => location.hash);
-      ctx.ok("nav-tab-" + t + "-hash", h.toLowerCase().includes(t.toLowerCase().slice(0, 4)), "hash=" + h);
+  // --- P2 navigation: ACTUAL visible enabled rail with exact route/hash,
+  // selected parents, heading/action content, exact back/forward, reload,
+  // invalid recovery. REST seed is fixture only; every claim is a DOM read.
+  // Rail (App.tsx navGroups, board selected): Boards/Roster/Board Advisors/
+  // Meetings/Sources/Records/People/Activity/Settings/Profile/Help. Wizard is
+  // hash-only ("#/wizard", section New-board wizard), not a rail button.
+  const railExpect = [
+    { key: "boards", label: "Boards", section: "Boards", heading: "Boards", action: "Board settings" },
+    { key: "profile", label: "Profile", section: "Profile", heading: "Profile", action: "One lead profile per board" },
+    { key: "roster", label: "Roster", section: "My Advisor Roster", heading: "My Advisor Roster", action: "Roster entries are reusable" },
+    { key: "advisors", label: "Board Advisors", section: "This Board\u0027s Advisors", heading: "This Board\u0027s Advisors", action: "Board seats" },
+    { key: "meet", label: "Meetings", section: "Meetings and conversation", heading: null, action: "Discussion" },
+    { key: "sources", label: "Sources", section: "Resources and Inbox", heading: "Resources and Inbox", action: "Resources and Inbox" },
+    { key: "records", label: "Records", section: "Records", heading: "Records", action: "Review drafts" },
+    { key: "people", label: "People", section: "People", heading: "People", action: "Board-scoped invitations" },
+    { key: "activity", label: "Activity", section: "Activity and Usage", heading: "Activity and Usage", action: "Activity and Usage" },
+    { key: "settings", label: "Settings", section: "Settings", heading: "Settings", action: "Model connection" },
+    { key: "help", label: "Help", section: "Help", heading: "Help", action: "Keyboard shortcuts" },
+  ];
+  for (const exp of railExpect) {
+    const btn = page.locator('nav[aria-label="Board navigation"] button[aria-label="' + exp.label + '"]');
+    const n = await btn.count().catch(() => 0);
+    ctx.ok("nav-visible-" + exp.key, n >= 1, exp.label + " rail button present with board selected");
+    if (!n) continue;
+    await btn.first().click({ timeout: 8000 });
+    await page.waitForTimeout(900);
+    const st = await page.evaluate((args) => {
+      const b = document.querySelector('nav[aria-label="Board navigation"] button[aria-label="' + args.label + '"]');
+      const sec = document.querySelector('section[aria-label="' + args.section + '"]');
+      const h = sec ? (sec.querySelector("h2") ? sec.querySelector("h2").textContent : "") : "";
+      return { hash: location.hash, cur: b ? b.getAttribute("aria-current") : null, hasSec: !!sec, heading: (h || "").slice(0, 120), body: document.body.innerText };
+    }, { label: exp.label, section: exp.section });
+    ctx.ok("nav-tab-" + exp.key + "-hash", st.hash === "#/" + exp.key || st.hash.indexOf("#/" + exp.key + "?") === 0, "hash=" + st.hash);
+    if (exp.key === "boards" || exp.key === "meet" || exp.key === "records" || exp.key === "advisors" || exp.key === "sources" || exp.key === "people" || exp.key === "activity") {
+      ctx.ok("nav-tab-" + exp.key + "-board", st.hash.indexOf("board=" + bid) >= 0, "selected board in hash=" + st.hash);
     }
+    ctx.ok("nav-tab-" + exp.key + "-selected", st.cur === "page", "aria-current=" + st.cur);
+    ctx.ok("nav-tab-" + exp.key + "-section", !!st.hasSec, "section[" + exp.section + "] present");
+    if (exp.heading) ctx.ok("nav-tab-" + exp.key + "-heading", (st.heading || "").indexOf(exp.heading.slice(0, 12)) >= 0, "h2=" + st.heading);
+    ctx.ok("nav-tab-" + exp.key + "-action", st.body.indexOf(exp.action) >= 0, "action/content=" + exp.action);
   }
+  // First-3 user flow exercised via actual UI rail clicks above (setup Boards,
+  // lead Profile, advisor Board Advisors). REST seed stays fixture only.
+  await page.goto(WEB + "/#/boards?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("setup-board-settings-dom", s.body.indexOf("Board settings") >= 0, s.hash);
+    ctx.ok("setup-activation-row", /Active configuration present|Not yet activated/.test(s.body), s.body.slice(0, 160));
+  }
+  await page.goto(WEB + "/#/profile?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  {
+    const s = await page.evaluate(() => {
+      const sec = document.querySelector('section[aria-label="Profile"]');
+      const inputs = sec ? Array.from(sec.querySelectorAll("input")).map((i) => i.value) : [];
+      return { hash: location.hash, body: document.body.innerText, inputs };
+    });
+    ctx.ok("lead-profile-dom", /Saved version|No saved profile yet/.test(s.body) && s.inputs.some((v) => String(v).indexOf("QA Lead") >= 0), s.hash + " inputs=" + s.inputs.slice(0, 3).join("|").slice(0, 120));
+  }
+  await page.goto(WEB + "/#/advisors?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("advisor-seats-dom", s.body.indexOf("Board seats") >= 0, s.hash);
+  }
+  // Meeting discussion + sub-views (Discussion/notes takeaways incl. Brief and
+  // Secretary provisional notes surface, Options, Decision) via real hashes.
   await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
-  const conv = await findAny(page, [{ role: "region", name: "Meetings and conversation" }, { text: leadMsg }], "meeting-conversation-renders");
-  if (conv) ctx.ok("meeting-deep-link-renders", true, "lead message visible");
-  await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => null);
-  await page.waitForTimeout(600);
-  const backHash = await page.evaluate(() => location.hash);
-  ctx.ok("nav-back-changes-hash", typeof backHash === "string", "hash=" + backHash);
-  await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => null);
-  await page.waitForTimeout(600);
-  const fwdOk = await page.evaluate(() => document.body && document.body.innerText.length > 50);
-  ctx.ok("nav-forward-renders", !!fwdOk, "body non-blank after forward");
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForTimeout(1200);
-  const stillBoards = await page.evaluate(() => document.body.innerText);
-  ctx.ok("reload-keeps-session", !/sign in/i.test(stillBoards.slice(0, 500)) || stillBoards.includes(run + "-board") || stillBoards.length > 200, "body-len=" + stillBoards.length);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("meeting-discussion-renders", s.hash.indexOf("#/meet") === 0 && s.hash.indexOf("board=" + bid) >= 0 && s.hash.indexOf("meeting=" + mid) >= 0 && s.body.indexOf(leadMsg) >= 0, s.hash);
+  }
+  await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1200);
+  {
+    const s = await page.evaluate(() => {
+      const tab = document.querySelector('[aria-label="Meeting views"] [role=tab][aria-selected="true"]');
+      return { hash: location.hash, sel: tab ? tab.textContent.trim() : "", body: document.body.innerText };
+    });
+    ctx.ok("meeting-takeaways-selected", s.hash.indexOf("mtab=takeaways") >= 0 && /Key takeaways/i.test(s.sel), "sel=" + s.sel + " hash=" + s.hash);
+    ctx.ok("meeting-notes-surface", s.body.indexOf("Secretary provisional notes") >= 0 && s.body.indexOf("Brief") >= 0, s.body.slice(0, 200));
+  }
+  await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=options", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1000);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("meeting-options-surface", s.hash.indexOf("mtab=options") >= 0 && s.body.indexOf("Options on the table") >= 0, s.hash);
+  }
+  await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=decision", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1000);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("meeting-decision-surface", s.hash.indexOf("mtab=decision") >= 0 && s.body.indexOf("Decision state") >= 0, s.hash);
+  }
+  // Records deep link + manual sources surface (Resources and Inbox is the
+  // manual-sources/read surface; Wiki/guests/deep-usage deferred features are
+  // NOT claimed).
+  await page.goto(WEB + "/#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1200);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("records-deep-link-exact", s.hash === "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, "hash=" + s.hash);
+    ctx.ok("records-review-surface", s.body.indexOf("Review drafts") >= 0, s.body.slice(0, 160));
+  }
+  await page.goto(WEB + "/#/sources?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1000);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("sources-surface", (s.hash === "#/sources?board=" + bid || s.hash.indexOf("#/sources?") === 0) && s.body.indexOf("Resources and Inbox") >= 0, "hash=" + s.hash);
+  }
+  // Wizard hash-only route renders a clear usable view (no broken route, no
+  // feature completion claim beyond its guide surface).
+  await page.goto(WEB + "/#/wizard", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  {
+    const s = await page.evaluate(() => ({ hash: location.hash, body: document.body.innerText }));
+    ctx.ok("wizard-surface", s.hash.indexOf("#/wizard") === 0 && s.body.indexOf("Create a board") >= 0, "hash=" + s.hash);
+  }
+  // Exact prior/next Back/Forward (not typeof/body-length).
+  await page.goto(WEB + "/#/people?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  const priorHash = await page.evaluate(() => location.hash);
+  await page.goto(WEB + "/#/help", { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
+  const nextHash = await page.evaluate(() => location.hash);
+  await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => null);
+  await page.waitForTimeout(900);
+  const backHash = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("nav-back-exact", backHash.h === priorHash, "back=" + backHash.h + " prior=" + priorHash);
+  ctx.ok("nav-back-section", backHash.body.indexOf("People") >= 0 && backHash.body.indexOf("Board-scoped invitations") >= 0, backHash.body.slice(0, 160));
+  await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => null);
+  await page.waitForTimeout(900);
+  const fwdHash = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("nav-forward-exact", fwdHash.h === nextHash, "fwd=" + fwdHash.h + " next=" + nextHash);
+  ctx.ok("nav-forward-section", fwdHash.body.indexOf("Help") >= 0 && fwdHash.body.indexOf("Keyboard shortcuts") >= 0, fwdHash.body.slice(0, 160));
+  // Reload keeps the SAME valid route (exact hash + same section/heading).
+  await page.goto(WEB + "/#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1200);
+  const beforeReload = await page.evaluate(() => location.hash);
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1500);
+  const afterReload = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("reload-same-route", afterReload.h === beforeReload, "before=" + beforeReload + " after=" + afterReload.h);
+  ctx.ok("reload-same-section", afterReload.body.indexOf("Review drafts") >= 0, afterReload.body.slice(0, 160));
+  // Invalid link recovers to the safe expected state (exact, not body-len).
   await page.goto(WEB + "/#/nope-not-a-tab", { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(800);
-  const invHash = await page.evaluate(() => ({ h: location.hash, len: document.body.innerText.length }));
-  ctx.ok("invalid-hash-recovers", invHash.len > 50, "hash=" + invHash.h + " len=" + invHash.len);
+  await page.waitForTimeout(1000);
+  const invHash = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("invalid-hash-recovers", invHash.h === "#/boards?board=" + bid + "&meeting=" + mid || invHash.h.indexOf("#/boards") === 0, "hash=" + invHash.h);
+  ctx.ok("invalid-hash-section", invHash.body.indexOf("Boards") >= 0 && !/something went wrong|white screen/i.test(invHash.body), invHash.body.slice(0, 160));
   const fakeId = "00000000-0000-0000-0000-000000000000";
   await page.goto(WEB + "/#/boards?board=" + fakeId, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(1000);
-  const invParent = await page.evaluate(() => document.body.innerText);
-  ctx.ok("invalid-parent-recovers", invParent.length > 50 && !/something went wrong|white screen/i.test(invParent), "len=" + invParent.length);
+  await page.waitForTimeout(1200);
+  const invParent = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("invalid-parent-recovers", invParent.h === "#/boards" && invParent.body.indexOf("Boards") >= 0 && !/something went wrong|white screen/i.test(invParent.body), "hash=" + invParent.h);
+  await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + fakeId, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1200);
+  const invMeet = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("invalid-meeting-recovers", invMeet.h.indexOf("#/meet?board=" + bid) === 0 && (invMeet.body.indexOf("Start meeting") >= 0 || invMeet.body.indexOf("Meetings") >= 0) && !/something went wrong|white screen/i.test(invMeet.body), "hash=" + invMeet.h);
+  await page.goto(WEB + "/#/records?board=" + bid + "&meeting=" + mid + "&rec=" + fakeId, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1200);
+  const invRec = await page.evaluate(() => ({ h: location.hash, body: document.body.innerText }));
+  ctx.ok("invalid-rec-recovers", invRec.h === "#/records?board=" + bid + "&meeting=" + mid && invRec.body.indexOf("Records") >= 0, "hash=" + invRec.h);
+  // Restore the selected board context dropped by the invalid-parent probe.
+  await page.goto(WEB + "/#/boards?board=" + bid, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(900);
 
   // --- P3 roles + archived DOM ---
   await page.goto(WEB + "/#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -522,6 +656,12 @@ try {
     } catch (e) { ctx.ok("secretary-second-renders", false, "second provisional body never rendered within 30s"); }
     const secDom2 = await page.evaluate(() => document.body.innerText);
     ctx.ok("secretary-new-clears-old", /provisional/i.test(secDom2), secDom2.slice(0, 400));
+    // Phase4 offline Retry/Resume/newer-question hydration is NOT browser-proven
+    // here (no fault-injection/mock server in this leg): FIRST-answer success,
+    // current-failure surfacing, Clear-saved-retry, Resume-with-0-requests, and
+    // newer-question hydration stay RUNTIME-PENDING. No phase4 browser-done
+    // claim is made; artifact records the pending scope.
+    writeArt("secretary-phase4-pending.json", { pending: ["offline-retry-before-resume", "resume-0-requests", "newer-question-hydration", "clear-saved-retry-wire"], note: "FIRST-answer success covered above via real composer; failure/retry/resume hydration not browser-exercised in this leg" });
   }
 
   // --- P7 voice through the REAL composer: this-attempt permission denial,
@@ -700,9 +840,9 @@ try {
     await vctx3.close();
   }
   // --- Enter key behavior: single Enter sends exactly one POST (acceptance);
-  // a same-tick double keydown count is RECORDED from the actual HTTP
-  // observer and reported to the UI owner. Keyboard acceptance is the
-  // single-Enter exactness below; the double count is data, not a waiver.
+  // same-tick double keydown MUST also send exactly ONE POST / ONE message
+  // with the exact submitted bytes (required double-submission guard). Both
+  // are hard acceptance; a 0- or 2-credit implementation FAILS here.
   {
     await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(1200);
@@ -733,8 +873,12 @@ try {
     });
     await page.waitForTimeout(3000);
     const msgsE2 = mustArray(ctx, "enter-msgs-double", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
-    ctx.ok("enter-double-count-recorded", true, "same-tick double keydown actual POSTs=" + enterPosts.length + " msgs " + msgsE1.length + "->" + msgsE2.length + " (reported to UI owner; acceptance is single-Enter exactness above)");
-    writeArt("enter-double.json", { posts: enterPosts.length, urls: enterPosts, msgsBefore: msgsE1.length, msgsAfter: msgsE2.length });
+    const doubleText = "enter double " + run;
+    const doubleHit = msgsE2.filter((m) => String(camel(m, "content") || "") === doubleText);
+    ctx.ok("enter-single-bytes", msgsE1.some((m) => String(camel(m, "content") || "") === "enter single " + run), "exact single bytes present");
+    ctx.ok("enter-double-single-post", enterPosts.length === 1, "same-tick double keydown actual POSTs=" + enterPosts.length);
+    ctx.ok("enter-double-single-msg", msgsE2.length === msgsE1.length + 1 && doubleHit.length === 1, "msgs " + msgsE1.length + "->" + msgsE2.length + " exactHits=" + doubleHit.length);
+    writeArt("enter-double.json", { posts: enterPosts.length, urls: enterPosts, msgsBefore: msgsE1.length, msgsAfter: msgsE2.length, doubleText });
     try { page.off("request", onEnterReq); } catch {}
   }
   // --- P8 token ABA + late 401 via UI (per-user drafts never cross) ---
