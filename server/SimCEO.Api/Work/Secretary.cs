@@ -809,9 +809,15 @@ public static class EvidenceAvailability
       if (d.MeetingId != meetingId) return new Status(false, "record not in this meeting");
       if (r.Version.HasValue && r.Version.Value != d.Version)
         return new Status(false, "superseded by v" + d.Version);
-      if (!string.Equals(d.Status, "approved", StringComparison.OrdinalIgnoreCase))
-        return new Status(false, "record no longer approved");
-      if (string.IsNullOrWhiteSpace(ditem)) return new Status(true, "current");
+      // Whole-record approval status gates BARE refs only (F1). An explicit approved
+      // item in a partially-approved record is current when the item is approved,
+      // the pin/scope match, and the effective referenced owner still holds it.
+      if (string.IsNullOrWhiteSpace(ditem))
+      {
+        if (!string.Equals(d.Status, "approved", StringComparison.OrdinalIgnoreCase))
+          return new Status(false, "record no longer approved");
+        return new Status(true, "current");
+      }
       var amap = RecordsOps.ItemMap(d.ItemsJson ?? "[]", out var amapErr);
       if (amapErr != "" || !amap.ContainsKey(ditem))
         return new Status(false, "record item removed");
