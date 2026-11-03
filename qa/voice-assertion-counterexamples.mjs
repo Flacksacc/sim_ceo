@@ -1,56 +1,63 @@
 import crypto from "node:crypto";
+import {
+  draftStrictEquals,
+  transcriptAppended,
+  staleWriteAbsent,
+  payloadShaMatches,
+  payloadBytesMatch,
+  waitForCount,
+} from "./voice-browser-assert.mjs";
+// Negative controls feed hostile inputs to the ACTUAL browser assertion
+// predicates (imported above), not to separately written copies. Each case
+// asserts the hostile input FAILS the real predicate while clean inputs pass.
 let pass = 0, fail = 0;
 const failures = [];
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log("  ok " + name); }
   else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
 }
-// Old vs new assertion logic on identical hostile inputs. Each case asserts
-// the OLD logic passes (demonstrating the hole) and the NEW logic fails.
-function oldNavNoLeak(draft) { return !String(draft).includes("qa transcript") || true; }
-function newNavNoLeak(draft) { return !String(draft).includes("qa transcript"); }
+// Stale transcript leak must fail the real exact-draft predicate.
 {
   const leaked = "nav-origin qa transcript";
-  ok("cx-nav-old-passes-on-leak", oldNavNoLeak(leaked) === true, leaked);
-  ok("cx-nav-new-fails-on-leak", newNavNoLeak(leaked) === false, leaked);
-  ok("cx-nav-new-passes-clean", newNavNoLeak("nav-origin") === true, "nav-origin");
+  ok("cx-nav-real-fails-on-leak", staleWriteAbsent(leaked, "nav-origin") === false, leaked);
+  ok("cx-nav-real-passes-clean", staleWriteAbsent("nav-origin", "nav-origin") === true, "nav-origin");
+  ok("cx-origin-intact-real", draftStrictEquals("nav-origin", "nav-origin") === true, "nav-origin");
 }
-function oldAba(draft, c0, c1) {
-  const hasStale = String(draft).includes("qa transcript") && !String(draft).includes("aba-origin-DONE");
-  return !hasStale || c1 === c0;
-}
-function newAba(draft, c0, c1) { return draft === "aba-origin" && c1 === c0; }
+// A-B-A: stale text with flat counter must fail the real predicate.
 {
   const leaked = "aba-origin qa transcript";
-  ok("cx-aba-old-passes-stale-plus-flat-counter", oldAba(leaked, 7, 7) === true, leaked);
-  ok("cx-aba-new-fails-stale-flat-counter", newAba(leaked, 7, 7) === false, leaked);
-  ok("cx-aba-new-passes-exact", newAba("aba-origin", 7, 7) === true, "aba-origin");
+  ok("cx-aba-real-fails-stale-flat-counter", staleWriteAbsent(leaked, "aba-origin") === false, leaked);
+  ok("cx-aba-real-passes-exact", staleWriteAbsent("aba-origin", "aba-origin") === true, "aba-origin");
 }
-function oldSha(s) { return typeof s === "string" && s.length >= 8; }
-function newSha(uploadBytes, providerSha) {
-  return crypto.createHash("sha256").update(uploadBytes).digest("hex").slice(0, 16) === providerSha;
-}
+// Upload/provider correlation uses the real sha/bytes predicates.
 {
   const a = Buffer.from("audio-bytes-A");
   const b = Buffer.from("audio-bytes-B-different");
   const bSha = crypto.createHash("sha256").update(b).digest("hex").slice(0, 16);
-  ok("cx-sha-old-passes-different-payload", oldSha(bSha) === true, bSha);
-  ok("cx-sha-new-fails-different-payload", newSha(a, bSha) === false, "A vs sha(B)");
   const aSha = crypto.createHash("sha256").update(a).digest("hex").slice(0, 16);
-  ok("cx-sha-new-passes-exact", newSha(a, aSha) === true, aSha);
+  ok("cx-sha-real-fails-different-payload", payloadShaMatches(aSha, bSha) === false, "A vs sha(B)");
+  ok("cx-sha-real-passes-exact", payloadShaMatches(aSha, aSha) === true, aSha);
+  ok("cx-bytes-real-fails", payloadBytesMatch(a.length, b.length) === false, a.length + " vs " + b.length);
+  ok("cx-bytes-real-passes", payloadBytesMatch(a.length, a.length) === true, String(a.length));
 }
-async function oldWaitSwallow(check) {
-  try { await check(); } catch {}
-  return true;
-}
-async function newWaitStrict(check) { await check(); return true; }
+// Retry draft uses the real append predicate.
 {
-  const hanging = () => new Promise((_, reject) => setTimeout(() => reject(new Error("timeout 50ms")), 50));
-  const oldR = await oldWaitSwallow(hanging);
-  ok("cx-wait-old-swallows-timeout", oldR === true, "proceeded despite timeout");
-  let newThrew = false;
-  try { await newWaitStrict(hanging); } catch { newThrew = true; }
-  ok("cx-wait-new-throws-timeout", newThrew === true, "strict barrier surfaces timeout");
+  ok("cx-retry-real-fails-partial", transcriptAppended("retry502", "retry502") === false, "missing transcript");
+  ok("cx-retry-real-passes-exact", transcriptAppended("retry502 qa transcript", "retry502") === true, "retry502 qa transcript");
+}
+// The real strict waiter must surface a hung barrier instead of proceeding.
+{
+  let calls = 0;
+  const hanging = async () => ({ transcribe: 7 + (calls++, 0) });
+  let threw = false;
+  const t0 = Date.now();
+  try { await waitForCount(hanging, 7, "cx-hold", 300); } catch { threw = true; }
+  const el = Date.now() - t0;
+  ok("cx-wait-real-throws-on-hold", threw === true, "elapsed=" + el);
+  ok("cx-wait-real-bounded", el < 5000, "elapsed=" + el);
+  const rising = async () => ({ transcribe: 8 });
+  const got = await waitForCount(rising, 7, "cx-release", 5000);
+  ok("cx-wait-real-passes-on-release", got.transcribe === 8, JSON.stringify(got));
 }
 console.log(fail === 0 ? "VOICEASSERTCX PASS " + pass : "VOICEASSERTCX FAIL pass=" + pass + " fail=" + fail);
 for (const f of failures) console.log(" - " + f);

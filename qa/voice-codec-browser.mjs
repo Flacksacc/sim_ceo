@@ -2,6 +2,15 @@ import { chromium } from "playwright-core";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { findDelimiters } from "./voice-multipart.mjs";
+import {
+  draftStrictEquals,
+  transcriptAppended,
+  staleWriteAbsent,
+  payloadShaMatches,
+  payloadBytesMatch,
+  waitForCount as waitForProviderCount,
+} from "./voice-browser-assert.mjs";
 const CDP = process.env.QA_CDP || "http://localhost:9333";
 const WEB = process.env.QA_WEB || "http://127.0.0.1:5192";
 const API = process.env.QA_API || "http://127.0.0.1:5115";
@@ -52,20 +61,8 @@ function extractAudioPart(body, contentType) {
   const m = /boundary=(?:"([^"]+)"|([^;\s]+))/.exec(contentType || "");
   if (!m) throw new Error("no boundary in " + contentType);
   const b = (m[1] || m[2] || "").trim();
-  const marker = Buffer.from("--" + b);
-  const idx = [];
-  let from = 0;
-  for (;;) {
-    const i = body.indexOf(marker, from);
-    if (i < 0) break;
-    const atStart = i === 0;
-    const framed = i >= 2 && body[i - 2] === 13 && body[i - 1] === 10;
-    const t = i + marker.length;
-    const close = body[t] === 45 && body[t + 1] === 45;
-    const crlf = body[t] === 13 && body[t + 1] === 10;
-    if ((atStart || framed) && (close || crlf)) idx.push({ at: i, close, head: t + 2 });
-    from = i + 1;
-  }
+  // Same strict shared scanner as the fake provider (full closing suffix).
+  const idx = findDelimiters(body, b);
   for (let d = 0; d < idx.length; d++) {
     if (idx[d].close) break;
     const nx = idx[d + 1];
@@ -96,6 +93,13 @@ const postedPaths = [];
 const dialogs = [];
 const uploads = [];
 let transcribeMode = "normal";
+let releaseASR = null;
+const holdASR = () => new Promise((r) => { releaseASR = r; });
+function releaseHeldASR() {
+  const r = releaseASR;
+  releaseASR = null;
+  if (r) r();
+}
 try {
   browser = await chromium.connectOverCDP(CDP);
   const beforeContexts = browser.contexts().map((c) => c.pages().length);
@@ -123,6 +127,7 @@ try {
     window.__acCreated = 0;
     window.__acClosed = 0;
     window.__decodeDelayMs = 0;
+    window.__renderDelayMs = 0;
     try {
       const OrigAC = window.AudioContext || window.webkitAudioContext;
       if (OrigAC) {
@@ -144,6 +149,24 @@ try {
       }
     } catch {}
     try {
+      const OrigOAC = window.OfflineAudioContext;
+      if (OrigOAC) {
+        const W = function (...a) {
+          const inst = new OrigOAC(...a);
+          try {
+            const origRender = inst.startRendering.bind(inst);
+            inst.startRendering = async (...sa) => {
+              if (window.__renderDelayMs) await new Promise((r) => setTimeout(r, window.__renderDelayMs));
+              return origRender(...sa);
+            };
+          } catch {}
+          return inst;
+        };
+        W.prototype = OrigOAC.prototype;
+        window.OfflineAudioContext = W;
+      }
+    } catch {}
+  try {
       const m = navigator.mediaDevices;
       if (m) {
         m.getUserMedia = async () => {
@@ -190,6 +213,22 @@ try {
       const ms = Number(transcribeMode.slice(6)) || 0;
       await new Promise((r) => setTimeout(r, ms));
     }
+    if (transcribeMode === "hold") {
+      // ASR barrier: headers captured above, body held until released.
+      await holdASR();
+      try { await route.continue(); } catch {}
+      return;
+    }
+    if (transcribeMode === "hold-after-provider") {
+      // Provider runs NOW (headers+body observed at the fake), the response
+      // is held until released: proves disposal of an already-running
+      // provider response against a stale/new operation.
+      let resp = null;
+      try { resp = await route.fetch(); } catch { try { await route.continue(); } catch {} return; }
+      await holdASR();
+      try { await route.fulfill({ response: resp }); } catch {}
+      return;
+    }
     await route.continue();
   });
   async function requireBox() {
@@ -211,17 +250,14 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Dictation transcribed into the draft."), null, { timeout: 60000 });
   }
   async function waitForCount(baseline, label, timeoutMs) {
-    const t0 = Date.now();
-    for (;;) {
-      const cc = await fakeCounts();
-      if (cc.transcribe > baseline) return cc;
-      if (Date.now() - t0 > (timeoutMs || 30000)) {
-        const tail = await page.locator("body").innerText().catch(() => "");
-        const dval = await page.evaluate(() => { const el = document.querySelector("textarea"); return el ? String(el.value).slice(0, 200) : "NO-TEXTAREA"; }).catch(() => "EVAL-FAIL");
-        const lll = await fakeLast().catch(() => null);
-        throw new Error(label + " timed out waiting for fresh provider hit; base=" + baseline + " cur=" + JSON.stringify(cc) + " lastN=" + (lll && lll.n) + " draft=" + JSON.stringify(String(dval).slice(0, 200)) + " bodyTail=" + JSON.stringify(tail.slice(-300)));
-      }
-      await page.waitForTimeout(500);
+    // The ACTUAL shared waiter: strict, never swallows a hung barrier.
+    try {
+      return await waitForProviderCount(fakeCounts, baseline, label, timeoutMs);
+    } catch (e) {
+      const tail = await page.locator("body").innerText().catch(() => "");
+      const dval = await page.evaluate(() => { const el = document.querySelector("textarea"); return el ? String(el.value).slice(0, 200) : "NO-TEXTAREA"; }).catch(() => "EVAL-FAIL");
+      const lll = await fakeLast().catch(() => null);
+      throw new Error(String((e && e.message) || e) + " draft=" + JSON.stringify(String(dval).slice(0, 200)) + " bodyTail=" + JSON.stringify(tail.slice(-300)) + " lastN=" + (lll && lll.n));
     }
   }
   async function gotoMeet(id) {
@@ -241,7 +277,11 @@ try {
     const c0 = await fakeCounts();
     const u0 = await scopedUsage(mid);
     const up0 = uploads.length;
-    transcribeMode = "delay:2500";
+    // Explicit released barriers: decode held 2s, render held 2s, ASR held
+    // until the test releases. Transcribing visible while the provider count
+    // stays flat proves the pending stages are observed, not assumed.
+    await page.evaluate(() => { window.__decodeDelayMs = 2000; window.__renderDelayMs = 2000; });
+    transcribeMode = "hold";
     const box = await requireBox();
     await box.fill("typed hello", { timeout: 15000 });
     await dictate.click({ timeout: 15000 });
@@ -254,15 +294,30 @@ try {
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
+    // Decode barrier: conversion still running, upload not yet sent.
+    await page.waitForTimeout(1200);
+    const heldCounts = await fakeCounts();
+    ok("decode-barrier-held", heldCounts.transcribe === c0.transcribe, c0.transcribe + "->" + heldCounts.transcribe);
+    // Render/upload barrier: poll until the captured upload arrives while
+    // the fake still shows no hit (headers sent, body held at the route).
+    let upSeen = false;
+    for (let i = 0; i < 40; i++) {
+      if (uploads.length > up0 + 0) { upSeen = uploads.length === up0 + 1; break; }
+      await page.waitForTimeout(500);
+    }
+    ok("asr-headers-sent", upSeen, "uploads=" + uploads.length + " base=" + up0);
+    const heldCounts2 = await fakeCounts();
+    ok("asr-body-held", heldCounts2.transcribe === c0.transcribe, c0.transcribe + "->" + heldCounts2.transcribe);
     await box.fill("typed hello DURINGREC DURING-HELD", { timeout: 15000 });
+    releaseHeldASR();
+    await page.evaluate(() => { window.__decodeDelayMs = 0; window.__renderDelayMs = 0; });
     transcribeMode = "normal";
     await waitTranscribed();
     await page.waitForTimeout(800);
     await shot("voice-transcribed.png");
     const draftVal = await box.inputValue();
     if (draftVal === null || draftVal === undefined) throw new Error("draft textarea missing");
-    const expected = "typed hello DURINGREC DURING-HELD qa transcript";
-    ok("editable-transcript-exact", draftVal === expected, JSON.stringify(draftVal).slice(0, 300));
+    ok("editable-transcript-exact", transcriptAppended(draftVal, "typed hello DURINGREC DURING-HELD"), JSON.stringify(draftVal).slice(0, 300));
     const c1 = await fakeCounts();
     ok("fresh-provider-hit", c1.transcribe === c0.transcribe + 1, JSON.stringify(c1));
     const last = await fakeLast();
@@ -270,8 +325,8 @@ try {
     ok("uploads-captured", uploads.length === up0 + 1, up0 + "->" + uploads.length);
     const up = uploads[uploads.length - 1];
     const audioPart = extractAudioPart(up.body, up.contentType);
-    ok("payload-sha-exact", sha16(audioPart) === last.audioSha256, sha16(audioPart) + " vs " + last.audioSha256);
-    ok("payload-bytes-exact", audioPart.length === last.audioBytes, audioPart.length + " vs " + last.audioBytes);
+    ok("payload-sha-exact", payloadShaMatches(sha16(audioPart), last.audioSha256), sha16(audioPart) + " vs " + last.audioSha256);
+    ok("payload-bytes-exact", payloadBytesMatch(audioPart.length, last.audioBytes), audioPart.length + " vs " + last.audioBytes);
     ok("fake-valid-wav", last.validWav === true, JSON.stringify(last).slice(0, 300));
     ok("fake-16k-mono", last.sampleRate === 16000 && last.channels === 1 && last.bits === 16, JSON.stringify(last).slice(0, 200));
     ok("fake-encoding-wav", String(last.encoding || "").toUpperCase() === "WAV", JSON.stringify(last).slice(0, 200));
@@ -296,27 +351,45 @@ try {
     ok("contexts-closed", cleanup.created > 0 && cleanup.closed >= 1, JSON.stringify(cleanup).slice(0, 200));
     try { await page.evaluate(() => { try { window.__stubOsc && window.__stubOsc.stop(); } catch {} try { window.__stubAC && window.__stubAC.close(); } catch {} }); } catch {}
   }
-  // Multi-start overlap: two fast clicks share one operation
+  // Multi-start overlap: two synchronous clicks share one operation. Both
+  // clicks are actually dispatched (never a swallowed locator timeout); the
+  // second is a benign no-op while starting, and exactly one provider hit
+  // lands with the exact draft.
   {
     const c0 = await fakeCounts();
-    await page.evaluate(() => { window.__voiceStubMode = "tone"; window.__decodeDelayMs = 0; });
+    await page.evaluate(() => { window.__voiceStubMode = "tone"; window.__resolvePermission = null; window.__decodeDelayMs = 0; window.__renderDelayMs = 0; });
     await gotoMeet(mid);
-    await requireBox();
-    const d = page.getByRole("button", { name: /Dictate/i }).first();
-    await d.click({ timeout: 15000 });
-    await d.click({ timeout: 15000 }).catch(() => {});
+    const obox = await requireBox();
+    await obox.fill("overlap-origin", { timeout: 15000 });
+    // Two clicks in the same task: no locator re-query, no timeout to
+    // swallow. The second runs while the first is still starting.
+    const clicks = await page.evaluate(() => {
+      const b = [...document.querySelectorAll("button")].find((x) => /Dictate/i.test((x.textContent || "") + " " + (x.getAttribute("aria-label") || "") + " " + (x.getAttribute("title") || "")));
+      if (!b) return -1;
+      b.click();
+      b.click();
+      return 2;
+    });
+    ok("overlap-clicks-dispatched", clicks === 2, String(clicks));
+    await waitRecording();
     await page.waitForTimeout(2000);
     const st = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
     ok("overlap-single-recording", st.pressed === true, JSON.stringify(st));
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(c0.transcribe, "overlap", 30000);
+    ok("overlap-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
+    await waitTranscribed();
+    const odraft = await (await requireBox()).inputValue();
+    ok("overlap-exact-draft", transcriptAppended(odraft, "overlap-origin"), JSON.stringify(String(odraft).slice(0, 200)));
   }
   // Pending permission late after navigation: no recorder/upload, no modal
   {
     const c0 = await fakeCounts();
-    await page.evaluate(() => { window.__voiceStubMode = "delay-permission"; window.__resolvePermission = null; });
+    await gotoMeet(mid2);
+    await (await requireBox()).fill("mid2-base", { timeout: 15000 });
     await gotoMeet(mid);
+    await page.evaluate(() => { window.__voiceStubMode = "delay-permission"; window.__resolvePermission = null; });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(800);
     await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid2, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -327,7 +400,7 @@ try {
     ok("pending-nav-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
     const secondDraft = await (await requireBox()).inputValue();
     if (secondDraft === null || secondDraft === undefined) throw new Error("textarea missing after pending nav");
-    ok("pending-nav-no-leak", !String(secondDraft).includes("qa transcript"), JSON.stringify(String(secondDraft).slice(0, 200)));
+    ok("pending-nav-no-leak", staleWriteAbsent(String(secondDraft), "mid2-base"), JSON.stringify(String(secondDraft).slice(0, 200)));
     const navBody = await page.locator("body").innerText();
     ok("pending-nav-no-stale-toast", !navBody.includes("Microphone unavailable"), navBody.slice(0, 200));
     await page.evaluate(() => { try { window.__lastStream && window.__lastStream.getTracks().forEach((t) => t.stop()); } catch {} });
@@ -353,6 +426,46 @@ try {
     const c1 = await waitForCount(c0.transcribe, "stale", 30000);
     ok("stale-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
   }
+  // Rejected late permission after unmount with a new op owning the UI: the
+  // old rejection is silent (no modal, no denial toast, no provider hit, no
+  // draft touch) and the new op completes exactly.
+  {
+    const c0 = await fakeCounts();
+    await gotoMeet(mid);
+    await (await requireBox()).fill("failwait-origin", { timeout: 15000 });
+    await gotoMeet(mid2);
+    await (await requireBox()).fill("failwait-second", { timeout: 15000 });
+    await gotoMeet(mid);
+    await page.evaluate(() => { window.__voiceStubMode = "delay-permission"; window.__resolvePermission = null; });
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(800);
+    // Unmount the pending op by navigating, then start a new op that owns UI.
+    await gotoMeet(mid2);
+    await page.waitForTimeout(800);
+    await page.evaluate(() => { window.__voiceStubMode = "tone"; });
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await waitRecording();
+    // Now reject the OLD permission: must be silent against the new op.
+    await page.evaluate(() => { window.__voiceStubMode = "fail-after-wait"; try { window.__resolvePermission && window.__resolvePermission(); } catch {} });
+    await page.waitForTimeout(1500);
+    const st = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
+    ok("failwait-new-op-unaffected", st.pressed === true, JSON.stringify(st));
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    const c1 = await waitForCount(c0.transcribe, "failwait", 30000);
+    ok("failwait-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
+    await waitTranscribed();
+    const fbody = await page.locator("body").innerText();
+    ok("failwait-no-denial-toast", !fbody.includes("Microphone unavailable"), fbody.slice(0, 200));
+    const fdraft = await (await requireBox()).inputValue();
+    ok("failwait-exact-draft", transcriptAppended(fdraft, "failwait-second"), JSON.stringify(String(fdraft).slice(0, 200)));
+    const c2 = await fakeCounts();
+    ok("failwait-no-extra-provider", c2.transcribe === c1.transcribe, c1.transcribe + "->" + c2.transcribe);
+    await gotoMeet(mid);
+    const back = await (await requireBox()).inputValue();
+    ok("failwait-origin-intact", staleWriteAbsent(String(back), "failwait-origin"), JSON.stringify(String(back).slice(0, 200)));
+    await page.evaluate(() => { window.__voiceStubMode = "tone"; window.__resolvePermission = null; });
+  }
   // Navigation during record cancels exactly, other meeting intact
   {
     const c0 = await fakeCounts();
@@ -370,13 +483,13 @@ try {
     await shot("voice-nav-second.png");
     const secondDraft = await (await requireBox()).inputValue();
     if (secondDraft === null || secondDraft === undefined) throw new Error("second textarea missing");
-    ok("nav-cancel-no-leak", secondDraft === "mid2-clean", JSON.stringify(String(secondDraft).slice(0, 200)));
+    ok("nav-cancel-no-leak", draftStrictEquals(String(secondDraft), "mid2-clean"), JSON.stringify(String(secondDraft).slice(0, 200)));
     const c1 = await fakeCounts();
     ok("nav-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
     await gotoMeet(mid);
     const originDraft = await (await requireBox()).inputValue();
     if (originDraft === null || originDraft === undefined) throw new Error("origin textarea missing");
-    ok("nav-origin-intact", String(originDraft) === "nav-origin", JSON.stringify(String(originDraft).slice(0, 300)));
+    ok("nav-origin-intact", draftStrictEquals(String(originDraft), "nav-origin"), JSON.stringify(String(originDraft).slice(0, 300)));
   }
   // Top-level tab unmount in surviving document
   {
@@ -398,12 +511,14 @@ try {
     await gotoMeet(mid);
     const back = await (await requireBox()).inputValue();
     if (back === null || back === undefined) throw new Error("back textarea missing");
-    ok("tab-unmount-origin-intact", back === "boards-origin", JSON.stringify(back.slice(0, 200)));
+    ok("tab-unmount-origin-intact", draftStrictEquals(back, "boards-origin"), JSON.stringify(back.slice(0, 200)));
   }
   // Delayed conversion cancelled by navigation
   {
     const c0 = await fakeCounts();
     await page.evaluate(() => { window.__decodeDelayMs = 3000; });
+    await gotoMeet(mid2);
+    await (await requireBox()).fill("conv-second", { timeout: 15000 });
     await gotoMeet(mid);
     const box4 = await requireBox();
     await box4.fill("conv-origin", { timeout: 15000 });
@@ -418,29 +533,38 @@ try {
     const c1 = await fakeCounts();
     ok("conversion-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
     const cd = await (await requireBox()).inputValue();
-    ok("conversion-cancel-no-leak", !String(cd).includes("qa transcript"), JSON.stringify(String(cd).slice(0, 200)));
+    ok("conversion-cancel-no-leak", staleWriteAbsent(String(cd), "conv-second"), JSON.stringify(String(cd).slice(0, 200)));
   }
-  // A-B-A during held ASR: stale result discarded after leave-and-return
+  // A-B-A with an already-running provider response: headers+body reach the
+  // fake (count +1 observed while the response is held), navigation stales
+  // the op, and the released response arriving after return must be
+  // disposed: exact origin draft, no transcript, no error UI.
   {
     const c0 = await fakeCounts();
     await gotoMeet(mid);
     const box = await requireBox();
     await box.fill("aba-origin", { timeout: 15000 });
-    transcribeMode = "delay:3000";
+    transcribeMode = "hold-after-provider";
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
-    await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid2, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Provider already ran while its response is held: +1 observed.
+    const held = await waitForProviderCount(fakeCounts, c0.transcribe, "aba-provider", 30000);
+    ok("aba-provider-ran", held.transcribe === c0.transcribe + 1, c0.transcribe + "->" + held.transcribe);
+    await gotoMeet(mid2);
     await page.waitForTimeout(800);
-    await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await gotoMeet(mid);
+    releaseHeldASR();
     transcribeMode = "normal";
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(4000);
     const c1 = await fakeCounts();
     const abaDraft = await (await requireBox()).inputValue();
     if (abaDraft === null || abaDraft === undefined) throw new Error("aba textarea missing");
-    ok("aba-no-stale", abaDraft === "aba-origin" && c1.transcribe === c0.transcribe, "draft=" + JSON.stringify(String(abaDraft).slice(0, 200)) + " counts=" + c0.transcribe + "->" + c1.transcribe);
+    ok("aba-no-stale", staleWriteAbsent(String(abaDraft), "aba-origin") && c1.transcribe === c0.transcribe + 1, "draft=" + JSON.stringify(String(abaDraft).slice(0, 200)) + " counts=" + c0.transcribe + "->" + c1.transcribe);
+    const abaBody = await page.locator("body").innerText();
+    ok("aba-no-error", !abaBody.includes("Dictation failed"), abaBody.slice(0, 200));
   }
   // Identity remount: reload during held ASR, old op never lands
   // NOTE: exact draft text is not asserted here. This suite runs on the vite dev server with React StrictMode,
@@ -465,7 +589,70 @@ try {
     ok("remount-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
     const rd = await (await requireBox()).inputValue();
     if (rd === null || rd === undefined) throw new Error("remount textarea missing");
-    ok("remount-no-stale", !String(rd).includes("qa transcript"), JSON.stringify(String(rd).slice(0, 200)));
+    ok("remount-exact-draft", draftStrictEquals(String(rd), "remount-origin"), JSON.stringify(String(rd).slice(0, 300)));
+  }
+  // Controlled identity remount in the surviving document: a real React App
+  // unmount/remount via simceo-auth-change with a new identity (epoch bump).
+  // The old held provider response must never touch the new identity UI;
+  // per-user drafts stay scoped; a new op works under the new identity and
+  // the origin draft is intact after switching back.
+  {
+    const c0 = await fakeCounts();
+    await gotoMeet(mid);
+    const ibox = await requireBox();
+    await ibox.fill("epoch-origin", { timeout: 15000 });
+    transcribeMode = "hold-after-provider";
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    const held2 = await waitForProviderCount(fakeCounts, c0.transcribe, "epoch-provider", 30000);
+    ok("epoch-provider-ran", held2.transcribe === c0.transcribe + 1, c0.transcribe + "->" + held2.transcribe);
+    const epochBefore = await page.evaluate(() => window.__simceoEpoch);
+    // Drive the real main.tsx remount path: the anon identity branch keys
+    // off simceo-fb-user-v2, while voice/draft scoping keys off simceo-user.
+    // Setting both performs an actual React App unmount/remount in the
+    // surviving document with an epoch bump and a new demo identity.
+    await page.evaluate(() => {
+      localStorage.setItem("simceo-fb-user-v2", "qa-fb-2");
+      localStorage.setItem("simceo-user", "qa-epoch2");
+      window.dispatchEvent(new Event("simceo-auth-change"));
+    });
+    await page.waitForTimeout(2000);
+    const epochAfter = await page.evaluate(() => window.__simceoEpoch);
+    ok("epoch-remount-bumped", epochAfter === epochBefore + 1, epochBefore + "->" + epochAfter);
+    // Old op aborted by unmount cleanup; delivering its held response must
+    // not write anything (fulfill on the dead route is ignored).
+    releaseHeldASR();
+    transcribeMode = "normal";
+    await page.waitForTimeout(3000);
+    await gotoMeet(mid);
+    const nbox = await requireBox();
+    const ndraft = await nbox.inputValue();
+    ok("epoch-new-identity-scoped", staleWriteAbsent(String(ndraft), ""), JSON.stringify(String(ndraft).slice(0, 200)));
+    await nbox.fill("epoch2-new", { timeout: 15000 });
+    const c1 = await fakeCounts();
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await waitRecording();
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    const c2 = await waitForCount(c1.transcribe, "epoch2", 30000);
+    await waitTranscribed();
+    ok("epoch2-fresh-hit", c2.transcribe === c1.transcribe + 1, c1.transcribe + "->" + c2.transcribe);
+    const e2draft = await (await requireBox()).inputValue();
+    ok("epoch2-exact-draft", transcriptAppended(e2draft, "epoch2-new"), JSON.stringify(String(e2draft).slice(0, 200)));
+    // Switch back: the origin draft is intact, never hydrated under the new account.
+    await page.evaluate(() => {
+      localStorage.removeItem("simceo-user");
+      localStorage.removeItem("simceo-fb-user-v2");
+      window.dispatchEvent(new Event("simceo-auth-change"));
+    });
+    await page.waitForTimeout(1500);
+    await gotoMeet(mid);
+    const backDraft = await (await requireBox()).inputValue();
+    ok("epoch-origin-intact", staleWriteAbsent(String(backDraft), "epoch-origin"), JSON.stringify(String(backDraft).slice(0, 300)));
   }
   // HTTP 502 body containing "aborted" is a visible error, retry releases op
   {
@@ -492,7 +679,7 @@ try {
     const c1 = await waitForCount(c0.transcribe, "aborted-retry", 30000);
     ok("aborted-body-retry-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
     const rd6 = await (await requireBox()).inputValue();
-    ok("aborted-body-retry-draft", rd6 === marker + " qa transcript", JSON.stringify(String(rd6).slice(0, 300)));
+    ok("aborted-body-retry-draft", transcriptAppended(rd6, marker), JSON.stringify(String(rd6).slice(0, 300)));
     await shot("voice-retry.png");
   }
   // Decode failure then retry with fresh-provider delta
@@ -541,7 +728,7 @@ try {
     ok("decode-retry-fresh-hit", c1.transcribe === cFail.transcribe + 1, cFail.transcribe + "->" + c1.transcribe);
     const retryDraft = await (await requireBox()).inputValue();
     if (retryDraft === null || retryDraft === undefined) throw new Error("retry textarea missing");
-    ok("decode-retry-draft", retryDraft === marker + " qa transcript", JSON.stringify(String(retryDraft).slice(0, 300)));
+    ok("decode-retry-draft", transcriptAppended(retryDraft, marker), JSON.stringify(String(retryDraft).slice(0, 300)));
   }
   // Mic denial error: the App surfaces denial as a toast (its own alert helper), never a native dialog.
   {

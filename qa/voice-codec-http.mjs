@@ -48,10 +48,12 @@ async function usageVoiceScoped() {
   const arr = await requireArray(API + "/api/usage?meetingId=" + mid, "usage-scoped");
   return arr.filter((x) => ((x.kind ?? x.Kind) || "") === "voice-transcribe").length;
 }
-async function callsBody() {
-  const r = await jget(API + "/api/models/calls");
-  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("calls ledger shape invalid " + r.status);
-  return JSON.stringify(r.json);
+async function callsArr(label) {
+  // Unrestricted-ledger proof requires the returned array to be COMPLETE:
+  // the endpoint caps at 200 rows, so a length strictly below 200 proves the
+  // visible array is the whole ledger and equality is not a capped false pass.
+  const arr = await requireArray(API + "/api/models/calls", label || "calls");
+  return arr;
 }
 async function callsShape() {
   const arr = await requireArray(API + "/api/models/calls", "calls");
@@ -158,7 +160,11 @@ function maxDurPlusOneFrame() {
 async function expectReject(name, buf, filename, ctype, wantStatus) {
   const c0 = await counts();
   const u0 = await usageVoiceScoped();
-  const calls0 = await callsBody();
+  // Exclusive fresh owned API process + strictly-below-cap length BEFORE
+  // every negative proves the compared array is the complete ledger.
+  const calls0 = await callsArr(name + "-calls0");
+  ok(name + "-ledger-complete", calls0.length < 200, "len=" + calls0.length);
+  const calls0Body = JSON.stringify(calls0);
   const r = await postTranscribe(mid, buf, filename, ctype);
   const is4xx = r.status >= 400 && r.status < 500;
   ok(name + "-4xx", is4xx && (wantStatus ? r.status === wantStatus : true), r.status + " " + r.text.slice(0, 160));
@@ -168,8 +174,9 @@ async function expectReject(name, buf, filename, ctype, wantStatus) {
   ok(name + "-no-fresh-hit", !last.json || last.json.n === (c0.transcribe || 0), "lastN=" + (last.json && last.json.n) + " base=" + c0.transcribe);
   const u1 = await usageVoiceScoped();
   ok(name + "-no-usage", u1 === u0, "usage " + u0 + "->" + u1);
-  const calls1 = await callsBody();
-  ok(name + "-no-model-calls", calls1 === calls0, "calls changed");
+  const calls1 = await callsArr(name + "-calls1");
+  ok(name + "-ledger-still-complete", calls1.length < 200, "len=" + calls1.length);
+  ok(name + "-no-model-calls", JSON.stringify(calls1) === calls0Body, "calls changed");
 }
 
 {
