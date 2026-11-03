@@ -1008,10 +1008,51 @@ void HttpTerminal(string name, string detail) { Fail(name, detail); httpFailed =
 bool HttpOwnsListener(System.Diagnostics.Process? pr, int port, string name)
 {
   var alive = false;
-  try { alive = pr is not null && !pr.HasExited; } catch { alive = false; }
+  var childPid = -1;
+  try { alive = pr is not null && !pr.HasExited; if (alive && pr is not null) childPid = pr.Id; } catch { alive = false; childPid = -1; }
+  var owned = false;
+  var ownDetail = "owned=false";
+  if (alive && childPid > 0)
+  {
+    if (!System.OperatingSystem.IsWindows())
+    {
+      owned = false;
+      ownDetail = "non-windows-owner-query-unsupported child=" + childPid;
+    }
+    else
+    {
+      try
+      {
+        var psArgs = "-NoProfile -NonInteractive -Command " + (char)34 + "Get-NetTCPConnection -LocalAddress ([System.Net.IPAddress]::Loopback) -LocalPort " + port + " -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess" + (char)34;
+        var (ownExit, ownOut, ownErr, ownTo) = RunBounded("powershell", psArgs, 15000);
+        var owners = new System.Collections.Generic.List<int>();
+        if (!ownTo && ownExit == 0 && !string.IsNullOrWhiteSpace(ownOut))
+        {
+          foreach (var tok in ownOut.Split((char[])null, System.StringSplitOptions.RemoveEmptyEntries))
+          {
+            var t2 = tok.Trim().Trim((char)44, (char)59);
+            if (int.TryParse(t2, out var opid)) owners.Add(opid);
+          }
+        }
+        owned = !ownTo && ownExit == 0 && owners.Contains(childPid);
+        ownDetail = "child=" + childPid + " owners=[" + string.Join(",", owners) + "] exit=" + ownExit + " timeout=" + ownTo;
+        var ownErrT = (ownErr ?? "").Trim();
+        if (!string.IsNullOrWhiteSpace(ownErrT)) ownDetail += " errlen=" + ownErrT.Length;
+      }
+      catch (Exception ex)
+      {
+        owned = false;
+        ownDetail = "owner-query-ex=" + ex.GetType().Name;
+      }
+    }
+  }
+  else
+  {
+    ownDetail = "child-not-alive";
+  }
   var bound = !PortFree(port);
-  var ok = alive && bound;
-  HttpExpect(ok, name, "child-alive=" + alive + " port-bound=" + bound + " port=" + port);
+  var ok = alive && owned;
+  HttpExpect(ok, name, "child-alive=" + alive + " owned-pid=" + owned + " port-bound=" + bound + " port=" + port + " " + ownDetail);
   return ok;
 }
 void HttpRequireListener(System.Diagnostics.Process? pr, int port, string name)
@@ -1338,6 +1379,7 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
   foreach (var mm in e1Doc.RootElement.GetProperty("meetings").EnumerateArray()) { flowMeeting = mm.GetProperty("Id").GetString() ?? ""; if (!string.IsNullOrWhiteSpace(flowMeeting)) break; }
   HttpExpect(!string.IsNullOrWhiteSpace(flowMeeting), "http-flow-meeting-found", flowMeeting);
   JsonDocument GuardOf(JsonDocument getDoc) { return getDoc; }
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-draft");
   var (dcSt, dcDoc) = PostJson(http, "http://127.0.0.1:5146/api/meetings/" + flowMeeting + "/record/draft", JsonDocument.Parse("[{\"id\":\"s1\",\"text\":\"BUY\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]").RootElement);
   HttpExpect(dcSt == System.Net.HttpStatusCode.Created, "http-draft-created", "status=" + (int)dcSt + " " + dcDoc.RootElement.GetRawText().Substring(0, Math.Min(300, dcDoc.RootElement.GetRawText().Length)));
   var flowId = dcDoc.RootElement.TryGetProperty("id", out var fidv) ? (fidv.GetString() ?? "") : (dcDoc.RootElement.TryGetProperty("Id", out var fidv2) ? (fidv2.GetString() ?? "") : "");
@@ -1351,9 +1393,11 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
     return new System.Collections.Generic.Dictionary<string, object?> { ["version"] = gi("version", "Version"), ["hash"] = gs("hash", "Hash"), ["reviewToken"] = gs("reviewToken", "ReviewToken"), ["watermark"] = gl("watermark", "Watermark") };
   }
   var (_, g0) = GetDraft(flowId); var g0g = GuardFor(g0);
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-revise");
   var (rvSt, rvDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/revise", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s2", ["text"] = "HOLD", ["version"] = g0g["version"], ["hash"] = g0g["hash"], ["reviewToken"] = g0g["reviewToken"], ["watermark"] = g0g["watermark"] });
   HttpExpect(rvSt == System.Net.HttpStatusCode.OK, "http-revise-s2-hold", "status=" + (int)rvSt + " " + rvDoc.RootElement.GetRawText().Substring(0, Math.Min(200, rvDoc.RootElement.GetRawText().Length)));
   var (_, g1) = GetDraft(flowId); var g1g = GuardFor(g1);
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-approve");
   var (apSt, apDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/approve", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s1", ["version"] = g1g["version"], ["hash"] = g1g["hash"], ["reviewToken"] = g1g["reviewToken"], ["watermark"] = g1g["watermark"] });
   HttpExpect(apSt == System.Net.HttpStatusCode.OK, "http-approve-s1-partial", "status=" + (int)apSt);
   HttpExpect(apDoc.RootElement.TryGetProperty("status", out var apstv) && (apstv.GetString() ?? "") == "partially-approved", "http-status-partially-approved", apDoc.RootElement.GetRawText());
@@ -1361,10 +1405,12 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
   var evOk = evSt == System.Net.HttpStatusCode.OK && evDoc.RootElement.ValueKind == JsonValueKind.Array;
   HttpExpect(evOk, "http-evidence-route-200", "evidence route resolves through the real resolver, status=" + (int)evSt);
   var (_, g2) = GetDraft(flowId); var g2g = GuardFor(g2);
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-discard");
   var (diSt, diDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/discard", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s2", ["version"] = g2g["version"], ["hash"] = g2g["hash"], ["reviewToken"] = g2g["reviewToken"], ["watermark"] = g2g["watermark"] });
   HttpExpect(diSt == System.Net.HttpStatusCode.OK, "http-discard-s2-approved", "status=" + (int)diSt);
   HttpExpect(diDoc.RootElement.TryGetProperty("status", out var distv) && (distv.GetString() ?? "") == "approved" && diDoc.RootElement.TryGetProperty("decided", out var didv) && didv.ValueKind == JsonValueKind.True, "http-status-approved-decided", diDoc.RootElement.GetRawText());
   var (_, g3) = GetDraft(flowId); var g3g = GuardFor(g3);
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-amend");
   var (amSt, amDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/amend", new System.Collections.Generic.Dictionary<string, object?> { ["version"] = g3g["version"], ["hash"] = g3g["hash"], ["reviewToken"] = g3g["reviewToken"], ["watermark"] = g3g["watermark"] });
   HttpExpect(amSt == System.Net.HttpStatusCode.Created, "http-amend-successor", "status=" + (int)amSt + " " + amDoc.RootElement.GetRawText().Substring(0, Math.Min(300, amDoc.RootElement.GetRawText().Length)));
   var succId = amDoc.RootElement.TryGetProperty("id", out var scv) ? (scv.GetString() ?? "") : "";
