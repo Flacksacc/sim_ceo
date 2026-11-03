@@ -62,10 +62,10 @@ try {
   // UI: nav rail Roster button; list rows live in .listpanel-rows OUTSIDE the detail section.
   await pg.locator('nav.rail').getByRole('button', { name: 'Roster', exact: true }).click({ timeout: 8000 });
   const panel = pg.locator('section[aria-label="My Advisor Roster"]');
-  await panel.waitFor({ timeout: 8000 });
+  await panel.waitFor({ state: 'visible', timeout: 8000 });
   ok(await panel.isVisible(), 'My Advisor Roster section visible');
   const listRows = pg.locator('.listpanel-rows button');
-  await listRows.first().waitFor({ timeout: 8000 });
+  await listRows.first().waitFor({ state: 'visible', timeout: 8000 });
   const entryRows = pg.locator('.listpanel-rows button[role="listitem"]');
   const uiCount = await entryRows.count();
   ok(uiCount === rows.length, `UI roster entry count matches API (${uiCount} vs ${rows.length})`);
@@ -75,7 +75,8 @@ try {
   for (const r of rows) {
     const nm = r?.entry?.name;
     if (!nm) continue;
-    if (await listPanel.getByText(String(nm), { exact: false }).first().isVisible().catch(() => false)) vis++;
+    const nmLoc = listPanel.getByText(String(nm), { exact: false }).first();
+    if (await nmLoc.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) vis++;
   }
   const named = rows.filter((r) => r?.entry?.name).length;
   ok(named >= 1 && vis === named, `all row names visible in list panel (${vis}/${named})`);
@@ -84,15 +85,27 @@ try {
   ok(selName.length > 0, 'first roster row has a name');
   await entryRows.first().click({ timeout: 8000 });
   const detailH2 = panel.locator('h2').first();
-  await detailH2.waitFor({ timeout: 8000 });
-  const h2Text = (await detailH2.innerText({ timeout: 8000 })).trim();
+  await detailH2.waitFor({ state: 'visible', timeout: 8000 });
+  let h2Text = '';
+  const h2Deadline = Date.now() + 8000;
+  while (Date.now() < h2Deadline) {
+    h2Text = ((await detailH2.innerText().catch(() => '')) || '').trim();
+    if (h2Text === selName) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
   ok(h2Text === selName, 'selected roster detail h2 shows the selected advisor name');
-  ok(await panel.locator('.roster-detail [data-roster-entry-id]').isVisible().catch(() => false), 'selected advisor detail card renders');
+  // Main detail card is the DIRECT child of .roster-detail (portrait review cards nest deeper).
+  const mainCard = panel.locator('.roster-detail > .card[data-roster-entry-id]');
+  await mainCard.waitFor({ state: 'visible', timeout: 8000 });
+  ok((await mainCard.count()) === 1, 'exactly one main detail card renders');
+  ok(await mainCard.isVisible(), 'selected advisor detail card renders');
+  const shownId = await mainCard.getAttribute('data-roster-entry-id');
+  ok(!!shownId && entrySet.has(String(shownId)), 'detail card shows a roster entry from the API list');
   const ov = await pg.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   ok(ov <= 1, `no desktop horizontal overflow (${ov}px)`);
   await pg.screenshot({ path: `${OUT}/desktop-1440.png` });
   await pg.setViewportSize({ width: 390, height: 844 });
-  await panel.waitFor({ timeout: 8000 }).catch(() => {});
+  await panel.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
   const ovm = await pg.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   ok(ovm <= 1, `no mobile390 horizontal overflow (${ovm}px)`);
   await pg.screenshot({ path: `${OUT}/mobile-390.png` });
