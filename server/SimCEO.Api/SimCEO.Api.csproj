@@ -17,23 +17,34 @@
   <ItemGroup>
     <PgSources Include="..\SimCEO.Postgres\**\*.cs" />
   </ItemGroup>
+  <!-- Custom -o with an absolute OutputPath must not be concatenated onto the
+       project directory (which produced C:\...\C:\...\pg-pub and failed the
+       build). _PgStageDir is the absolute staging dir in both cases. -->
   <Target Name="StagePostgresBackend" AfterTargets="Build" Condition="'$(SkipStagePostgres)' != 'true'"
           Inputs="@(PgSources)" Outputs="$(OutputPath)SimCEO.Postgres.dll">
-    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(MSBuildProjectDirectory)\$(OutputPath)pg-pub&quot; --nologo -v q" />
+    <PropertyGroup>
+      <_PgStageDir Condition="!$([System.IO.Path]::IsPathRooted('$(OutputPath)'))">$(MSBuildProjectDirectory)\$(OutputPath)pg-pub</_PgStageDir>
+      <_PgStageDir Condition="$([System.IO.Path]::IsPathRooted('$(OutputPath)'))">$(OutputPath)pg-pub</_PgStageDir>
+    </PropertyGroup>
+    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(_PgStageDir)&quot; --nologo -v q" />
     <ItemGroup>
-      <PgStagedDlls Include="$(OutputPath)pg-pub\*.dll" Exclude="$(OutputPath)pg-pub\SimCEO.Api.*" />
+      <PgStagedDlls Include="$(_PgStageDir)\*.dll" Exclude="$(_PgStageDir)\SimCEO.Api.*" />
     </ItemGroup>
     <Copy SourceFiles="@(PgStagedDlls)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-    <RemoveDir Directories="$(OutputPath)pg-pub" />
+    <RemoveDir Directories="$(_PgStageDir)" />
   </Target>
   <!-- Publish (Docker) output lands in PublishDir, not OutputPath: publish the Postgres backend the same way as Build and stage every dependency there. -->
   <Target Name="StagePostgresBackendPublish" AfterTargets="Publish" Condition="'$(SkipStagePostgres)' != 'true'">
-    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(MSBuildProjectDirectory)\$(OutputPath)pg-pub&quot; --nologo -v q" />
+    <PropertyGroup>
+      <_PgPubStageDir Condition="!$([System.IO.Path]::IsPathRooted('$(OutputPath)'))">$(MSBuildProjectDirectory)\$(OutputPath)pg-pub</_PgPubStageDir>
+      <_PgPubStageDir Condition="$([System.IO.Path]::IsPathRooted('$(OutputPath)'))">$(OutputPath)pg-pub</_PgPubStageDir>
+    </PropertyGroup>
+    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(_PgPubStageDir)&quot; --nologo -v q" />
     <ItemGroup>
-      <PgPubDlls Include="$(OutputPath)pg-pub\*.dll" Exclude="$(OutputPath)pg-pub\SimCEO.Api.*" />
+      <PgPubDlls Include="$(_PgPubStageDir)\*.dll" Exclude="$(_PgPubStageDir)\SimCEO.Api.*" />
     </ItemGroup>
     <Copy SourceFiles="@(PgPubDlls)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
-    <RemoveDir Directories="$(OutputPath)pg-pub" />
+    <RemoveDir Directories="$(_PgPubStageDir)" />
   </Target>
 
 </Project>

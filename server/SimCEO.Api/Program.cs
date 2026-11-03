@@ -325,7 +325,22 @@ if (args.Contains("--selftest"))
 }
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "simceo-api", time = DateTime.UtcNow, instance = Environment.GetEnvironmentVariable("SIMCEO_INSTANCE") ?? "dev" }));
-app.MapGet("/ready", (InMemoryStore s) => string.IsNullOrEmpty(s.PgError) ? Results.Ok(new { ready = true, store = Pg.Backend is null ? "inmemory" : "postgres" }) : Results.Json(new { ready = false, store = "unavailable", error = s.PgError }, statusCode: 503));
+app.MapGet("/ready", (InMemoryStore s) =>
+{
+  // Live backend probe: a cached startup string cannot report a mid-run DB
+  // outage. In PG mode every readiness check issues one tiny SELECT; any
+  // backend failure fails closed 503 while /health stays 200 (process alive).
+  if (Pg.Backend is null)
+    return string.IsNullOrEmpty(s.PgError)
+      ? Results.Ok(new { ready = true, store = "inmemory" })
+      : Results.Json(new { ready = false, store = "unavailable", error = s.PgError }, statusCode: 503);
+  try { Pg.Backend.All<SecurityState>(); }
+  catch (Exception ex)
+  {
+    return Results.Json(new { ready = false, store = "unavailable", error = "backend unreachable: " + ex.GetType().Name }, statusCode: 503);
+  }
+  return Results.Ok(new { ready = true, store = "postgres" });
+});
 app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
 {
   mode = Pg.Backend is null ? "memory" : "postgres",

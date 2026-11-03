@@ -638,7 +638,17 @@ public static class SourceGovernance
           }
         }
         else if (liveHere)
-        { error = "snapshot head has an ambiguous empty identity while its family still holds sources; resolve by uploading a new version instead."; return false; }
+        {
+          // Allocation stubs (version 0, empty identity) are legitimate
+          // pending-family high-water markers created by ReserveVersion, not
+          // ambiguous head pins: they never satisfy headship and are folded on
+          // promotion. Only a non-stub headless pin rejects here; an approved
+          // family backed by a stub alone still fails the head-coverage check
+          // below, so headless-approved revival stays closed.
+          var isAllocStub = h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty;
+          if (!isAllocStub)
+          { error = "snapshot head has an ambiguous empty identity while its family still holds sources; resolve by uploading a new version instead."; return false; }
+        }
         // Persisted allocation high-water must cover the family maximum and
         // the head pin: a lowered high-water would silently recycle a retired
         // version number for new content.
@@ -673,6 +683,7 @@ public static class SourceGovernance
           // Stub allocation trackers (version 0, empty identity) are not heads:
           // a pending-only family backed only by a stub is still headless by design.
           if (h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty) continue;
+          headed.Add(h.BoardId.ToString("N") + "|" + (h.FamilyKey ?? ""));
         }
       foreach (var d in byId.Values)
       {
@@ -1320,7 +1331,10 @@ public static class SourceGovernance
       s.SourceHeads[head.Id] = head;
     }
     else if (next > head.HighWater) head.HighWater = next;
-    try { s.SourceHeads.Flush(); } catch { }
+    // Durability faults propagate to the caller's Atomic unit (which rolls back
+    // the whole reservation+insertion on failure). Swallowing Flush here would
+    // silently lose allocation history and recycle versions after a restart.
+    s.SourceHeads.Flush();
     return next;
   }
 
