@@ -1302,40 +1302,37 @@ public static class BackupGraphValidator
     }
     foreach (var x in r.sources) if (x is null || Empty(x.Id) || Empty(x.BoardId)) return "Backup source missing lineage.";
     foreach (var ss in r.sections ?? new List<Domain.SourceSection>()) if (ss is null || Empty(ss.Id) || Empty(ss.SourceId)) return "Backup source section missing lineage.";
-    foreach (var d in r.drafts)
-    {
-      if (d is null || Empty(d.Id) || Empty(d.BoardId) || Empty(d.MeetingId)) return "Backup record draft missing lineage.";
-      if (!string.IsNullOrWhiteSpace(d.ApprovedJson))
-      {
-        try
-        {
-          using var _ap = System.Text.Json.JsonDocument.Parse(d.ApprovedJson);
-          // Typed shape: approved list must be an array of string ids ([1] is malformed and must reject before any write).
-          if (_ap.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft ApprovedJson must be an array.";
-          foreach (var _ae in _ap.RootElement.EnumerateArray())
-          {
-            if (_ae.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft ApprovedJson entries must be strings.";
-          }
-        }
-        catch { return "Backup record draft ApprovedJson is not valid JSON."; }
-      }
-      foreach (var dj in new[] { d.ItemsJson, d.SupersedesJson })
-      {
-        if (string.IsNullOrWhiteSpace(dj)) continue;
-        try
-        {
-          using var _dd = System.Text.Json.JsonDocument.Parse(dj);
-          // Typed shape: record graphs must be arrays of objects (object {}, [1], numeric ids are malformed and must reject before any write).
-          if (_dd.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft JSON must be an array.";
-          foreach (var _de in _dd.RootElement.EnumerateArray())
-          {
-            if (_de.ValueKind != System.Text.Json.JsonValueKind.Object) return "Backup record draft entries must be objects.";
-            if (_de.TryGetProperty("id", out var _did) && _did.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft entry id must be a string.";
-          }
-        }
-        catch { return "Backup record draft JSON is not valid JSON."; }
-      }
-    }
+    // Record graphs are validated by the ONE shared complete staged validator (Records F2): typed history
+    // + final revision/token/actor/item correspondence, approved/discarded disjointness, supersedes
+    // parent/cycle, snapshot declared-ref/approved/version/dedup, scope IDs/hash/state. The legacy inline
+    // loop (which demanded SupersedesJson OBJECTS while healthy amend writes STRING ids) is REPLACED here,
+    // not stacked: this call is the only record-graph gate before destructive replacement.
+    // Staged source-version maps (F3/P1): built from the staged graph's own
+    // sources+migrate-version events+heads via the shared helper, so alias and
+    // canonical validation reflect actual staged provenance, never caller invention.
+    var (sourceOriginals, sourceCanonicals) = RecordsOps.BuildSourceVersionMaps(
+      r.sources ?? Enumerable.Empty<Domain.SourceDoc>(),
+      r.events ?? Enumerable.Empty<Domain.SourceEvent>(),
+      r.heads ?? Enumerable.Empty<Domain.SourceFamilyHead>());
+    // Controlled old-schema legacy-marker import (F2/P1): pre-marker backups (version<4)
+    // carry no LegacyReview property, so missing (null) markers become true ONLY where
+    // the recognized old prehistory shape and genuine base contract validate. Modern v4
+    // exports always carry an explicit marker, so a wiped v4 row retains null/false and
+    // fails closed below. No decisions or history are invented.
+    if (r.drafts is not null) RecordsOps.ApplyLegacyMarkerBackfill(r.drafts, r.version);
+    // Adoptability tokens for newly marked legacy rows (F2/P1): the existing fresh-review
+    // and copy workflows match on the review token, so a backfilled legacy row with a blank
+    // token would be unreviewable. Assign the deterministic boot-style legacy token ONLY to
+    // just-marked rows that still lack one; user bytes, hashes, decisions, and history are
+    // untouched, and modern rows (explicit marker or non-blank history) never match.
+    if (r.drafts is not null)
+      foreach (var ld in r.drafts)
+        if (ld is not null && ld.LegacyReview == true && string.IsNullOrWhiteSpace(ld.ReviewToken)
+          && ld.ReviewRevision <= 1 && RecordsOps.IsBlankJsonArray(ld.HistoryJson)
+          && RecordsOps.IsBlankJsonArray(ld.EvidenceSnapshotJson))
+          ld.ReviewToken = RecordsOps.LegacyReviewToken(ld.Id, ld.Version, ld.Hash ?? "");
+    var recordErr = RecordsOps.ValidateRestoreEntries(r.drafts, sourceOriginals, sourceCanonicals);
+    if (recordErr is not null) return recordErr;
     // Effective binaries must decode before any live mutation: malformed base64 rejects (no silent Data=null loss).
     if (r.blobs is not null)
     {

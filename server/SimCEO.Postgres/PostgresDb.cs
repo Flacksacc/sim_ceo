@@ -407,6 +407,7 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"ReviewToken\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"HistoryJson\" text NOT NULL DEFAULT '[]'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"EvidenceSnapshotJson\" text NOT NULL DEFAULT '[]'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"LegacyReview\" boolean NULL");
       // Compatibility-only initialization for RECOGNIZED legacy rows only
       // (blank review token AND pre-review revision): fill blank columns with
       // deterministic/stable values. Never touch Decided or a non-blank
@@ -438,6 +439,21 @@ public static class PgBoot
         }
       }
       db.SaveChanges();
+      // Persisted legacy-review provenance backfill (F2/P1): genuine pre-review rows
+      // (blank history AND blank snapshots, never mutated) gain marker true. ONLY missing
+      // (null) markers are upgraded and ONLY where the recognized prehistory shape holds;
+      // explicit false (modern writers) is never touched, so a wiped modern row stays
+      // closed. The genuine base contract is enforced at restore; boot never invents
+      // decisions or history and never alters user bytes, tokens, hashes, or decisions.
+      foreach (var d in db.Drafts.ToList())
+      {
+        if (d.LegacyReview.HasValue) continue;
+        if (d.ReviewRevision > 1) continue;
+        if (!SimCEO.Api.RecordsOps.IsBlankJsonArray(d.HistoryJson)) continue;
+        if (!SimCEO.Api.RecordsOps.IsBlankJsonArray(d.EvidenceSnapshotJson)) continue;
+        d.LegacyReview = true;
+      }
+      db.SaveChanges();
  db.Database.ExecuteSqlRaw("ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"SourcePolicyMode\" text NOT NULL DEFAULT 'allowAll'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"ReviewState\" text NOT NULL DEFAULT 'pending'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"Origin\" text NOT NULL DEFAULT 'upload'");
@@ -448,8 +464,9 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexError\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexCompletedAt\" timestamp with time zone NULL");
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceSections\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"SourceVersion\" integer NOT NULL DEFAULT 1, \"ContentHash\" text NOT NULL DEFAULT '', \"Ordinal\" integer NOT NULL DEFAULT 1, \"Heading\" text NOT NULL DEFAULT '', \"Location\" text NOT NULL DEFAULT '', \"Text\" text NOT NULL DEFAULT '', \"IndexGeneration\" integer NOT NULL DEFAULT 1, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
-      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"HighWater\" integer NOT NULL DEFAULT 0, \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"HighWater\" integer NOT NULL DEFAULT 0, \"FloorVersion\" integer NOT NULL DEFAULT 0, \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"SourceHeads\" ADD COLUMN IF NOT EXISTS \"HighWater\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"SourceHeads\" ADD COLUMN IF NOT EXISTS \"FloorVersion\" integer NOT NULL DEFAULT 0");
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");

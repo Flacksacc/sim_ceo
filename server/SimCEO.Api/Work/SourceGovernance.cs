@@ -20,6 +20,12 @@ public sealed record ActiveIndexJob(Guid JobId, long Epoch, int Generation);
 
 public static class SourceGovernance
 {
+  /// <summary>Code-only FinishIndex fault seam for rollback tests. In-process QA may set
+  /// <see cref="FinishIndexCallbackFault"/> to force the ACTUAL FinishIndex unit callback to fail AFTER
+  /// staged section/head/event writes, proving full rollback. Never exposed via HTTP routes, environment,
+  /// or headers: it is a plain in-process Func like the PgFaults seams.</summary>
+  public static Func<bool>? FinishIndexCallbackFault;
+
   public const int MaxSections = 20;
   public const int MaxSectionChars = 2000;
   public const int MaxTotalChars = 12000;
@@ -221,19 +227,53 @@ public static class SourceGovernance
       // Fold any stub allocation tracker water into the promoted head so no
       // allocation history is lost when the real head materializes.
       var stubHw = s.SourceHeads.Values.Where(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty).Select(h => (int?)h.HighWater).Max() ?? 0;
-      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = win.row.Version, HeadSourceId = win.row.Id, HighWater = Math.Max(g.Max(x => x.Version), stubHw), UpdatedAt = DateTime.UtcNow };
+      // Family floor (provenance baseline): first-known legitimate version =
+      // min present version across ALL family rows (approved or pending), folded
+      // with any stub floor already recorded for this family.
+      var famMin = s.Sources.Values.Where(x => x.BoardId == g.Key.BoardId && x.FamilyKey == g.Key.FamilyKey).Select(x => (int?)x.Version).Min() ?? win.row.Version;
+      var stubFloor = s.SourceHeads.Values.Where(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty && h.FloorVersion >= 1).Select(h => (int?)h.FloorVersion).Min() ?? famMin;
+      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = win.row.Version, HeadSourceId = win.row.Id, HighWater = Math.Max(g.Max(x => x.Version), stubHw), FloorVersion = Math.Min(famMin, stubFloor), UpdatedAt = DateTime.UtcNow };
       s.SourceHeads[head.Id] = head;
       // Remove absorbed stubs in the same unit: a leftover zero-version row would
       // make unordered head lookups ambiguous between the stub and the real head.
       foreach (var sh in s.SourceHeads.Values.Where(h => h.Id != head.Id && h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty).ToList())
         s.SourceHeads.TryRemove(sh.Id, out _);
     }
-    // Maintain monotonic high-water on existing heads.
+    // Maintain monotonic high-water on existing heads, and backfill the family
+    // floor for pre-provenance heads (upgrade path): the truthful first-known
+    // version is the min present version on live/accepted data. Never raises an
+    // established floor and never invents history: governed flows only ever add
+    // rows above the floor. Blank-family heads are skipped (transient legacy
+    // state converges through canonicalization first).
     foreach (var h in s.SourceHeads.Values.ToList())
     {
       var liveMax = s.Sources.Values.Where(x => x.BoardId == h.BoardId && x.FamilyKey == h.FamilyKey).Select(x => (int?)x.Version).Max() ?? 0;
       var want = Math.Max(Math.Max(h.HeadVersion, liveMax), h.HighWater);
       if (want != h.HighWater) { h.HighWater = want; h.UpdatedAt = DateTime.UtcNow; }
+      if (h.FloorVersion <= 0 && !string.IsNullOrWhiteSpace(h.FamilyKey))
+      {
+        var liveMin = s.Sources.Values.Where(x => x.BoardId == h.BoardId && x.FamilyKey == h.FamilyKey).Select(x => (int?)x.Version).Min();
+        if (liveMin.HasValue && liveMin.Value >= 1) { h.FloorVersion = liveMin.Value; h.UpdatedAt = DateTime.UtcNow; }
+      }
+    }
+    // Provenance stubs for headless families (P1 sparse): pending-only sparse
+    // families (e.g. genuine single-v3 legacy migrations) carry no head, event,
+    // or approval history, so a floor-less restore cannot tell them from
+    // partial-family removal. Record the truthful first-known floor (min
+    // present version) and high-water (max present) in a stub head (version 0,
+    // empty identity): stubs never satisfy headship, are skipped by
+    // head-coverage validation, and fold into real heads on promotion. Backup
+    // tampering (a member deleted post-export) still rejects because the
+    // exported stub retains the pre-deletion floor.
+    foreach (var fg in s.Sources.Values.ToList().GroupBy(x => (x.BoardId, x.FamilyKey)).ToList())
+    {
+      if (string.IsNullOrWhiteSpace(fg.Key.FamilyKey)) continue;
+      if (s.SourceHeads.Values.Any(h => h.BoardId == fg.Key.BoardId && h.FamilyKey == fg.Key.FamilyKey)) continue;
+      var fmin = fg.Min(x => x.Version);
+      var fmax = fg.Max(x => x.Version);
+      if (fmin < 1 || fmax < 1) continue;
+      var stub = new SourceFamilyHead { BoardId = fg.Key.BoardId, FamilyKey = fg.Key.FamilyKey, HeadVersion = 0, HeadSourceId = Guid.Empty, HighWater = fmax, FloorVersion = fmin, UpdatedAt = DateTime.UtcNow };
+      s.SourceHeads[stub.Id] = stub;
     }
     try { s.SourceHeads.Flush(); } catch { }
   }
@@ -311,6 +351,7 @@ public static class SourceGovernance
             foreach (var drop in hg.Where(h => h.Id != keep.Id).ToList())
             {
               if (drop.HighWater > keep.HighWater) keep.HighWater = drop.HighWater;
+              if (drop.FloorVersion >= 1) keep.FloorVersion = keep.FloorVersion >= 1 ? Math.Min(keep.FloorVersion, drop.FloorVersion) : drop.FloorVersion;
               s.SourceHeads.TryRemove(drop.Id, out _);
             }
           }
@@ -546,16 +587,32 @@ public static class SourceGovernance
       if (!famVersions.TryGetValue(key, out var vs)) { vs = new HashSet<int>(); famVersions[key] = vs; }
       vs.Add(d.Version);
     }
+    // Floor-aware density (family provenance baseline): every version in
+    // floor..max must be present. The floor comes from staged head/stub
+    // provenance (0/unknown = strict dense-from-1). Genuine sparse legacy
+    // families (first-known v3, no v1/v2 ever) carry their floor in an exported
+    // stub; backup tampering (a member deleted post-export) still rejects
+    // because the stub retains the pre-deletion floor.
     // No silent partial-family removal: surviving non-legacy families must
-    // hold dense versions 1..max. A gap means versions were deleted outside
+    // hold dense versions floor..max. A gap means versions were deleted outside
     // the supported whole-family removal or exclusion; reject instead of
     // recycling numbers.
     if (!legacyKeys)
     {
+      var famFloor = new Dictionary<string, int>(StringComparer.Ordinal);
+      if (restored.heads is not null)
+        foreach (var hh in restored.heads)
+        {
+          if (hh is null || string.IsNullOrWhiteSpace(hh.FamilyKey) || hh.FloorVersion < 1) continue;
+          var hk = hh.BoardId.ToString("N") + "|" + hh.FamilyKey;
+          if (!famFloor.TryGetValue(hk, out var ffe) || hh.FloorVersion < ffe) famFloor[hk] = hh.FloorVersion;
+        }
       foreach (var kv in famVersions)
       {
         var max = famMax[kv.Key];
-        for (var v = 1; v <= max; v++)
+        var floor = famFloor.TryGetValue(kv.Key, out var ffg) ? ffg : 1;
+        if (floor > max) { error = "snapshot family floor v" + floor + " is above its maximum v" + max + "; partial-family state is not supported."; return false; }
+        for (var v = floor; v <= max; v++)
           if (!kv.Value.Contains(v))
           { error = "snapshot family skips version v" + v + "; partial-family removal is not supported (exclude or remove the whole family instead)."; return false; }
       }
@@ -662,6 +719,12 @@ public static class SourceGovernance
           if (h.HighWater != 0 && (h.HighWater < fmax || h.HighWater < h.HeadVersion))
           { error = "snapshot head high-water does not cover its family; versions would be recycled."; return false; }
         }
+        // Persisted family floor (provenance baseline): 0 = unknown/pre-provenance
+        // (strict dense-from-1 applies in the family check). A negative floor is
+        // forged; a floor above a positive head pin is inconsistent (stubs pin
+        // version 0 and are exempt from the pin comparison).
+        if (h.FloorVersion < 0) { error = "snapshot head carries an illegal family floor."; return false; }
+        if (h.FloorVersion > 0 && h.HeadVersion > 0 && h.FloorVersion > h.HeadVersion) { error = "snapshot head family floor is above its head version."; return false; }
       }
     }
     // No-fallback on removal: a non-legacy family that still holds
@@ -994,21 +1057,36 @@ public static class SourceGovernance
             var h = s.SourceHeads.Values.FirstOrDefault(x => x.BoardId == d.BoardId && x.FamilyKey == d.FamilyKey);
             if (h is null)
             {
-              h = new SourceFamilyHead { BoardId = d.BoardId, FamilyKey = d.FamilyKey, HeadVersion = d.Version, HeadSourceId = d.Id, HighWater = d.Version, UpdatedAt = DateTime.UtcNow };
+              var promMin = s.Sources.Values.Where(x => x.BoardId == d.BoardId && x.FamilyKey == d.FamilyKey).Select(x => (int?)x.Version).Min() ?? d.Version;
+              // Promotion-time floor: first-known version across live family rows.
+              h = new SourceFamilyHead { BoardId = d.BoardId, FamilyKey = d.FamilyKey, HeadVersion = d.Version, HeadSourceId = d.Id, HighWater = d.Version, FloorVersion = promMin >= 1 ? promMin : d.Version, UpdatedAt = DateTime.UtcNow };
               s.SourceHeads[h.Id] = h;
             }
-            else if (d.Version > h.HeadVersion)
+            // Promotion-time floor backfill for pre-provenance heads/stubs: keep
+            // an established floor, otherwise record the truthful first-known version.
+            if (h.FloorVersion <= 0)
+            {
+              var promMin2 = s.Sources.Values.Where(x => x.BoardId == d.BoardId && x.FamilyKey == d.FamilyKey).Select(x => (int?)x.Version).Min() ?? d.Version;
+              if (promMin2 >= 1) { h.FloorVersion = promMin2; h.UpdatedAt = DateTime.UtcNow; }
+            }
+            // Promotion follows ORIGINAL-version ordering (server-owned alias), consistent with the pre-commit eligibility gate above: an actual newer original (e.g. orig v2, canonical v2) promotes above a parked old duplicate (orig v1, canonical v3). Canonical numbers alone never decide the head.
+            var dOrigProm = OriginalVersionOf(s, d);
+            int hOrigProm = h.HeadVersion;
+            if (h.HeadSourceId != Guid.Empty && s.Sources.TryGetValue(h.HeadSourceId, out var hDocProm) && hDocProm is not null && hDocProm.BoardId == d.BoardId && hDocProm.FamilyKey == d.FamilyKey)
+              hOrigProm = OriginalVersionOf(s, hDocProm);
+            if (dOrigProm > hOrigProm)
             {
               h.HeadVersion = d.Version; h.HeadSourceId = d.Id; if (d.Version > h.HighWater) h.HighWater = d.Version; h.UpdatedAt = DateTime.UtcNow;
             }
-            else if (d.Version == h.HeadVersion && h.HeadSourceId != Guid.Empty && h.HeadSourceId != d.Id)
+            else if (dOrigProm == hOrigProm)
             {
-              throw new InvalidOperationException("family/version collision at promotion");
+              if (h.HeadSourceId != Guid.Empty && h.HeadSourceId != d.Id)
+                throw new InvalidOperationException("family/version collision at promotion");
+              if (h.HeadSourceId == Guid.Empty)
+              { h.HeadSourceId = d.Id; h.UpdatedAt = DateTime.UtcNow; }
             }
-            else if (d.Version == h.HeadVersion && h.HeadSourceId == Guid.Empty)
-            {
-              h.HeadSourceId = d.Id; h.UpdatedAt = DateTime.UtcNow;
-            }
+            else
+              throw new InvalidOperationException("superseded by newer original version before commit");
             s.Sources.Flush(); s.SourceHeads.Flush();
             RecordEvent(s, d, "approve", "v" + d.Version);
             InvalidateLocked(s, d.BoardId);
@@ -1327,7 +1405,11 @@ public static class SourceGovernance
     // everywhere a current head is required) and are replaced by real promotions.
     if (head is null)
     {
-      head = new SourceFamilyHead { BoardId = boardId, FamilyKey = familyKey, HeadVersion = 0, HeadSourceId = Guid.Empty, HighWater = next, UpdatedAt = DateTime.UtcNow };
+      // Stub floor: truthful first-known version across live family rows (a legacy
+      // transient may already hold rows below the reservation); a row-less family
+      // records the reservation itself as its first-known version.
+      var rmin = s.Sources.Values.Where(x => x.BoardId == boardId && x.FamilyKey == familyKey).Select(x => (int?)x.Version).Min() ?? next;
+      head = new SourceFamilyHead { BoardId = boardId, FamilyKey = familyKey, HeadVersion = 0, HeadSourceId = Guid.Empty, HighWater = next, FloorVersion = rmin >= 1 ? rmin : next, UpdatedAt = DateTime.UtcNow };
       s.SourceHeads[head.Id] = head;
     }
     else if (next > head.HighWater) head.HighWater = next;
@@ -1441,7 +1523,10 @@ public static class SourceGovernance
         // the actual backend transaction against freshly fetched rows: the
         // pre-gate captured source object never sources the mutation, so an
         // intervening tracker-clear cannot detach the write target.
-        string? failure = null;
+        // Partial-write faults escape the unit below (no failure swallowing):
+        // the store-bound unit rolls back ALL staged effects and the exception
+        // propagates to the caller for an honest post-commit/uncertain-rollback
+        // classification. Controlled stale/failed-extraction paths return normally.
         bool stale = false;
         string? staleErr = null;
         var eventName = isReindex ? "reindex" : "index";
@@ -1468,10 +1553,7 @@ public static class SourceGovernance
           if (!string.Equals(cur.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
             || cur.IndexGeneration != res.Generation)
           { stale = true; staleErr = "A newer index attempt superseded this one; stale completion discarded."; return; }
-          string? ferr = null;
-          try
-          {
-            // Fail closed on explicit extraction failure: raw Original bytes must
+          // Fail closed on explicit extraction failure (partial-write faults escape, no inner catch): raw Original bytes must
             // not stand in for extractor output. Textual uploads extract locally;
             // anything else requires a successful extractor result first.
             var md = Extraction.MarkdownOf(cur.ExtractionJson);
@@ -1527,15 +1609,12 @@ public static class SourceGovernance
             cur.IndexState = "completed"; cur.IndexError = ""; cur.IndexCompletedAt = DateTime.UtcNow;
             s.Sources.Flush(); s.SourceSections.Flush();
             RecordEvent(s, cur, eventName, "gen" + res.Generation + " sections" + built.Count);
-          }
-          catch (Exception ex)
-          {
-            ferr = ex.Message;
-          }
-          if (ferr is not null) { failure = ferr; return; }
+            // QA-only inner-callback fault (code-only, never HTTP/env/header): fires AFTER staged writes inside
+            // the ACTUAL unit callback, so the fault escapes and rolls back ALL staged effects. A predecessor
+            // inner-catch that swallowed this would commit partials and fail the rollback assertions.
+            if (FinishIndexCallbackFault?.Invoke() == true) throw new InvalidOperationException("injected finish-index callback fault (SourceGovernance.FinishIndexCallbackFault)");
+          // No catch inside the unit: a partial-write failure must escape Atomic.Run so ALL staged source/section/head/event effects roll back instead of committing partials.
         });
-        if (failure is not null)
-          return (false, false, false, failure, 500);
         if (stale)
           return (false, true, false, staleErr, 409);
         // Retire the completed reservation only if it is still current.
@@ -1579,6 +1658,13 @@ public static class SourceGovernance
               // Caller + authority revalidated inside the unit: a revocation or
               // logout between reservation and stamping must not mutate the row.
               if (PeopleOps.Check(s, req, stamped.BoardId, stamped.Scope == "meeting" ? stamped.MeetingId : null, need) is not null) return;
+              // Policy-drift gate BEFORE any derived write: a board policy change
+              // (mode/blocked-type revision or allowance) between reservation and
+              // stamping must not mutate the row. Reservation key + live allowance
+              // are both rechecked against the freshly fetched board/row.
+              if (!string.Equals(PolicyRevisionKey(s, stamped.BoardId), res.PolicyKey, StringComparison.Ordinal)) return;
+              if (!s.Boards.TryGetValue(stamped.BoardId, out var stampBoard) || stampBoard is null) return;
+              if (!PolicyAllows(stampBoard, stamped)) return;
               stamped.ExtractionJson = extractionJson;
               s.Sources.Flush();
             });

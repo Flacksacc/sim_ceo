@@ -119,6 +119,15 @@ public sealed class RecordDraft
   public string DiscardedJson { get; set; } = "[]";
   public int ReviewRevision { get; set; } = 1;
   public string ReviewToken { get; set; } = "";
+  // Persisted legacy-review provenance (F2/P1): true ONLY for genuine pre-review
+  // rows (pre-provenance schema: blank history AND blank snapshots, never mutated).
+  // Modern writers leave this null/false and always append history on create and
+  // every decision, so a null/false row with blank history is a wiped or forged
+  // modern row and fails closed. Controlled backfill (PG boot) and old-schema
+  // import (backup version<4) set missing (null) markers to true ONLY where the
+  // recognized old prehistory shape and genuine base contract validate. Decisions
+  // and history are never invented from this marker.
+  public bool? LegacyReview { get; set; }
   public string HistoryJson { get; set; } = "[]";
   public string EvidenceSnapshotJson { get; set; } = "[]";
   public string SupersedesJson { get; set; } = "[]";
@@ -165,6 +174,14 @@ public sealed class SourceFamilyHead
   public string FamilyKey { get; set; } = "";
   public int HeadVersion { get; set; } = 0;
   public Guid HeadSourceId { get; set; } = Guid.Empty;
+  // Persisted family floor (provenance baseline): the first-known legitimate
+  // version of this family. Recorded truthfully on live data at head/stub
+  // creation and backfilled (min present version) for pre-provenance heads at
+  // upgrade; carried in backups. Restore requires every version in
+  // floor..max to be present, so partial-family removal rejects while genuine
+  // sparse legacy families (first-known v3, no v1/v2 ever) restore. 0 =
+  // unknown/pre-provenance: restore falls back to strict dense-from-1.
+  public int FloorVersion { get; set; } = 0;
   // Persisted allocation high-water: the highest version EVER allocated in this
   // family. ReserveVersion never reuses a version at or below the high-water,
   // so restoring an older backup cannot silently recycle a retired version

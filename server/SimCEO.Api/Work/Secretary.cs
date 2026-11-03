@@ -354,18 +354,42 @@ public static class SecretaryContext
       }
       else if (kind == "record")
       {
-        if (!Guid.TryParse(r.Ref, out var did)) continue;
+        // Strict record identity (F1): bare GUID = legacy whole-record (approved current only); explicit
+        // sourceRecordId:itemId resolves the REFERENCED item at its pinned version with exact item/quote
+        // scope (source item text, never destination itemId, never whole-export for an item cite).
+        // Malformed composites are dropped, never whole-record. Historical pins preserve approved exact
+        // bytes with their version; unpinned item cites resolve the current version.
+        if (!EvidenceRef.TryParseRecordRef(r.Ref, out var did, out var ditem, out _)) continue;
         if (!s.Drafts.TryGetValue(did, out var draft) || draft is null) continue;
-        if (draft.BoardId != boardId || draft.MeetingId != meetingId || draft.Status != "approved") continue;
+        if (draft.BoardId != boardId || draft.MeetingId != meetingId) continue;
         if (r.Version.HasValue && r.Version.Value != draft.Version) continue;
-        var exp = RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false);
-        if (string.IsNullOrWhiteSpace(exp)) continue;
-        if (!string.IsNullOrWhiteSpace(r.Excerpt))
+        if (string.IsNullOrWhiteSpace(ditem))
         {
-          if (!exp.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
-          outRefs.Add(EvidenceRef.ForRecord(draft, r.Excerpt!));
+          if (draft.Status != "approved") continue;
+          var exp = RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false);
+          if (string.IsNullOrWhiteSpace(exp)) continue;
+          if (!string.IsNullOrWhiteSpace(r.Excerpt))
+          {
+            if (!exp.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+            outRefs.Add(EvidenceRef.ForRecord(draft, r.Excerpt!));
+          }
+          else outRefs.Add(EvidenceRef.ForRecord(draft, exp.Trim()));
         }
-        else outRefs.Add(EvidenceRef.ForRecord(draft, exp.Trim()));
+        else
+        {
+          var rmap = RecordsOps.ItemMap(draft.ItemsJson ?? "[]", out var rmapErr);
+          if (rmapErr != "" || !rmap.TryGetValue(ditem, out var ritem)) continue;
+          var rap = new HashSet<string>(RecordsOps.ParseIdList(draft.ApprovedJson ?? "[]"), StringComparer.Ordinal);
+          if (!rap.Contains(ditem)) continue;
+          var itemText = RecordsOps.ItemText(ritem);
+          if (string.IsNullOrWhiteSpace(itemText)) continue;
+          if (!string.IsNullOrWhiteSpace(r.Excerpt))
+          {
+            if (!itemText.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+            outRefs.Add(EvidenceRef.ForRecordItem(did.ToString(), draft.Version, ditem, r.Excerpt!));
+          }
+          else outRefs.Add(EvidenceRef.ForRecordItem(did.ToString(), draft.Version, ditem, EvidenceRef.ExactExcerpt(itemText, 240)));
+        }
       }
       else if (kind == "message")
       {
@@ -473,9 +497,27 @@ public static class SecretaryContext
       }
       else if (c.Kind == "record")
       {
-        if (!Guid.TryParse(c.Ref, out var did) || !s.Drafts.TryGetValue(did, out var draft) || draft is null) continue;
-        var span = string.IsNullOrWhiteSpace(c.Excerpt) ? RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false).Trim() : c.Excerpt!;
-        var line = "CALLER RECORD v" + draft.Version + ": " + span;
+        // Strict identity (F1): item cites resolve the REFERENCED item text (never whole-export for an item
+        // cite, never destination text); malformed composites are skipped, never whole-record.
+        if (!EvidenceRef.TryParseRecordRef(c.Ref, out var did, out var ditem, out _) || !s.Drafts.TryGetValue(did, out var draft) || draft is null) continue;
+        string span;
+        string line;
+        if (string.IsNullOrWhiteSpace(ditem))
+        {
+          span = string.IsNullOrWhiteSpace(c.Excerpt) ? RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false).Trim() : c.Excerpt!;
+          line = "CALLER RECORD v" + draft.Version + ": " + span;
+        }
+        else
+        {
+          var pmap = RecordsOps.ItemMap(draft.ItemsJson ?? "[]", out var pmapErr);
+          if (pmapErr != "" || !pmap.TryGetValue(ditem, out var pitem)) continue;
+          var ptext = RecordsOps.ItemText(pitem);
+          if (string.IsNullOrWhiteSpace(ptext)) continue;
+          if (!string.IsNullOrWhiteSpace(c.Excerpt) && !ptext.Contains(c.Excerpt!, StringComparison.Ordinal)) continue;
+          span = string.IsNullOrWhiteSpace(c.Excerpt) ? ptext : c.Excerpt!;
+          line = "CALLER RECORD v" + draft.Version + " [" + ditem + "]: " + span;
+        }
+        if (string.IsNullOrWhiteSpace(span)) continue;
         var before = sb.Length;
         AppendLineBudgeted(line, true);
         if (sb.Length > before) evidenceOut.Add(c);
@@ -757,15 +799,39 @@ public static class EvidenceAvailability
     }
     if (kind == "record")
     {
-      if (!Guid.TryParse(r.Ref, out var did) || !s.Drafts.TryGetValue(did, out var d) || d is null)
+      // Strict identity (F1/F5): bare GUID = legacy whole-record; explicit item refs resolve the
+      // REFERENCED item with effective-owner Current semantics. Malformed composites are unavailable.
+      if (!EvidenceRef.TryParseRecordRef(r.Ref, out var did, out var ditem, out _))
+        return new Status(false, "record ref malformed");
+      if (!s.Drafts.TryGetValue(did, out var d) || d is null)
         return new Status(false, "record removed");
       if (d.BoardId != boardId) return new Status(false, "record moved");
       if (d.MeetingId != meetingId) return new Status(false, "record not in this meeting");
       if (r.Version.HasValue && r.Version.Value != d.Version)
         return new Status(false, "superseded by v" + d.Version);
-      if (!string.Equals(d.Status, "approved", StringComparison.OrdinalIgnoreCase))
-        return new Status(false, "record no longer approved");
-      return new Status(true, "current");
+      // Whole-record approval status gates BARE refs only (F1). An explicit approved
+      // item in a partially-approved record is current when the item is approved,
+      // the pin/scope match, and the effective referenced owner still holds it.
+      if (string.IsNullOrWhiteSpace(ditem))
+      {
+        if (!string.Equals(d.Status, "approved", StringComparison.OrdinalIgnoreCase))
+          return new Status(false, "record no longer approved");
+        return new Status(true, "current");
+      }
+      var amap = RecordsOps.ItemMap(d.ItemsJson ?? "[]", out var amapErr);
+      if (amapErr != "" || !amap.ContainsKey(ditem))
+        return new Status(false, "record item removed");
+      var aap = new HashSet<string>(RecordsOps.ParseIdList(d.ApprovedJson ?? "[]"), StringComparer.Ordinal);
+      if (!aap.Contains(ditem))
+        return new Status(false, "record item not approved");
+      // Current follows the EFFECTIVE referenced owner: a replaced historical item is not current.
+      foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId)))
+      {
+        if (v.EffectiveOwners.TryGetValue(ditem, out var eo)
+          && string.Equals(eo.RecordId, did.ToString(), StringComparison.OrdinalIgnoreCase) && eo.Version == d.Version)
+          return new Status(true, "current");
+      }
+      return new Status(false, "record item replaced");
     }
     if (kind == "message")
     {
