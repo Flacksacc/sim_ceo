@@ -21,7 +21,7 @@ public sealed class InMemoryStore
   public Table<Domain.VoiceTurn> VoiceTurns { get; } = new();
   public Table<Domain.LeadProfile> LeadProfiles { get; } = new();
   public Table<Domain.JobRow> Jobs { get; } = new();
-  public Table<Domain.Note> Notes { get; } = new();
+  public Table<Domain.Note> Notes { get; } = new(); public Table<Domain.SecretaryRequest> SecretaryRequests { get; } = new(); public Table<Domain.NoteHistory> NoteHistories { get; } = new();
   public Table<Domain.Grant> Grants { get; } = new();
   public Table<Domain.Invite> Invites { get; } = new();
   public Table<Domain.AdvisorImage> Images { get; } = new();

@@ -364,7 +364,7 @@ public static class OpsEndpoints
         return Results.Json(new { error = "Only the owner can export backups." }, statusCode: 403);
       var snapshot = new
       {
-        version = 2,
+        version = 3,
         at = DateTime.UtcNow,
         boards = s.Boards.Values.ToList(),
         roster = s.Roster.Values.ToList(),
@@ -377,6 +377,8 @@ public static class OpsEndpoints
         blobs = s.Sources.Values.ToDictionary(
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
         leads = s.LeadProfiles.Values.ToList(),
+        secretaryRequests = s.SecretaryRequests.Values.ToList(),
+        noteHistories = s.NoteHistories.Values.ToList(),
           wizardDrafts = s.WizardDrafts.Values.ToList(),
         grants = s.Grants.Values.ToList(),
         invites = s.Invites.Values.ToList(),
@@ -397,15 +399,29 @@ public static class OpsEndpoints
       JsonDocument doc;
       try { doc = JsonDocument.Parse(snapshot); }
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
-      if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2))
+      if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2 or 3))
         return Results.BadRequest("Unsupported backup version.");
       var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
         new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
       if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
+      Dictionary<string, List<Message>> msgCopy;
+      try
+      {
+        msgCopy = new Dictionary<string, List<Message>>();
+        string? graphError = BackupGraphValidator.Validate(restored);
+        if (graphError is not null) return Results.Json(new { error = graphError }, statusCode: 422);
+        foreach (var kv in restored.messages) msgCopy[kv.Key] = kv.Value ?? new List<Message>();
+      }
+      catch (Exception vex) { return Results.Json(new { error = "Backup validation failed: " + vex.Message }, statusCode: 422); }
       lock (s.SetupLock)
       {
+        try
+        {
+        Atomic.Run(() =>
+        {
         s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
         s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
+        s.SecretaryRequests.Clear(); s.NoteHistories.Clear();
         s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
         foreach (var b in restored.boards) s.Boards[b.Id] = b;
         foreach (var r in restored.roster) s.Roster[r.Id] = r;
@@ -413,7 +429,7 @@ public static class OpsEndpoints
         foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
         foreach (var kv in restored.messages)
           if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
-        foreach (var n in restored.notes) s.Notes[n.Id] = n;
+        foreach (var n in restored.notes) { if (n.RootId == Guid.Empty) n.RootId = n.Id; s.Notes[n.Id] = n; }
         foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
         foreach (var x in restored.sources) s.Sources[x.Id] = x; if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss; if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh; if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
         // Deliberate legacy migration (P2 #9): pre-phase-6 snapshots carry
@@ -440,12 +456,17 @@ public static class OpsEndpoints
             CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
           };
         }
+        foreach (var sr in restored.secretaryRequests ?? new List<SecretaryRequest>()) s.SecretaryRequests[sr.Id] = sr;
+        foreach (var hh in restored.noteHistories ?? new List<NoteHistory>()) s.NoteHistories[hh.Id] = hh;
         foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
         foreach (var g in restored.grants) s.Grants[g.Id] = g;
         foreach (var i in restored.invites) s.Invites[i.Id] = i;
         if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
-        s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
+        });
+        }
+        catch (Exception rex) { return Results.Json(new { error = "Backup restore failed and rolled back: " + rex.Message }, statusCode: 422); }
       }
+      s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
       return Results.Ok(new { restored = restored.boards.Count, at = restored.at });
     });
 
@@ -491,6 +512,119 @@ public static class OpsEndpoints
   }
 }
 
+public static class BackupGraphValidator
+{
+  static bool Empty(Guid g) => g == Guid.Empty;
+  // Full graph validation BEFORE any write. Correct-hash invalid graphs must
+  // fail here, never mid-restore. Returns an error string or null when valid.
+  public static string? Validate(BackupSnapshot r)
+  {
+    if (r.boards is null || r.meetings is null || r.messages is null || r.notes is null || r.drafts is null
+      || r.sources is null || r.blobs is null || r.leads is null || r.grants is null || r.invites is null || r.images is null)
+      return "Backup snapshot is missing required collections.";
+    foreach (var b in r.boards) if (b is null || Empty(b.Id)) return "Backup board missing id.";
+    if (r.boards.Select(b => b!.Id).Distinct().Count() != r.boards.Count) return "Backup board ids are not unique.";
+    foreach (var m in r.meetings) if (m is null || Empty(m.Id) || Empty(m.BoardId)) return "Backup meeting missing lineage.";
+    var boardIds = new HashSet<Guid>(r.boards.Select(b => b!.Id));
+    var meetingById = new Dictionary<Guid, Meeting>();
+    foreach (var m in r.meetings)
+    {
+      if (m is null) return "Backup meeting is null.";
+      if (!boardIds.Contains(m.BoardId)) return "Backup meeting references a missing board.";
+      if (meetingById.ContainsKey(m.Id)) return "Backup meeting ids are not unique.";
+      meetingById[m.Id] = m;
+    }
+    foreach (var l in r.leads) if (l is null || Empty(l.Id)) return "Backup lead is null or missing id.";
+    foreach (var x in r.roster) if (x is null || Empty(x.Id)) return "Backup roster entry is null or missing id.";
+    foreach (var a in r.advisors) if (a is null || Empty(a.Id) || Empty(a.BoardId) || Empty(a.RosterEntryId)) return "Backup advisor missing lineage.";
+    foreach (var g in r.grants) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
+    foreach (var i in r.invites) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
+    foreach (var w in r.wizardDrafts ?? new List<Domain.WizardDraft>()) if (w is null || Empty(w.Id)) return "Backup wizard draft is null or missing id.";
+    foreach (var x in r.sources) if (x is null || Empty(x.Id) || Empty(x.BoardId)) return "Backup source missing lineage.";
+    foreach (var ss in r.sections ?? new List<Domain.SourceSection>()) if (ss is null || Empty(ss.Id) || Empty(ss.SourceId)) return "Backup source section missing lineage.";
+    foreach (var d in r.drafts) if (d is null || Empty(d.Id) || Empty(d.BoardId) || Empty(d.MeetingId)) return "Backup record draft missing lineage.";
+    var noteIds = new HashSet<Guid>();
+    foreach (var n in r.notes)
+    {
+      if (n is null || Empty(n.Id)) return "Backup note missing id.";
+      if (!noteIds.Add(n.Id)) return "Backup note ids are not unique.";
+      if (Empty(n.RootId)) n.RootId = n.Id;
+      if (Empty(n.BoardId) || Empty(n.MeetingId)) return "Backup note missing parent scope.";
+      if (!meetingById.TryGetValue(n.MeetingId, out var pm) || pm.BoardId != n.BoardId) return "Backup note references a missing parent meeting.";
+      if (n.Revision < 1) return "Backup note revision invalid.";
+      if (n.NoteStatus != "current" && n.NoteStatus != "superseded" && n.NoteStatus != "reversed") return "Backup note status invalid.";
+    }
+    var byId = r.notes.ToDictionary(n => n!.Id);
+    var currentsPerRoot = new Dictionary<Guid, int>();
+    foreach (var n in r.notes)
+    {
+      var root = n!.RootId;
+      if (!byId.ContainsKey(root) && !r.notes.Any(x => x!.Id == root)) return "Backup note root has no chain head.";
+      if (n.NoteStatus == "current") currentsPerRoot[root] = currentsPerRoot.TryGetValue(root, out var c) ? c + 1 : 1;
+      if (n.PredecessorId.HasValue)
+      {
+        if (!byId.TryGetValue(n.PredecessorId.Value, out var pred)) return "Backup note predecessor missing.";
+        if ((pred.RootId == Guid.Empty ? pred.Id : pred.RootId) != root) return "Backup note predecessor crosses lineage.";
+        if (pred.Revision != n.Revision - 1) return "Backup note revision chain is not continuous.";
+        var steps = 0;
+        var walk = n;
+        while (walk!.PredecessorId.HasValue && steps <= r.notes.Count)
+        {
+          walk = byId[walk.PredecessorId.Value];
+          steps++;
+          if (walk.Id == n.Id) return "Backup note lineage contains a cycle.";
+        }
+        if (steps > r.notes.Count) return "Backup note lineage contains a cycle.";
+      }
+    }
+    foreach (var kv in currentsPerRoot) if (kv.Value != 1) return "Backup note root has duplicate current revisions.";
+    foreach (var h in r.noteHistories ?? new List<Domain.NoteHistory>())
+    {
+      if (h is null || Empty(h.Id) || Empty(h.RootId) || Empty(h.NoteId)) return "Backup history row missing lineage.";
+      if (Empty(h.BoardId) || Empty(h.MeetingId)) return "Backup history row missing parent scope.";
+      if (!byId.TryGetValue(h.NoteId, out var hn)) return "Backup history references a missing note.";
+      var hroot = hn.RootId == Guid.Empty ? hn.Id : hn.RootId;
+      if (h.RootId != hroot) return "Backup history root does not match its note lineage.";
+      if (h.BoardId != hn.BoardId || h.MeetingId != hn.MeetingId) return "Backup history scope does not match its note.";
+      if (h.Revision != hn.Revision) return "Backup history revision does not match its note revision.";
+    }
+    var noncePerMeeting = new Dictionary<string, int>();
+    var reqIds = new HashSet<Guid>();
+    var reqNoteIds = new HashSet<Guid?>();
+    foreach (var sr in r.secretaryRequests ?? new List<Domain.SecretaryRequest>())
+    {
+      if (sr is null || Empty(sr.Id)) return "Backup secretary request missing id.";
+      if (!reqIds.Add(sr.Id)) return "Backup secretary request ids are not unique.";
+      if (Empty(sr.BoardId) || Empty(sr.MeetingId)) return "Backup secretary request missing parent scope.";
+      if (!meetingById.TryGetValue(sr.MeetingId, out var rm) || rm.BoardId != sr.BoardId) return "Backup secretary request references a missing parent meeting.";
+      if (string.IsNullOrWhiteSpace(sr.ClientNonce)) return "Backup secretary request missing nonce.";
+      var key = sr.MeetingId + "|" + sr.ClientNonce.Trim();
+      if (noncePerMeeting.ContainsKey(key)) return "Backup secretary request nonce is not unique per meeting.";
+      noncePerMeeting[key] = 1;
+      if (sr.Status != "pending" && sr.Status != "inflight" && sr.Status != "answering" && sr.Status != "needs-clarification" && sr.Status != "completed" && sr.Status != "failed" && sr.Status != "discarded" && sr.Status != "interrupted")
+        return "Backup secretary request status invalid.";
+      if (sr.Phase != "initial" && sr.Phase != "continuation") return "Backup secretary request phase invalid.";
+      if (string.IsNullOrWhiteSpace(sr.InputHash) || string.IsNullOrWhiteSpace(sr.InputText)) return "Backup secretary request missing input identity.";
+      if (sr.Phase == "continuation" && string.IsNullOrWhiteSpace(sr.Question)) return "Backup continuation request missing question lineage.";
+      if (!string.IsNullOrWhiteSpace(sr.Answer) && string.IsNullOrWhiteSpace(sr.Question)) return "Backup answer is missing its question lineage.";
+      if (sr.NoteId.HasValue)
+      {
+        if (!byId.TryGetValue(sr.NoteId.Value, out var rn)) return "Backup secretary request references a missing note.";
+        if (rn.BoardId != sr.BoardId || rn.MeetingId != sr.MeetingId) return "Backup secretary request note crosses board or meeting scope.";
+        if (sr.Status != "completed") return "Backup secretary request note pointer without completed status.";
+      }
+      if (sr.Status == "completed" && !sr.NoteId.HasValue) return "Backup completed request is missing its note pointer.";
+      if (!SimCEO.Api.Work.SecretaryContext.TryParseSnapshot(sr.SnapshotJson, out _)) return "Backup secretary request snapshot is invalid.";
+      if (Empty(sr.AttemptId)) return "Backup secretary request is missing its attempt identity.";
+      if (!string.IsNullOrWhiteSpace(sr.CallerRefsJson))
+      {
+        try { using var d = System.Text.Json.JsonDocument.Parse(sr.CallerRefsJson); if (d.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup caller refs are not an array."; }
+        catch { return "Backup caller refs are not valid JSON."; }
+      }
+    }
+    return null;
+  }
+}
 public sealed record BackupImage(Guid id, Guid? rosterEntryId, Guid? boardAdvisorId,
   string kind, string provenance, string contentType, string? data,
   string? review = null, DateTime createdAt = default);
@@ -500,7 +634,7 @@ public sealed record BackupSnapshot(int version, DateTime at,
   List<Meeting> meetings, Dictionary<string, List<Message>> messages,
   List<Note> notes, List<RecordDraft> drafts, List<SourceDoc> sources,
   Dictionary<string, string> blobs, List<LeadProfile> leads,
-  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null);
+  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null, List<Domain.SecretaryRequest>? secretaryRequests = null, List<Domain.NoteHistory>? noteHistories = null);
 
 public static class CommandMap
 {

@@ -425,7 +425,8 @@ public static class SimCEOEndpoints
         }
         else
         {
-          var freshCapNote = new Note { BoardId = m.BoardId, MeetingId = id, Kind = "run-cap", Scope = "meeting", Provisional = false, Title = "cap:" + leadFloor, Body = capBody };
+          var freshCapNote = new Note { BoardId = m.BoardId, MeetingId = id, Kind = "run-cap", Scope = "meeting", Provisional = false, Title = "cap:" + leadFloor, Body = capBody, RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current" };
+          freshCapNote.RootId = freshCapNote.Id;
           s.Notes[freshCapNote.Id] = freshCapNote;
         }
         s.Notes.Flush();
@@ -676,27 +677,8 @@ public static class SimCEOEndpoints
 
     });
 
-    // ---- Secretary: provisional answers, never decisions by themselves ----
-    app.MapPost("/api/meetings/{id:guid}/secretary", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
-    {
-      if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
-      var setupFixes = new List<string>();
-      if (LeadSetup.ResolveLeadFor(s, m.BoardId) is null) setupFixes.Add("Save the board-lead profile.");
-      if (!s.Advisors.Values.Any(a => a.BoardId == m.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");
-      if (setupFixes.Count > 0) return Results.Json(new { error = "Board setup is incomplete.", fixes = setupFixes }, statusCode: 409);
-      if (PeopleOps.Guard(gw, req) is { } cappedSec) return cappedSec;
-      var text = body.TryGetProperty("request", out var r) ? (r.GetString() ?? "") : "";
-      string answer;
-      try
-      {
-        answer = await gw.CompleteAsync(ModelPolicy.SparkFor(s, m.BoardId), "secretary", text, ContextBudget.BidTokens, 2048,
-        ownerOverride: PeopleOps.IsOwner(req));
-      }
-      catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
-      return Results.Ok(new { answer, provisional = true });
-    });
 
+    app.MapSecretary();
     app.MapRoster();
     app.MapWizardGuide();
     app.MapMeetingExtras();
