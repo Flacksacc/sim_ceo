@@ -9,6 +9,16 @@ namespace SimCEO.Api.Data;
 /// in-memory dictionaries. Operational streams (audit, usage, model
 /// calls) and auth sessions are intentionally memory-only.
 /// </summary>
+/// <summary>
+/// Code-only storage-fault seam for rollback tests. In-process QA may set
+/// <see cref="FailBeforeCommit"/> to force the next backend commit to fail,
+/// proving durable rollback. Never exposed via HTTP routes or environment.
+/// </summary>
+public static class PgFaults
+{
+  public static Func<bool>? FailBeforeCommit;
+}
+
 public interface IPgBackend
 {
   T? Find<T>(Guid id) where T : class;

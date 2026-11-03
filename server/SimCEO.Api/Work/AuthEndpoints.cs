@@ -6,13 +6,6 @@ using SimCEO.Api.Domain;
 
 namespace SimCEO.Api;
 
-// Built-in account auth (no external provider): PBKDF2-hashed passwords,
-// opaque session tokens, explicit expiry. Identity resolution order:
-//  1. Authorization: Bearer <session token> (401 when expired/unknown),
-//  2. X-User demo header,
-//  3. "owner" fallback (single-user dev default).
-// Failed-login throttling is in-memory and best-effort; production should
-// add a persistent throttle and HTTPS-only cookies.
 public sealed class Account
 {
   public Guid Id { get; set; } = Guid.NewGuid();
@@ -55,8 +48,11 @@ public static class AuthOps
     email = (email ?? "").Trim().ToLowerInvariant();
     if (!ValidEmail(email) || string.IsNullOrEmpty(password))
       return (null, "Email and password are required.", 400);
-    lock (s.AuthLock)
+    // Consistent lock order: SetupLock outer, AuthLock inner. Never hold AuthLock into SetupLock.
+    lock (s.SetupLock)
     {
+      lock (s.AuthLock)
+      {
       var fails = s.AuthFails.TryGetValue(email, out var f) ? f : new List<DateTime>();
       fails = fails.Where(t => DateTime.UtcNow - t < ThrottleWindow).ToList();
       s.AuthFails[email] = fails;
@@ -71,6 +67,7 @@ public static class AuthOps
         return (null, "Invalid email or password.", 401);
       }
       fails.Clear();
+      try { SecurityOps.EnsureMigrated(s); } catch (Exception ex) { throw new InvalidOperationException("Migration commit failed.", ex); }
       var session = new Session
       {
         Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)),
@@ -79,6 +76,7 @@ public static class AuthOps
       };
       s.Sessions[session.Token] = session;
       return (session, null, 200);
+      }
     }
   }
 
@@ -89,10 +87,14 @@ public static class AuthOps
         || !auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
       return false;
     var token = auth.ToString()["Bearer ".Length..].Trim();
-    if (!s.Sessions.TryGetValue(token, out var session) || session.ExpiresAt <= DateTime.UtcNow)
-      return false;
-    email = session.Email;
-    return true;
+    try
+    {
+      if (!s.Sessions.TryGetValue(token, out var session) || session.ExpiresAt <= DateTime.UtcNow)
+        return false;
+      email = session.Email;
+      return true;
+    }
+    catch { return false; }
   }
 
   public static string ResolveUser(InMemoryStore s, HttpRequest req)
@@ -114,16 +116,35 @@ public static class AuthEndpoints
       if (!AuthOps.ValidEmail(email)) return Results.BadRequest("A valid email is required.");
       if (password.Length < AuthOps.MinPasswordLength)
         return Results.BadRequest($"Password must be at least {AuthOps.MinPasswordLength} characters.");
-      lock (s.AuthLock)
+      lock (s.SetupLock)
       {
-        if (s.Accounts.Values.Any(a => a.Email == email))
-          return Results.Conflict("An account with that email already exists.");
-        var salt = AuthOps.NewSalt();
-        var acct = new Account { Email = email, Salt = salt, Hash = AuthOps.HashPassword(password, salt) };
-        s.Accounts[acct.Id] = acct;
-        var (session, _, _) = AuthOps.Login(s, email, password);
-        s.Audit.Add(new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
-        return Results.Created("/api/auth/me", new { email, token = session?.Token, expiresAt = session?.ExpiresAt });
+        lock (s.AuthLock)
+        {
+          if (s.Accounts.Values.Any(a => a.Email == email))
+            return Results.Conflict("An account with that email already exists.");
+          var salt = AuthOps.NewSalt();
+          var acct = new Account { Email = email, Salt = salt, Hash = AuthOps.HashPassword(password, salt) };
+          try
+          {
+            Atomic.Run(() =>
+            {
+              s.Accounts[acct.Id] = acct;
+              SecurityOps.EnsureFirstAdmin(s, email, acct.Id);
+              SecurityOps.EnsureMigrated(s);
+            });
+          }
+          catch (Exception ex) { throw new InvalidOperationException("Registration commit failed; no account, session, or partial migration was committed.", ex); }
+          var session = new Session
+          {
+            Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)),
+            AccountId = acct.Id, Email = acct.Email,
+            ExpiresAt = DateTime.UtcNow + AuthOps.SessionLifetime,
+          };
+          s.Sessions[session.Token] = session;
+          try { if (s.Accounts.Values.Count == 1) SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { }
+          s.Audit.Add(new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
+          return Results.Created("/api/auth/me", new { email, token = session.Token, expiresAt = session.ExpiresAt });
+        }
       }
     });
 
@@ -139,9 +160,14 @@ public static class AuthEndpoints
 
     app.MapPost("/api/auth/logout", (InMemoryStore s, HttpRequest req) =>
     {
+      string tok = "";
       if (req.Headers.TryGetValue("Authorization", out var auth)
           && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-        s.Sessions.TryRemove(auth.ToString()["Bearer ".Length..].Trim(), out _);
+      {
+        tok = auth.ToString()["Bearer ".Length..].Trim();
+        s.Sessions.TryRemove(tok, out _);
+      }
+      try { if (!string.IsNullOrEmpty(tok)) SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(tok); } catch { }
       return Results.Ok(new { loggedOut = true });
     });
 
@@ -151,6 +177,15 @@ public static class AuthEndpoints
         return Results.Ok(new { user = email, authenticated = true });
       var demo = PeopleOps.UserOf(s, req);
       return Results.Ok(new { user = demo, authenticated = false });
+    });
+
+    app.MapGet("/api/auth/status", (InMemoryStore s) =>
+    {
+      var secure = PeopleOps.IsSecure(s);
+      var admin = PeopleOps.AdminEmail(s);
+      int accounts = 0;
+      try { accounts = s.Accounts.Values.Count; } catch { }
+      return Results.Ok(new { authRequired = secure, hasAccounts = accounts > 0, accountCount = accounts, admin = secure ? admin : "" });
     });
   }
 }

@@ -8,6 +8,6 @@
     "qa:live": "node navigation.cjs --live"
   },
   "devDependencies": {
-    "playwright-core": "1.64.1"
+    "playwright-core": "^1.64.1"
   }
 }

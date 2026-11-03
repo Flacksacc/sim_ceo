@@ -27,6 +27,8 @@ public sealed class PostgresDb : DbContext
   public DbSet<Invite> Invites => Set<Invite>();
   public DbSet<AdvisorImage> Images => Set<AdvisorImage>();
   public DbSet<SimCEO.Api.Account> AuthAccounts => Set<SimCEO.Api.Account>();
+  public DbSet<Membership> Memberships => Set<Membership>();
+  public DbSet<SecurityState> SecurityStates => Set<SecurityState>();
 
   protected override void OnModelCreating(ModelBuilder b)
   {
@@ -79,6 +81,9 @@ public sealed class PostgresBackend : IPgBackend
         _depth = 1;
         var result = op();
         _db.SaveChanges();
+        var failCommit = false;
+        try { failCommit = SimCEO.Api.Data.PgFaults.FailBeforeCommit?.Invoke() == true; } catch { failCommit = false; }
+        if (failCommit) throw new InvalidOperationException("injected commit fault (PgFaults.FailBeforeCommit)");
         tx.Commit();
         return result;
       }
@@ -229,6 +234,13 @@ public sealed class PostgresBackend : IPgBackend
 
 public static class PgBoot
 {
+  private static int DdlStep = -1;
+  private static void Ddl(Npgsql.NpgsqlConnection conn, string sql, int step)
+  {
+    DdlStep = step;
+    using var cmd = new Npgsql.NpgsqlCommand(sql, conn);
+    cmd.ExecuteNonQuery();
+  }
   public static bool TryWire(string cs, out string error)
   {
     error = "";
@@ -241,21 +253,56 @@ public static class PgBoot
         error = "Postgres unreachable; refusing in-memory fallback for requested PG mode.";
         return false;
       }
-      db.Database.EnsureCreated();
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"ParentSequence\" bigint");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"Stance\" character varying(30) NOT NULL DEFAULT ''");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"AdvisorId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"Notes\" ADD COLUMN IF NOT EXISTS \"EvidenceJson\" text NOT NULL DEFAULT '[]'");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"WizardDrafts\" ADD COLUMN IF NOT EXISTS \"Version\" integer NOT NULL DEFAULT 1");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchJobId\" text NOT NULL DEFAULT ''");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0");
-      db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''");
+      using var conn = new Npgsql.NpgsqlConnection(cs);
+      conn.Open();
+      // Explicit schema creation: every entity table is created IF NOT EXISTS so BOTH fresh
+      // databases and 94d predecessors (which lack Memberships/SecurityStates and newer columns)
+      // upgrade deterministically. Additive ALTERs below backfill newer columns.
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Boards\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"Name\" text NOT NULL DEFAULT \'\', \"Mission\" text NOT NULL DEFAULT \'\', \"Stage\" text NOT NULL DEFAULT \'\', \"Archived\" boolean NOT NULL DEFAULT false, \"ActiveConfig\" boolean NOT NULL DEFAULT false, \"DraftJson\" text NOT NULL DEFAULT \'{}\' , \"ActiveJson\" text NOT NULL DEFAULT \'{}\' , \"LeadProfileVersion\" integer NOT NULL DEFAULT 1, \"RetainAudio\" boolean NOT NULL DEFAULT false, \"BlockedTypes\" text NOT NULL DEFAULT \'\', \"DiscussionPolicy\" text NOT NULL DEFAULT \'balanced\', \"DataUse\" text NOT NULL DEFAULT \'contributor\', \"OwnerKey\" text NOT NULL DEFAULT \'\', \"AccessEnforced\" boolean NOT NULL DEFAULT false, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 1);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"RosterEntries\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"AccountId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Type\" integer NOT NULL DEFAULT 0, \"Name\" text NOT NULL DEFAULT \'\', \"Description\" text NOT NULL DEFAULT \'\', \"ProfileJson\" text NOT NULL DEFAULT \'{}\' , \"Version\" integer NOT NULL DEFAULT 1, \"Archived\" boolean NOT NULL DEFAULT false, \"Tags\" text NOT NULL DEFAULT \'\', \"OwnerKey\" text NOT NULL DEFAULT \'\', \"ResearchJson\" text NOT NULL DEFAULT \'{}\' , \"ResearchedAt\" timestamp with time zone, \"ResearchRequested\" boolean NOT NULL DEFAULT false, \"EvidenceCount\" integer NOT NULL DEFAULT 0, \"ResearchJobId\" text NOT NULL DEFAULT \'\', \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0, \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 2);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"BoardAdvisors\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"RosterEntryId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"RosterVersion\" integer NOT NULL DEFAULT 1, \"BoardRole\" text NOT NULL DEFAULT \'\', \"Approved\" boolean NOT NULL DEFAULT false, \"Removed\" boolean NOT NULL DEFAULT false, \"ImageProvenance\" text NOT NULL DEFAULT \'initials\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 3);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Meetings\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Title\" text NOT NULL DEFAULT \'\', \"State\" integer NOT NULL DEFAULT 0, \"Brief\" text NOT NULL DEFAULT \'\', \"ParticipantIdsJson\" text NOT NULL DEFAULT \'[]\', \"DeliveredRevision\" bigint NOT NULL DEFAULT 0, \"Generation\" bigint NOT NULL DEFAULT 0, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 4);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Messages\" (\"MeetingId\" uuid NOT NULL, \"Sequence\" bigint NOT NULL, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"AdvisorId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Sender\" text NOT NULL DEFAULT \'\', \"AdvisorName\" text, \"Content\" text NOT NULL DEFAULT \'\', \"ParentSequence\" bigint, \"Stance\" character varying(30) NOT NULL DEFAULT \'\', \"Status\" text NOT NULL DEFAULT \'\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now(), PRIMARY KEY (\"MeetingId\", \"Sequence\"))", 5);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Drafts\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Version\" integer NOT NULL DEFAULT 1, \"Watermark\" bigint NOT NULL DEFAULT 0, \"ItemsJson\" text NOT NULL DEFAULT \'[]\', \"Hash\" text NOT NULL DEFAULT \'\', \"ApprovedJson\" text NOT NULL DEFAULT \'[]\', \"SupersedesJson\" text NOT NULL DEFAULT \'[]\', \"Decided\" boolean NOT NULL DEFAULT false, \"Status\" text NOT NULL DEFAULT \'open\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 6);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Sources\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"FileName\" text NOT NULL DEFAULT \'\', \"ContentHash\" text NOT NULL DEFAULT \'\', \"Version\" integer NOT NULL DEFAULT 1, \"Approved\" boolean NOT NULL DEFAULT false, \"Excluded\" boolean NOT NULL DEFAULT false, \"Scope\" text NOT NULL DEFAULT \'board\', \"MeetingId\" uuid, \"ExtractionJson\" text NOT NULL DEFAULT \'{}\' , \"Original\" bytea, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 7);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"WizardDrafts\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"Version\" integer NOT NULL DEFAULT 1, \"AccountId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Status\" character varying(50) NOT NULL DEFAULT \'draft\', \"Step\" integer NOT NULL DEFAULT 1, \"PresetKey\" text NOT NULL DEFAULT \'\', \"FieldsJson\" text NOT NULL DEFAULT \'{}\' , \"ProvenanceJson\" text NOT NULL DEFAULT \'[]\', \"InterviewJson\" text NOT NULL DEFAULT \'{}\' , \"OwnerKey\" text NOT NULL DEFAULT \'\', \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 8);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"VoiceTurns\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"CreatorKey\" text NOT NULL DEFAULT \'\', \"State\" text NOT NULL DEFAULT \'draft\', \"Transcript\" text NOT NULL DEFAULT \'\', \"AudioRetained\" boolean NOT NULL DEFAULT false, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 9);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"LeadProfiles\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Version\" integer NOT NULL DEFAULT 1, \"Name\" text NOT NULL DEFAULT \'\', \"RoleLabel\" text NOT NULL DEFAULT \'\', \"Background\" text NOT NULL DEFAULT \'\', \"FamiliarTopics\" text NOT NULL DEFAULT \'\', \"SimplerTopics\" text NOT NULL DEFAULT \'\', \"CommPrefs\" text NOT NULL DEFAULT \'\', \"ProvenanceJson\" text NOT NULL DEFAULT \'{}\' , \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 10);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Jobs\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"IdempotencyKey\" text NOT NULL DEFAULT \'\', \"Kind\" text NOT NULL DEFAULT \'\', \"State\" text NOT NULL DEFAULT \'\', \"Payload\" text NOT NULL DEFAULT \'\', \"Attempts\" integer NOT NULL DEFAULT 0, \"Error\" text NOT NULL DEFAULT \'\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now(), \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 11);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Notes\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"Kind\" text NOT NULL DEFAULT \'\', \"Title\" text NOT NULL DEFAULT \'\', \"Body\" text NOT NULL DEFAULT \'\', \"Scope\" text NOT NULL DEFAULT \'\', \"Provisional\" boolean NOT NULL DEFAULT false, \"EvidenceJson\" text NOT NULL DEFAULT \'[]\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 12);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Grants\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid, \"UserKey\" text NOT NULL DEFAULT \'\', \"Access\" text NOT NULL DEFAULT \'\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 13);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Invites\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid, \"Email\" text NOT NULL DEFAULT \'\', \"UserKey\" text NOT NULL DEFAULT \'\', \"State\" text NOT NULL DEFAULT \'pending\', \"Role\" text NOT NULL DEFAULT \'\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 14);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Images\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"RosterEntryId\" uuid, \"BoardAdvisorId\" uuid, \"Kind\" character varying(50) NOT NULL DEFAULT \'upload\', \"Provenance\" character varying(500) NOT NULL DEFAULT \'\', \"Review\" text NOT NULL DEFAULT \'\', \"ContentType\" character varying(100) NOT NULL DEFAULT \'image/png\', \"Data\" bytea, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 15);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"AuthAccounts\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"Email\" text NOT NULL DEFAULT \'\', \"Salt\" text NOT NULL DEFAULT \'\', \"Hash\" text NOT NULL DEFAULT \'\', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 16);
+      Ddl(conn, "CREATE UNIQUE INDEX IF NOT EXISTS \"IX_AuthAccounts_Email\" ON \"AuthAccounts\" (\"Email\")", 17);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"Memberships\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MeetingId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"UserKey\" text NOT NULL DEFAULT \'\', \"Active\" boolean NOT NULL DEFAULT true, \"JoinedAt\" timestamp with time zone NOT NULL DEFAULT now(), \"LeftAt\" timestamp with time zone)", 18);
+      Ddl(conn, "CREATE TABLE IF NOT EXISTS \"SecurityStates\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"AuthRequired\" boolean NOT NULL DEFAULT false, \"AdminEmail\" text NOT NULL DEFAULT \'\', \"AdminAccountId\" uuid NOT NULL DEFAULT \'00000000-0000-0000-0000-000000000000\', \"MigrationDone\" boolean NOT NULL DEFAULT false, \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT now(), \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now())", 19);
+      Ddl(conn, "CREATE INDEX IF NOT EXISTS \"IX_Sources_BoardId\" ON \"Sources\" (\"BoardId\")", 20);
+      Ddl(conn, "CREATE INDEX IF NOT EXISTS \"IX_BoardAdvisors_BoardId\" ON \"BoardAdvisors\" (\"BoardId\")", 21);
+      Ddl(conn, "CREATE INDEX IF NOT EXISTS \"IX_Meetings_BoardId\" ON \"Meetings\" (\"BoardId\")", 22);
+      Ddl(conn, "ALTER TABLE \"WizardDrafts\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT \'\'", 23);
+      Ddl(conn, "ALTER TABLE \"VoiceTurns\" ADD COLUMN IF NOT EXISTS \"CreatorKey\" text NOT NULL DEFAULT \'\'", 24);
+      Ddl(conn, "ALTER TABLE \"SecurityStates\" ADD COLUMN IF NOT EXISTS \"MigrationDone\" boolean NOT NULL DEFAULT false", 25);
+      Ddl(conn, "ALTER TABLE \"SecurityStates\" ADD COLUMN IF NOT EXISTS \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT now()", 38);
+      Ddl(conn, "ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"ParentSequence\" bigint", 26);
+      Ddl(conn, "ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"Stance\" character varying(30) NOT NULL DEFAULT ''", 27);
+      Ddl(conn, "ALTER TABLE \"Messages\" ADD COLUMN IF NOT EXISTS \"AdvisorId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'", 28);
+      Ddl(conn, "ALTER TABLE \"Notes\" ADD COLUMN IF NOT EXISTS \"EvidenceJson\" text NOT NULL DEFAULT '[]'", 29);
+      Ddl(conn, "ALTER TABLE \"WizardDrafts\" ADD COLUMN IF NOT EXISTS \"Version\" integer NOT NULL DEFAULT 1", 30);
+      Ddl(conn, "ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchJobId\" text NOT NULL DEFAULT ''", 31);
+      Ddl(conn, "ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0", 32);
+      Ddl(conn, "ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''", 33);
+      Ddl(conn, "ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''", 34);
+      Ddl(conn, "ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"AccessEnforced\" boolean NOT NULL DEFAULT false", 35);
+      Ddl(conn, "ALTER TABLE \"Grants\" ADD COLUMN IF NOT EXISTS \"MeetingId\" uuid", 36);
+      Ddl(conn, "ALTER TABLE \"Invites\" ADD COLUMN IF NOT EXISTS \"MeetingId\" uuid", 37);
       Pg.Backend = new PostgresBackend(db);
       return true;
     }
     catch (Exception ex)
     {
-      error = $"Postgres wire-up failed ({ex.GetType().Name}); refusing in-memory fallback for requested PG mode.";
+      var inner = ex; while (inner.InnerException is not null) inner = inner.InnerException;
+      error = $"Postgres wire-up failed step {DdlStep} ({ex.GetType().Name}: {inner.Message}); refusing in-memory fallback for requested PG mode.";
       return false;
     }
   }

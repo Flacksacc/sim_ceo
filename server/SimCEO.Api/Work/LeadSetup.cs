@@ -25,6 +25,14 @@ public static class LeadSetup
     s.LeadProfiles.Values.Where(l => l.BoardId == boardId).OrderByDescending(l => l.UpdatedAt).FirstOrDefault()
     ?? (boardId == Guid.Empty ? null : ResolveLead(s));
 
+  // Strict resolution: board-owned profile only, NEVER the global fallback.
+  // Fallback content is installation data; direct reads gate it separately.
+  public static LeadProfile? ResolveLeadForStrict(InMemoryStore s, Guid boardId) =>
+    s.LeadProfiles.Values.Where(l => l.BoardId == boardId).OrderByDescending(l => l.UpdatedAt).FirstOrDefault();
+
+  public static bool IsFallback(LeadProfile? lead, Guid boardId) =>
+    lead is not null && lead.BoardId != boardId;
+
   // Canonical reviewed draft: identity + full content of the effective lead
   // and per-advisor role/profile/version/reviewed inputs, not just counters.
   // Changing a fallback lead to another profile with the same version still

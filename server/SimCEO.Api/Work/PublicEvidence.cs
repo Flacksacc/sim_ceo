@@ -222,7 +222,7 @@ public sealed class PublicEvidenceFetcher
     return addrs;
   }
 
-  internal static bool IsStructureAllowed(Uri uri, out string reason)
+  public static bool IsStructureAllowed(Uri uri, out string reason)
   {
     reason = "";
     if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
@@ -268,7 +268,7 @@ public sealed class PublicEvidenceFetcher
     return true;
   }
 
-  internal static bool IsPublicIp(IPAddress ip)
+  public static bool IsPublicIp(IPAddress ip)
   {
     if (IPAddress.IsLoopback(ip)) return false;
     if (ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any)) return false;
@@ -346,7 +346,7 @@ public sealed class PublicEvidenceFetcher
     return true;
   }
 
-  private static async Task<byte[]> ReadBoundedAsync(HttpContent content, int maxBytes, CancellationToken ct)
+  public static async Task<byte[]> ReadBoundedAsync(HttpContent content, int maxBytes, CancellationToken ct)
   {
     ct.ThrowIfCancellationRequested();
     using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
@@ -660,5 +660,100 @@ public sealed class PublicEvidenceFetcher
     var tail = sb.ToString().Trim();
     if (tail.Length >= 20) result.Add(tail);
     return result;
+  }
+}
+
+// Bounded PUBLIC raster retrieval reusing the pinned-transport safety pattern:
+// single DNS resolution with ALL-addresses-public enforcement (incl. IPv4-mapped
+// IPv6 normalization), pinned TCP connect (no second DNS), whole-operation
+// deadline covering DNS + headers + body, no redirects, no auth/cookies/proxy,
+// streamed size cap, raster magic-byte validation, redacted errors.
+public sealed class PublicImageFetcher
+{
+  public const int MaxImageBytes = 5 * 1024 * 1024;
+  public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+
+  public static async Task<(byte[]? Data, string? ContentType)> FetchRasterAsync(string url, CancellationToken ct = default)
+  {
+    Uri uri;
+    try { uri = new Uri(url, UriKind.Absolute); }
+    catch { return (null, null); }
+    if (!PublicEvidenceFetcher.IsStructureAllowed(uri, out _)) return (null, null);
+    using var urlCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    urlCts.CancelAfter(RequestTimeout);
+    var bct = urlCts.Token;
+    try
+    {
+      // Single resolution; EVERY resolved address must be public (mapped normalized).
+      System.Net.IPAddress[] addrs;
+      try { addrs = await System.Net.Dns.GetHostAddressesAsync(uri.Host, bct).ConfigureAwait(false); }
+      catch { return (null, null); }
+      if (addrs is null || addrs.Length == 0) return (null, null);
+      var pinned = new System.Collections.Generic.List<System.Net.IPAddress>();
+      foreach (var a in addrs)
+      {
+        var ip = a;
+        if (ip.IsIPv4MappedToIPv6) { try { ip = ip.MapToIPv4(); } catch { return (null, null); } }
+        if (!PublicEvidenceFetcher.IsPublicIp(ip)) return (null, null);
+        pinned.Add(ip);
+      }
+      var handler = new System.Net.Http.SocketsHttpHandler
+      {
+        AllowAutoRedirect = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+        UseCookies = false,
+        Credentials = null,
+        UseProxy = false,
+        Proxy = null,
+      };
+      handler.ConnectCallback = async (ctx, ctk) =>
+      {
+        var port = ctx.DnsEndPoint.Port;
+        Exception? last = null;
+        foreach (var ip in pinned)
+        {
+          var sock = new System.Net.Sockets.Socket(ip.AddressFamily, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+          try
+          {
+            await sock.ConnectAsync(ip, port, ctk).ConfigureAwait(false);
+            return (System.IO.Stream)new System.Net.Sockets.NetworkStream(sock, ownsSocket: true);
+          }
+          catch (OperationCanceledException) { try { sock.Dispose(); } catch { } throw; }
+          catch (Exception ex) { try { sock.Dispose(); } catch { } last = ex; }
+        }
+        throw last ?? new HttpRequestException("no validated endpoint reachable");
+      };
+      using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+      using var req = new HttpRequestMessage(HttpMethod.Get, uri);
+      req.Headers.UserAgent.ParseAdd("SimCEO-PublicImage/1.0");
+      using var res = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, bct).ConfigureAwait(false);
+      var status = (int)res.StatusCode;
+      if (status is >= 300 and < 400) return (null, null); // redirects rejected, never followed
+      if (!res.IsSuccessStatusCode) return (null, null);
+      var media = res.Content.Headers.ContentType?.MediaType ?? "";
+      if (!media.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) return (null, null);
+      byte[] bytes;
+      try { bytes = await PublicEvidenceFetcher.ReadBoundedAsync(res.Content, MaxImageBytes, bct).ConfigureAwait(false); }
+      catch { return (null, null); }
+      if (bytes.Length == 0 || bytes.Length > MaxImageBytes) return (null, null);
+      if (!HasRasterMagic(bytes)) return (null, null);
+      return (bytes, media);
+    }
+    catch { return (null, null); }
+  }
+
+  public static bool HasRasterMagic(byte[] b)
+  {
+    try
+    {
+      if (b.Length >= 8 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true; // PNG
+      if (b.Length >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true; // JPEG
+      if (b.Length >= 6 && b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x38) return true; // GIF
+      if (b.Length >= 12 && b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46
+        && b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50) return true; // WEBP
+      if (b.Length >= 2 && b[0] == 0x42 && b[1] == 0x4D) return true; // BMP
+      return false;
+    }
+    catch { return false; }
   }
 }

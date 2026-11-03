@@ -10,10 +10,43 @@ namespace SimCEO.Api.Work;
 // with lead profile plus advisor seats.
 public static class WizardGuide
 {
+  // One reusable owner/board resolver for every actual wizard route.
+  internal static bool TryWizardUser(InMemoryStore s, HttpRequest req, WizardDraft? d, out string user, out IResult? denied)
+  {
+    user = "";
+    if (PeopleOps.BadToken(s, req) is { } bad) { denied = bad; return false; }
+    try
+    {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var em)) { denied = Results.Json(new { error = "Authentication required." }, statusCode: 401); return false; }
+        user = em;
+      }
+      else user = PeopleOps.UserOf(s, req);
+    }
+    catch (InvalidOperationException) { denied = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+    if (d is not null && !string.IsNullOrWhiteSpace(d.OwnerKey))
+    {
+      if (!string.Equals(d.OwnerKey, user, StringComparison.OrdinalIgnoreCase) && !PeopleOps.IsInstallationAdmin(s, user))
+      { denied = PeopleOps.Denied(); return false; }
+    }
+    else if (d is not null && string.IsNullOrWhiteSpace(d.OwnerKey) && PeopleOps.IsSecure(s))
+    {
+      // Blank-owner drafts are legacy leftovers (migration adopts them to the admin).
+      // Only the installation admin may touch an unadopted draft.
+      try { if (!PeopleOps.IsInstallationAdmin(s, user)) { denied = PeopleOps.Denied(); return false; } }
+      catch (InvalidOperationException) { denied = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+    }
+    denied = null;
+    return true;
+  }
+
   public static void MapWizardGuide(this WebApplication app)
   {
-    app.MapGet("/api/wizard/{id:guid}/review", (InMemoryStore s, Guid id) =>
+    app.MapGet("/api/wizard/{id:guid}/review", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
+      if (!s.WizardDrafts.TryGetValue(id, out var __wd0)) return Results.NotFound();
+      if (!TryWizardUser(s, req, __wd0, out _, out var deniedRw)) return deniedRw;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
       var blockers = Blockers(d);
       return Results.Ok(new
@@ -28,8 +61,8 @@ public static class WizardGuide
 
     app.MapPost("/api/wizard/{id:guid}/suggest", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badS) return badS;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound("wizard draft");
+      if (!TryWizardUser(s, req, d, out _, out var deniedSg)) return deniedSg;
       var step = body.TryGetProperty("step", out var st) && st.ValueKind == JsonValueKind.Number ? st.GetInt32() : d.Step;
       var input = body.TryGetProperty("input", out var q) ? (q.GetString() ?? "") : "";
       try
@@ -48,13 +81,14 @@ public static class WizardGuide
 
     app.MapPost("/api/wizard/{id:guid}/interview", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badI) return badI;
       if (!s.WizardDrafts.TryGetValue(id, out var dd)) return Results.NotFound("wizard draft");
+      if (!TryWizardUser(s, req, dd, out _, out var deniedIv)) return deniedIv;
       var sem = s.DraftLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
       await sem.WaitAsync();
       try
       {
         if (!s.WizardDrafts.TryGetValue(id, out var d) || d is null) return Results.NotFound("wizard draft");
+        if (!TryWizardUser(s, req, d, out _, out var deniedIv2)) return deniedIv2;
         if (!body.TryGetProperty("version", out var vw) || vw.ValueKind != JsonValueKind.Number || !vw.TryGetInt32(out var want) || want != d.Version)
           return Results.Conflict("Stale wizard draft; refresh and re-apply your edit.");
         var answer = body.TryGetProperty("answer", out var av) && av.ValueKind == JsonValueKind.String ? (av.GetString() ?? "") : "";
@@ -168,8 +202,8 @@ public static class WizardGuide
     });
     app.MapPost("/api/wizard/{id:guid}/create", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badCreate) return badCreate;
       if (!s.WizardDrafts.TryGetValue(id, out var wd)) return Results.NotFound("wizard draft");
+      if (!TryWizardUser(s, req, wd, out var createUser, out var deniedCr)) return deniedCr;
       var sem = s.DraftLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
       if (!sem.Wait(0)) return Results.Conflict("Draft is busy (interview running); retry.");
       try
@@ -177,14 +211,15 @@ public static class WizardGuide
         lock (s.SetupLock)
         {
           if (!s.WizardDrafts.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound("wizard draft");
-          return CreateFromDraft(s, id, fresh, PeopleOps.UserOf(s, req));
+          if (!TryWizardUser(s, req, fresh, out var createUser2, out var deniedCr2)) return deniedCr2;
+          return CreateFromDraft(s, req, id, fresh, createUser2);
         }
       }
       finally { sem.Release(); }
     });
   }
 
-  private static IResult CreateFromDraft(InMemoryStore s, Guid id, WizardDraft wd, string ownerKey)
+  private static IResult CreateFromDraft(InMemoryStore s, HttpRequest req, Guid id, WizardDraft wd, string ownerKey)
   {
     {
       var d = wd;
@@ -197,6 +232,7 @@ public static class WizardGuide
       {
         var priorAdvisors = s.Advisors.Values.Where(a => a.BoardId == priorBoard && !a.Removed)
           .Select(a => new { advisor = a.Id, role = a.BoardRole }).ToList<object>();
+        if (PeopleOps.Check(s, req, priorBoard, null, "read") is { } deniedReplay) return deniedReplay;
         return Results.Ok(new
         {
           board = prior, advisors = priorAdvisors, resumed = true,
@@ -210,7 +246,7 @@ public static class WizardGuide
       var seats = f.Advisors.Where(seat => !string.IsNullOrWhiteSpace(seat.Role)).Take(11).ToList();
       if (string.IsNullOrWhiteSpace(f.LeadName))
         return Results.Json(new { error = "Lead name is required." }, statusCode: 409);
-      var board = new Board { Id = Guid.NewGuid(), Name = f.Name, Mission = f.Mission, Stage = f.Stage, CreatedAt = DateTime.UtcNow };
+      var board = new Board { Id = Guid.NewGuid(), Name = f.Name, Mission = f.Mission, Stage = f.Stage, OwnerKey = ownerKey, CreatedAt = DateTime.UtcNow };
       var created = new List<object>();
       var createdAdvisors = new List<Guid>();
       var createdRoster = new List<Guid>();

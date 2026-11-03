@@ -16,7 +16,7 @@ public static class NavigationEndpoints
     app.MapGet("/api/boards/{bid:guid}/meetings/{mid:guid}", (InMemoryStore s, HttpRequest req, Guid bid, Guid mid) =>
     {
       if (!s.Meetings.TryGetValue(mid, out var m) || m.BoardId != bid) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, m.BoardId, mid, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, mid, "read") is { } deniedNav) return deniedNav;
       return Results.Ok(m);
     });
   }

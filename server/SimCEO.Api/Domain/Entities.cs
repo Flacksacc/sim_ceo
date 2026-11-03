@@ -24,6 +24,8 @@ public sealed class Board
   public string BlockedTypes { get; set; } = "";
   public string DiscussionPolicy { get; set; } = "balanced";
   public string DataUse { get; set; } = "contributor";
+  public string OwnerKey { get; set; } = "";
+  public bool AccessEnforced { get; set; }
   public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
@@ -141,6 +143,7 @@ public sealed class WizardDraft
   [Key] public Guid Id { get; set; } = Guid.NewGuid();
   public int Version { get; set; } = 1;
   public Guid AccountId { get; set; }
+  public string OwnerKey { get; set; } = "";
   [MaxLength(50)] public string Status { get; set; } = "draft";
   public int Step { get; set; } = 1;
   public string PresetKey { get; set; } = "";
@@ -155,6 +158,7 @@ public sealed class VoiceTurn
   [Key] public Guid Id { get; set; } = Guid.NewGuid();
   public Guid BoardId { get; set; }
   public Guid MeetingId { get; set; }
+  public string CreatorKey { get; set; } = "";
   public string State { get; set; } = "draft";
   public string Transcript { get; set; } = "";
   public bool AudioRetained { get; set; }
@@ -208,6 +212,28 @@ public sealed class Invite
   public string State { get; set; } = "pending";
   public string Role { get; set; } = "";
   public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class Membership
+{
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public Guid BoardId { get; set; }
+  public Guid MeetingId { get; set; }
+  public string UserKey { get; set; } = "";
+  public bool Active { get; set; } = true;
+  public DateTime JoinedAt { get; set; } = DateTime.UtcNow;
+  public DateTime? LeftAt { get; set; }
+}
+
+public sealed class SecurityState
+{
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public bool AuthRequired { get; set; }
+  public string AdminEmail { get; set; } = "";
+  public Guid AdminAccountId { get; set; }
+  public bool MigrationDone { get; set; }
+  public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+  public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
 
 public sealed class AdvisorImage

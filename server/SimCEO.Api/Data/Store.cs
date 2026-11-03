@@ -2,12 +2,6 @@ using System.Collections.Concurrent;
 
 namespace SimCEO.Api.Data;
 
-/// <summary>
-/// Storage facade. In-memory by default; when the app enables Postgres
-/// (USE_POSTGRES=1 with a reachable connection string), tables are backed
-/// by EF Core via <see cref="Postgres.IPostgresBackend"/> and the
-/// dictionaries below are used only for AuthFails (rate-limit scratch).
-/// </summary>
 public sealed class InMemoryStore
 {
   public Table<Domain.Board> Boards { get; } = new();
@@ -24,6 +18,8 @@ public sealed class InMemoryStore
   public Table<Domain.Note> Notes { get; } = new();
   public Table<Domain.Grant> Grants { get; } = new();
   public Table<Domain.Invite> Invites { get; } = new();
+  public Table<Domain.Membership> Memberships { get; } = new();
+  public Table<Domain.SecurityState> Security { get; } = new();
   public Table<Domain.AdvisorImage> Images { get; } = new();
   public Table<Account> Accounts { get; } = new();
   public ConcurrentDictionary<string, Session> Sessions { get; } = new();
