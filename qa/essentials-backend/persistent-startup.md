@@ -63,3 +63,49 @@ powershell -File qa/essentials-backend/essentials-persist.ps1 -Action stop -Proj
 Dummy credentials only: no provider key from the coding profile, no live
 paid call. The isolated project gets its own fresh volumes automatically
 (compose prefixes named volumes per project).
+
+## Pre-cutover human-state preservation (read-only; primary preflight)
+
+Before ANY cutover, primary runs the read-only preservation helper
+`qa/essentials-backend/capture-human-state.ps1` (Muse-authored, preservation
+only; no app/test/runtime changes). It captures the ORIGINAL running old
+human API (default `http://127.0.0.1:5080`) plus the MAIN private `.env`
+into a NEW unique ignored `MAIN/.tmp/human-state-<UTCstamp>-<guid8>/` dir.
+It never overwrites an existing capture, never mutates anything (GET-only,
+no POST/PUT/import/restart/stop/Docker/SQL), and never prints bodies,
+drafts, or credentials (manifest holds statuses, SHA256s, counts only).
+
+Exact invocation from the MAIN checkout (helper file lives in this worktree,
+finds its sibling browser helper by its own path, operates on MAIN):
+
+```powershell
+powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo
+# optionally also preserve original browser drafts via the existing allowlisted helper:
+powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo -IncludeBrowser
+```
+
+What the helper verifies: the `/api/backup` wrapper snapshot string SHA256
+against `wrapper.hash` using the actual old `Hashing.FullHash` semantics
+(lowercase hex SHA256 over the exact snapshot UTF8 bytes) before credit;
+exact wrapper raw bytes AND exact embedded snapshot bytes are preserved
+separately (no re-serialization). Counts only (no names/content) for
+boards/meetings/messages/notes/drafts/roster/advisors/sources/wizardDrafts/
+images/etc, plus raw `/ready`, `/api/activity/jobs`, `/api/usage`,
+`/api/activity/audit`, `/api/models/calls`, `/api/model/status`,
+`/api/spending`, and per-meeting `/api/meetings/{Id}/voice`.
+
+Known old-backup omissions (documented in the capture manifest, must not be
+misread): the domain backup carries NO accounts/sessions/grants/invites/
+security-states/ACL (authstate is NOT exported and counts are never
+inferred); audit is API-capped at 200 so zero `auth.register` events proves
+nothing; `/api/model/status` never returns a raw key (only
+configured/source/model/chatOverride-empty); jobs/usage/model-calls
+endpoints truncate (take100/500/200). A complete capture is NOT cutover
+readiness: the old in-memory API MUST NOT be stopped solely because a
+domain snapshot exists (the snapshot is unrestorable without authstate and
+is only one preflight input). Cutover/start remain BLOCKED on Docker
+startup approval.
+
+Do NOT overwrite the older checkpoint
+`.tmp/dev-app-preservation-20261103-141739-UTC-backup.json`, and leave the
+current MAIN `tmp.txt` (c924892, unknown origin) untouched.
