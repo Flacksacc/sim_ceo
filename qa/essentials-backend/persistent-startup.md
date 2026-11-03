@@ -1,4 +1,4 @@
-# Essentials persistent startup (human-run; agents never cut over)
+# Essentials persistent startup (authorized runnable; primary-only cutover)
 
 ## What this is
 A NEW dedicated compose project `simceo-essentials` (db + app ONLY) with NEW
@@ -9,47 +9,55 @@ are separate and never mounted here.
 
 ## Preservation contract
 - `sim_ceo_pgdata` is only INSPECTED (docker volume inspect) in preflight; the
-  helper aborts with a warning if it is missing, never creates or repairs it.
-- Fresh user state must be captured (GET /api/backup on the CURRENT user API)
-  immediately before any cutover, and restored only into this new project DB
-  after the human approves. No agent performs the cutover.
-- Same secret contract as MAIN: container env comes from MAIN `.env`
-  (`POSTGRES_PASSWORD`, private `META_API_KEY` app key, `META_API_BASE`).
-  Never commit `.env`; never use a coding-profile key.
-- Ports: API 5080 (matches dev API + Vite 5173 origin). Stop any dev API on
-  5080 first; the helper preflights this. Production serves the built web
-  from wwwroot on 5080; dev flow (Vite 5173 -> API 5080) is unchanged.
+  helper warns if it is missing, never creates or repairs it.
+- Fresh user state must be captured (GET /api/backup on the CURRENT user API) immediately before any cutover, plus a config backup, and restored only into this new project DB by PRIMARY as the final coherent cutover after checks. Muse performs ONLY isolated new-project/ports proof; Muse never cuts over the human project.
+- Container env comes from the SELECTED existing private app `.env`
+  (`POSTGRES_PASSWORD`, private `META_API_KEY` app key, `META_API_BASE`),
+  loaded by the helper into its PRIVATE process environment so the values
+  always win over any inherited coding-profile key (compose `--env-file`
+  has LOWER precedence than process env, so the helper never uses it).
+  Never commit `.env`; never print keys, full `config`, or container env;
+  the helper logs set/empty status only (never values, suffixes, full config, or container env).
+- Ports: API `${APP_HOST_PORT:-5080}` (human default 5080, matches dev API + Vite 5173 origin). The human entry point :5173 must match API :5080 after cutover (Vite/proper forwarder or concrete start below). Stop any dev API on the chosen port first; the helper preflights this and fails before acquisition if busy.
+- Build context is the repo root relative to the compose file (`../..`), so
+  the same file works in a MAIN checkout and in a runnable worktree. The
+  runtime image installs a portable curl/wget probe (apt/tdnf/apk covered;
+  the build FAILS if no probe can be provided) and ships a working
+  `HEALTHCHECK` on `/health`. Readiness additionally requires the real PG
+  response body `{"ready":true,"store":"postgres"}` on `/ready`.
 
 ## Verified runtime facts (2026-11-03, Muse)
 - `mcr.microsoft.com/dotnet/aspnet:10.0` contains NEITHER wget NOR curl NOR
-  python3 (`docker run --rm <image> sh -c "command -v wget curl python3"`
-  prints nothing). The image HEALTHCHECK (`wget -qO- .../health`) therefore
-  always reports unhealthy. This stack sets `healthcheck.disable: true` on
-  app and gates readiness by host-side polling (`/health` 200 liveness +
-  `/ready` 200 store=postgres) in `essentials-persist.ps1`.
+  python3, so the Dockerfile installs the probe at build time (portable
+  across apt/tdnf/apk) instead of assuming it.
+- The helper validates with `compose config -q` (quiet: proves the render
+  without printing interpolated secrets) and builds db AND app explicitly
+  (`--build` on both, so no stale versioned image is reused).
 - Native `dotnet publish` of SimCEO.Api + PG readiness + restart behavior are
   proven by the owned QA runner in this directory (`run.ps1`, per-run
   artifacts under `art-*`).
 
-## Dockerfile proposal (NOT applied; needs primary approval)
-```dockerfile
-# runtime stage, before ENTRYPOINT:
-RUN apt-get update && apt-get install -y --no-install-recommends wget && rm -rf /var/lib/apt/lists/*
-```
-Value: working in-image HEALTHCHECK. Cost: one apt package in the runtime
-image. Until approved, host polling remains the gate.
-
-## Human commands
+## Human commands (from the repo root, MAIN checkout)
 ```powershell
-# review-only render (no containers, no volumes):
-docker compose --project-name simceo-essentials -f qa/essentials-backend/simceo-essentials.compose.yaml --env-file .env config
-# start (from the repo root, MAIN checkout):
-powershell -File qa/essentials-backend/essentials-persist.ps1 -Action start
+# review-only render (quiet; no containers, no volumes, no secrets printed):
+powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
+# start with the selected existing app .env (private; never modified). Concrete final start (primary cutover only): -File qa/essentials-backend/essentials-persist.ps1 -Action start -EnvFile .env
 # status / stop:
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action stop
 ```
 Readiness: `GET http://localhost:5080/health` 200 and
-`GET http://localhost:5080/ready` 200 `{"ready":true,"store":"postgres"}`.
-Rollback: `stop`, then optionally `docker compose ... down -v` removes ONLY
-the new project volumes; `sim_ceo_pgdata` and the old stack are unaffected.
+`GET http://localhost:5080/ready` 200 `{"ready":true,"store":"postgres"}`
+plus `healthy` container status (`docker inspect` on the app container).
+Rollback: `stop` ONLY and PRESERVE all volumes (NEVER `down -v` for the persistent human project). `sim_ceo_pgdata` and the old stack are unaffected.
+
+## Isolated verification (agents/primary ONLY; never user ports)
+Native build/runtime proof uses an ISOLATED project and ports, never
+5080/5173/9333:
+```powershell
+powershell -File qa/essentials-backend/essentials-persist.ps1 -Action start -Project simceo-ess-verify -AppPort 5191 -PgPassword "verify-only-dummy" -MetaKey "verify-dummy" -MetaBase "http://127.0.0.1:9"
+powershell -File qa/essentials-backend/essentials-persist.ps1 -Action stop -Project simceo-ess-verify -AppPort 5191
+```
+Dummy credentials only: no provider key from the coding profile, no live
+paid call. The isolated project gets its own fresh volumes automatically
+(compose prefixes named volumes per project).

@@ -185,7 +185,10 @@ public static class LeadSetup
     {
       return (null, "Stale lead profile; refresh and re-apply your edit.", 409);
     }
-    catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (InvalidOperationException iox) when (iox.Message == "gone") { return (null, "board not found", 404); }
+    catch (SimCEO.Api.Data.CommitUnknownException cux) { return (null, "Lead save outcome is unknown (the commit may have succeeded); refresh and verify before retrying: " + cux.Message, 500); }
+    catch (SimCEO.Api.Data.PostCommitException pcx) { return (null, "Lead save committed, but a post-commit effect failed: " + pcx.Message, 500); }
+    catch (AggregateException agx) { return (null, "Lead save failed and rollback is uncertain; prior state may be partial: " + agx.Message, 500); }
     catch (UnauthorizedAccessException) { throw; }
     catch (Exception ex) { return (null, "Lead save failed; no state changed: " + ex.Message, 500); }
     return (savedOut, null, 200);
@@ -252,7 +255,10 @@ public static class LeadSetup
     {
       return (null, "Setup draft changed; refresh review.", 409);
     }
-    catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (InvalidOperationException iox) when (iox.Message == "gone") { return (null, "board not found", 404); }
+    catch (SimCEO.Api.Data.CommitUnknownException cux) { return (null, "Activation outcome is unknown (the commit may have succeeded); refresh and verify before retrying: " + cux.Message, 500); }
+    catch (SimCEO.Api.Data.PostCommitException pcx) { return (null, "Activation committed, but a post-commit effect failed: " + pcx.Message, 500); }
+    catch (AggregateException agx) { return (null, "Activation failed and rollback is uncertain; prior state may be partial: " + agx.Message, 500); }
     catch (UnauthorizedAccessException) { throw; }
     catch (Exception ex) { return (null, "Activation failed; no state changed: " + ex.Message, 500); }
     return (activatedOut, null, 200);

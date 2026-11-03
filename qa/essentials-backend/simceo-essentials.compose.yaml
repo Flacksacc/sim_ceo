@@ -1,7 +1,9 @@
 # Persistent HUMAN essentials stack (reviewable, NOT run by agents).
 # Project simceo-essentials with NEW volumes: the stopped production volume
-# sim_ceo_pgdata (unknown older user data) is never touched, mounted, or
-# overwritten by this stack. db + app ONLY: no optional services.
+# sim_ceo_pgdata (unknown older user data) is never touched, mounted,
+# overwritten, or dropped by this stack. db + app ONLY: no optional services.
+# Build context is the repository root RELATIVE to this file (../..), so the
+# same file works in a MAIN checkout and in a runnable worktree.
 name: simceo-essentials
 services:
   db:
@@ -9,7 +11,7 @@ services:
     environment:
       POSTGRES_DB: simceo
       POSTGRES_USER: simceo
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (private app .env, loaded into process env by the helper; never committed)}
     volumes:
       - simceo_essentials_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,32 +20,28 @@ services:
       timeout: 5s
       retries: 10
   app:
-    # Context is the MAIN repo root (four hops from this file); the human
-    # persistent app builds from MAIN, not from any review worktree.
     build:
-      context: ../../../..
+      context: ../..
       dockerfile: Dockerfile
     image: simceo-essentials-app:1.0.0
-    # Only the needed vars enter the container (values interpolated from
-    # MAIN .env via the helper --env-file flag; never committed).
+    # Only the needed vars enter the container (values come from the PRIVATE
+    # process environment prepared by essentials-persist.ps1 from the existing
+    # app .env; never committed, never printed). No --env-file is used on
+    # purpose: process env always wins, so an inherited coding-profile key
+    # can never shadow the selected app key.
     environment:
       USE_POSTGRES: "1"
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (private app .env, loaded into process env by the helper; never committed)}
       META_API_KEY: ${META_API_KEY:-}
       META_API_BASE: ${META_API_BASE:-}
-      CONNECTIONSTRINGS__APP: "Host=db;Port=5432;Database=simceo;Username=simceo;Password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in MAIN .env}"
+      CONNECTIONSTRINGS__APP: "Host=db;Port=5432;Database=simceo;Username=simceo;Password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (private app .env, loaded into process env by the helper; never committed)}"
       ASPNETCORE_ENVIRONMENT: Production
     depends_on:
       db:
         condition: service_healthy
-    ports: ["5080:5080"]
+    ports: ["${APP_HOST_PORT:-5080}:5080"]
     volumes:
       - simceo_essentials_appdata:/app/data
-    # The image HEALTHCHECK (wget) was verified absent from the aspnet
-    # runtime (no wget/curl/python3); host-side polling in the helper script
-    # is the readiness gate until the Dockerfile proposal is accepted.
-    healthcheck:
-      disable: true
 volumes:
   simceo_essentials_pgdata:
   simceo_essentials_appdata:

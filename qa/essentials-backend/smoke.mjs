@@ -19,7 +19,7 @@ function req(method, path, body, token) {
     const h = {};
     if (data) h["Content-Type"] = "application/json";
     if (token) h["authorization"] = "Bearer " + token;
-    const r = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: method, headers: h }, (res) => {
+    const r = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: method, headers: h, timeout: 20000 }, (res) => {
       const bu = [];
       res.on("data", (c) => bu.push(c));
       res.on("end", () => {
@@ -29,6 +29,7 @@ function req(method, path, body, token) {
         resolve({ status: res.statusCode, json: j, text: t });
       });
     });
+    r.on("timeout", () => { try { r.destroy(new Error("qa-http-timeout")); } catch (e) {} });
     r.on("error", (e) => resolve({ status: 0, json: null, text: "ERR:" + e.message }));
     if (data) r.write(data);
     r.end();

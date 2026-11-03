@@ -94,6 +94,7 @@ public sealed class PostgresBackend : IPgBackend
     {
       if (_depth > 0) return op();
       IDbContextTransaction? tx = null;
+      var commitAttempted = false;
       try
       {
         tx = _db.Database.BeginTransaction();
@@ -104,11 +105,27 @@ public sealed class PostgresBackend : IPgBackend
         var failCommit = false;
         try { failCommit = SimCEO.Api.Data.PgFaults.FailBeforeCommit?.Invoke() == true; } catch { failCommit = false; }
         if (failCommit) throw new InvalidOperationException("injected commit fault (PgFaults.FailBeforeCommit)");
+        commitAttempted = true;
         tx.Commit();
+        var lostAck = false;
+        try { lostAck = SimCEO.Api.Data.PgFaults.FailAfterCommitAck?.Invoke() == true; } catch { lostAck = false; }
+        if (lostAck) throw new SimCEO.Api.Data.CommitUnknownException("injected lost acknowledgement after successful commit (PgFaults.FailAfterCommitAck)", new TimeoutException("simulated lost commit acknowledgement"));
         return result;
       }
-      catch
+      catch (SimCEO.Api.Data.CommitUnknownException)
       {
+        try { tx?.Rollback(); } catch { }
+        try { _db.ChangeTracker.Clear(); } catch { }
+        throw;
+      }
+      catch (Exception ex)
+      {
+        if (commitAttempted && IsTransportFailure(ex))
+        {
+          try { tx?.Rollback(); } catch { }
+          try { _db.ChangeTracker.Clear(); } catch { }
+          throw new SimCEO.Api.Data.CommitUnknownException("commit failed with a transport-level error; outcome unknown (commit may have succeeded).", ex);
+        }
         try { tx?.Rollback(); } catch { }
         try { _db.ChangeTracker.Clear(); } catch { }
         throw;
@@ -120,6 +137,26 @@ public sealed class PostgresBackend : IPgBackend
         _depth = 0;
       }
     }
+  }
+
+  private static bool IsTransportFailure(Exception ex)
+  {
+    for (var e = ex; e is not null; e = e.InnerException)
+    {
+      if (e is TimeoutException || e is System.IO.IOException || e is System.Net.Sockets.SocketException) return true;
+      var tn = e.GetType().FullName ?? "";
+      if (tn.Contains("Npgsql"))
+      {
+        try
+        {
+          var sp = e.GetType().GetProperty("SqlState");
+          var sv = sp?.GetValue(e) as string;
+          if (string.IsNullOrEmpty(sv)) return true;
+        }
+        catch { }
+      }
+    }
+    return false;
   }
 
   public T? Find<T>(Guid id) where T : class
@@ -447,6 +484,9 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"Mode\" text NOT NULL DEFAULT 'warn'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"ModelApiKeyOverride\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"InstallationPolicies\" ADD COLUMN IF NOT EXISTS \"ModelChatOverride\" text NOT NULL DEFAULT ''");
+      // Secret hygiene: key material is memory-only by contract; blank any
+      // legacy-persisted override so no application key rests in the database.
+      db.Database.ExecuteSqlRaw("UPDATE \"InstallationPolicies\" SET \"ModelApiKeyOverride\" = '' WHERE \"ModelApiKeyOverride\" IS NOT NULL AND \"ModelApiKeyOverride\" <> ''");
       Pg.Backend = new PostgresBackend(db);
       return true;
     }

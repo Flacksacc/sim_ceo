@@ -696,6 +696,7 @@ public static class RosterEndpoints
       string jobId = "";
       int baseVersion;
       string startSubject;
+      (Guid epochId, long epochRev) resPin = (Guid.Empty, 0L);
       lock (s.SetupLock)
       {
         if (!s.Roster.TryGetValue(id, out var entry) || entry.Archived) return Results.NotFound();
@@ -713,7 +714,7 @@ public static class RosterEndpoints
           Atomic.Run(s, () =>
           {
             if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
-            if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (!RosterOps.CanWriteRoster(s, req, cur)) throw PeopleOps.AuthFault(s, req);
             if (cur.ResearchRequested && cur.ResearchedAt is null && !string.IsNullOrEmpty(cur.ResearchJobId) && RosterOps.IsLiveResearchJob(cur.ResearchJobId))
               throw new InvalidOperationException("running");
             cur.ResearchRequested = true;
@@ -723,18 +724,20 @@ public static class RosterEndpoints
             cur.ResearchJobId = jobId;
             cur.ResearchBaseVersion = cur.Version;
             baseVersion = cur.Version;
+            resPin = PublicationGuard.Capture(s);
             cur.UpdatedAt = DateTime.UtcNow;
             RosterOps.UnapproveBoardCopies(s, id);
             s.Roster[cur.Id] = cur;
           });
         }
+        catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+        catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
         catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Conflict("Research is already running for this advisor; wait for it to finish."); }
         catch (InvalidOperationException) { return Results.NotFound(); }
         catch (Exception ex) { return Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
         RosterOps.MarkLiveResearchJob(jobId);
       }
-      var resPin = PublicationGuard.Capture(s);
       try
       {
       var subject = startSubject;
@@ -772,10 +775,16 @@ public static class RosterEndpoints
       {
         lock (s.SetupLock)
         {
-          Atomic.Run(s, () =>
+          IResult? failCleanupErr = null;
+          try
           {
-            if (s.Roster.TryGetValue(id, out var failed) && failed.ResearchJobId == jobId)
+            Atomic.Run(s, () =>
             {
+              if (!s.Roster.TryGetValue(id, out var failed) || failed is null) return;
+              if (failed.ResearchJobId != jobId) return;
+              if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
+              if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked");
+              if (!RosterOps.CanWriteRoster(s, req, failed)) throw new UnauthorizedAccessException("denied");
               failed.ResearchJobId = "";
               failed.ResearchRequested = true;
               failed.ResearchedAt = null;
@@ -785,9 +794,14 @@ public static class RosterEndpoints
               RosterOps.UnapproveBoardCopies(s, id);
               s.Roster[failed.Id] = failed;
               s.Roster.Flush();
-            }
-          });
+            });
+          }
+          catch (InvalidOperationException iox) when (iox.Message == "res-restored") { failCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
+          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { failCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+          catch (UnauthorizedAccessException) { failCleanupErr = PeopleOps.Denied(); }
+          catch (Exception fex) { failCleanupErr = Results.Json(new { error = "Research failure cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
           RosterOps.ClearLiveResearchJob(jobId);
+          if (failCleanupErr is not null) return failCleanupErr;
         }
         return PeopleOps.ModelError(ex);
       }
@@ -806,18 +820,28 @@ public static class RosterEndpoints
         }
         if (cur.Version != baseVersion)
         {
-          Atomic.Run(s, () =>
+          IResult? staleCleanupErr = null;
+          try
           {
-            if (!s.Roster.TryGetValue(id, out var stale) || stale is null) return;
-            if (stale.ResearchJobId == jobId)
+            Atomic.Run(s, () =>
             {
+              if (!s.Roster.TryGetValue(id, out var stale) || stale is null) return;
+              if (stale.ResearchJobId != jobId) return;
+              if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
+              if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked");
+              if (!RosterOps.CanWriteRoster(s, req, stale)) throw new UnauthorizedAccessException("denied");
               stale.ResearchJobId = "";
               stale.ResearchRequested = true;
               stale.UpdatedAt = DateTime.UtcNow;
               s.Roster[stale.Id] = stale;
-            }
-          });
+            });
+          }
+          catch (InvalidOperationException iox) when (iox.Message == "res-restored") { staleCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
+          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { staleCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+          catch (UnauthorizedAccessException) { staleCleanupErr = PeopleOps.Denied(); }
+          catch (Exception fex) { staleCleanupErr = Results.Json(new { error = "Research cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
           RosterOps.ClearLiveResearchJob(jobId);
+          if (staleCleanupErr is not null) return staleCleanupErr;
           return Results.Conflict("Advisor profile changed during research; rerun research on the new version.");
         }
         var built = new
@@ -860,9 +884,8 @@ public static class RosterEndpoints
         }
         catch (InvalidOperationException iox) when (iox.Message == "res-restored")
         {
-          try { Atomic.Run(s, () => { if (s.Roster.TryGetValue(id, out var staleRs) && staleRs is not null && staleRs.ResearchJobId == jobId) { staleRs.ResearchJobId = ""; staleRs.ResearchRequested = true; staleRs.UpdatedAt = DateTime.UtcNow; s.Roster[staleRs.Id] = staleRs; } }); } catch { }
           RosterOps.ClearLiveResearchJob(jobId);
-          return Results.Conflict("Domain was restored during research; rerun research on the current version.");
+          return Results.Conflict("Domain was restored during research; the restored entry was left untouched; rerun research on the current version.");
         }
         catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (UnauthorizedAccessException) { RosterOps.ClearLiveResearchJob(jobId); return PeopleOps.Denied(); }

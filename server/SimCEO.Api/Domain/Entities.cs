@@ -365,6 +365,9 @@ public sealed class InstallationPolicy
   [Key] public Guid Id { get; set; }
   public decimal? MonthlyCapUsd { get; set; }
   public string Mode { get; set; } = "warn";
+  /// <summary>LEGACY column, never written by current code and never read:
+  /// API key material is memory-only (PolicyStore) and must never be persisted.
+  /// Kept so older databases open without migration; cleared at boot.</summary>
   public string ModelApiKeyOverride { get; set; } = "";
   public string ModelChatOverride { get; set; } = "";
 }

@@ -24,7 +24,9 @@ public static class ModelSettingsEndpoints
         if (!isAdmMs) return PeopleOps.Denied();
       }
       var storedKey = PolicyStore.ReadApiKey(s);
-      var storedChat = PolicyStore.ReadChatModel(s);
+      string storedChat;
+      try { storedChat = PolicyStore.ReadChatModel(s); }
+      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
       var key = !string.IsNullOrWhiteSpace(storedKey)
         ? storedKey
         : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
@@ -55,6 +57,7 @@ public static class ModelSettingsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403);
+      if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest("body must be a JSON object.");
       var allowed = new[] { ModelPolicy.SparkStandard, ModelPolicy.SparkContributor, ModelPolicy.Wonder };
       // Parse + type-validate the FULL payload first: no partial mutation on
       // bad input, and unknown wording fails honestly instead of silently
@@ -73,7 +76,7 @@ public static class ModelSettingsEndpoints
         if (newChat.Length > 0 && !allowed.Contains(newChat)) return Results.BadRequest("Unknown chat model.");
       }
       IResult? setGuardErr = null;
-      Atomic.Run(s, () =>
+      try { Atomic.Run(s, () =>
       {
         // Fresh authority INSIDE the mutation unit (not just the outer check).
         if (PeopleOps.IsSecure(s))
@@ -88,7 +91,8 @@ public static class ModelSettingsEndpoints
         PolicyStore.WriteConnection(s, effKey, effChat);
         if (keyPresent) Atomic.Audit(s, new AuditEvent { Action = "model.key-set", Detail = "override " + (string.IsNullOrWhiteSpace(effKey) ? "cleared" : "updated") });
         if (chatPresent) Atomic.Audit(s, new AuditEvent { Action = "model.chat-set", Detail = string.IsNullOrWhiteSpace(effChat) ? "default" : effChat });
-      });
+      }); }
+      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
       if (setGuardErr is not null) return setGuardErr;
       return Results.Ok(new { ok = true });
     });
@@ -105,47 +109,92 @@ public static class ModelSettingsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can test the model connection." }, statusCode: 403);
-      var gw = new ModelGateway(s);
-      var chatNow = PolicyStore.ReadChatModel(s);
-      var model = !string.IsNullOrWhiteSpace(chatNow) ? chatNow : ModelPolicy.SparkStandard;
-      var sw = System.Diagnostics.Stopwatch.StartNew();
+      string keyBefore, chatBefore;
       try
       {
-        await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 512, ct, ownerOverride: true);
-      }
-      catch (Exception ex)
-      {
-        sw.Stop();
-        var kind = ex is OperationCanceledException ? "cancelled"
-          : ex is ProviderException pex ? "provider HTTP " + pex.Status
-          : ex is ProviderNotConfiguredException ? "not configured"
-          : ex is CapExceededException ? "capped"
-          : "transport failure";
-        var err = "model test failed: " + kind + "; see usage ledger for billing; no upstream content retained";
-        lock (s.ModelLock)
+        lock (s.RootGate)
         {
-          s.ModelLastTestAt = DateTime.UtcNow;
-          s.ModelLastTestOk = false;
-          s.ModelLastTestError = err;
-          s.ModelLastTestModel = model;
+          var ov = PolicyStore.ReadApiKey(s);
+          keyBefore = !string.IsNullOrWhiteSpace(ov) ? ov : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
+          chatBefore = PolicyStore.ReadChatModel(s);
         }
-        Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + kind + ")" });
-        // No client secret is ever returned; an unconfigured provider is 503
-        // (unavailable), not a silent 200-false.
-        if (ex is ProviderNotConfiguredException)
-          return Results.Json(new { ok = false, model, error = err }, statusCode: 503);
-        return Results.Ok(new { ok = false, model, error = err });
       }
+      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
+      var model = !string.IsNullOrWhiteSpace(chatBefore) ? chatBefore : ModelPolicy.SparkStandard;
+      var gw = new ModelGateway(s);
+      var sw = System.Diagnostics.Stopwatch.StartNew();
+      Exception? callEx = null;
+      try { await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 512, ct, ownerOverride: true); }
+      catch (Exception cex) { callEx = cex; }
       sw.Stop();
-      lock (s.ModelLock)
+      var callKind = callEx is null ? "ok"
+        : callEx is OperationCanceledException ? "cancelled"
+        : callEx is ProviderException cpex ? "provider HTTP " + cpex.Status
+        : callEx is ProviderNotConfiguredException ? "not configured"
+        : callEx is CapExceededException ? "capped"
+        : "transport failure";
+      IResult? testGuardErr = null;
+      IResult? testOutcome = null;
+      try
       {
-        s.ModelLastTestAt = DateTime.UtcNow;
-        s.ModelLastTestOk = true;
-        s.ModelLastTestError = string.Empty;
-        s.ModelLastTestModel = model;
+        Atomic.Run(s, () =>
+        {
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var tsIn)) { testGuardErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+            var admIn = PeopleOps.AdminEmail(s);
+            if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, tsIn, StringComparison.OrdinalIgnoreCase)) { testGuardErr = Results.Json(new { error = "Only the installation admin can test the model connection." }, statusCode: 403); return; }
+          }
+          else if (!PeopleOps.IsOwner(req)) { testGuardErr = PeopleOps.Denied(); return; }
+          string keyNow, chatNow;
+          try
+          {
+            var ov2 = PolicyStore.ReadApiKey(s);
+            keyNow = !string.IsNullOrWhiteSpace(ov2) ? ov2 : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
+            chatNow = PolicyStore.ReadChatModel(s);
+          }
+          catch (SimCEO.Api.Data.PolicyUnavailableException) { testGuardErr = Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); return; }
+          if (!string.Equals(keyNow, keyBefore, StringComparison.Ordinal) || !string.Equals(chatNow, chatBefore, StringComparison.Ordinal))
+          {
+            testGuardErr = Results.Conflict("Model settings changed during the test; the stale result was discarded, not published.");
+            return;
+          }
+          if (callEx is null)
+          {
+            lock (s.ModelLock)
+            {
+              s.ModelLastTestAt = DateTime.UtcNow;
+              s.ModelLastTestOk = true;
+              s.ModelLastTestError = string.Empty;
+              s.ModelLastTestModel = model;
+            }
+            Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "ok: " + model });
+            testOutcome = Results.Ok(new { ok = true, model, latencyMs = sw.ElapsedMilliseconds });
+          }
+          else
+          {
+            var err = "model test failed: " + callKind + "; see usage ledger for billing; no upstream content retained";
+            lock (s.ModelLock)
+            {
+              s.ModelLastTestAt = DateTime.UtcNow;
+              s.ModelLastTestOk = false;
+              s.ModelLastTestError = err;
+              s.ModelLastTestModel = model;
+            }
+            Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + callKind + ")" });
+            if (callEx is ProviderNotConfiguredException)
+              testOutcome = Results.Json(new { ok = false, model, error = err }, statusCode: 503);
+            else
+              testOutcome = Results.Ok(new { ok = false, model, error = err });
+          }
+        });
       }
-      Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "ok: " + model });
-      return Results.Ok(new { ok = true, model, latencyMs = sw.ElapsedMilliseconds });
+      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
+      catch (SimCEO.Api.Data.PostCommitException pcx) { return Results.Json(new { error = "Model test committed, but a post-commit effect failed: " + pcx.Message }, statusCode: 500); }
+      catch (AggregateException agx) { return Results.Json(new { error = "Model test failed and rollback is uncertain: " + agx.Message }, statusCode: 500); }
+      catch (Exception tex) { return Results.Json(new { error = "Model test status not recorded: " + tex.Message }, statusCode: 500); }
+      if (testGuardErr is not null) return testGuardErr;
+      return testOutcome!;
     });
   }
 }

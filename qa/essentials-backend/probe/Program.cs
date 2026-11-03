@@ -22,6 +22,8 @@ void RecordPair(ModelGateway gw, Guid callId)
 }
 (int usage, int calls) LedgerCounts(InMemoryStore s) => (s.Usage.Count(), s.ModelCalls.Count());
 bool LedgerHas(InMemoryStore s, Guid id) => s.Usage.Any(u => u.Id == id) && s.ModelCalls.Any(c => c.Id == id);
+string NormAt(string json) { using var d = System.Text.Json.JsonDocument.Parse(json); var r = d.RootElement; var at = r.TryGetProperty("At", out var a) ? a.GetString() ?? "" : (r.TryGetProperty("at", out var a2) ? a2.GetString() ?? "" : ""); return string.IsNullOrEmpty(at) ? json : json.Replace(at, "AT"); }
+bool SameRow(string a, string b) => NormAt(a) == NormAt(b);
 // ---------- memory: concurrent gateway pairs, both complete prior ledgers ----------
 {
   var s = new InMemoryStore();
@@ -77,6 +79,28 @@ bool LedgerHas(InMemoryStore s, Guid id) => s.Usage.Any(u => u.Id == id) && s.Mo
   ot.Start(); ft.Start();
   ot.Join(TimeSpan.FromSeconds(20)); ft.Join(TimeSpan.FromSeconds(20));
   Check(s.Audit.Any(a => a.Action == "probe.foreign"), "mem-foreign-audit-survives", "audit present after unrelated rollback");
+}
+// ---------- memory: genuine partial pair (fault BETWEEN appends) rolls back fully ----------
+{
+  var s = new InMemoryStore();
+  var gw = new ModelGateway(s);
+  var prior = Guid.NewGuid();
+  RecordPair(gw, prior);
+  var priorU = System.Text.Json.JsonSerializer.Serialize(s.Usage.First(u => u.Id == prior));
+  var priorC = System.Text.Json.JsonSerializer.Serialize(s.ModelCalls.First(c => c.Id == prior));
+  var victim = Guid.NewGuid();
+  var firedM = 0;
+  ModelGateway.FailAfterFirstAppend = () => { if (System.Threading.Interlocked.Exchange(ref firedM, 1) == 1) return false; return true; };
+  Exception? vExM = null;
+  try { RecordPair(gw, victim); } catch (Exception ex) { vExM = ex; }
+  finally { ModelGateway.FailAfterFirstAppend = null; }
+  var sawM = vExM is UsageStorageException || (vExM is TargetInvocationException tm && tm.InnerException is UsageStorageException);
+  Check(sawM, "mem-gateway-midpair-fault", vExM?.GetType().Name ?? "none");
+  Check(!s.Usage.Any(u => u.Id == victim) && !s.ModelCalls.Any(c => c.Id == victim), "mem-gateway-midpair-no-partial", "victim fully absent");
+  Check(LedgerHas(s, prior), "mem-gateway-midpair-prior-survives", "prior present");
+  var priorUA = System.Text.Json.JsonSerializer.Serialize(s.Usage.First(u => u.Id == prior));
+  var priorCA = System.Text.Json.JsonSerializer.Serialize(s.ModelCalls.First(c => c.Id == prior));
+  Check(SameRow(priorU, priorUA) && SameRow(priorC, priorCA), "mem-gateway-midpair-prior-fields", "prior fields identical");
 }
 // ---------- memory: owner-thread immediate effect still runs outside any unit ----------
 {
@@ -157,6 +181,90 @@ else
       finally { ModelGateway.FailNextAppend = null; }
     }
     {
+      {
+      var pgm = new InMemoryStore();
+      var gw = new ModelGateway(pgm);
+      var prior = Guid.NewGuid();
+      RecordPair(gw, prior);
+      var priorU = System.Text.Json.JsonSerializer.Serialize(pgm.Usage.First(u => u.Id == prior));
+      var priorC = System.Text.Json.JsonSerializer.Serialize(pgm.ModelCalls.First(c => c.Id == prior));
+      var victim = Guid.NewGuid();
+      var firedP = 0;
+      ModelGateway.FailAfterFirstAppend = () => { if (System.Threading.Interlocked.Exchange(ref firedP, 1) == 1) return false; return true; };
+      Exception? vExP = null;
+      try { RecordPair(gw, victim); } catch (Exception ex) { vExP = ex; }
+      finally { ModelGateway.FailAfterFirstAppend = null; }
+      var sawP = vExP is UsageStorageException || (vExP is TargetInvocationException tp && tp.InnerException is UsageStorageException);
+      Check(sawP, "pg-gateway-midpair-fault", vExP?.GetType().Name ?? "none");
+      Check(!pgm.Usage.Any(u => u.Id == victim) && !pgm.ModelCalls.Any(c => c.Id == victim), "pg-gateway-midpair-no-partial", "victim fully absent after mid-pair fault");
+      Check(LedgerHas(pgm, prior), "pg-gateway-midpair-prior-survives", "prior present");
+      var sf0 = new InMemoryStore();
+      Check(sf0.Usage.Any(u => u.Id == prior) && sf0.ModelCalls.Any(c => c.Id == prior), "pg-gateway-midpair-prior-durable", "prior durable in fresh store");
+      var priorUA = System.Text.Json.JsonSerializer.Serialize(sf0.Usage.First(u => u.Id == prior));
+      var priorCA = System.Text.Json.JsonSerializer.Serialize(sf0.ModelCalls.First(c => c.Id == prior));
+      Check(SameRow(priorU, priorUA) && SameRow(priorC, priorCA), "pg-gateway-midpair-prior-fields", "prior fields identical across stores (At normalized: PG truncates to microseconds)");
+    }
+    { // failed FIRST policy write with no singleton present: effective + durable unchanged
+      var pgf = new InMemoryStore();
+      try { Pg.Backend!.Remove<InstallationPolicy>(PolicyStore.SingletonId); Pg.Backend.Save(); } catch { }
+      var (bCap0, bMode0) = PolicyStore.ReadSpend(pgf);
+      var firedFb = 0;
+      PgFaults.FailBeforeCommit = () => System.Threading.Interlocked.Exchange(ref firedFb, 1) == 0;
+      Exception? fbEx = null;
+      try { Atomic.Run(pgf, () => { PolicyStore.WriteSpend(pgf, 4242m, "block"); }); }
+      catch (Exception ex) { fbEx = ex; }
+      finally { PgFaults.FailBeforeCommit = null; }
+      var (bCap1, bMode1) = PolicyStore.ReadSpend(pgf);
+      var sf = new InMemoryStore();
+      var (bCapF, bModeF) = PolicyStore.ReadSpend(sf);
+      Check(fbEx is not null, "pg-first-policy-write-fails", fbEx?.GetType().Name ?? "none");
+      Check(bCap1 == bCap0 && bMode1 == bMode0, "pg-first-policy-effective-unchanged", "cap=" + (bCap1?.ToString() ?? "null") + " mode=" + bMode1);
+      Check(bCapF == bCap0 && bModeF == bMode0, "pg-first-policy-durable-unchanged", "fresh cap=" + (bCapF?.ToString() ?? "null") + " mode=" + bModeF);
+    }
+    { // policy lookup outage fails closed: no defaults, no different-key fallback
+      var pgl = new InMemoryStore();
+      PgFaults.FailPolicyLookup = () => true;
+      Exception? lkEx = null;
+      try { _ = PolicyStore.ReadSpend(pgl); } catch (Exception ex) { lkEx = ex; }
+      Exception? lkEx2 = null;
+      try { _ = PolicyStore.ReadChatModel(pgl); } catch (Exception ex) { lkEx2 = ex; }
+      Exception? capEx = null;
+      try { new ModelGateway(pgl).ThrowIfCapped(false); } catch (Exception ex) { capEx = ex; }
+      PgFaults.FailPolicyLookup = null;
+      Check(lkEx is PolicyUnavailableException, "pg-policy-spend-fails-closed", lkEx?.GetType().Name ?? "none");
+      Check(lkEx2 is PolicyUnavailableException, "pg-policy-chat-fails-closed", lkEx2?.GetType().Name ?? "none");
+      Check(capEx is PolicyUnavailableException, "pg-policy-cap-fails-closed", capEx?.GetType().Name ?? "none");
+    }
+    { // genuine DEFERRED constraint: violation surfaces at COMMIT, rolls back honestly
+      var pgd = new InMemoryStore();
+      Atomic.Run(pgd, () => { PolicyStore.WriteSpend(pgd, 7m, "block"); });
+      using (var conn = new Npgsql.NpgsqlConnection(pgCs!)) { conn.Open(); using var cmd = new Npgsql.NpgsqlCommand("ALTER TABLE \"InstallationPolicies\" ADD CONSTRAINT \"chk_probe_deferred\" EXCLUDE USING btree (\"Mode\" WITH =) DEFERRABLE INITIALLY DEFERRED", conn); cmd.ExecuteNonQuery(); }
+      Exception? defEx = null;
+      try { Atomic.Run(pgd, () => { Pg.Backend!.Upsert(new InstallationPolicy { Id = Guid.NewGuid(), MonthlyCapUsd = 1m, Mode = "block" }); Pg.Backend.Save(); }); }
+      catch (Exception ex) { defEx = ex; }
+      finally { try { using var conn2 = new Npgsql.NpgsqlConnection(pgCs!); conn2.Open(); using var cmd2 = new Npgsql.NpgsqlCommand("ALTER TABLE \"InstallationPolicies\" DROP CONSTRAINT \"chk_probe_deferred\"", conn2); cmd2.ExecuteNonQuery(); } catch { } }
+      var (dCap, dMode) = PolicyStore.ReadSpend(pgd);
+      var sdf = new InMemoryStore();
+      var (dCapF, dModeF) = PolicyStore.ReadSpend(sdf);
+      Check(defEx is not null && defEx is not CommitUnknownException, "pg-deferred-commit-fails-rolledback", defEx?.GetType().Name ?? "none");
+      Check(dCap == 7m && dMode == "block", "pg-deferred-effective-unchanged", "cap=" + (dCap?.ToString() ?? "null") + " mode=" + dMode);
+      Check(dCapF == 7m && dModeF == "block", "pg-deferred-durable-unchanged", "fresh cap=" + (dCapF?.ToString() ?? "null") + " mode=" + dModeF);
+    }
+    { // real commit + lost acknowledgement: UNKNOWN outcome, state ADOPTED (not rolled back)
+      var pga = new InMemoryStore();
+      var firedAck = 0;
+      PgFaults.FailAfterCommitAck = () => System.Threading.Interlocked.Exchange(ref firedAck, 1) == 0;
+      Exception? ackEx = null;
+      try { Atomic.Run(pga, () => { PolicyStore.WriteSpend(pga, 11m, "warn"); }); }
+      catch (Exception ex) { ackEx = ex; }
+      finally { PgFaults.FailAfterCommitAck = null; }
+      var (aCap, aMode) = PolicyStore.ReadSpend(pga);
+      var saf = new InMemoryStore();
+      var (aCapF, aModeF) = PolicyStore.ReadSpend(saf);
+      Check(ackEx is CommitUnknownException, "pg-lostack-unknown", ackEx?.GetType().Name ?? "none");
+      Check(aCapF == 11m && aModeF == "warn", "pg-lostack-durable-adopted", "fresh cap=" + (aCapF?.ToString() ?? "null") + " mode=" + aModeF);
+      Check(aCap == 11m && aMode == "warn", "pg-lostack-effective-adopted", "cap=" + (aCap?.ToString() ?? "null") + " mode=" + aMode);
+    }
       var s = new InMemoryStore();
       Atomic.Run(s, () => { PolicyStore.WriteSpend(s, 7m, "block"); });
       var s2 = new InMemoryStore();

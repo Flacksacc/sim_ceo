@@ -112,7 +112,7 @@ public static class WizardGuide
             Atomic.Run(s, () =>
             {
               if (!s.WizardDrafts.TryGetValue(draftId0, out var cur0) || cur0 is null) throw new InvalidOperationException("Draft is gone.");
-              if (!TryWizardUser(s, req, cur0, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (!TryWizardUser(s, req, cur0, out _, out _)) throw PeopleOps.AuthFault(s, req);
               if (cur0.Version != ver0) throw new InvalidOperationException("stale");
             cur0.Step = after0.Count == 0 ? 4 : after0.Min(b => b.step);
             cur0.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = checkpoints0, pendingQuestion = question, lastAnalysis = new { ok = true, at = DateTime.UtcNow, started = true } });
@@ -122,6 +122,8 @@ public static class WizardGuide
             s.WizardDrafts[cur0.Id] = cur0;
             });
           }
+          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+          catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
           catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
@@ -134,6 +136,7 @@ public static class WizardGuide
           if (!string.IsNullOrWhiteSpace(answer))
             turns.Add(new InterviewTurn(currentQ, answer.Trim(), DateTime.UtcNow, ""));
           var jobId = Guid.NewGuid().ToString("N");
+          (Guid epochId, long epochRev) wizPin = (Guid.Empty, 0L);
           var pendingAt = DateTime.UtcNow;
           var pendingCheckpoints = ReadCheckpoints(d);
           var draftIdP = d.Id; var verP = d.Version;
@@ -142,22 +145,24 @@ public static class WizardGuide
             Atomic.Run(s, () =>
             {
               if (!s.WizardDrafts.TryGetValue(draftIdP, out var curP) || curP is null) throw new InvalidOperationException("Draft is gone.");
-              if (!TryWizardUser(s, req, curP, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (!TryWizardUser(s, req, curP, out _, out _)) throw PeopleOps.AuthFault(s, req);
               if (curP.Version != verP) throw new InvalidOperationException("stale");
               curP.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = pendingCheckpoints, pendingQuestion = currentQ, lastAnalysis = new { ok = false, status = "pending", jobId, at = pendingAt, turn = turns.Count } });
               NormalizeInterview(curP);
               curP.Version++;
+              wizPin = PublicationGuard.Capture(s);
               curP.UpdatedAt = DateTime.UtcNow;
               s.WizardDrafts[curP.Id] = curP;
             });
           }
+          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+          catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
           catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
           catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(draftIdP, out var savedP) || savedP is null) return Results.NotFound("wizard draft");
           var pendingVersion = savedP.Version;
-          var wizPin = PublicationGuard.Capture(s);
           var gw = new ModelGateway(s);
           var gate = PeopleOps.Guard(gw, req);
           InterviewParsed? parsed = null;
@@ -216,7 +221,7 @@ public static class WizardGuide
             Atomic.Run(s, () =>
             {
               if (!s.WizardDrafts.TryGetValue(completionId, out var cur) || cur is null) throw new InvalidOperationException("gone");
-              if (!TryWizardUser(s, req, cur, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (!TryWizardUser(s, req, cur, out _, out _)) throw PeopleOps.AuthFault(s, req);
               if (s.RestoreEpochId != wizPin.epochId || s.RestoreEpochRev != wizPin.epochRev) throw new InvalidOperationException("restored");
               string? curJob = null;
               try
@@ -245,6 +250,8 @@ public static class WizardGuide
               Atomic.Audit(s, new AuditEvent { Action = "wizard.interview", Detail = JsonSerializer.Serialize(new { draft = completionId, turn = turns.Count }) });
             });
           }
+          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+          catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "changed") { return Results.Conflict("Draft changed during interview; retry with the latest version."); }
           catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during interview; retry with the latest version."); }

@@ -347,6 +347,11 @@ app.MapGet("/ready", (InMemoryStore s) =>
   {
     return Results.Json(new { ready = false, store = "unavailable", error = "backend unreachable: " + ex.GetType().Name }, statusCode: 503);
   }
+  try { PolicyStore.ReadSpend(s); }
+  catch (Exception ex)
+  {
+    return Results.Json(new { ready = false, store = "unavailable", error = "policy store unreachable: " + ex.GetType().Name }, statusCode: 503);
+  }
   return Results.Ok(new { ready = true, store = "postgres" });
 });
 app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
@@ -380,6 +385,26 @@ app.MapGet("/api/admin/diag", (InMemoryStore s, HttpRequest req) =>
   }
   try
   {
+    int dBoards, dMeetings, dDrafts, dSources, dNotes, dJobs, dJobsFailed, dSec, dWiki, dUsage, dCalls;
+    string dSpendMode; bool dHasCap; string dApiKey, dChat; DateTime? dTestAt; bool dTestOk;
+    lock (s.RootGate)
+    {
+      dBoards = s.Boards.Values.Count();
+      dMeetings = s.Meetings.Values.Count();
+      dDrafts = s.Drafts.Values.Count();
+      dSources = s.Sources.Values.Count();
+      dNotes = s.Notes.Values.Count();
+      dJobs = s.Jobs.Values.Count();
+      dJobsFailed = s.Jobs.Values.Count(j => j.State == "failed");
+      dSec = s.SecretaryRequests.Values.Count();
+      dWiki = s.WikiResources.Values.Count();
+      dUsage = s.Usage.Count();
+      dCalls = s.ModelCalls.Count();
+      var dsp = PolicyStore.ReadSpend(s);
+      dSpendMode = dsp.mode; dHasCap = dsp.cap.HasValue;
+      dApiKey = PolicyStore.ReadApiKey(s); dChat = PolicyStore.ReadChatModel(s);
+      dTestAt = s.ModelLastTestAt; dTestOk = s.ModelLastTestOk;
+    }
     return Results.Ok(new
     {
       backendOk,
@@ -389,20 +414,20 @@ app.MapGet("/api/admin/diag", (InMemoryStore s, HttpRequest req) =>
       hasRestoreIdentity = s.RestoreEpochId != Guid.Empty,
       counts = new
       {
-        boards = s.Boards.Values.Count(),
-        meetings = s.Meetings.Values.Count(),
-        drafts = s.Drafts.Values.Count(),
-        sources = s.Sources.Values.Count(),
-        notes = s.Notes.Values.Count(),
-        jobs = s.Jobs.Values.Count(),
-        jobsFailed = s.Jobs.Values.Count(j => j.State == "failed"),
-        secretaryRequests = s.SecretaryRequests.Values.Count(),
-        wikiResources = s.WikiResources.Values.Count(),
-        usageRows = s.Usage.Count(),
-        modelCalls = s.ModelCalls.Count(),
+        boards = dBoards,
+        meetings = dMeetings,
+        drafts = dDrafts,
+        sources = dSources,
+        notes = dNotes,
+        jobs = dJobs,
+        jobsFailed = dJobsFailed,
+        secretaryRequests = dSec,
+        wikiResources = dWiki,
+        usageRows = dUsage,
+        modelCalls = dCalls,
       },
-      spend = new { mode = PolicyStore.ReadSpend(s).mode, hasMonthlyCap = PolicyStore.ReadSpend(s).cap.HasValue },
-      model = new { hasKeyOverride = !string.IsNullOrWhiteSpace(PolicyStore.ReadApiKey(s)), chatOverride = string.IsNullOrWhiteSpace(PolicyStore.ReadChatModel(s)) ? "default" : "custom", lastTestOk = s.ModelLastTestOk, lastTestAt = s.ModelLastTestAt },
+      spend = new { mode = dSpendMode, hasMonthlyCap = dHasCap },
+      model = new { hasKeyOverride = !string.IsNullOrWhiteSpace(dApiKey), chatOverride = string.IsNullOrWhiteSpace(dChat) ? "default" : "custom", lastTestOk = dTestOk, lastTestAt = dTestAt },
       security = new { secure = PeopleOps.IsSecure(s), hasAdmin = !string.IsNullOrWhiteSpace(PeopleOps.AdminEmail(s)) },
     });
   }
@@ -431,11 +456,11 @@ static List<object> BoardsFor(InMemoryStore s, HttpRequest req, bool includeArch
 {
   var query = s.Boards.Values.AsEnumerable();
   if (!includeArchived) query = query.Where(b => !b.Archived);
-  var all = query.OrderByDescending(b => b.CreatedAt).Take(100).ToList();
-  if (!PeopleOps.IsSecure(s)) return all.Cast<object>().ToList();
+  var all = query.OrderByDescending(b => b.CreatedAt).ToList();
+  if (!PeopleOps.IsSecure(s)) return all.Take(100).Cast<object>().ToList();
   if (!AuthOps.TrySession(s, req, out var user)) return new List<object>();
   var admin = PeopleOps.AdminEmail(s);
-  if (!string.IsNullOrWhiteSpace(admin) && string.Equals(admin, user, StringComparison.OrdinalIgnoreCase)) return all.Cast<object>().ToList();
+  if (!string.IsNullOrWhiteSpace(admin) && string.Equals(admin, user, StringComparison.OrdinalIgnoreCase)) return all.Take(100).Cast<object>().ToList();
   var out_ = new List<object>();
   foreach (var b in all)
   {
@@ -448,9 +473,9 @@ static List<object> BoardsFor(InMemoryStore s, HttpRequest req, bool includeArch
     if (PeopleOps.Can(s, req, b.Id, null, "read")) { out_.Add(ScopedBoardView(s, b)); continue; }
     // Meeting-only guests: minimal scrubbed DTO only (no DraftJson/ActiveJson/OwnerKey/lead internals).
     var mids = PeopleOps.GuestMeetingIds(s, user, b.Id);
-    if (mids.Count > 0) { var (lm, ls, lp) = EffectiveGuestView(s, b); out_.Add(new { id = b.Id, name = b.Name, mission = lm, stage = ls, discussionPolicy = lp, guest = true, meetingIds = mids }); continue; }
+    if (mids.Count > 0) { var (lm, ls, lp) = EffectiveGuestView(s, b); out_.Add(new { id = b.Id, name = b.Name, mission = lm, stage = ls, discussionPolicy = lp, archived = b.Archived, guest = true, meetingIds = mids }); continue; }
   }
-  return out_;
+  return out_.Take(100).ToList();
 }
 
 app.MapGet("/api/boards", (InMemoryStore s, HttpRequest req, bool? includeArchived) => Results.Ok(BoardsFor(s, req, includeArchived == true)));

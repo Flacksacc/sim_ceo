@@ -146,6 +146,10 @@ public static class PeopleOps
     {
       return Results.Json(new { error = ex.Message }, statusCode: 503);
     }
+    catch (SimCEO.Api.Data.PolicyUnavailableException)
+    {
+      return Results.Json(new { error = "Installation policy store unavailable; try again." }, statusCode: 503);
+    }
   }
 
   public static IResult ProviderError(ProviderException ex) =>
@@ -154,6 +158,7 @@ public static class PeopleOps
   public static IResult ModelError(Exception ex) => ex switch
   {
     CapExceededException cex => Results.Json(new { error = cex.Message }, statusCode: 402),
+    SimCEO.Api.Data.PolicyUnavailableException => Results.Json(new { error = "Installation policy store unavailable; try again." }, statusCode: 503),
     ProviderException pex => ProviderError(pex),
     _ => Results.Json(new { error = ex.Message }, statusCode: 502),
   };
@@ -186,6 +191,13 @@ public static class PeopleOps
     return null;
   }
 
+  public static Exception AuthFault(InMemoryStore s, HttpRequest req)
+  {
+    try { if (IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return new UnauthorizedAccessException("revoked"); }
+    catch (InvalidOperationException) { return new InvalidOperationException("security-unavailable"); }
+    return new UnauthorizedAccessException("denied");
+  }
+
   public static IResult Denied() =>
     Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
 
@@ -205,7 +217,9 @@ public static class PeopleOps
     {
       return s.Grants.Values.Where(g => g.BoardId == boardId && g.MeetingId != null
         && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase))
-        .Select(g => g.MeetingId!.Value).Distinct().ToList();
+        .Select(g => g.MeetingId!.Value).Distinct()
+        .Where(mid => s.Meetings.TryGetValue(mid, out var mt) && mt is not null && mt.BoardId == boardId)
+        .ToList();
     }
     catch { return new List<Guid>(); }
   }

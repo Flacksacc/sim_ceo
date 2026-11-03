@@ -3,14 +3,21 @@ using SimCEO.Api.Domain;
 
 namespace SimCEO.Api.Work;
 
-/// <summary>Effective installation policy (spending controls + model
-/// connection overrides). PG mode: the singleton InstallationPolicy row is
-/// the source of truth (survives restarts); the in-memory fields are a
-/// write-through cache refreshed on every write. Memory mode: the in-memory
-/// fields are the truth. Readers prefer the database whenever a backend is
-/// wired so a restarted process observes current policy. All writers run
-/// inside the caller-owned store-bound unit so PG commits roll back with
-/// the unit and memory rollback restores via MemoryCapture (Spend).</summary>
+// Effective installation policy (spending controls + model connection
+// overrides). Spending controls are durable: the singleton InstallationPolicy
+// row is the source of truth in PG mode (survives restarts); the in-memory
+// fields are a write-through cache refreshed only AFTER durable success.
+// Memory mode: the in-memory fields are the truth. Readers prefer the
+// database whenever a backend is wired so a restarted process observes
+// current policy. A storage FAILURE is never a missing row: lookups throw
+// PolicyUnavailableException (fail closed, 503) instead of substituting
+// defaults or a different environment key. All writers run inside the
+// caller-owned store-bound unit so PG commits roll back with the unit and
+// the deep memory snapshot restores scalars in every mode.
+// SECRET CONTRACT: API key material is NEVER persisted. The key override
+// lives memory-only (seeded from the private app environment at startup,
+// replaceable at runtime, cleared on restart). Only non-secret settings
+// (spend cap/mode, chat model name) are durable.
 public static class PolicyStore
 {
   public static readonly Guid SingletonId = Guid.Parse("11111111-2222-4333-8444-555555555555");
@@ -18,55 +25,95 @@ public static class PolicyStore
   public static (decimal? cap, string mode) ReadSpend(InMemoryStore s)
   {
     var b = Pg.Backend;
-    if (b is null) return (s.Spend.MonthlyCapUsd, s.Spend.Mode);
-    InstallationPolicy? row = null;
-    try { row = b.Find<InstallationPolicy>(SingletonId); } catch { row = null; }
-    if (row is null) return (s.Spend.MonthlyCapUsd, s.Spend.Mode);
+    if (b is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, s.Spend.Mode); }
+    InstallationPolicy? row;
+    try
+    {
+      if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
+      row = b.Find<InstallationPolicy>(SingletonId);
+    }
+    catch (PolicyUnavailableException) { throw; }
+    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting defaults.", ex); }
+    if (row is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, s.Spend.Mode); }
     return (row.MonthlyCapUsd, string.IsNullOrWhiteSpace(row.Mode) ? "warn" : row.Mode);
   }
+
   public static void WriteSpend(InMemoryStore s, decimal? cap, string mode)
   {
-    s.Spend.MonthlyCapUsd = cap;
-    s.Spend.Mode = mode;
     var b = Pg.Backend;
-    if (b is null) return;
-    var row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId };
+    if (b is null) { lock (s.RootGate) { s.Spend.MonthlyCapUsd = cap; s.Spend.Mode = mode; } return; }
+    decimal? oldCap; string oldMode;
+    lock (s.RootGate) { oldCap = s.Spend.MonthlyCapUsd; oldMode = s.Spend.Mode; }
+    try { Atomic.Compensate(s, () => { lock (s.RootGate) { s.Spend.MonthlyCapUsd = oldCap; s.Spend.Mode = oldMode; } }); } catch { }
+    InstallationPolicy row;
+    try { row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId }; }
+    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; spend update refused.", ex); }
     row.MonthlyCapUsd = cap;
     row.Mode = mode;
     b.Upsert(row);
     if (!b.IsTransacting) b.Save();
+    lock (s.RootGate) { s.Spend.MonthlyCapUsd = cap; s.Spend.Mode = mode; }
   }
 
   public static string ReadApiKey(InMemoryStore s)
   {
-    var b = Pg.Backend;
-    if (b is null) return s.ModelApiKeyOverride;
-    InstallationPolicy? row = null;
-    try { row = b.Find<InstallationPolicy>(SingletonId); } catch { row = null; }
-    return row is null ? s.ModelApiKeyOverride : (row.ModelApiKeyOverride ?? "");
+    lock (s.RootGate) return s.ModelApiKeyOverride;
   }
+
   public static string ReadChatModel(InMemoryStore s)
   {
     var b = Pg.Backend;
-    if (b is null) return s.ModelChatOverride;
-    InstallationPolicy? row = null;
-    try { row = b.Find<InstallationPolicy>(SingletonId); } catch { row = null; }
-    return row is null ? s.ModelChatOverride : (row.ModelChatOverride ?? "");
+    if (b is null) { lock (s.RootGate) return s.ModelChatOverride; }
+    InstallationPolicy? row;
+    try
+    {
+      if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
+      row = b.Find<InstallationPolicy>(SingletonId);
+    }
+    catch (PolicyUnavailableException) { throw; }
+    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting a different model.", ex); }
+    if (row is null) { lock (s.RootGate) return s.ModelChatOverride; }
+    return row.ModelChatOverride ?? "";
   }
 
   public static void WriteConnection(InMemoryStore s, string apiKey, string chatModel)
   {
-    s.ModelApiKeyOverride = apiKey;
-    s.ModelChatOverride = chatModel;
-    s.ModelLastTestAt = null;
-    s.ModelLastTestOk = false;
-    s.ModelLastTestError = string.Empty;
     var b = Pg.Backend;
-    if (b is null) return;
-    var row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId };
-    row.ModelApiKeyOverride = apiKey;
-    row.ModelChatOverride = chatModel;
-    b.Upsert(row);
-    if (!b.IsTransacting) b.Save();
+    string oldKey, oldChat; DateTime? oldAt; bool oldOk; string oldErr, oldModel;
+    lock (s.RootGate)
+    {
+      oldKey = s.ModelApiKeyOverride; oldChat = s.ModelChatOverride;
+      oldAt = s.ModelLastTestAt; oldOk = s.ModelLastTestOk; oldErr = s.ModelLastTestError; oldModel = s.ModelLastTestModel;
+    }
+    try
+    {
+      Atomic.Compensate(s, () =>
+      {
+        lock (s.RootGate)
+        {
+          s.ModelApiKeyOverride = oldKey; s.ModelChatOverride = oldChat;
+          s.ModelLastTestAt = oldAt; s.ModelLastTestOk = oldOk;
+          s.ModelLastTestError = oldErr; s.ModelLastTestModel = oldModel;
+        }
+      });
+    }
+    catch { }
+    if (b is not null)
+    {
+      InstallationPolicy row;
+      try { row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId }; }
+      catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; connection update refused.", ex); }
+      row.ModelChatOverride = chatModel;
+      b.Upsert(row);
+      if (!b.IsTransacting) b.Save();
+    }
+    lock (s.RootGate)
+    {
+      s.ModelApiKeyOverride = apiKey;
+      s.ModelChatOverride = chatModel;
+      s.ModelLastTestAt = null;
+      s.ModelLastTestOk = false;
+      s.ModelLastTestError = string.Empty;
+    }
   }
 }

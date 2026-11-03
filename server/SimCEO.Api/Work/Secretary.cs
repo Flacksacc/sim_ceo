@@ -807,6 +807,7 @@ public static class SecretaryEndpoints
   internal static bool IsStorageFault(Exception? ex)
   {
     if (ex is null) return false;
+    if (ex is SimCEO.Api.Data.PolicyUnavailableException) return true;
     if (ex is TimeoutException or System.IO.IOException or TaskCanceledException or OperationCanceledException) return true;
     var tn = ex.GetType().FullName ?? "";
     if (tn.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) || tn.Contains("Postgres", StringComparison.OrdinalIgnoreCase) || tn.Contains("EntityFramework", StringComparison.OrdinalIgnoreCase) || tn.Contains("DbUpdate", StringComparison.Ordinal)) return true;
@@ -815,8 +816,20 @@ public static class SecretaryEndpoints
   internal static bool IsTransportBreak(Exception? ex)
   {
     if (ex is null) return false;
+    if (ex is SimCEO.Api.Data.PostCommitException) return true;
     if (ex is TimeoutException or System.IO.IOException or TaskCanceledException or OperationCanceledException || ex is System.Net.Sockets.SocketException) return true;
     return IsTransportBreak(ex.InnerException);
+  }
+  // Narrow delivery-shape helper (review #11): distinguish missing manifests
+  // from known-empty manifests. Null/whitespace/invalid JSON => null (missing,
+  // never fabricated as []); valid JSON (including "[]") is returned as-is so
+  // normal/answer/initial-failure hydrate/replay stay consistent. Callers
+  // expose this as `omitted` on idempotent replay and GET request.
+  internal static List<string>? ParseOmittedManifest(string? json)
+  {
+    if (string.IsNullOrWhiteSpace(json)) return null;
+    try { return System.Text.Json.JsonSerializer.Deserialize<List<string>>(json); }
+    catch { return null; }
   }
   static bool FailBound(InMemoryStore s, Guid reqId, Guid attempt, string err)
   {
@@ -1082,9 +1095,11 @@ return null;
         if (replayKind == "completed")
         {
           s.Notes.TryGetValue(replay.NoteId!.Value, out var rn);
-          return Results.Ok(new { requestId = replay.Id, clientNonce = replay.ClientNonce, status = replay.Status, note = rn, replay = true });
+          var __omReplay = ParseOmittedManifest(replay.OmittedJson);
+          return Results.Ok(new { requestId = replay.Id, clientNonce = replay.ClientNonce, status = replay.Status, note = rn, omitted = __omReplay, replay = true });
         }
-        return Results.Ok(new { requestId = replay.Id, clientNonce = replay.ClientNonce, status = replay.Status, question = replay.Question, replay = true });
+        var __omReplayQ = ParseOmittedManifest(replay.OmittedJson);
+        return Results.Ok(new { requestId = replay.Id, clientNonce = replay.ClientNonce, status = replay.Status, question = replay.Question, omitted = __omReplayQ, replay = true });
       }
       if (reserved is null || string.IsNullOrEmpty(reservedPrompt)) return Results.Json(new { error = "Reservation failed; retry with the same nonce." }, statusCode: 409);
       var myReq = reserved; var myAttempt = myReq.AttemptId;
@@ -1170,6 +1185,11 @@ return null;
           try { __omPub = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh.OmittedJson ?? "[]") ?? new(); } catch { }
           return Results.Ok(new { requestId = fresh.Id, clientNonce = fresh.ClientNonce, status = fresh.Status, note = created, omitted = __omPub });
         });
+        }
+        catch (Exception pubEx) when (pubEx is SimCEO.Api.Data.PostCommitException)
+        {
+          SecretaryTransitions.ReconcileAfterUncertainCommit(s, myReq.Id, pubNoteId, pubNoteId);
+          return Results.Json(new { error = "Publication committed (or the commit outcome is unknown); reconciled against stored state. Re-read before retrying with the same nonce." }, statusCode: 502);
         }
         catch (Exception pubEx) when (IsTransportBreak(pubEx))
         {
@@ -1374,7 +1394,8 @@ return null;
       if (replayAns is not null)
       {
         s.Notes.TryGetValue(replayAns.NoteId!.Value, out var rn2);
-        return Results.Ok(new { requestId = replayAns.Id, clientNonce = replayAns.ClientNonce, status = replayAns.Status, note = rn2, replay = true });
+        var __omReplayA = ParseOmittedManifest(replayAns.OmittedJson);
+        return Results.Ok(new { requestId = replayAns.Id, clientNonce = replayAns.ClientNonce, status = replayAns.Status, note = rn2, omitted = __omReplayA, replay = true });
       }
       if (reservedAns is null || string.IsNullOrEmpty(reservedAnsPrompt)) return Results.Json(new { error = "Continuation reservation failed; retry." }, statusCode: 409);
       var myReq2 = reservedAns;
@@ -1458,6 +1479,11 @@ return null;
           return Results.Ok(new { requestId = fresh2.Id, clientNonce = fresh2.ClientNonce, status = fresh2.Status, note = created2, omitted = __omPub2 });
         });
         }
+        catch (Exception pubEx2) when (pubEx2 is SimCEO.Api.Data.PostCommitException)
+        {
+          SecretaryTransitions.ReconcileAfterUncertainCommit(s, myReq2.Id, pubNoteId2, pubNoteId2);
+          return Results.Json(new { error = "Continuation publication committed (or the commit outcome is unknown); reconciled against stored state. Re-read before retrying with the same nonce." }, statusCode: 502);
+        }
         catch (Exception pubEx2) when (IsTransportBreak(pubEx2))
         {
           SecretaryTransitions.ReconcileAfterUncertainCommit(s, myReq2.Id, pubNoteId2, pubNoteId2);
@@ -1490,7 +1516,8 @@ return null;
         if (note.BoardId != r.BoardId || note.MeetingId != id) return Results.NotFound();
         if (!PeopleOps.Can(s, req, note.BoardId, note.MeetingId, "read")) return PeopleOps.Denied();
       }
-      return Results.Ok(new { request = r, note });
+      var __omGet = ParseOmittedManifest(r.OmittedJson);
+      return Results.Ok(new { request = r, note, omitted = __omGet });
     });
     app.MapGet("/api/meetings/{id:guid}/notes/history", (InMemoryStore s, HttpRequest req, Guid id) =>
     {

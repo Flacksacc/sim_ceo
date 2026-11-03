@@ -211,11 +211,14 @@ public sealed class ModelGateway
     return cost.HasValue ? cost.Value.ToString("F6") : "unknown";
   }
 
-  // Code-only ledger-append fault seam for rollback proofs (in-process QA
-  // only): when set, the next pair append fails before any write, proving the
-  // unit restores prior ledgers without erasing a concurrent pair. Never
-  // exposed via HTTP routes or environment.
+  // Code-only ledger-append fault seams for rollback proofs (in-process QA
+  // only). FailNextAppend fails BEFORE any row write (proves fault mapping
+  // without erasing concurrent pairs; it cannot by itself prove partial-pair
+  // rollback). FailAfterFirstAppend fails BETWEEN the two appends, proving
+  // the unit rolls back a genuine partial pair. Never HTTP routes or
+  // environment.
   internal static Func<bool>? FailNextAppend;
+  internal static Func<bool>? FailAfterFirstAppend;
 
   // ONE ledger + ONE usage event per ACTUAL provider call. Callers pass a
   // fresh callId per HTTP attempt (each retry is its own billed call).
@@ -273,8 +276,9 @@ public sealed class ModelGateway
         }
         try
         {
-          if (FailNextAppend?.Invoke() == true) throw new InvalidOperationException("injected ledger append fault");
+          if (FailNextAppend?.Invoke() == true) throw new InvalidOperationException("injected ledger append fault (before any write)");
           _store.ModelCalls.Add(call);
+          if (FailAfterFirstAppend?.Invoke() == true) throw new InvalidOperationException("injected ledger append fault (after first append)");
           _store.Usage.Add(row);
         }
         catch (Exception appendEx)

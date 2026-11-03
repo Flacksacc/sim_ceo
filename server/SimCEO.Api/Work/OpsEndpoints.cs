@@ -143,8 +143,19 @@ public static class OpsEndpoints
     app.MapPost("/api/boards/import", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badImp) return badImp;
-      var snapshot = body.TryGetProperty("snapshot", out var sn) ? sn.GetString() ?? "" : "";
-      var hash = body.TryGetProperty("hash", out var h) ? h.GetString() ?? "" : "";
+      if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest("body must be a JSON object.");
+      string snapshot = "";
+      if (body.TryGetProperty("snapshot", out var sn))
+      {
+        if (sn.ValueKind != JsonValueKind.String) return Results.BadRequest("snapshot must be a string.");
+        snapshot = sn.GetString() ?? "";
+      }
+      string hash = "";
+      if (body.TryGetProperty("hash", out var h))
+      {
+        if (h.ValueKind != JsonValueKind.String) return Results.BadRequest("hash must be a string.");
+        hash = h.GetString() ?? "";
+      }
       if (string.IsNullOrWhiteSpace(snapshot)) return Results.BadRequest("snapshot is required.");
       if (!string.Equals(Hashing.FullHash(Encoding.UTF8.GetBytes(snapshot)), hash, StringComparison.OrdinalIgnoreCase))
         return Results.Conflict("Snapshot hash mismatch; import the exact exported text.");
@@ -529,8 +540,19 @@ public static class OpsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can restore backups." }, statusCode: 403);
-      var snapshot = body.TryGetProperty("snapshot", out var sn) ? sn.GetString() ?? "" : "";
-      var hash = body.TryGetProperty("hash", out var h) ? h.GetString() ?? "" : "";
+      if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest("body must be a JSON object.");
+      string snapshot = "";
+      if (body.TryGetProperty("snapshot", out var sn))
+      {
+        if (sn.ValueKind != JsonValueKind.String) return Results.BadRequest("snapshot must be a string.");
+        snapshot = sn.GetString() ?? "";
+      }
+      string hash = "";
+      if (body.TryGetProperty("hash", out var h))
+      {
+        if (h.ValueKind != JsonValueKind.String) return Results.BadRequest("hash must be a string.");
+        hash = h.GetString() ?? "";
+      }
       if (!string.Equals(Hashing.FullHash(Encoding.UTF8.GetBytes(snapshot)), hash, StringComparison.OrdinalIgnoreCase))
         return Results.Conflict("Backup hash mismatch; restore the exact exported text.");
       JsonDocument doc;
@@ -767,7 +789,22 @@ public static class OpsEndpoints
             // status; a post-commit effect failure means the restore COMMITTED
             // (never claim prior state was restored for it).
             if (__ex is RestoreAuthException rae) return Results.Json(new { error = rae.Message }, statusCode: rae.Status);
-            if (__ex is SimCEO.Api.Data.PostCommitException pce) return Results.Json(new { error = "Restore committed; a post-commit effect failed: " + pce.Message }, statusCode: 500);
+            if (__ex is SimCEO.Api.Data.CommitUnknownException cux)
+            {
+              s.ActiveIndexJobs.Clear();
+              s.SourceEpoch++;
+              s.RestoreEpochId = Guid.NewGuid();
+              s.RestoreEpochRev++;
+              return Results.Json(new { error = "Restore outcome is unknown (the replacement may have committed); stale publishers invalidated, refresh and verify before retrying: " + cux.Message }, statusCode: 500);
+            }
+            if (__ex is SimCEO.Api.Data.PostCommitException pce)
+            {
+              s.ActiveIndexJobs.Clear();
+              s.SourceEpoch++;
+              s.RestoreEpochId = Guid.NewGuid();
+              s.RestoreEpochRev++;
+              return Results.Json(new { error = "Restore committed; a post-commit effect failed: " + pce.Message }, statusCode: 500);
+            }
             if (__ex is AggregateException) return Results.Json(new { error = "Restore failed and rollback is uncertain; prior state may be partial: " + __ex.Message }, statusCode: 500);
             return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
           }
@@ -952,6 +989,10 @@ public static class OpsEndpoints
           Atomic.Audit(s, new AuditEvent { BoardId = claimBoard == Guid.Empty ? null : claimBoard, Action = "job.succeeded", Detail = System.Text.Json.JsonSerializer.Serialize(new { job = id }) });
         });
       }
+      catch (SimCEO.Api.Data.CommitUnknownException cux) { return Results.Json(new { error = "Job completion outcome is unknown (the commit may have succeeded); re-read the job before retrying: " + cux.Message }, statusCode: 500); }
+      catch (SimCEO.Api.Data.PostCommitException pcx) { return Results.Json(new { error = "Job completion committed, but a post-commit effect failed: " + pcx.Message }, statusCode: 500); }
+      catch (AggregateException agx) { return Results.Json(new { error = "Job completion failed and rollback is uncertain: " + agx.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (iox.Message == "superseded" || iox.Message == "restored") { return Results.Conflict("Job moved on during execution; re-read before retrying."); }
       catch (InvalidOperationException) { return Results.NotFound(); }
       catch (Exception ex) { return Results.Json(new { error = "Job completion failed: " + ex.Message }, statusCode: 500); }
       if (!s.Jobs.TryGetValue(id, out var done) || done is null) return Results.NotFound();
@@ -974,7 +1015,9 @@ public static class OpsEndpoints
       else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
       var now = DateTime.UtcNow;
       var (known, unknown) = ModelGateway.MonthSpend(s);
-      var (cap, spendMode) = PolicyStore.ReadSpend(s);
+      decimal? cap; string spendMode;
+      try { (cap, spendMode) = PolicyStore.ReadSpend(s); }
+      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
       var storageMode = Pg.Backend is null ? "memory-session-lifetime" : "postgres-durable";
       return Results.Ok(new
       {
@@ -1015,6 +1058,7 @@ public static class OpsEndpoints
       // Parse + type-validate the FULL payload first: a bad mode value
       // or a non-numeric cap fails 400 with zero state change. Unknown mode
       // wording is rejected honestly instead of silently keeping the old mode.
+      if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest("body must be a JSON object.");
       decimal? newCap = null; var capPresent = false;
       string? newMode = null; var modePresent = false;
       if (body.TryGetProperty("monthlyCapUsd", out var pc))
@@ -1022,7 +1066,13 @@ public static class OpsEndpoints
         if (pc.ValueKind != JsonValueKind.Number && pc.ValueKind != JsonValueKind.Null)
           return Results.BadRequest("monthlyCapUsd must be a number or null.");
         capPresent = true;
-        newCap = pc.ValueKind == JsonValueKind.Number ? pc.GetDecimal() : null;
+        if (pc.ValueKind == JsonValueKind.Number)
+        {
+          if (!decimal.TryParse(pc.GetRawText(), System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var capDec))
+            return Results.BadRequest("monthlyCapUsd is out of range.");
+          newCap = capDec;
+        }
+        else newCap = null;
       }
       if (body.TryGetProperty("mode", out var pm))
       {
@@ -1034,7 +1084,7 @@ public static class OpsEndpoints
       }
       {
         IResult? gateErrSp = null;
-        Atomic.Run(s, () =>
+        try { Atomic.Run(s, () =>
         {
           if (PeopleOps.IsSecure(s))
           {
@@ -1048,9 +1098,12 @@ public static class OpsEndpoints
           var wantMode = modePresent ? newMode! : (string.IsNullOrWhiteSpace(curMode) ? "warn" : curMode);
           PolicyStore.WriteSpend(s, wantCap, wantMode);
           Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { MonthlyCapUsd = wantCap, Mode = wantMode }) });
-        });
+        }); }
+        catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
         if (gateErrSp is not null) return gateErrSp;
-        var (finCap, finMode) = PolicyStore.ReadSpend(s);
+        decimal? finCap; string finMode;
+        try { (finCap, finMode) = PolicyStore.ReadSpend(s); }
+        catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
         return Results.Ok(new { MonthlyCapUsd = finCap, Mode = finMode });
       }
     });
@@ -1219,7 +1272,15 @@ public static class BackupGraphValidator
     foreach (var g in r.grants ?? Enumerable.Empty<Grant>()) if (g is null || Empty(g.Id)) return "Backup grant missing id.";
     foreach (var iv in r.invites ?? Enumerable.Empty<Invite>()) if (iv is null || Empty(iv.Id)) return "Backup invite missing id.";
     if (r.jobs is not null) { var sj = new HashSet<Guid>(); foreach (var j in r.jobs) { if (j is null || Empty(j.Id)) return "Backup job missing id."; if (!sj.Add(j.Id)) return "Backup job ids are not unique."; } }
-    if (r.voiceTurns is not null) { var sv = new HashSet<Guid>(); foreach (var vt in r.voiceTurns) { if (vt is null || Empty(vt.Id)) return "Backup voice turn missing id."; if (!sv.Add(vt.Id)) return "Backup voice turn ids are not unique."; } }
+    if (r.voiceTurns is not null) { var sv = new HashSet<Guid>(); foreach (var vt in r.voiceTurns) { if (vt is null || Empty(vt.Id)) return "Backup voice turn missing id."; if (!sv.Add(vt.Id)) return "Backup voice turn ids are not unique."; }
+      foreach (var vt in r.voiceTurns) {
+        if (Empty(vt.BoardId)) return "Backup voice turn missing board.";
+        if (Empty(vt.MeetingId)) return "Backup voice turn missing meeting.";
+        if (!boardIds.Contains(vt.BoardId)) return "Backup voice turn references a missing board.";
+        if (!meetingById.TryGetValue(vt.MeetingId, out var vmt)) return "Backup voice turn references a missing meeting.";
+        if (vmt.BoardId != vt.BoardId) return "Backup voice turn board/meeting mismatch.";
+        if (vt.State != "draft" && vt.State != "sent") return "Backup voice turn has illegal state.";
+      } }
     foreach (var g in r.grants ?? Enumerable.Empty<Grant>()) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
     foreach (var i in r.invites ?? Enumerable.Empty<Invite>()) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
     foreach (var w in r.wizardDrafts ?? new List<Domain.WizardDraft>()) if (w is null || Empty(w.Id)) return "Backup wizard draft is null or missing id.";

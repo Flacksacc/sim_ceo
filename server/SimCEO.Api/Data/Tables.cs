@@ -17,6 +17,14 @@ namespace SimCEO.Api.Data;
 public static class PgFaults
 {
   public static Func<bool>? FailBeforeCommit;
+  public static Func<bool>? FailAfterCommitAck;
+  /// <summary>
+  /// Code-only policy-lookup outage seam. When set, InstallationPolicy reads
+  /// fail as if the store were unreachable (while ordinary tables stay
+  /// available). Readers must fail closed (PolicyUnavailableException /
+  /// 503), never substitute defaults or a different key. Never HTTP/env/header.
+  /// </summary>
+  public static Func<bool>? FailPolicyLookup;
 }
 
 /// <summary>
@@ -73,9 +81,18 @@ public static class Pg
 /// <summary>Deferred post-commit effects ran after a successful commit but at
 /// least one failed. The state IS committed; callers must not report that
 /// prior state was restored and must not report uncertain rollback.</summary>
-public sealed class PostCommitException : Exception
+public class PostCommitException : Exception
 {
   public PostCommitException(string message, Exception inner) : base(message, inner) { }
+}
+public sealed class CommitUnknownException : PostCommitException
+{
+  public CommitUnknownException(string message, Exception inner) : base(message, inner) { }
+}
+public sealed class PolicyUnavailableException : Exception
+{
+  public PolicyUnavailableException(string message, Exception inner) : base(message, inner) { }
+  public PolicyUnavailableException(string message) : base(message) { }
 }
 public static class Atomic
 {
@@ -149,7 +166,7 @@ public static class Atomic
       else { outer = true; st.Depth = 1; st.Aborted = false; st.OwnerThread = Environment.CurrentManagedThreadId; }
       if (!outer) st.Depth++;
     }
-    if (outer && Pg.Backend is null)
+    if (outer)
     {
       // Capture fault must unwind cleanly: depth reset, no snapshot, no state.
       try { st.MemSnap = s.CaptureMemory(); }
@@ -216,6 +233,16 @@ public static class Atomic
     {
       if (!succeeded)
       {
+        // The commit may have SUCCEEDED (lost acknowledgement, transport
+        // failure during COMMIT): restoring the memory snapshot or running
+        // compensations would DIVERGE from possibly-committed durable state.
+        // Unwind ownership without state surgery and report unknown so the
+        // caller adopts success instead of claiming prior state was restored.
+        if (ex is PostCommitException)
+        {
+          lock (UnitGate) { st.Depth = 0; st.Aborted = false; st.OwnerThread = 0; st.Deferred = null; st.Compensations = null; st.MemSnap = null; }
+          throw;
+        }
         bool doRollback = false;
         lock (UnitGate)
         {
@@ -241,7 +268,7 @@ public static class Atomic
       st.Depth = 0; st.Aborted = false; st.OwnerThread = 0;
     }
     Exception? restoreError = null;
-    if (snap is not null && Pg.Backend is null)
+    if (snap is not null)
     {
       try { s.RestoreMemory(snap); }
       catch (Exception rex) { restoreError = rex; }
