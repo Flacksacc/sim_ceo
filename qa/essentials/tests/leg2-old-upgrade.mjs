@@ -5,13 +5,17 @@
 //   .tmp/predecessor-complete-primary-20261103-1021.dump (custom format)
 //   .tmp/predecessor-complete-primary-20261103-1021-canonical-backup.json
 // Flow: assert fresh DB empty -> restore dump into it (exclusive temp path,
-// verified cleanup) -> DB fingerprint A (full field/byte, every family) ->
-// API gen1 (current upgrade) -> fingerprint B + startup-log migration proof
-// -> API gen2/gen3 restarts -> fingerprints C/D -> B==C==D exactly; A vs B:
-// every pre-existing table byte-identical, ONLY new-table additions allowed
-// (explicit justified schema diffs); unknown legacy JobPayload opaque plain
-// string preserved read-only, never executed. No old-DB drops, no global
-// docker labels, no foreign containers. Exit nonzero on ANY failure.
+// verified cleanup) -> narrow FRAMING fixture (NULL vs literal "<NULL>" vs
+// empty, CR/LF/RS/US/control bytes, unicode, trailing spaces; change
+// detection; determinism; dropped afterwards) -> DB fingerprint A (full
+// field/byte, every family, Postgres-native JSON, NO client trimming or
+// unescaped separator framing) -> API gen1 (current upgrade) ->
+// fingerprint B + startup-log migration proof -> API gen2/gen3 restarts ->
+// fingerprints C/D -> B==C==D exactly; A vs B: every pre-existing table
+// byte-identical, ONLY new-table additions allowed (explicit justified
+// schema diffs); unknown legacy JobPayload opaque plain string preserved
+// read-only, never executed. No old-DB drops, no global docker labels, no
+// foreign containers. Exit nonzero on ANY failure.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -39,6 +43,12 @@ const writeArt = (name, obj) => {
   catch (e) { ctx.ok("artifact-" + name, false, String(e).slice(0, 160)); }
 };
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+// Canonical value encoding for name-aligned comparison: JSON.stringify is
+// injective per JSON value (null -> "null", strings stay quoted, numbers
+// bare), so NULL vs "<NULL>" vs "" vs 0 can never collide.
+const normVal = (v) => JSON.stringify(v);
+const stripQ = (x) => String(x || "").replace(/^"|"$/g, "");
+const keyOf = (o) => String(o["Id"] ?? o["id"] ?? o["ID"] ?? Object.values(o)[0]);
 function docker(args, timeoutMs = 60000) {
   return execFileSync("docker", args, { windowsHide: true, timeout: timeoutMs, stdio: "pipe" }).toString();
 }
@@ -111,53 +121,105 @@ try {
   }
 
   const colNames = (t) => psql(DB, "SELECT string_agg(quote_ident(column_name), ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema='public' AND table_name='" + t + "';").split(",");
-  // Normalize psql line terminators (ONE trailing newline per record is a
-  // transport artifact, not data; embedded newlines are preserved).
-  const normBody = (body) => body.split("\x1e").map((l) => l.replace(/\r?\n$/, "")).filter((l) => l.length > 0).join("\x1e");
+  // Postgres-native JSON fingerprint: exact JSON text Postgres emitted, one
+  // entry per table with parsed rows for name-aligned analysis. No Split,
+  // Trim, Replace or separator framing is applied to any field value.
   const snapFingerprint = (tag) => {
     const tables = tableList(DB);
     const out = {};
     for (const t of tables) {
       const n = rowCount(DB, t);
-      const body = normBody(fingerprintTable(DB, t));
-      out[t] = { rows: n, sha: sha256(body), body, cols: colNames(t) };
+      const raw = fingerprintTable(DB, t);
+      let parsed = null;
+      try { parsed = JSON.parse(raw); }
+      catch (e) { ctx.ok("fingerprint-json-" + t, false, "not JSON: " + String(e).slice(0, 120)); throw new Error("fingerprint not JSON for " + t); }
+      ctx.ok("fingerprint-json-" + t, Array.isArray(parsed), "rows=" + (Array.isArray(parsed) ? parsed.length : "?"));
+      if (!Array.isArray(parsed)) throw new Error("fingerprint not array for " + t);
+      ctx.ok("fingerprint-count-" + t, parsed.length === n, "count=" + n + " json=" + parsed.length);
+      out[t] = { rows: n, sha: sha256(raw), json: raw, parsed, cols: colNames(t) };
       if (tag) writeArt("fp-" + tag + "-" + t + ".sha", out[t].sha + " rows=" + n + " cols=" + out[t].cols.length + "\n");
     }
     return out;
   };
-  // On byte mismatch: NAME-ALIGNED per-column diff of the first differing
-  // rows (max 3), so migration normalizations are explicit and justifiable.
+  // --- narrow discriminating framing fixture: proves the comparator is byte
+  // proof (not a weak hash over lossy framing). Runs BEFORE fingerprint A on
+  // a dedicated probe table, then DROPPED so upgrade fingerprints stay clean.
+  // Cases: SQL NULL vs the literal text "<NULL>" vs empty string, a real
+  // CR/LF pair, RS chr(30), US chr(31), trailing spaces, tab, non-ASCII
+  // unicode -- plus determinism and real-change detection.
+  {
+    psql(DB, "CREATE TABLE \"qa_framing_probe\" (\"Id\" integer PRIMARY KEY, \"T\" text);");
+    psql(DB, "INSERT INTO \"qa_framing_probe\" (\"Id\", \"T\") VALUES (1, NULL), (2, '<NULL>'), (3, 'a' || chr(13) || chr(10) || 'b' || chr(30) || chr(31) || 'c  '), (4, 'caf' || chr(233) || ' ' || chr(20013) || chr(25991) || chr(9));");
+    const raw1 = fingerprintTable(DB, "qa_framing_probe");
+    let p1 = null;
+    try { p1 = JSON.parse(raw1); } catch (e) { ctx.ok("framing-json", false, String(e).slice(0, 120)); throw new Error("framing fingerprint not JSON"); }
+    ctx.ok("framing-rows", Array.isArray(p1) && p1.length === 4, "rows=" + (Array.isArray(p1) ? p1.length : "?"));
+    const byId1 = new Map((p1 || []).map((r) => [Number(r["Id"] ?? r["id"]), r]));
+    const r1 = byId1.get(1) || {}, r2 = byId1.get(2) || {}, r3 = byId1.get(3) || {}, r4 = byId1.get(4) || {};
+    ctx.ok("framing-null-is-null", ("T" in r1) && r1["T"] === null, "id1=" + normVal(r1["T"]));
+    ctx.ok("framing-literal-distinct", r2["T"] === "<NULL>", "id2=" + normVal(r2["T"]));
+    ctx.ok("framing-controls-preserved", r3["T"] === "a\r\nb\x1e\x1fc  ", "id3=" + normVal(r3["T"]));
+    ctx.ok("framing-unicode-tab", r4["T"] === "caf\u00e9 \u4e2d\u6587\t", "id4=" + normVal(r4["T"]));
+    writeArt("framing.json", { sha: sha256(raw1), rows: p1 });
+    ctx.ok("framing-deterministic", fingerprintTable(DB, "qa_framing_probe") === raw1, "same bytes twice");
+    // Real change detection: append one byte to the control-char row.
+    psql(DB, "UPDATE \"qa_framing_probe\" SET \"T\" = \"T\" || 'X' WHERE \"Id\" = 3;");
+    const raw2 = fingerprintTable(DB, "qa_framing_probe");
+    ctx.ok("framing-change-detected", sha256(raw2) !== sha256(raw1), "sha moved on 1-byte change");
+    const p2 = JSON.parse(raw2);
+    const byId2 = new Map(p2.map((r) => [Number(r["Id"] ?? r["id"]), r]));
+    ctx.ok("framing-change-exact-row", (byId2.get(3) || {})["T"] === "a\r\nb\x1e\x1fc  X", "id3=" + normVal((byId2.get(3) || {})["T"]));
+    ctx.ok("framing-change-others-intact", normVal((byId2.get(1) || {})["T"]) === "null" && (byId2.get(2) || {})["T"] === "<NULL>" && (byId2.get(4) || {})["T"] === "caf\u00e9 \u4e2d\u6587\t", "other rows byte-identical");
+    // NULL -> 'x' and literal -> empty stay distinct from each other and NULL.
+    psql(DB, "UPDATE \"qa_framing_probe\" SET \"T\" = 'x' WHERE \"Id\" = 1;");
+    psql(DB, "UPDATE \"qa_framing_probe\" SET \"T\" = '' WHERE \"Id\" = 2;");
+    const p3 = JSON.parse(fingerprintTable(DB, "qa_framing_probe"));
+    const byId3 = new Map(p3.map((r) => [Number(r["Id"] ?? r["id"]), r]));
+    ctx.ok("framing-null-to-value", (byId3.get(1) || {})["T"] === "x", "id1=" + normVal((byId3.get(1) || {})["T"]));
+    ctx.ok("framing-empty-distinct", (byId3.get(2) || {})["T"] === "" && (byId3.get(2) || {})["T"] !== null, "id2=" + normVal((byId3.get(2) || {})["T"]));
+    psql(DB, "DROP TABLE \"qa_framing_probe\";");
+    ctx.ok("framing-probe-dropped", !tableList(DB).includes("qa_framing_probe"), "probe removed before fingerprint A");
+  }
+    // numeric probe: bigint past JS safe integer + large numeric stay exact as raw PG JSON lexemes.
+  // Raw text is compared (never JSON.parse numbers, which would round); change detection included.
+  {
+    psql(DB, "CREATE TABLE qa_numeric_probe (id integer PRIMARY KEY, bi bigint, nm numeric)");
+    psql(DB, "INSERT INTO qa_numeric_probe (id, bi, nm) VALUES (1, 9007199254740993, 12345678901234567890.123456789)");
+    const rawN = fingerprintTable(DB, "qa_numeric_probe");
+    ctx.ok("numeric-raw-bigint", rawN.includes("9007199254740993"), "bigint lexeme exact");
+    ctx.ok("numeric-raw-decimal", rawN.includes("12345678901234567890.123456789"), "numeric lexeme exact");
+    writeArt("numeric-probe.json", { sha: sha256(rawN) });
+    ctx.ok("numeric-deterministic", fingerprintTable(DB, "qa_numeric_probe") === rawN, "same bytes twice");
+    psql(DB, "UPDATE qa_numeric_probe SET bi = 9007199254740994 WHERE id = 1");
+    const rawN2 = fingerprintTable(DB, "qa_numeric_probe");
+    ctx.ok("numeric-change-detected", sha256(rawN2) !== sha256(rawN), "sha moves on one digit change");
+    psql(DB, "DROP TABLE qa_numeric_probe");
+    ctx.ok("numeric-probe-dropped", true, "probe removed before fingerprint A");
+  }
+// On byte mismatch: NAME-ALIGNED per-column diff of the first differing
+  // rows (max 3) over PARSED JSON values, so migration normalizations are
+  // explicit and justifiable. Values compare with null-vs-string-safe
+  // encoding (JSON.stringify), never with lossy text splits.
   const diffDetail = (t, a, b) => {
-    const SEP = String.fromCharCode(31);
-    const sq = (x) => String(x || "").replace(/"/g, "");
-    const colsA = (a.cols || []).map(sq), colsB = (b.cols || []).map(sq);
-    const rowsA = a.body.split("\x1e").filter((l) => l.length > 0);
-    const rowsB = b.body.split("\x1e").filter((l) => l.length > 0);
+    const colsB = (b.cols || []).map(stripQ);
     const byIdB = new Map();
-    for (const lb of rowsB) {
-      const vb = lb.split(SEP);
-      const o = {};
-      for (let i = 0; i < colsB.length; i++) o[colsB[i]] = i < vb.length ? vb[i] : "<MISSING-COL>";
-      byIdB.set(String(o["Id"] || o["id"] || vb[0]), { o, lb });
-    }
+    for (const o of (b.parsed || [])) byIdB.set(keyOf(o), o);
     const detail = [];
-    for (const la of rowsA) {
-      const va = la.split(SEP);
-      const oa = {};
-      for (let i = 0; i < colsA.length; i++) oa[colsA[i]] = i < va.length ? va[i] : "<MISSING-COL>";
-      const id = String(oa["Id"] || oa["id"] || va[0]);
-      const hit = byIdB.get(id);
-      if (!hit) { detail.push({ key: id.slice(0, 60), missingInB: true }); }
+    for (const oa of (a.parsed || [])) {
+      const id = keyOf(oa);
+      const ob = byIdB.get(id);
+      if (!ob) { detail.push({ key: id.slice(0, 60), missingInB: true }); }
       else {
         const changed = [];
-        for (const col of new Set([...Object.keys(oa), ...Object.keys(hit.o)])) {
-          if (oa[col] !== hit.o[col]) changed.push({ col, before: String(oa[col] ?? "").slice(0, 220), after: String(hit.o[col] ?? "").slice(0, 220) });
+        for (const col of new Set([...Object.keys(oa), ...Object.keys(ob)])) {
+          if (normVal(oa[col]) !== normVal(ob[col])) changed.push({ col, before: normVal(oa[col]).slice(0, 220), after: normVal(ob[col]).slice(0, 220) });
         }
         if (changed.length > 0) detail.push({ key: id.slice(0, 60), changedCols: changed.map((x) => x.col), changed });
       }
       if (detail.length >= 3) break;
     }
-    writeArt("diff-" + t + ".json", { table: t, rowsA: rowsA.length, rowsB: rowsB.length, sample: detail });
+    void colsB;
+    writeArt("diff-" + t + ".json", { table: t, rowsA: (a.parsed || []).length, rowsB: (b.parsed || []).length, sample: detail });
     return detail.map((d) => (d.changedCols || []).join(",")).join("|").slice(0, 300);
   };
   // --- fingerprint A: pre-upgrade, every family, full field/byte ---
@@ -238,42 +300,40 @@ try {
   let stable = true;
   for (const t of tablesBCD) {
     const same = fpB[t] && fpC[t] && fpD[t] && fpB[t].sha === fpC[t].sha && fpB[t].sha === fpD[t].sha && fpB[t].rows === fpC[t].rows && fpB[t].rows === fpD[t].rows;
-    if (!same) { stable = false; ctx.ok("restart-stable-" + t, false, "B=" + JSON.stringify(fpB[t]) + " C=" + JSON.stringify(fpC[t]) + " D=" + JSON.stringify(fpD[t])); }
+    if (!same) { stable = false; ctx.ok("restart-stable-" + t, false, "shaB=" + (fpB[t] || {}).sha + " shaC=" + (fpC[t] || {}).sha + " shaD=" + (fpD[t] || {}).sha + " rows=" + (fpB[t] || {}).rows + "/" + (fpC[t] || {}).rows + "/" + (fpD[t] || {}).rows); }
   }
   if (stable) ctx.ok("restart-stable-all", true, "tables=" + tablesBCD.size);
 
   // A vs B: pre-existing rows byte-identical EXCEPT explicit justified
-  // schema evolution: added tables (new features) + added columns with
-  // empty/canonical backfills (phase-6 family identity, review hardening,
-  // note revisions, ownership attribution). Any rewrite of a pre-existing
-  // column, any row gain/loss, or any dropped table is a hard FAIL.
+  // schema evolution: added tables (new features) + added columns whose
+  // backfill is a UNIFORM server default across all pre-existing rows (any
+  // data-dependent per-row rewrite is a hard FAIL); source collision
+  // renumbers only with content preserved + server-owned migrate-version
+  // event. Any rewrite of a pre-existing value, any row gain/loss, or any
+  // dropped table is a hard FAIL.
   const addedTables = Object.keys(fpB).filter((t) => !fpA[t]);
   writeArt("added-tables.json", addedTables);
   const schemaDiff = { addedTables: [], addedColumns: {}, backfills: {} };
   for (const t of addedTables) schemaDiff.addedTables.push({ table: t, rows: fpB[t].rows });
   let upgradeClean = true;
-  const MISSING = "<MISSING-COL>";
   for (const t of Object.keys(fpA)) {
     if (!fpB[t]) { upgradeClean = false; ctx.ok("upgrade-preserves-" + t, false, "table missing after upgrade"); continue; }
     if (fpB[t].sha === fpA[t].sha && fpB[t].rows === fpA[t].rows) { ctx.ok("upgrade-preserves-" + t, true, "rows=" + fpB[t].rows + " byte-identical"); continue; }
     if (fpB[t].rows !== fpA[t].rows) { upgradeClean = false; ctx.ok("upgrade-preserves-" + t, false, "ROW COUNT CHANGED A=" + fpA[t].rows + " B=" + fpB[t].rows); continue; }
-    const colsA = fpA[t].cols || [], colsB = fpB[t].cols || [];
+    const colsA = (fpA[t].cols || []).map(stripQ), colsB = (fpB[t].cols || []).map(stripQ);
     const addedCols = colsB.filter((x) => !colsA.includes(x));
     schemaDiff.addedColumns[t] = addedCols;
-    const SEP = String.fromCharCode(31);
-    const stripQ = (x) => String(x || "").replace(/"/g, "");
-    const rowById = (body, cols) => {
-      const m = new Map();
-      for (const line of body.split("\x1e").filter((l) => l.length > 0)) {
-        const vs = line.split(SEP);
-        const o = {};
-        for (let i = 0; i < cols.length; i++) o[stripQ(cols[i])] = i < vs.length ? vs[i] : MISSING;
-        const id = o["Id"] || o["id"] || vs[0];
-        m.set(String(id), o);
+    const mapA = new Map((fpA[t].parsed || []).map((o) => [keyOf(o), o]));
+    const mapB = new Map((fpB[t].parsed || []).map((o) => [keyOf(o), o]));
+    // Uniform-default backfill proof for every added column: the same
+    // server default on EVERY pre-existing row, recorded for review.
+    const backfillVals = {};
+    for (const c of addedCols) backfillVals[c] = new Set();
+    for (const ob of mapB.values()) {
+      for (const c of addedCols) {
+        if (c in ob) backfillVals[c].add(normVal(ob[c]));
       }
-      return m;
-    };
-    const mapA = rowById(fpA[t].body, colsA), mapB = rowById(fpB[t].body, colsB);
+    }
     let justified = true, justification = "";
     const changedOldCols = new Set();
     const renumberedSources = [];
@@ -281,9 +341,9 @@ try {
       const ob = mapB.get(String(id));
       if (!ob) { justified = false; justification = "row lost " + String(id).slice(0, 40); break; }
       for (const col of Object.keys(oa)) {
-        if (!colsB.map(stripQ).includes(col)) { justified = false; changedOldCols.add("dropped-col:" + col); continue; }
-        if (oa[col] === ob[col]) continue;
-        if (addedCols.map(stripQ).includes(col)) continue;
+        if (!colsB.includes(col)) { justified = false; changedOldCols.add("dropped-col:" + col); continue; }
+        if (normVal(oa[col]) === normVal(ob[col])) continue;
+        if (addedCols.includes(col)) continue;
         // Sources collision renumber: Version may move ONLY with a
         // server-owned migrate-version event AND preserved content bytes.
         if (t === "Sources" && col === "Version") {
@@ -291,9 +351,80 @@ try {
           continue;
         }
         justified = false;
-        changedOldCols.add(col + ":[" + String(oa[col]).slice(0, 60) + "]->[" + String(ob[col]).slice(0, 60) + "]");
+        changedOldCols.add(col + ":[" + normVal(oa[col]).slice(0, 60) + "]->[" + normVal(ob[col]).slice(0, 60) + "]");
       }
       if (!justified) break;
+    }
+    if (justified) {
+      for (const c of addedCols) {
+        const distinct = Array.from(backfillVals[c] || []);
+        if (distinct.length === 1) { schemaDiff.backfills[t + "." + c] = distinct[0]; continue; }
+        // Justified per-row derivations (documented server migrations, each
+        // VERIFIED per row -- never a shape-only pass):
+        if (t === "Notes" && c === "RootId") {
+          // Chain-root norm: rows whose RootId was empty adopt their own Id.
+          let okR = true;
+          for (const ob of mapB.values()) { if (normVal(ob[c]) !== normVal(ob["Id"] ?? ob["id"])) { okR = false; break; } }
+          if (okR) { schemaDiff.backfills[t + "." + c] = "own-id"; continue; }
+          justified = false; justification = "RootId backfill is not own-id for every row"; break;
+        }
+        if (t === "Sources" && c === "ReviewState") {
+          // Faithful projection of the row's OWN pre-existing Approved flag.
+          let okR = true;
+          for (const [id, ob] of mapB) {
+            const oa = mapA.get(String(id));
+            const want = (oa && oa["Approved"] === true) ? "approved" : "pending";
+            if (normVal(ob[c]) !== normVal(want)) { okR = false; break; }
+          }
+          if (okR) { schemaDiff.backfills[t + "." + c] = "approved-flag-projection"; continue; }
+          justified = false; justification = "ReviewState backfill mismatches own Approved flag"; break;
+        }
+        if (t === "Sources" && c === "FamilyKey") {
+          // Canonical family identity FamilyKeyFor(board,scope,meeting,
+          // origin,file) recomputed per row from the row's OWN columns.
+          const normFn = (name) => { let s = String(name ?? "").trim(); const ix = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\")); if (ix >= 0) s = s.slice(ix + 1); return s.trim().toLowerCase(); };
+          let okR = true, checked = 0;
+          for (const [id, ob] of mapB) {
+            const oa = mapA.get(String(id));
+            if (!oa) { okR = false; break; }
+            const isWiki = String(oa["Origin"] ?? "").trim().toLowerCase() === "wiki";
+            if (isWiki) {
+              if (normVal(ob[c]) !== normVal("")) { okR = false; justification = "wiki FamilyKey must stay default on " + String(id).slice(0, 8); break; }
+              checked++; continue;
+            }
+            const bid = String(oa["BoardId"] ?? oa["boardId"]).replace(/-/g, "").toLowerCase();
+            const sc = (oa["Scope"] ?? oa["scope"]) === "meeting" ? "meeting" : "board";
+            const midRaw = oa["MeetingId"] ?? oa["meetingId"];
+            const mid = (sc === "meeting" && midRaw != null) ? String(midRaw).replace(/-/g, "").toLowerCase() : "-";
+            const orgRaw = String(oa["Origin"] ?? oa["origin"] ?? "");
+            const org = /^\s*$/.test(orgRaw) ? "upload" : orgRaw.trim().toLowerCase();
+            const want = bid + "|" + sc + "|" + mid + "|" + org + "|" + normFn(oa["FileName"] ?? oa["fileName"]);
+            if (normVal(ob[c]) !== normVal(want)) { okR = false; justification = "FamilyKey mismatch on " + String(id).slice(0, 8); break; }
+            checked++;
+          }
+          if (okR && checked > 0) { schemaDiff.backfills[t + "." + c] = "canonical-family-key x" + checked; continue; }
+          if (!okR) { justified = false; break; }
+          justified = false; justification = "no rows checked for FamilyKey"; break;
+        }
+        if (t === "Drafts" && c === "ReviewToken") {
+          // Deterministic legacy derivation HashOf("legacy-review:"+idN+":"+
+          // version+":"+hash) -- recomputed per row and compared exactly.
+          let okR = true, checked = 0;
+          for (const [id, ob] of mapB) {
+            const oa = mapA.get(String(id));
+            if (!oa) { okR = false; break; }
+            const oid = String(oa["Id"] ?? oa["id"]);
+            const idN = oid.replace(/-/g, "").toLowerCase();
+            const want = sha256("legacy-review:" + idN + ":" + String(oa["Version"] ?? oa["version"]) + ":" + String(oa["Hash"] ?? oa["hash"] ?? "")).slice(0, 16);
+            if (normVal(ob[c]) !== normVal(want)) { okR = false; justification = "ReviewToken mismatch on " + oid.slice(0, 8); break; }
+            checked++;
+          }
+          if (okR && checked > 0) { schemaDiff.backfills[t + "." + c] = "legacy-review-hash x" + checked; continue; }
+          if (!okR) { justified = false; break; }
+          justified = false; justification = "no rows checked for ReviewToken"; break;
+        }
+        justified = false; justification = "added-col " + c + " has " + distinct.length + " distinct backfills (not a uniform server default): " + distinct.slice(0, 3).join(" | ").slice(0, 200); break;
+      }
     }
     // Validate renumbered sources: content preserved + migrate-version event.
     if (justified && renumberedSources.length > 0) {
@@ -302,9 +433,9 @@ try {
         evRows = psql(DB, "SELECT \"SourceId\", \"Action\", \"Detail\" FROM \"SourceEvents\";").split("\n").filter((l) => l.trim().length > 0);
       } catch (e) { justified = false; justification = "cannot read SourceEvents: " + String(e).slice(0, 120); }
       for (const r of renumberedSources) {
-        const sameOrig = String(r.a["Original"] || "") === String(r.b["Original"] || "");
-        const sameHash = String(r.a["ContentHash"] || "") === String(r.b["ContentHash"] || "");
-        const want = "v" + r.from + "->v" + r.to;
+        const sameOrig = normVal(r.a["Original"]) === normVal(r.b["Original"]);
+        const sameHash = normVal(r.a["ContentHash"]) === normVal(r.b["ContentHash"]);
+        const want = "v" + String(r.from) + "->v" + String(r.to);
         const hasEv = evRows.some((l) => l.includes(r.id) && /migrate-version/i.test(l) && l.includes(want));
         if (!sameOrig) { justified = false; justification = "renumber " + r.id.slice(0, 8) + " content bytes changed"; break; }
         if (!hasEv) { justified = false; justification = "renumber " + r.id.slice(0, 8) + " missing migrate-version " + want + " (hashRepair=" + (!sameHash) + ")"; break; }
@@ -312,7 +443,7 @@ try {
       if (justified) schemaDiff.backfills[t + ".renumbered"] = renumberedSources.map((r) => ({ id: r.id, from: r.from, to: r.to }));
     }
     if (justified) {
-      ctx.ok("upgrade-schema-evolution-" + t, true, "rows=" + fpB[t].rows + " addedCols=[" + addedCols.map((x) => x.replace(/"/g, "")).join(",") + "]");
+      ctx.ok("upgrade-schema-evolution-" + t, true, "rows=" + fpB[t].rows + " addedCols=[" + addedCols.join(",") + "]");
       try {
         const detail = diffDetail(t, fpA[t], fpB[t]);
         schemaDiff.backfills[t] = detail;

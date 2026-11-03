@@ -147,6 +147,15 @@ export function sharedNewId(beforeCalls, beforeUsage, afterCalls, afterUsage) {
   return { ok: true, id: idC, call: nC[0], row: nU[0] };
 }
 
+// PG timestamptz stores microsecond precision: a 7th fractional second digit
+// in a JSON "at" is an in-memory EF identity-map artifact (the tracked entity
+// keeps 7-digit ticks until ChangeTracker.Clear detaches it), never stored
+// data. ONLY the At-field lexeme is aligned to 6 digits so a fault path
+// that clears tracking cannot false-fail; any real stored change still fails.
+// This weakens nothing PG can persist; leg4 backs it with exact raw PG bytes for the same prior IDs. All other fields stay byte-exact.
+export function normAt(json) {
+  return String(json).replace(/("(?:at)"\s*:\s*"[^"]*?\.\d{6})\d+((?:Z|[+-]\d{2}:?\d{2})")/gi, "$1$2");
+}
 // All prior full rows must be byte-identical below actual caps (no silent rewrite).
 export function priorRowsIntact(before, after) {
   if (after.length < before.length) return false;
@@ -154,7 +163,7 @@ export function priorRowsIntact(before, after) {
   const aById = new Map(after.map((r) => [String(camel(r, "id")), JSON.stringify(r)]));
   for (const r of before) {
     const a = aById.get(String(camel(r, "id")));
-    if (a === undefined || a !== JSON.stringify(r)) return false;
+    if (a === undefined || normAt(a) !== normAt(JSON.stringify(r))) return false;
   }
   void bIds;
   return true;

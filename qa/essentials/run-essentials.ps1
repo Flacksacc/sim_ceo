@@ -45,6 +45,16 @@ if ($ApiPort -ne $OWN_API -or $FakePort -ne $OWN_FAKE -or $WebPort -ne $OWN_WEB 
   exit 2
 }
 $ownedDb = @()
+# LIVE provider arming (leg8 ONLY, OFF by default): the real app key arrives
+# privately from PRIMARY in the runner child ENV AFTER deterministic final
+# builds. Capture it once, then STRIP it from this process so no other child
+# can inherit it implicitly; forward it ONLY to the leg8 API + leg env.
+# Never log it, never use the inherited coding-profile key.
+$liveArmed = ([System.Environment]::GetEnvironmentVariable("ESS_QA_LIVE", "Process") -eq "1")
+$liveKey = [System.Environment]::GetEnvironmentVariable("META_API_KEY", "Process")
+if ($liveArmed -and [string]::IsNullOrWhiteSpace($liveKey)) { throw "ESS_QA_LIVE=1 but no META_API_KEY in runner env; primary must supply the app key via child env" }
+if ($liveArmed) { [System.Environment]::SetEnvironmentVariable("META_API_KEY", $null, "Process"); [System.Environment]::SetEnvironmentVariable("ESS_QA_LIVE", $null, "Process") }
+$ownedDb = @()
 $containerWasRunning = $false
 function Step($n) { Write-Output ""; Write-Output ("=== " + $n + " ===") }
 function Ok($n) { Write-Output ("  ok " + $n) }
@@ -78,8 +88,8 @@ function DockerInspectIdent() {
   $running = [bool]$obj.State.Running
   return @{ id = $id; image = $img; ports = $ports; running = $running }
 }
-$LegFiles = @{ leg0 = "tests/leg0-root-config.mjs"; leg1 = "tests/leg1-core-smoke.mjs"; leg2 = "tests/leg2-old-upgrade.mjs"; leg3 = "tests/leg3-records.mjs"; leg4 = "tests/leg4-secretary.mjs"; leg5 = "tests/leg5-voice.mjs"; leg6 = "tests/leg6-web.mjs"; leg7 = "tests/leg7-backup-outage.mjs" }
-$SelfManaged = @("leg2", "leg7")
+$LegFiles = @{ leg0 = "tests/leg0-root-config.mjs"; leg1 = "tests/leg1-core-smoke.mjs"; leg2 = "tests/leg2-old-upgrade.mjs"; leg3 = "tests/leg3-records.mjs"; leg4 = "tests/leg4-secretary.mjs"; leg5 = "tests/leg5-voice.mjs"; leg6 = "tests/leg6-web.mjs"; leg7 = "tests/leg7-backup-outage.mjs"; leg4b = "tests/leg4b-secretary-lostack.mjs"; leg8 = "tests/leg8-live-asr.mjs" }
+$SelfManaged = @("leg2", "leg4b", "leg7")
 function Start-Owned($file, $argList, $workdir, $envmap, $outFile, $errFile) {
   $backup = @{}
   foreach ($k in $envmap.Keys) { $backup[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process"); [System.Environment]::SetEnvironmentVariable($k, [string]$envmap[$k], "Process") }
@@ -134,7 +144,7 @@ function Stop-Owned($proc, $label, $timeoutSec = 20) {
     return @{ ok = $true; msg = $label + ": stopped exit=$code" }
   } catch { return @{ ok = $false; msg = $label + ": stop-fatal: " + $_.Exception.Message } }
 }
-function ValidDbName($db) { return ($db -match '^essentials_leg[0-9]_[a-z0-9_]+$') }
+function ValidDbName($db) { return ($db -match '^essentials_leg[0-9][a-z]?_[a-z0-9_]+$') }
 try {
   Step "root-config"
   foreach ($rel in @("SimCEO.sln", "server/SimCEO.Api/SimCEO.Api.csproj", "web/src/App.tsx", "server/SimCEO.Api/Work/Secretary.cs")) {
@@ -166,7 +176,7 @@ try {
   }
   Ok "owned-ports-free $ApiPort/$FakePort/$WebPort"
   $legList = @($Legs -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-  $supported = @("leg0", "leg1", "leg2", "leg3", "leg4", "leg5", "leg6", "leg7")
+  $supported = @("leg0", "leg1", "leg2", "leg3", "leg4", "leg4b", "leg5", "leg6", "leg7", "leg8")
   foreach ($l in $legList) { if ($supported -notcontains $l) { throw "unsupported leg '$l' (supported: $($supported -join ',')); nothing is deferred-silently" } }
   $needBackend = @($legList | Where-Object { $_ -ne "leg0" })
   Step "container-identity"
@@ -264,6 +274,7 @@ try {
     if (Test-Path $legDir) { throw "leg artifact dir already exists (refusing overwrite): $legDir" }
     New-Item -ItemType Directory -Force $legDir | Out-Null
     $legBaseEnv = @{ ESS_QA_PROJECTROOT = $ProjectRoot; ESS_QA_APPROOT = $Approot; ESS_QA_HEAD = $head; ESS_QA_DIRTY_HASH = $dirtyHash; ESS_QA_RUN_ID = $runId; ESS_QA_LEG = $leg; ESS_QA_CONTAINER_IDENT = (Join-Path $artRoot "container-ident.json"); ESS_QA_ARTIFACT_DIR = $legDir; ESS_QA_PUBLISH_DIR = $pubDir; ESS_QA_API_DLL = $dll; ESS_QA_API_DLL_HASH = $apiDllHash; ESS_QA_PG_DLL_HASH = $pgDllHash; QA_API = "http://127.0.0.1:$ApiPort"; QA_FAKE = "http://127.0.0.1:$FakePort"; QA_WEB = "http://127.0.0.1:$WebPort" }
+    if ($liveArmed -and $leg -eq "leg8") { $legBaseEnv["ESS_QA_LIVE"] = "1"; $legBaseEnv["META_API_KEY"] = $liveKey }
     if ($leg -eq "leg0") {
       $p0 = $null
       try {
@@ -286,6 +297,9 @@ try {
     if ($LASTEXITCODE -ne 0) { Bad $leg "create-db-failed"; continue }
     $script:ownedDb += $db
     $pgConn = "Host=127.0.0.1;Port=$PgPort;Database=$db;Username=simceo;Password=qa-only"
+    # Per-leg DB identity, bound AFTER $db exists for THIS leg (never stale).
+    $legBaseEnv["ESS_QA_DB"] = $db
+    $legBaseEnv["ESS_QA_PG_CONN"] = $pgConn
     if ($SelfManaged -contains $leg) {
       Ok ($leg + "-self-managed (runner owns DB only; leg owns its API generations)")
       $legProc = $null
@@ -315,6 +329,7 @@ try {
     $apiProc = $null; $fakeProc = $null; $webProc = $null; $legProc = $null
     try {
       $apiEnv = @{ ASPNETCORE_URLS = "http://127.0.0.1:$ApiPort"; META_API_BASE = "http://127.0.0.1:$FakePort"; META_API_KEY = "qa-dummy"; USE_POSTGRES = "1"; CONNECTIONSTRINGS__APP = $pgConn }
+      if ($liveArmed -and $leg -eq "leg8") { $apiEnv["META_API_KEY"] = $liveKey }
       $apiProc = Start-Owned "dotnet" @($dll) $pubDir $apiEnv $apiOut $apiErr
       Write-Output ("  api-pid=" + $apiProc.Id)
       $fakeProc = Start-Owned "node.exe" @("qa/essentials/helpers/essentials-fake.mjs", "--port", "$FakePort") $ProjectRoot @{} $fakeOut $fakeErr

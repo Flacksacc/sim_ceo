@@ -76,6 +76,23 @@ async function makeApprovedAdvisor(token, boardId, role, tag) {
   writeArt("loaded-assemblies.json", { apiDllSha256: apiDllHash, pgDllSha256: pgDllHash, readyStore: camel(r.json, "store"), backendMode: camel(b.json, "mode") });
   console.log("  info published-api-dll-sha256=" + apiDllHash);
   console.log("  info published-pg-dll-sha256=" + pgDllHash);
+  // Published-vs-LOADED identity via an actual process mechanism: exactly ONE
+  // live dotnet process executes the published DLL file (Win32 command line
+  // contains the exact published path). The port half of the binding is the
+  // leg's own HTTP traffic: every check in this leg went to 127.0.0.1:5142,
+  // which served /ready PG from that process. Never the JSON response hash.
+  {
+    const apiDll = process.env.ESS_QA_API_DLL_HASH ? (process.env.ESS_QA_API_DLL || "") : "";
+    let boundNote = "";
+    try {
+      const { execFileSync } = await import("node:child_process");
+      const ps = execFileSync("powershell.exe", ["-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='dotnet.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"], { windowsHide: true, timeout: 30000, encoding: "utf8" });
+      const hits = String(ps).split(/\r?\n/).filter((l) => apiDll !== "" && l.toLowerCase().includes(apiDll.toLowerCase()));
+      ctx.ok("api-process-bound", hits.length === 1, "live dotnet procs executing the published DLL: " + hits.length);
+      boundNote = hits.join(";").slice(0, 240);
+    } catch (e) { ctx.ok("api-process-bound", false, "process query failed: " + String((e && e.message) || e).slice(0, 160)); }
+    writeArt("loaded-binding.json", { dll: apiDll, bound: boundNote });
+  }
 }
 
 // --- auth: ownerA (admin-first), ownerB; secure contract, no private 200 leak ---

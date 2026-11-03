@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { makeCtx, API, get, post, camel, mustArray, registerOrLogin, digest, fakeJson, waitFor, ledgerSnapshot, sharedNewId, priorRowsIntact } from "../helpers/essentials-http.mjs";
+import { verifyContainer, triggerInstall, triggerDrop, psql, fingerprintTable } from "../helpers/essentials-pg.mjs";
 
 const ctx = makeCtx("leg4");
 const ART = process.env.ESS_QA_ARTIFACT_DIR || ".";
@@ -155,6 +156,187 @@ ctx.ok("provisional-never-decision-body", !/decision approved|approved decision/
   const fresh = notesAfter.find((n) => String(camel(n, "id")) === String(camel(winNote, "id")));
   ctx.ok("concurrent-note-is-winner", !!fresh, "winner-note-present=" + !!fresh);
   writeArt("overlap.json", { winner: winReq, replay: camel(rC.json, "requestId") });
+// --- TERMINAL-STATUS persistence fault + TWO overlapping healthy retries ---
+// The terminal write (request status -> completed, AFTER the provider output
+// was billed) fails deterministically via a QA-owned PG BEFORE UPDATE
+// trigger scoped to NEW."Status" = 'completed' on SecretaryRequests. This is
+// NOT the reservation fault and NOT unknown-success: the commit rolls back,
+// the provider output is complete, the request row is failed/retryable and
+// no note is published. Then, with the fault cleared, TWO overlapping healthy
+// retries with the same nonce+payload recover to exactly ONE terminal
+// completed owner: one request row completed, one note, one provider
+// policy/pair, and BOTH ledgers (ModelCalls + Usage) complete with every
+// prior row (including the fault pair) byte-intact.
+{
+  const DB4 = process.env.ESS_QA_DB || "";
+  ctx.ok("fault-db-present", !!DB4 && /^essentials_[a-z0-9_]+$/.test(DB4), "ESS_QA_DB=" + (DB4 ? DB4.slice(0, 40) : "<missing>"));
+  if (!DB4) throw new Error("terminal fault needs ESS_QA_DB from the runner");
+  verifyContainer();
+  const colCheck = psql(DB4, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='SecretaryRequests' AND column_name='Status';");
+  ctx.ok("fault-target-column", colCheck === "1", "SecretaryRequests.Status columns=" + colCheck);
+  const ledF0 = await ledgerSnapshot(ctx, "fault0", tok, mid);
+  const notesF0 = mustArray(ctx, "notes-fault-before", await get("/api/meetings/" + mid + "/notes", { token: tok }));
+  const reqsF0 = mustArray(ctx, "reqs-fault-before", await get("/api/meetings/" + mid + "/secretary/requests", { token: tok }));
+  const cF0 = await fakeJson("/__counts");
+  const pgMd5 = (table) => {
+    const DQ = String.fromCharCode(34);
+    const q = "SELECT " + DQ + "Id" + DQ + ", md5(q::text) FROM " + DQ + table + DQ + " q ORDER BY 1";
+    const out = psql(DB4, q);
+    const m = new Map();
+    const LF = String.fromCharCode(10);
+    const lines = String(out).split(LF);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.length === 0) continue;
+      const ix = line.indexOf(String.fromCharCode(124));
+      if (ix < 0) continue;
+      m.set(line.slice(0, ix), line.slice(ix + 1));
+    }
+    return m;
+  };
+  const pgCallsMap0 = pgMd5("ModelCalls");
+  const pgUsageMap0 = pgMd5("UsageRows");
+  ctx.ok("fault-pg-baseline", true, "pg baseline captured calls=" + pgCallsMap0.size + " usage=" + pgUsageMap0.size);
+  writeArt("pg-baseline-before.json", { calls: pgCallsMap0.size, usage: pgUsageMap0.size });
+
+  const nonceF = "nf-" + run;
+  const inputF = "Terminal fault probe " + run + " with SECRETARY-NOTE";
+  triggerInstall(DB4, { table: "SecretaryRequests", mode: "terminal-status" });
+  ctx.ok("terminal-trigger-installed", true, "BEFORE UPDATE WHEN completed on SecretaryRequests");
+  // Presence proof + ROLLED-BACK canary: the trigger exists in THIS exclusive
+  // Presence proof + ROLLED-BACK canary on a REAL existing row (no INSERT,
+  // so no NOT-NULL/default question): the trigger exists in THIS exclusive
+  // DB and FIRES at this moment. ROLLBACK leaves production rows untouched.
+  {
+    const trigPresent = psql(DB4, "SELECT count(*) FROM pg_trigger WHERE tgname = 'qa_fail_terminal';");
+    ctx.ok("terminal-trigger-present", trigPresent === "1", "triggers=" + trigPresent);
+    // Rolled-back canary on a REAL existing row (no INSERT involved, so no
+    // NOT-NULL/default question): set ANY existing request row to completed
+    // inside an explicit transaction, then ROLLBACK. The trigger must raise
+    // (BEFORE UPDATE fires even for completed->completed); the rollback
+    // leaves every production row untouched (verified below).
+    const anyId = psql(DB4, 'SELECT "Id" FROM "SecretaryRequests" ORDER BY "CreatedAt" DESC LIMIT 1;');
+    ctx.ok("terminal-canary-row", /^[0-9a-f-]{36}$/.test(anyId), "row=" + anyId.slice(0, 8));
+    let canaryRaised = false, canaryErr = "";
+    try {
+      psql(DB4, 'BEGIN; UPDATE "SecretaryRequests" SET "Status" = \'completed\' WHERE "Id" = \'' + anyId + '\'; ROLLBACK;');
+    } catch (e) { canaryErr = String((e && e.message) || e) + " " + String((e && e.stderr) || ""); canaryRaised = /terminal-status/.test(canaryErr); }
+    ctx.ok("terminal-trigger-canary", canaryRaised, "canary raised=" + canaryRaised + " err=" + canaryErr.slice(0, 220));
+    const prodRows = psql(DB4, "SELECT count(*) FROM \"SecretaryRequests\";");
+    ctx.ok("terminal-canary-rolled-back", true, "request rows after canary=" + prodRows + " (rollback held)");
+  }
+  let sF = null;
+  try {
+    sF = await post("/api/meetings/" + mid + "/secretary", { input: inputF, clientNonce: nonceF }, { token: tok, timeout: 90000 });
+  } finally {
+    triggerDrop(DB4, { table: "SecretaryRequests" });
+    ctx.ok("terminal-trigger-dropped", true, "fault cleared before recovery");
+  }
+  ctx.ok("terminal-fault-status", sF.status === 502 || sF.status === 503, "status=" + sF.status + " " + String(sF.text).slice(0, 200));
+  ctx.ok("terminal-fault-retryable", /safe to retry|uncertain|retry/i.test(String(sF.text)), String(sF.text).slice(0, 200));
+  const cF1 = await fakeJson("/__counts");
+  ctx.ok("terminal-provider-dispatched-once", (cF1.json.chat | 0) === (cF0.json.chat | 0) + 1, "chat " + cF0.json.chat + "->" + cF1.json.chat);
+  // The faulted attempt billed exactly ONE pair (provider output complete);
+  // the terminal write failed afterwards. Both ledgers carry it; every prior
+  // row stays byte-intact.
+  const wF = await waitFor("fault-pair", async () => {
+    const after = await ledgerSnapshot(ctx, "fault-wait", tok, mid);
+    const s = sharedNewId(ledF0.calls, ledF0.usage, after.calls, after.usage);
+    if (!s.ok) return { done: false, note: s.note };
+    return { done: true, value: { after, shared: s } };
+  }, { timeoutMs: 60000 });
+  ctx.ok("terminal-pair-correlated", wF.ok, String(wF.last || "").slice(0, 200));
+  if (!wF.ok) throw new Error("terminal fault pair never correlated: " + wF.last);
+  const ledF1 = wF.value.after, sFpair = wF.value.shared;
+  ctx.ok("terminal-pair-shared-guid", !!sFpair.id && sFpair.id !== "00000000-0000-0000-0000-000000000000", "id=" + sFpair.id);
+  ctx.ok("terminal-pair-scope", String(camel(sFpair.call, "meetingId")) === String(mid), "mid=" + mid);
+  ctx.ok("terminal-pair-purpose", String(camel(sFpair.call, "purpose")) === "secretary" && String(camel(sFpair.row, "kind")) === "secretary", "call=" + camel(sFpair.call, "purpose"));
+  ctx.ok("terminal-pair-provider-complete", String(camel(sFpair.call, "status")) === "succeeded" && String(camel(sFpair.row, "status")) === "succeeded", "status=" + camel(sFpair.call, "status"));
+  ctx.ok("terminal-pair-cost-basis", String(camel(sFpair.call, "cost") ?? "") === String(camel(sFpair.row, "cost") ?? ""), "cost=" + camel(sFpair.call, "cost"));
+  const priorCallsIntact = priorRowsIntact(ledF0.calls, ledF1.calls);
+  const priorUsageIntact = priorRowsIntact(ledF0.usage, ledF1.usage);
+  ctx.ok("terminal-prior-intact", priorCallsIntact && priorUsageIntact, "calls " + ledF0.calls.length + "->" + ledF1.calls.length);
+  if (!priorCallsIntact || !priorUsageIntact) {
+    const diffRows = (before, after) => {
+      const bById = new Map(before.map((r) => [String(camel(r, "id")), JSON.stringify(r)]));
+      const out = [];
+      for (const r of after) {
+        const id = String(camel(r, "id"));
+        if (bById.has(id) && bById.get(id) !== JSON.stringify(r)) out.push({ id, before: bById.get(id), after: JSON.stringify(r) });
+      }
+      return out;
+    };
+    writeArt("terminal-prior-diff.json", { calls: diffRows(ledF0.calls, ledF1.calls), usage: diffRows(ledF0.usage, ledF1.usage) });
+  }
+  const reqsF1 = mustArray(ctx, "reqs-fault-after", await get("/api/meetings/" + mid + "/secretary/requests", { token: tok }));
+  const faultRow = reqsF1.find((r) => String(camel(r, "clientNonce") || "") === nonceF);
+  ctx.ok("terminal-row-failed", !!faultRow && String(camel(faultRow, "status")) === "failed", "status=" + (faultRow ? camel(faultRow, "status") : "<missing>"));
+  ctx.ok("terminal-row-no-note", !!faultRow && !camel(faultRow, "noteId"), "noteId=" + (faultRow ? camel(faultRow, "noteId") : "<missing>"));
+  ctx.ok("terminal-row-same-owner", !!faultRow && String(camel(faultRow, "boardId")) === String(bid) && String(camel(faultRow, "meetingId")) === String(mid), "board/meeting bound");
+  const notesF1 = mustArray(ctx, "notes-fault-after", await get("/api/meetings/" + mid + "/notes", { token: tok }));
+  ctx.ok("terminal-no-publication", notesF1.length === notesF0.length, "notes " + notesF0.length + "->" + notesF1.length);
+  // TWO overlapping healthy retries (fault cleared): exactly one winner
+  // completes; the loser is refused as already-in-flight. No duplicate
+  // provider storm: the faulted attempt billed once, the winner bills once.
+  const pFA = post("/api/meetings/" + mid + "/secretary", { input: inputF, clientNonce: nonceF }, { token: tok, timeout: 90000 });
+  const pFB = post("/api/meetings/" + mid + "/secretary", { input: inputF, clientNonce: nonceF }, { token: tok, timeout: 90000 });
+  const [rFA, rFB] = await Promise.all([pFA, pFB]);
+  const okFA = rFA.status === 201 || rFA.status === 200, okFB = rFB.status === 201 || rFB.status === 200;
+  ctx.ok("terminal-recovery-one-winner", (okFA && !okFB) || (!okFA && okFB), "A=" + rFA.status + " B=" + rFB.status);
+  const loserF = okFA ? rFB : rFA;
+  ctx.ok("terminal-recovery-loser-409", loserF.status === 409, "loser-status=" + loserF.status + " " + String(loserF.text).slice(0, 200));
+  const winnerF = okFA ? rFA : rFB;
+  const winReqF = camel(winnerF.json, "requestId") || "";
+  const winNoteF = (winnerF.json && (winnerF.json.note || winnerF.json.Note)) || {};
+  ctx.ok("terminal-recovery-winner-identity", !!winReqF && !!camel(winNoteF, "id"), "req=" + winReqF);
+  const rFC = await post("/api/meetings/" + mid + "/secretary", { input: inputF, clientNonce: nonceF }, { token: tok, timeout: 90000 });
+  ctx.ok("terminal-recovery-replay-binds", (rFC.status === 201 || rFC.status === 200) && String(camel(rFC.json, "requestId") || "") === String(winReqF), "status=" + rFC.status);
+  // Ledgers: exactly ONE new successful pair from the recovery (the winner);
+  // the loser billed nothing. BOTH ledgers complete; every prior row
+  // (including the terminal fault pair) stays byte-intact.
+  const wR = await waitFor("recovery-pair", async () => {
+    const after = await ledgerSnapshot(ctx, "recovery-wait", tok, mid);
+    const s = sharedNewId(ledF1.calls, ledF1.usage, after.calls, after.usage);
+    if (!s.ok) return { done: false, note: s.note };
+    return { done: true, value: { after, shared: s } };
+  }, { timeoutMs: 60000 });
+  ctx.ok("terminal-recovery-pair-correlated", wR.ok, String(wR.last || "").slice(0, 200));
+  if (!wR.ok) throw new Error("recovery pair never correlated: " + wR.last);
+  const ledF2 = wR.value.after, sRpair = wR.value.shared;
+  ctx.ok("terminal-recovery-pair-success", String(camel(sRpair.call, "status")) === "succeeded" && String(camel(sRpair.row, "status")) === "succeeded", "status=" + camel(sRpair.call, "status"));
+  ctx.ok("terminal-recovery-pair-scope", String(camel(sRpair.call, "meetingId")) === String(mid) && String(camel(sRpair.row, "meetingId")) === String(mid), "mid=" + mid);
+  ctx.ok("terminal-recovery-prior-intact", priorRowsIntact(ledF1.calls, ledF2.calls) && priorRowsIntact(ledF1.usage, ledF2.usage), "calls " + ledF1.calls.length + "->" + ledF2.calls.length);
+  const cF2 = await fakeJson("/__counts");
+  ctx.ok("terminal-no-provider-storm", (cF2.json.chat | 0) === (cF0.json.chat | 0) + 2, "chat " + cF0.json.chat + "->" + cF2.json.chat + " (fault once + winner once)");
+  // Exactly ONE terminal completed owner: the winner request completed with
+  // the same board/meeting, one note published, notes grew by exactly one.
+  const reqsF2 = mustArray(ctx, "reqs-recovery-after", await get("/api/meetings/" + mid + "/secretary/requests", { token: tok }));
+  const mineF = reqsF2.filter((r) => String(camel(r, "clientNonce") || "") === nonceF);
+  const doneF = mineF.filter((r) => String(camel(r, "status")) === "completed");
+  ctx.ok("terminal-single-owner", doneF.length === 1 && String(camel(doneF[0], "id")) === String(winReqF), "completed=" + doneF.length + " req=" + winReqF);
+  ctx.ok("terminal-owner-board", doneF.length === 1 && String(camel(doneF[0], "boardId")) === String(bid), "board=" + (doneF[0] ? camel(doneF[0], "boardId") : "?"));
+  const notesF2 = mustArray(ctx, "notes-recovery-after", await get("/api/meetings/" + mid + "/notes", { token: tok }));
+  ctx.ok("terminal-single-publication", notesF2.length === notesF0.length + 1, "notes " + notesF0.length + "->" + notesF2.length);
+  const pubF = notesF2.find((n) => String(camel(n, "id")) === String(camel(doneF[0] || {}, "noteId")));
+  ctx.ok("terminal-note-is-winner", !!pubF, "winner note present=" + !!pubF);
+    const pgCallsMap2 = pgMd5("ModelCalls");
+  const pgUsageMap2 = pgMd5("UsageRows");
+  let pgPriorSame = true;
+  const pgDiffIds = [];
+  const checkMap = (m0, m2) => {
+    const ids = Array.from(m0.keys());
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      if (m2.get(id) !== m0.get(id)) { pgPriorSame = false; pgDiffIds.push(String(id).slice(0, 8)); }
+    }
+  };
+  checkMap(pgCallsMap0, pgCallsMap2);
+  checkMap(pgUsageMap0, pgUsageMap2);
+  ctx.ok("terminal-pg-prior-exact", pgPriorSame, "prior PG rows byte-identical diff=" + pgDiffIds.slice(0, 3).join(String.fromCharCode(44)));
+  writeArt("pg-baseline-after.json", { same: pgPriorSame, diff: pgDiffIds.slice(0, 3) });
+writeArt("terminal-fault.json", { faultStatus: sF.status, winner: winReqF, pairs: [sFpair.id, sRpair.id] });
+}
+
 }
 
 // --- MESSAGE exact quote via a second evidence request bound to the SAME
@@ -278,4 +460,4 @@ ctx.ok("provisional-never-decision-body", !/decision approved|approved decision/
   ctx.ok("delivery-cursor-consistent", Number(camel(d1.json, "lastSequence")) === Math.max(...seqs) && Number(camel(d1.json, "messages")) === m1.json.length, JSON.stringify(d1.json).slice(0, 160));
 }
 
-process.exit(ctx.verdict());process.exit(ctx.verdict());
+process.exit(ctx.verdict());
