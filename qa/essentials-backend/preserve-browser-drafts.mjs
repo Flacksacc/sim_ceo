@@ -157,7 +157,7 @@ function isNonAppTarget(entry, origin) {
 const ORIGIN_PROBE = "(() => ({ href: String(location.href), origin: String(location.origin) }))()";
 
 // Readonly draft capture. No mutation, no events, no navigation. Full exact
-// draft/recovery key names + full values and full visible nonsecret field
+// draft/recovery key names (incl. Secretary sec-envelope:/sec-answer-envelope:/sec-submit:/sec-pending: and simceo-draft:/simceo-wizard:) + full values and full visible nonsecret field
 // values; bounded by key/field counts plus a shared total-char budget with
 // fail-closed incomplete reporting (never silently drops keys/fields).
 // Query AND hash parameters are sanitized: only the pre-existing safe set is
@@ -165,7 +165,8 @@ const ORIGIN_PROBE = "(() => ({ href: String(location.href), origin: String(loca
 const DRAFT_CAPTURE = `(() => {
   const SAFE_PARAMS = new Set(["boardId","board","meetingId","meeting","recordId","record","step","tab","view"]);
   const SECRET_RE = /token|session|api[_-]?key|apikey|secret|password|auth|credential|bearer|code|state/i;
-  const DRAFT_RE = /draft|recover|unsent|autosave|auto-save|backup/i;
+  const APP_KEY_RE = /^(sec-envelope:|sec-answer-envelope:|sec-submit:|sec-pending:|simceo-draft:|simceo-wizard:)/;
+  const DRAFT_RE = /draft|recover|unsent|autosave|auto-save|backup|sec-envelope:|sec-answer-envelope:|sec-submit:|sec-pending:|simceo-draft:|simceo-wizard:/i;
   const SECRET_KEY_RE = /token|session|api[_-]?key|apikey|credential|secret|auth|password|bearer|simceo-token/i;
   const SECRET_FIELD_RE = /token|api[_-]?key|apikey|secret|password|passwd|pwd|auth|credential|session|bearer/i;
   const out = { url: "", route: "", paramsKept: {}, paramsDropped: 0,
@@ -173,8 +174,8 @@ const DRAFT_CAPTURE = `(() => {
     incomplete: false, incompleteReason: "", totalChars: 0, draftMatchCount: 0, fieldMatchCount: 0 };
   const markIncomplete = (reason) => { out.incomplete = true; if (!out.incompleteReason) out.incompleteReason = reason; };
   let pathName = "";
-  try { out.url = String(location.origin) + String(location.pathname); } catch {}
-  try { pathName = String(location.pathname || ""); } catch {}
+  try { out.url = String(location.origin) + String(location.pathname); } catch { markIncomplete("location-read-error"); }
+  try { pathName = String(location.pathname || ""); } catch { markIncomplete("location-read-error"); }
   const keepSafe = (sp) => {
     for (const kv of sp) {
       const k = kv[0], v = kv[1];
@@ -215,13 +216,14 @@ const DRAFT_CAPTURE = `(() => {
       cleanHash = hPath + (kept.length ? "?" + kept.join("&") : "");
     }
   } catch {}
-  try { out.route = (String(pathName || "") + String(cleanHash || "")).slice(0, ${MAX_ROUTE_CHARS}); } catch {}
+  try { out.route = (String(pathName || "") + String(cleanHash || "")).slice(0, ${MAX_ROUTE_CHARS}); } catch { markIncomplete("route-read-error"); }
   try {
     const keys = Object.keys(localStorage || {});
     out.storageScanned = keys.length;
     const matched = [];
     for (const k of keys) {
       if (!DRAFT_RE.test(k)) continue;
+      if (APP_KEY_RE.test(k)) { matched.push(String(k)); continue; }
       if (SECRET_KEY_RE.test(k)) { out.storageSkippedSecret++; continue; }
       matched.push(String(k));
     }
@@ -230,13 +232,13 @@ const DRAFT_CAPTURE = `(() => {
     const take = matched.slice(0, ${MAX_STORAGE_KEYS});
     for (const k of take) {
       let raw = "";
-      try { raw = localStorage.getItem(k) ?? ""; } catch { continue; }
+      try { raw = localStorage.getItem(k) ?? ""; } catch { markIncomplete("storage-read-error"); continue; }
       const full = String(raw);
       if ((out.totalChars + full.length) > ${MAX_TOTAL_CAPTURE_CHARS}) { markIncomplete("total-capture-limit-storage"); break; }
       out.totalChars += full.length;
       out.storageKeys.push({ k: k, len: full.length, truncated: false, preview: full });
     }
-  } catch {}
+  } catch { markIncomplete("storage-enumeration-error"); }
   try {
     const els = document.querySelectorAll("textarea, input, select, [contenteditable='true'], [contenteditable='']");
     out.fieldScanned = els.length;
@@ -250,7 +252,7 @@ const DRAFT_CAPTURE = `(() => {
       const aria = String(el.getAttribute ? (el.getAttribute("aria-label") || "") : "");
       if (SECRET_FIELD_RE.test(id + " " + name + " " + ph + " " + aria)) continue;
       let r = null;
-      try { r = el.getBoundingClientRect(); } catch {}
+      try { r = el.getBoundingClientRect(); } catch { markIncomplete("field-measure-error"); }
       if (!r || (!(r.width || r.height))) continue;
       let label = aria || ph || name || id || tag;
       try {
@@ -267,7 +269,7 @@ const DRAFT_CAPTURE = `(() => {
           val = (el.checked ? "checked:" : "unchecked:") + String(el.value || "on");
         } else if (el.isContentEditable) { val = String(el.textContent || ""); }
         else { val = String(el.value ?? ""); }
-      } catch {}
+      } catch { markIncomplete("field-read-error"); }
       if (!val) continue;
       cands.push({ kind: String(kind).slice(0, 32), label: label, val: String(val) });
     }
@@ -280,7 +282,7 @@ const DRAFT_CAPTURE = `(() => {
       out.totalChars += full.length;
       out.fields.push({ kind: c.kind, label: c.label, len: full.length, truncated: false, preview: full });
     }
-  } catch {}
+  } catch { markIncomplete("dom-capture-error"); }
   return out;
 })()`;
 
@@ -352,7 +354,7 @@ const payload = {
     maxTotalCaptureChars: MAX_TOTAL_CAPTURE_CHARS, maxTotalJsonChars: MAX_TOTAL_JSON_CHARS,
     maxRouteChars: MAX_ROUTE_CHARS,
     httpTimeoutMs: HTTP_TIMEOUT_MS, wsTimeoutMs: WS_TIMEOUT_MS, evalTimeoutMs: EVAL_TIMEOUT_MS },
-  note: "Scoped human draft/recovery backup only: full exact nonsecret draft/recovery keys+values and visible unsent field values; credential/token/session/API-key keys and secret fields excluded at capture; query+hash sanitized to safe board/meeting/record/step/tab/view params only (raw hash never stored); non-app/newtab targets skipped; total capture bounded with fail-closed incomplete reporting. Run only against operator-owned loopback :5173/:5174 pages.",
+  note: "Scoped human draft/recovery backup only: full exact nonsecret draft/recovery keys+values (incl. Secretary sec-envelope:/sec-answer-envelope:/sec-submit:/sec-pending: and simceo-draft:/simceo-wizard:) and visible unsent field values; credential/token/session/API-key keys and secret fields excluded at capture; query+hash sanitized to safe board/meeting/record/step/tab/view params only (raw hash never stored); non-app/newtab targets skipped; total capture bounded with fail-closed incomplete reporting. Run only against operator-owned loopback :5173/:5174 pages.",
   requireAppCapture: true,
   skippedNonAppCount: skippedNonApp.length,
   incompleteCount: results.filter((r) => r.status === "incomplete-capture").length,
