@@ -1187,21 +1187,31 @@ public static class BackupGraphValidator
     // parent/cycle, snapshot declared-ref/approved/version/dedup, scope IDs/hash/state. The legacy inline
     // loop (which demanded SupersedesJson OBJECTS while healthy amend writes STRING ids) is REPLACED here,
     // not stacked: this call is the only record-graph gate before destructive replacement.
-    var sourceOriginals = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-    foreach (var xs in r.sources)
-    {
-      if (xs is null || xs.Id == Guid.Empty) continue;
-      var best = xs.Version; var found = false;
-      foreach (var ee in r.events ?? Enumerable.Empty<Domain.SourceEvent>())
-      {
-        if (ee is null || ee.SourceId != xs.Id || !string.Equals(ee.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)) continue;
-        var det = ee.Detail ?? ""; var arrow = det.IndexOf("->", StringComparison.Ordinal);
-        if (arrow <= 1) continue;
-        if (int.TryParse(det.Substring(0, arrow).Trim().TrimStart('v', 'V'), out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
-      }
-      sourceOriginals[xs.Id.ToString()] = found ? best : xs.Version;
-    }
-    var recordErr = RecordsOps.ValidateRestoreEntries(r.drafts, sourceOriginals);
+    // Staged source-version maps (F3/P1): built from the staged graph's own
+    // sources+migrate-version events+heads via the shared helper, so alias and
+    // canonical validation reflect actual staged provenance, never caller invention.
+    var (sourceOriginals, sourceCanonicals) = RecordsOps.BuildSourceVersionMaps(
+      r.sources ?? Enumerable.Empty<Domain.SourceDoc>(),
+      r.events ?? Enumerable.Empty<Domain.SourceEvent>(),
+      r.heads ?? Enumerable.Empty<Domain.SourceFamilyHead>());
+    // Controlled old-schema legacy-marker import (F2/P1): pre-marker backups (version<4)
+    // carry no LegacyReview property, so missing (null) markers become true ONLY where
+    // the recognized old prehistory shape and genuine base contract validate. Modern v4
+    // exports always carry an explicit marker, so a wiped v4 row retains null/false and
+    // fails closed below. No decisions or history are invented.
+    if (r.drafts is not null) RecordsOps.ApplyLegacyMarkerBackfill(r.drafts, r.version);
+    // Adoptability tokens for newly marked legacy rows (F2/P1): the existing fresh-review
+    // and copy workflows match on the review token, so a backfilled legacy row with a blank
+    // token would be unreviewable. Assign the deterministic boot-style legacy token ONLY to
+    // just-marked rows that still lack one; user bytes, hashes, decisions, and history are
+    // untouched, and modern rows (explicit marker or non-blank history) never match.
+    if (r.drafts is not null)
+      foreach (var ld in r.drafts)
+        if (ld is not null && ld.LegacyReview == true && string.IsNullOrWhiteSpace(ld.ReviewToken)
+          && ld.ReviewRevision <= 1 && RecordsOps.IsBlankJsonArray(ld.HistoryJson)
+          && RecordsOps.IsBlankJsonArray(ld.EvidenceSnapshotJson))
+          ld.ReviewToken = RecordsOps.LegacyReviewToken(ld.Id, ld.Version, ld.Hash ?? "");
+    var recordErr = RecordsOps.ValidateRestoreEntries(r.drafts, sourceOriginals, sourceCanonicals);
     if (recordErr is not null) return recordErr;
     // Effective binaries must decode before any live mutation: malformed base64 rejects (no silent Data=null loss).
     if (r.blobs is not null)

@@ -39,6 +39,9 @@ public static partial class RecordsOps
         foreach (var r in refs.EnumerateArray())
         {
           if (r.ValueKind != JsonValueKind.Object) { error = "Draft item '" + id + "' ref must be an object."; return false; }
+          // Write-time typed gate (F6): the shared scalar contract applies at write,
+          // so a shape rejected by exports/resolver is rejected at publication too.
+          if (!RefScalarValid(r, out var scalarErr)) { error = "Draft item `" + id + "` ref is malformed (" + scalarErr + ")."; return false; }
           var parsedRef = EvidenceRef.Parse(r);
           if (parsedRef is null) { error = "Draft item '" + id + "' carries an invalid evidence ref."; return false; }
           foreach (var meta in new[] { "url", "title", "excerpt" })
@@ -64,22 +67,41 @@ public static partial class RecordsOps
     return true;
   }
 
-  // Shared actual-consumer ref/scalar validation (F6): BOTH export modes and the resolver reject the same
-  // malformed ref shapes. Non-array refs, non-object entries, and numeric kind/ref/id/version properties
-  // fail closed with no failopen partial render. Semantic validity (unknown kinds, fractional versions,
-  // stale pins) stays with EvidenceRef.Parse and the resolver; stored bytes are never erased.
+  // Shared actual-consumer ref/scalar validation (F6): BOTH export modes, the resolver,
+  // readability gate, and the write validator reject the same malformed ref shapes.
+  // Non-array refs, non-object entries, non-string scalars, and non-positive-integer
+  // versions fail closed with no failopen partial render. The version rule matches
+  // EvidenceRef.Parse (null/absent or positive integer); fractional/zero/negative or
+  // non-numeric versions invalidate the whole export. Stored bytes are never erased.
+  // Singular typed gate for ONE ref object: shared by the array gate below and the
+  // write-time draft validator, so publication and reads enforce identical shapes.
+  public static bool RefScalarValid(JsonElement r, out string error)
+  {
+    error = "";
+    if (r.ValueKind != JsonValueKind.Object) { error = "ref must be an object."; return false; }
+    if (r.TryGetProperty("kind", out var rk) && rk.ValueKind != JsonValueKind.String && rk.ValueKind != JsonValueKind.Null) { error = "ref kind must be a string."; return false; }
+    if (r.TryGetProperty("ref", out var rr) && rr.ValueKind != JsonValueKind.String && rr.ValueKind != JsonValueKind.Null) { error = "ref ref must be a string."; return false; }
+    if (r.TryGetProperty("id", out var ri) && ri.ValueKind != JsonValueKind.String && ri.ValueKind != JsonValueKind.Null) { error = "ref id must be a string."; return false; }
+    foreach (var meta in new[] { "url", "title", "excerpt", "sectionId", "location", "contentHash" })
+    {
+      if (r.TryGetProperty(meta, out var mv) && mv.ValueKind != JsonValueKind.String && mv.ValueKind != JsonValueKind.Null) { error = "ref field `" + meta + "` must be a string."; return false; }
+    }
+    if (r.TryGetProperty("version", out var rv) && rv.ValueKind != JsonValueKind.Null)
+    {
+      if (rv.ValueKind != JsonValueKind.Number || !rv.TryGetInt32(out var vi) || vi < 1) { error = "ref version must be a positive integer."; return false; }
+    }
+    if (r.TryGetProperty("indexGeneration", out var ig) && ig.ValueKind != JsonValueKind.Null)
+    {
+      if (ig.ValueKind != JsonValueKind.Number || !ig.TryGetInt32(out _)) { error = "ref indexGeneration must be an integer."; return false; }
+    }
+    return true;
+  }
   public static bool RefScalarsValid(JsonElement refs, out string error)
   {
     error = "";
     if (refs.ValueKind != JsonValueKind.Array) { error = "refs must be an array."; return false; }
     foreach (var r in refs.EnumerateArray())
-    {
-      if (r.ValueKind != JsonValueKind.Object) { error = "ref must be an object."; return false; }
-      if (r.TryGetProperty("kind", out var rk) && rk.ValueKind != JsonValueKind.String && rk.ValueKind != JsonValueKind.Null) { error = "ref kind must be a string."; return false; }
-      if (r.TryGetProperty("ref", out var rr) && rr.ValueKind != JsonValueKind.String && rr.ValueKind != JsonValueKind.Null) { error = "ref ref must be a string."; return false; }
-      if (r.TryGetProperty("id", out var ri) && ri.ValueKind != JsonValueKind.String && ri.ValueKind != JsonValueKind.Null) { error = "ref id must be a string."; return false; }
-      if (r.TryGetProperty("version", out var rv) && rv.ValueKind != JsonValueKind.Number && rv.ValueKind != JsonValueKind.Null) { error = "ref version must be a number."; return false; }
-    }
+      if (!RefScalarValid(r, out error)) return false;
     return true;
   }
 
@@ -108,6 +130,7 @@ public static partial class RecordsOps
     // Whole-graph field validation BEFORE any render decision (F6): every item (approved or not) must
     // carry well-typed id/text/detail/status/scope and well-typed ref scalars. A malformed UNAPPROVED item
     // fails the whole export closed instead of being silently skipped. Stored bytes are never erased.
+    var itemIds = new HashSet<string>(StringComparer.Ordinal);
     foreach (var el in items.RootElement.EnumerateArray())
     {
       if (el.ValueKind != JsonValueKind.Object) return "";
@@ -118,8 +141,14 @@ public static partial class RecordsOps
         if (el.TryGetProperty(opt, out var pov) && pov.ValueKind != JsonValueKind.String) return "";
       }
       if (el.TryGetProperty("refs", out var prf) && !RefScalarsValid(prf, out _)) return "";
+      itemIds.Add(pi.GetString()!);
     }
+    // Approval-to-item correspondence (F6): a ghost approved id (no draft item)
+    // fails the whole export closed instead of silently rendering nothing.
+    foreach (var aid in ok)
+      if (!itemIds.Contains(aid)) return "";
     var sb = new StringBuilder();
+    var anyApprovedText = false;
     foreach (var el in items.RootElement.EnumerateArray())
     {
       if (el.ValueKind != JsonValueKind.Object) return "";
@@ -128,6 +157,7 @@ public static partial class RecordsOps
       if (!ok.Contains(id)) continue;
       if (!el.TryGetProperty("text", out var t) || t.ValueKind != JsonValueKind.String) return "";
       var text = t.GetString() ?? "";
+      if (!string.IsNullOrWhiteSpace(text)) anyApprovedText = true;
       sb.AppendLine("- [" + id + "] " + text);
       if (detailed)
       {
@@ -144,7 +174,9 @@ public static partial class RecordsOps
           var bits = new List<string>();
           foreach (var r in rf.EnumerateArray())
           {
-            if (EvidenceRef.Parse(r) is { } er) bits.Add(er.Kind + ":" + er.Ref);
+            // Detailed mode fails closed on unparseable declared refs (F6): a fractional
+            // version or unknown shape never silently drops while the item text renders.
+            var per = EvidenceRef.Parse(r); if (per is null) return ""; bits.Add(per.Kind + ":" + per.Ref);
           }
           if (bits.Count > 0) sb.AppendLine("  refs: " + string.Join(", ", bits));
         }
@@ -156,6 +188,9 @@ public static partial class RecordsOps
         if (el.TryGetProperty("refs", out var rf2) && !RefScalarsValid(rf2, out _)) return "";
       }
     }
+    // Empty approved text (F6): approved items with no approved text never yield
+    // an available card. The marker-only row "- [g1] " is controlled unavailable output.
+    if (!anyApprovedText) return "";
     return sb.ToString();
     }
     catch (InvalidOperationException) { return ""; }
@@ -199,9 +234,9 @@ public static partial class RecordsOps
 
   public static bool IsReadableItems(string itemsJson)
   {
-    // Strict readability: every element must be an object with string id/text.
-    // Malformed (numeric/missing) items fail closed to unavailable cards and
-    // never reach BuildExport failopen. Legacy healthy arrays still pass.
+    // Strict readability (F6): every element must be an object with string id/text,
+    // string optional scalars, and well-typed ref scalars (shared gate). Malformed
+    // (numeric/missing) items fail closed to unavailable cards. Legacy healthy arrays pass.
     try
     {
       using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(itemsJson) ? "[]" : itemsJson);
@@ -211,6 +246,11 @@ public static partial class RecordsOps
         if (el.ValueKind != JsonValueKind.Object) return false;
         if (!el.TryGetProperty("id", out var iv) || iv.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(iv.GetString())) return false;
         if (!el.TryGetProperty("text", out var tv) || tv.ValueKind != JsonValueKind.String) return false;
+        foreach (var opt in new[] { "detail", "status", "scope" })
+        {
+          if (el.TryGetProperty(opt, out var ov) && ov.ValueKind != JsonValueKind.String) return false;
+        }
+        if (el.TryGetProperty("refs", out var rf) && !RefScalarsValid(rf, out _)) return false;
       }
       return true;
     }
@@ -418,7 +458,7 @@ public static partial class RecordsOps
     foreach (var id in dc)
       if (!map.ContainsKey(id)) { error = "Discarded id '" + id + "' has no draft item; explicit repair required."; return false; }
     if (ap.Any(id => dc.Contains(id, StringComparer.Ordinal))) { error = "Decision state overlaps; explicit repair required."; return false; }
-    if (string.IsNullOrWhiteSpace(d.HistoryJson)) { error = "Decision history is blank; explicit repair required."; return false; }
+    if (IsBlankJsonArray(d.HistoryJson)) { error = "Decision history is blank; explicit repair required."; return false; }
     if (!StrictHistoryEntries(d.HistoryJson, out var herr)) { error = herr; return false; }
     if (string.IsNullOrWhiteSpace(d.SupersedesJson)) { error = "Supersedes state is blank; explicit repair required."; return false; }
     if (!StrictSupersedesEntries(d.SupersedesJson, d.Id, out var serr)) { error = serr; return false; }
@@ -497,9 +537,18 @@ public static partial class RecordsOps
       using var h = JsonDocument.Parse(historyJson);
       if (h.RootElement.ValueKind != JsonValueKind.Array) { error = "Decision history is malformed; explicit repair required."; return false; }
       var lastSeq = 0;
+      // Revision monotonicity (F2): writers emit the resulting review revision per
+      // entry, so healthy histories never regress. A jump-ahead-then-regress forgery
+      // fails here even when the final tip matches the row.
+      var lastRev = 0;
       foreach (var e in h.RootElement.EnumerateArray())
       {
         if (!TryParseHistoryEntry(e, out var eerr)) { error = eerr; return false; }
+        if (e.TryGetProperty("revision", out var erv) && erv.ValueKind == JsonValueKind.Number && erv.TryGetInt32(out var eri))
+        {
+          if (eri < lastRev) { error = "Decision history revision regressed; explicit repair required."; return false; }
+          lastRev = eri;
+        }
         if (e.TryGetProperty("seq", out var sq) && sq.ValueKind == JsonValueKind.Number && sq.TryGetInt32(out var si))
         {
           if (si != lastSeq + 1) { error = "Decision history sequence must ascend without gaps; explicit repair required."; return false; }
@@ -613,7 +662,7 @@ public static partial class RecordsOps
   // available; a requested version pin must equal the entry version or a genuine original-version source alias
   // (requested1/resolved3 valid, unrelated999 rejected). Reads stay lenient; replace-time validation is strict.
   public static bool SnapshotRestoreCheck(Dictionary<string, JsonElement> map, HashSet<string> approved,
-    List<EvidenceSnapshot> snaps, IDictionary<string, int>? sourceOriginalOf, out string error)
+    List<EvidenceSnapshot> snaps, IDictionary<string, int>? sourceOriginalOf, IDictionary<string, int>? sourceCanonicalOf, out string error)
   {
     error = "";
     var seenKey = new HashSet<string>(StringComparer.Ordinal);
@@ -650,17 +699,23 @@ public static partial class RecordsOps
       }
       if (!hasRef)
       { error = "Backup record snapshot ref `" + sn.Kind + ":" + sn.Ref + "` has no declared item ref."; return false; }
-      // Requested/version correspondence: unpinned declarations accept the captured version; pinned ones
-      // must equal the entry version or a genuine same-source original-version alias.
+      // Requested/version correspondence (F3): unpinned declarations accept the captured version; pinned ones
+      // must equal the entry version or a genuine validated alias of that source's ACTUAL mapping: the declared
+      // pin must equal the source's recorded ORIGINAL version AND the capture must equal its CANONICAL version
+      // (requested-v1/resolved-v3 valid only for that source's real orig-1/canon-3 pair; requested-1/captured-999
+      // and null/wrong/duplicate/undeclared/unapproved captures reject). Both maps are built from the staged
+      // graph's own sources+migrate-version events+heads (the shared BuildSourceVersionMaps helper), never
+      // caller-invented: a forged alias without a real event falls back to canonical and fails the pin.
       if (declaredPins.Count > 0 && !(sn.Version.HasValue && declaredPins.Contains(sn.Version.Value)))
       {
         var aliasOk = false;
-        if (string.Equals(sn.Kind, "source", StringComparison.OrdinalIgnoreCase) && sourceOriginalOf is not null)
+        if (string.Equals(sn.Kind, "source", StringComparison.OrdinalIgnoreCase) && sourceOriginalOf is not null && sourceCanonicalOf is not null)
         {
           try
           {
-            if (sourceOriginalOf.TryGetValue(sn.Ref, out var orig))
-              foreach (var pin in declaredPins) if (pin == orig) { aliasOk = true; break; }
+            if (sourceOriginalOf.TryGetValue(sn.Ref, out var orig) && sourceCanonicalOf.TryGetValue(sn.Ref, out var canon))
+              foreach (var pin in declaredPins)
+                if (pin == orig && sn.Version == canon && canon >= orig && orig >= 1) { aliasOk = true; break; }
           }
           catch { aliasOk = false; }
         }
@@ -673,6 +728,132 @@ public static partial class RecordsOps
     return true;
   }
 
+  // Shared staged source-version map builder (F3/P1 contract). Both maps derive from
+  // the STAGED graph's own rows: original = min migrate-version from-version for the
+  // source (fallback: the staged current version, never an alias); canonical = the
+  // staged head pin for the source's family when positive, else the staged family max.
+  // Ops restore and QA build both maps with this helper, so a forged alias (pin 1
+  // with no real migrate event) falls back to canonical and fails the declared pin.
+  public static (Dictionary<string, int> OriginalOf, Dictionary<string, int> CanonicalOf) BuildSourceVersionMaps(
+    IEnumerable<Domain.SourceDoc> sources, IEnumerable<Domain.SourceEvent> events, IEnumerable<Domain.SourceFamilyHead> heads)
+  {
+    var srcList = sources.Where(x => x is not null && x.Id != Guid.Empty).ToList();
+    var evtList = (events ?? Enumerable.Empty<Domain.SourceEvent>()).Where(x => x is not null).ToList();
+    var headList = (heads ?? Enumerable.Empty<Domain.SourceFamilyHead>()).Where(x => x is not null).ToList();
+    var orig = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    foreach (var xs in srcList)
+    {
+      var best = xs.Version; var found = false;
+      foreach (var ee in evtList)
+      {
+        if (ee.SourceId != xs.Id || !string.Equals(ee.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)) continue;
+        var det = ee.Detail ?? ""; var arrow = det.IndexOf("->", StringComparison.Ordinal);
+        if (arrow <= 1) continue;
+        if (int.TryParse(det.Substring(0, arrow).Trim().TrimStart('v', 'V'), out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
+      }
+      orig[xs.Id.ToString()] = found ? best : xs.Version;
+    }
+    var famMax = new Dictionary<string, int>(StringComparer.Ordinal);
+    foreach (var xs in srcList)
+    {
+      var fk = xs.BoardId.ToString("N") + "|" + (xs.FamilyKey ?? "");
+      famMax[fk] = famMax.TryGetValue(fk, out var mm) ? Math.Max(mm, xs.Version) : xs.Version;
+    }
+    var canon = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    foreach (var xs in srcList)
+    {
+      var fk = xs.BoardId.ToString("N") + "|" + (xs.FamilyKey ?? "");
+      var pin = headList.Where(h => h.BoardId == xs.BoardId && string.Equals(h.FamilyKey ?? "", xs.FamilyKey ?? "", StringComparison.Ordinal) && h.HeadVersion > 0).Select(h => (int?)h.HeadVersion).FirstOrDefault();
+      canon[xs.Id.ToString()] = pin ?? (famMax.TryGetValue(fk, out var fm) ? fm : xs.Version);
+    }
+    return (orig, canon);
+  }
+  // Whitespace-robust blank JSON array test (F2/P1): null, empty, "[]", and "[ ]" all
+  // count as blank. Malformed JSON is NOT blank (it fails closed downstream).
+  // Public for the PG boot backfill (same worktree, narrow provenance use).
+  public static bool IsBlankJsonArray(string? json)
+  {
+    if (string.IsNullOrWhiteSpace(json)) return true;
+    try
+    {
+      using var dd = JsonDocument.Parse(json);
+      return dd.RootElement.ValueKind == JsonValueKind.Array && dd.RootElement.GetArrayLength() == 0;
+    }
+    catch (JsonException) { return false; }
+  }
+  // Narrow persisted legacy-review provenance (F2/P1): genuine pre-review rows
+  // predate history/snapshot capture entirely (blank history AND blank snapshots
+  // on a never-mutated row, ReviewRevision<=1). Modern writers ALWAYS append
+  // history on create and every decision, so a null/false marker with blank
+  // history is a wiped or forged modern row, never legacy. Revision<=1 alone is
+  // NOT proof of legacy: a modern new no-ref row is naturally rev1 with empty
+  // snapshots, so only the persisted marker admits the legacy path.
+  public static bool IsLegacyPrehistoryShape(RecordDraft d)
+  {
+    if (d is null) return false;
+    return IsBlankJsonArray(d.HistoryJson) && IsBlankJsonArray(d.EvidenceSnapshotJson) && d.ReviewRevision <= 1;
+  }
+  // Genuine legacy base contract (no blanket accept): typed items/decisions with
+  // approved/discarded membership and no overlap, well-formed supersedes entries,
+  // a legal version, content hash equal to items, and a known status. Lifecycle
+  // coherence (status/decided vs pending) is deliberately NOT required: genuine
+  // old rows (e.g. approved-with-pending) predate the modern decided contract and
+  // stay inert readonly. Returns an error string or null when the base is genuine.
+  public static string? LegacyBaseError(RecordDraft d)
+  {
+    if (d is null) return "Backup record draft is null.";
+    var map = ItemMap(d.ItemsJson, out var mapErr);
+    if (mapErr != "") return "Backup record draft items malformed (" + mapErr + ").";
+    if (!TryStrictIdList(d.ApprovedJson, out var ap, out var ae)) return "Backup record draft ApprovedJson malformed (" + ae + ").";
+    if (!TryStrictIdList(d.DiscardedJson, out var dc, out var de)) return "Backup record draft DiscardedJson malformed (" + de + ").";
+    foreach (var id in ap) if (!map.ContainsKey(id)) return "Backup record draft approved id has no draft item.";
+    foreach (var id in dc) if (!map.ContainsKey(id)) return "Backup record draft discarded id has no draft item.";
+    var apSet = new HashSet<string>(ap, StringComparer.Ordinal);
+    var dcSet = new HashSet<string>(dc, StringComparer.Ordinal);
+    if (apSet.Overlaps(dcSet)) return "Backup record draft approved and discarded sets overlap.";
+    if (!StrictSupersedesEntries(d.SupersedesJson, d.Id, out var serr)) return "Backup record draft supersedes malformed (" + serr + ").";
+    if (d.Version < 1) return "Backup record draft carries an illegal version.";
+    string expectHash;
+    try { expectHash = Hashing.HashOf(d.ItemsJson ?? "[]"); }
+    catch { return "Backup record draft items are unreadable."; }
+    if (string.IsNullOrWhiteSpace(d.Hash) || !string.Equals(d.Hash ?? "", expectHash, StringComparison.OrdinalIgnoreCase))
+      return "Backup record draft content hash does not match its items; explicit repair required.";
+    var knownStatus = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "open", "partially-approved", "approved", "discarded", "superseded" };
+    if (string.IsNullOrWhiteSpace(d.Status) || !knownStatus.Contains(d.Status.Trim()))
+      return "Backup record draft carries an unknown status.";
+    return null;
+  }
+  // Controlled old-schema backfill/import (F2/P1): missing (null) markers become
+  // true ONLY for pre-marker backups (version<4) where BOTH the recognized old
+  // prehistory shape AND the genuine base contract validate. Explicit false
+  // (modern writers) is never upgraded; malformed rows keep null so the modern
+  // path reports their exact cause. Modern v4 exports always carry an explicit
+  // marker, so a wiped v4 row retains null/false and fails closed. No decisions
+  // or history are invented here.
+  public static void ApplyLegacyMarkerBackfill(IEnumerable<RecordDraft> drafts, int backupVersion)
+  {
+    if (backupVersion >= 4) return;
+    if (drafts is null) return;
+    foreach (var d in drafts)
+    {
+      if (d is null || d.LegacyReview.HasValue) continue;
+      if (!IsLegacyPrehistoryShape(d)) continue;
+      if (LegacyBaseError(d) is not null) continue;
+      d.LegacyReview = true;
+    }
+  }
+  // Narrow explicit legacy adoption (F2/P1): a pending genuine-legacy row may
+  // enter modern review ONLY through the existing fresh-review (refresh) or copy
+  // (revise/amend-branch) workflow, which writes the first history entry
+  // explicitly. Approve/discard paths stay closed until adoption completes.
+  // Decided legacy rows stay terminal; modern marker-false/null blank rows never adopt.
+  public static bool IsLegacyAdoptable(RecordDraft d)
+  {
+    if (d is null || d.LegacyReview != true) return false;
+    if (d.Decided) return false;
+    if (!IsLegacyPrehistoryShape(d)) return false;
+    return LegacyBaseError(d) is null;
+  }
   // Domain validator handoff for Ops restore (minimal, no Ops rewrite): Ops owner
   // calls this BEFORE any destructive replacement. Validates typed record graphs,
   // parent correspondence, and snapshot/ref/approval correspondence pre-mutation.
@@ -682,7 +863,8 @@ public static partial class RecordsOps
   // mutation still fails closed until explicit repair. No approval history is fabricated and no
   // healthy old graph is blanket-rejected. Only malformed graphs fail here.
   // sourceOriginalOf maps a source id string to its ORIGINAL version (pre-renumber alias root).
-  public static string ValidateRestoreEntries(IEnumerable<RecordDraft> drafts, IDictionary<string, int>? sourceOriginalOf = null)
+  // sourceCanonicalOf maps a source id string to its CANONICAL version (staged head pin, else family max); alias capture must equal it.
+  public static string ValidateRestoreEntries(IEnumerable<RecordDraft> drafts, IDictionary<string, int>? sourceOriginalOf = null, IDictionary<string, int>? sourceCanonicalOf = null)
   {
     var byId = new Dictionary<string, RecordDraft>(StringComparer.OrdinalIgnoreCase);
     foreach (var d in drafts)
@@ -730,14 +912,62 @@ public static partial class RecordsOps
       var knownStatus = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "open", "partially-approved", "approved", "discarded", "superseded" };
       if (!string.IsNullOrWhiteSpace(d.Status) && !knownStatus.Contains(d.Status.Trim()))
         return "Backup record draft carries an unknown status.";
+      // Legacy readonly rule (F2/P1): ONLY a persisted legacy-review marker (controlled
+      // old-schema backfill/import) with blank history AND blank snapshots on a
+      // NEVER-MUTATED row (ReviewRevision<=1) counts as genuine pre-review data. v2
+      // backups predate history/snapshot capture entirely; never-mutated upg-era rows
+      // carry review tokens but no history. Modern writers advance ReviewRevision on
+      // EVERY decision and always append history, so revision<=1 alone is NOT proof of
+      // legacy: a modern new no-ref row is naturally rev1 with empty snapshots, and a
+      // wiped modern row keeps its null/false marker. Marker-false/null blank rows stay
+      // on the modern path and fail closed. Accepted legacy rows are base-validated
+      // below (typed items/decisions, version, hash, known status; lifecycle coherence
+      // is pre-modern and not required) and stay inert readonly: no approval history is
+      // fabricated, no captures exist, and mutations stay closed except through the
+      // narrow explicit legacy adoption in refresh/revise.
+      var histBlank = IsBlankJsonArray(d.HistoryJson);
+      var tokenBlank = string.IsNullOrWhiteSpace(d.ReviewToken);
+      var snapsBlank = IsBlankJsonArray(d.EvidenceSnapshotJson);
+      if (d.LegacyReview == true && histBlank && snapsBlank && d.ReviewRevision <= 1)
+      {
+        var legacyErr = LegacyBaseError(d);
+        if (legacyErr is not null) return legacyErr;
+        continue;
+      }
       if (d.Decided && apSet.Count == 0 && dcSet.Count == 0)
         return "Backup record draft decided with no decisions.";
-      // Legacy readonly rule: blank token AND blank history AND blank snapshots = genuine pre-review row.
-      // Bytes preserved, reads stay lenient, mutations stay closed. Anything partial is inconsistent.
-      var histBlank = string.IsNullOrWhiteSpace(d.HistoryJson) || d.HistoryJson.Trim() == "[]";
-      var tokenBlank = string.IsNullOrWhiteSpace(d.ReviewToken);
-      var snapsBlank = string.IsNullOrWhiteSpace(d.EvidenceSnapshotJson) || d.EvidenceSnapshotJson.Trim() == "[]";
-      if (histBlank && tokenBlank && snapsBlank) continue;
+      // Modern writer-identity correspondence (F2): version, content hash, and
+      // status/decided lifecycle must match actual writer semantics. Legacy
+      // pre-review rows (above) stay byte-preserved and readonly.
+      if (d.Version < 1) return "Backup record draft carries an illegal version.";
+      string expectHash;
+      try { expectHash = Hashing.HashOf(d.ItemsJson ?? "[]"); }
+      catch { return "Backup record draft items are unreadable."; }
+      if (!string.Equals(d.Hash ?? "", expectHash, StringComparison.OrdinalIgnoreCase))
+        return "Backup record draft content hash does not match its items; explicit repair required.";
+      var peCount = map.Keys.Count(k => !apSet.Contains(k) && !dcSet.Contains(k));
+      var isSupersededRow = string.Equals((d.Status ?? "").Trim(), "superseded", StringComparison.OrdinalIgnoreCase);
+      if (isSupersededRow)
+      {
+        if (!d.Decided) return "Backup record draft superseded without a decision; explicit repair required.";
+      }
+      else if (peCount == 0 && apSet.Count == 0 && dcSet.Count == 0)
+      {
+        // Writer-created empty drafts stay open/undecided until the first decision;
+        // discard-all converges to discarded. Anything else is forged lifecycle.
+        var st0 = (d.Status ?? "").Trim();
+        if (d.Decided || !(string.Equals(st0, "open", StringComparison.OrdinalIgnoreCase) || string.Equals(st0, "discarded", StringComparison.OrdinalIgnoreCase)))
+          return "Backup record draft lifecycle does not match its empty decision sets; explicit repair required.";
+      }
+      else
+      {
+        var expectStatus = ComputeStatus(apSet.Count, dcSet.Count, peCount, false);
+        if (!string.Equals((d.Status ?? "").Trim(), expectStatus, StringComparison.OrdinalIgnoreCase))
+          return "Backup record draft status `" + (d.Status ?? "") + "` does not match its decision sets; explicit repair required.";
+        var expectDecided = peCount == 0 && (apSet.Count > 0 || dcSet.Count > 0);
+        if (d.Decided != expectDecided)
+          return "Backup record draft decided flag does not match its decision sets; explicit repair required.";
+      }
       if (tokenBlank) return "Backup record draft decision history without review token.";
       if (histBlank) return "Backup record draft review state without decision history.";
       if (!snapsBlank && (histBlank || tokenBlank)) return "Backup record draft snapshots without review state.";
@@ -749,7 +979,7 @@ public static partial class RecordsOps
       List<EvidenceSnapshot> snapList;
       try { snapList = GetSnapshots(d); }
       catch { return "Backup record snapshot correspondence unreadable."; }
-      if (!SnapshotRestoreCheck(map, apSet, snapList, sourceOriginalOf, out var snapErr))
+      if (!SnapshotRestoreCheck(map, apSet, snapList, sourceOriginalOf, sourceCanonicalOf, out var snapErr))
         return "Backup record " + snapErr;
     }
     return null;
@@ -1206,6 +1436,16 @@ public static partial class RecordsOps
             var okState = ParseIdList(rd.ApprovedJson).Count > 0
               && !string.Equals(rd.Status, "superseded", StringComparison.OrdinalIgnoreCase);
             var okReadable = IsReadableItems(rd.ItemsJson);
+            // Approval-to-item correspondence BEFORE available-card construction (F6):
+            // every approved id must name a draft item. Ghost approvals yield unavailable
+            // cards, never an empty available card. BuildExport enforces the same rule.
+            var okMembers = true;
+            if (string.IsNullOrWhiteSpace(recItemPart))
+            {
+              var wmap = ItemMap(rd.ItemsJson, out var wmapErr);
+              if (wmapErr != "") okMembers = false;
+              else foreach (var aid in ParseIdList(rd.ApprovedJson)) if (!wmap.ContainsKey(aid)) { okMembers = false; break; }
+            }
             var okItem = true;
             string itemTxt = "";
             if (!string.IsNullOrWhiteSpace(recItemPart))
@@ -1217,6 +1457,8 @@ public static partial class RecordsOps
                 var rap = new HashSet<string>(ParseIdList(rd.ApprovedJson), StringComparer.Ordinal);
                 if (!rap.Contains(recItemPart)) okItem = false;
                 else itemTxt = ItemText(ritem);
+                // An approved item with empty text never yields an available card (F6).
+                if (okItem && string.IsNullOrWhiteSpace(itemTxt)) okItem = false;
               }
               // LIVE Current follows the EFFECTIVE referenced owner (F5): a replaced historical item
               // (A:s1 BUY superseded by B:s1 CUT) is NOT live-current even when the old record row still
@@ -1232,7 +1474,7 @@ public static partial class RecordsOps
                   && eo.Version == rd.Version;
               }
             }
-            if (okBoard && okAuth && okVersion && okState && okReadable && okItem)
+            if (okBoard && okAuth && okVersion && okState && okReadable && okMembers && okItem)
             {
               string txt;
               string ttl;
@@ -1799,7 +2041,10 @@ public static partial class RecordsOps
             if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedAuto1) return deniedAuto1;
             if (IsSuperseded(d))
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
+            // Narrow explicit legacy adoption (F2/P1): a pending genuine-legacy row may enter
+            // modern review through this fresh-review workflow, which writes the first
+            // history entry explicitly below. Approve/discard paths stay closed.
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr) && !RecordsOps.IsLegacyAdoptable(d))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (body.ValueKind != JsonValueKind.Object)
               return Results.Json(new { error = "Refresh review: send the current version, hash, review token and watermark together." }, statusCode: 400);
@@ -1838,7 +2083,7 @@ public static partial class RecordsOps
               ReviewRevision = d.ReviewRevision + 1, ReviewToken = newTokenF,
               HistoryJson = newHistoryF, SupersedesJson = d.SupersedesJson,
               EvidenceSnapshotJson = d.EvidenceSnapshotJson,
-              Decided = d.Decided, Status = d.Status, CreatedAt = d.CreatedAt,
+              Decided = d.Decided, Status = d.Status, CreatedAt = d.CreatedAt, LegacyReview = d.LegacyReview,
             };
             Dictionary<string, object?> payload;
             try { payload = RecordsOps.ReviewPayload(s, req, staged, meeting); }
@@ -2140,7 +2385,10 @@ public static partial class RecordsOps
             if (!amend && old.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
             if (amend && (!old.Decided || !string.Equals(old.Status, "approved", StringComparison.OrdinalIgnoreCase)))
               return Results.Conflict("Only a final approved record can be amended; revise the current open version instead.");
-            if (!RecordsOps.StrictStateCheck(s, old, out var serr))
+            // Narrow explicit legacy adoption (F2/P1): a pending genuine-legacy row may enter
+            // modern review through this copy workflow, which writes the first history entry
+            // explicitly below (branch on the child, child-entry on the parent).
+            if (!RecordsOps.StrictStateCheck(s, old, out var serr) && !RecordsOps.IsLegacyAdoptable(old))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, old, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
@@ -2180,7 +2428,7 @@ public static partial class RecordsOps
               ItemsJson = items, Hash = Hashing.HashOf(items),
               ApprovedJson = "[]", DiscardedJson = "[]",
               ReviewRevision = 1, ReviewToken = RecordsOps.NewReviewToken(),
-              HistoryJson = "[]", EvidenceSnapshotJson = "[]",
+              HistoryJson = "[]", EvidenceSnapshotJson = "[]", LegacyReview = false,
               SupersedesJson = JsonSerializer.Serialize(SupersedesOf(old, extraSupersedes)),
             };
             RecordsOps.AppendHistory(next, amend ? "amend-branch" : "revise-branch", "", old.ItemsJson, items, actor);

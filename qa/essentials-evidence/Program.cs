@@ -55,6 +55,33 @@ static int? OrigOf(InMemoryStore s, string refId)
   try { if (Guid.TryParse(refId, out var g) && s.Sources.TryGetValue(g, out var dd) && dd is not null) return SourceGovernance.OriginalVersionOf(s, dd); } catch { }
   return null;
 }
+static string H(string itemsJson) => SimCEO.Api.Work.Hashing.HashOf(itemsJson ?? "[]");
+// Bounded process helper (F7): concurrent stdout/stderr drain with a hard timeout,
+// retained handle cleanup by the caller, nonzero exits surfaced (never swallowed).
+static void DrainLines(System.IO.StreamReader rd, System.Text.StringBuilder sb)
+{
+  try { string? ln; while ((ln = rd.ReadLine()) != null) { lock (sb) { sb.AppendLine(ln); } } } catch { }
+}
+static (int exit, string stdout, string stderr, bool timedOut) RunBounded(string file, string args, int timeoutMs)
+{
+  var psi = new System.Diagnostics.ProcessStartInfo(file, args) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+  using var pr = new System.Diagnostics.Process { StartInfo = psi };
+  var outSb = new System.Text.StringBuilder(); var errSb = new System.Text.StringBuilder();
+  try
+  {
+    if (!pr.Start()) return (-1, "", "start-failed", false);
+    var oTask = System.Threading.Tasks.Task.Run(() => DrainLines(pr.StandardOutput, outSb));
+    var eTask = System.Threading.Tasks.Task.Run(() => DrainLines(pr.StandardError, errSb));
+    var exited = pr.WaitForExit(timeoutMs);
+    var drained = System.Threading.Tasks.Task.WaitAll(new[] { oTask, eTask }, 15000);
+    if (!exited || !drained) { try { pr.Kill(true); } catch { } return (-1, outSb.ToString(), errSb.ToString(), true); }
+    return (pr.ExitCode, outSb.ToString(), errSb.ToString(), false);
+  }
+  catch (Exception ex) { return (-1, "", ex.GetType().Name + ":" + ex.Message, false); }
+}
+// Staged maps built the Ops way (F3/P1 contract): from the store's own sources+events+heads.
+static (Dictionary<string, int> orig, Dictionary<string, int> canon) MapsOf(InMemoryStore s)
+  => RecordsOps.BuildSourceVersionMaps(s.Sources.Values, s.SourceEvents.Values, s.SourceHeads.Values);
 var mem = new InMemoryStore();
 var ownerReq = FakeReq(""); var aliceReq = FakeReq("alice"); var bobReq = FakeReq("bob");
 var bid1 = SeedBoard(mem, "allowAll", "");
@@ -116,6 +143,7 @@ var missActor = "[{\"seq\":1,\"revision\":1,\"token\":\"t1\",\"action\":\"approv
 Expect(!RecordsOps.StrictHistoryEntries(missActor, out var missActorErr), "f4-history-missing-actor-rejected", missActorErr);
 var recMeet = new Meeting { BoardId = bid1, Title = "rec-m", State = MeetingState.Active, Generation = 0 }; mem.Meetings[recMeet.Id] = recMeet; mem.Meetings.Flush();
 var srcRec = new RecordDraft { BoardId = bid1, MeetingId = recMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"s1\",\"text\":\"source item\"}]", Hash = "h", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-src-1", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-src-1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"source item\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"h\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" }; mem.Drafts[srcRec.Id] = srcRec; mem.Drafts.Flush();
+srcRec.Hash = H(srcRec.ItemsJson);
 var expRef = SimCEO.Api.Work.EvidenceRef.ForRecordItem(srcRec.Id.ToString(), 1, "s1", "excerpt");
 Expect(expRef.Ref == srcRec.Id + ":s1", "f4-explicit-ref-encodes-item", expRef.Ref);
 Expect(SimCEO.Api.Work.EvidenceRef.TryParseRecordRef(expRef.Ref, out var expRid, out var expItem, out _), "f1-parser-roundtrip-forrecorditem", expRef.Ref);
@@ -188,6 +216,39 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   Expect(!avBad.Available, "f1-avail-malformed-unavailable", avBad.Reason);
   var avStale = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", recA.Id + ":s1", 99, null, null, null), bid1, secMeet.Id);
   Expect(!avStale.Available && avStale.Reason.Contains("superseded"), "f1-avail-stale-pin", avStale.Reason);
+  // ---- F1 explicit approved item in a PARTIALLY-APPROVED record is current ----
+  var partMeet = new Meeting { BoardId = bid1, Title = "f1-partial-m", State = MeetingState.Active, Generation = 0 }; mem.Meetings[partMeet.Id] = partMeet; mem.Meetings.Flush();
+  var partItems = "[{\"id\":\"s1\",\"text\":\"exact approved alpha\"},{\"id\":\"s2\",\"text\":\"pending beta\"}]";
+  var part = new RecordDraft { BoardId = bid1, MeetingId = partMeet.Id, Version = 1, Watermark = 0, ItemsJson = partItems, Hash = "hp", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f1p-1", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f1p-0\",\"action\":\"create\",\"itemId\":\"\",\"oldText\":\"\",\"newText\":\"\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hp\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":2,\"revision\":2,\"token\":\"tok-f1p-1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"exact approved alpha\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hp\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = false, Status = "partially-approved" };
+  part.Hash = H(part.ItemsJson); mem.Drafts[part.Id] = part; mem.Drafts.Flush();
+  var avPartItem = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", part.Id + ":s1", 1, null, null, null), bid1, partMeet.Id);
+  Expect(avPartItem.Available && avPartItem.Reason == "current", "f1-avail-partial-approved-item-current", avPartItem.Reason);
+  var avPartBare = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", part.Id.ToString(), 1, null, null, null), bid1, partMeet.Id);
+  Expect(!avPartBare.Available && avPartBare.Reason == "record no longer approved", "f1-avail-partial-bare-gated", avPartBare.Reason);
+  var avPartPend = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", part.Id + ":s2", null, null, null, null), bid1, partMeet.Id);
+  Expect(!avPartPend.Available, "f1-avail-partial-pending-unavailable", avPartPend.Reason);
+  // Note-history route expression: the actual endpoint runs ParseJsonList + Resolve per
+  // ref (Secretary.cs note-history); exercise that exact expression with a real note.
+  var partNote = new Note { BoardId = bid1, MeetingId = partMeet.Id, Kind = "note", Title = "cite", Body = "body", Scope = "meeting", Provisional = true, EvidenceJson = "[{\"kind\":\"record\",\"ref\":\"" + part.Id + ":s1\",\"version\":1}]", RootId = Guid.Empty, Revision = 1, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
+  partNote.RootId = partNote.Id; mem.Notes[partNote.Id] = partNote; mem.Notes.Flush();
+  var partAvail = SimCEO.Api.Work.EvidenceRef.ParseJsonList(partNote.EvidenceJson ?? "[]").Select(r => EvidenceAvailability.Resolve(mem, r, partNote.BoardId, partNote.MeetingId)).ToList();
+  Expect(partAvail.Count == 1 && partAvail[0].Available && partAvail[0].Reason == "current", "f1-note-history-partial-item-current", partAvail.Count == 1 ? partAvail[0].Reason : "count=" + partAvail.Count);
+  // Secretary prep block: the exact CanonicalizeCaller + BuildPacket calls the legacy
+  // briefing route runs before its model call (model excluded: no provider keys).
+  var partCanon = SecretaryContext.CanonicalizeCaller(mem, bid1, partMeet.Id, new List<SimCEO.Api.Work.EvidenceRef> { new("record", part.Id + ":s1", 1, null, null, "approved alpha") });
+  Expect(partCanon.Count(c => c.Kind == "record" && c.Ref == part.Id + ":s1" && c.Excerpt == "approved alpha") == 1, "f1-prep-partial-item-quote", "count=" + partCanon.Count);
+  var partRefs = new List<SimCEO.Api.Work.EvidenceRef>();
+  var partPacket = SecretaryContext.BuildPacket(mem, partMeet, "alpha", partCanon, partRefs, 20000);
+  Expect(partPacket.Contains("CALLER RECORD v1 [s1]: approved alpha"), "f1-prep-partial-item-line", "packet carries exact item line");
+  // Inheritance then replacement (F1 availability + F5 ownership, both paths).
+  var inhB = new RecordDraft { BoardId = bid1, MeetingId = partMeet.Id, Version = 1, Watermark = 0, ItemsJson = partItems, Hash = "hpb", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f1p-B", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f1p-B\",\"action\":\"create\",\"itemId\":\"\",\"oldText\":\"\",\"newText\":\"\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hpb\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[\"" + part.Id + "\"]", EvidenceSnapshotJson = "[]", Decided = false, Status = "open" };
+  inhB.Hash = H(inhB.ItemsJson); mem.Drafts[inhB.Id] = inhB; mem.Drafts.Flush();
+  var avInh = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", part.Id + ":s1", 1, null, null, null), bid1, partMeet.Id);
+  Expect(avInh.Available && avInh.Reason == "current", "f1-avail-inherited-still-current", avInh.Reason);
+  var inhRep = new RecordDraft { BoardId = bid1, MeetingId = partMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"s1\",\"text\":\"REPLACED CUT\"},{\"id\":\"s2\",\"text\":\"pending beta\"}]", Hash = "hpr", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f1p-C", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f1p-C0\",\"action\":\"create\",\"itemId\":\"\",\"oldText\":\"\",\"newText\":\"\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hpr\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":2,\"revision\":2,\"token\":\"tok-f1p-C\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"REPLACED CUT\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hpr\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[\"" + part.Id + "\"]", EvidenceSnapshotJson = "[]", Decided = false, Status = "partially-approved" };
+  inhRep.Hash = H(inhRep.ItemsJson); mem.Drafts.TryRemove(inhB.Id, out _); mem.Drafts[inhRep.Id] = inhRep; mem.Drafts.Flush();
+  var avRepl = EvidenceAvailability.Resolve(mem, new SimCEO.Api.Work.EvidenceRef("record", part.Id + ":s1", 1, null, null, null), bid1, partMeet.Id);
+  Expect(!avRepl.Available && avRepl.Reason == "record item replaced", "f1-avail-replaced-after-approve", avRepl.Reason);
 }
 // ---- F3 unrelated-999 rejection + one coherent capture ----
 {
@@ -218,8 +279,10 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   var f5Meet = new Meeting { BoardId = bid1, Title = "f5-m", State = MeetingState.Active, Generation = 0 }; mem.Meetings[f5Meet.Id] = f5Meet; mem.Meetings.Flush();
   var recV1 = new RecordDraft { BoardId = bid1, MeetingId = f5Meet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"s1\",\"text\":\"BUY\"}]", Hash = "h5a", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f5-A", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f5-A\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"BUY\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"h5a\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
   mem.Drafts[recV1.Id] = recV1; mem.Drafts.Flush();
+recV1.Hash = H(recV1.ItemsJson);
   var recV2 = new RecordDraft { BoardId = bid1, MeetingId = f5Meet.Id, Version = 2, Watermark = 0, ItemsJson = "[{\"id\":\"s1\",\"text\":\"CUT\"}]", Hash = "h5b", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f5-B", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f5-B\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"CUT\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h5b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[\"" + recV1.Id + "\"]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
   mem.Drafts[recV2.Id] = recV2; mem.Drafts.Flush();
+recV2.Hash = H(recV2.ItemsJson);
   Expect(RecordsOps.ValidateRestoreEntries(new[] { recV1, recV2 }) is null, "f5-amend-pair-validates", "A->B healthy");
   var destLive = new RecordDraft { BoardId = bid1, MeetingId = f5Meet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"d1\",\"text\":\"cite old\",\"refs\":[{\"kind\":\"record\",\"ref\":\"" + recV1.Id + ":s1\",\"version\":1}]}]", Hash = "h5d", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f5-D", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = false, Status = "open" };
   var liveOld = RecordsOps.ResolveEvidenceAuthorized(mem, ownerReq, destLive);
@@ -279,6 +342,26 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   var ghostDraft = new RecordDraft { BoardId = bid1, MeetingId = recMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"g1\",\"text\":\"good\"}]", Hash = "h6b", ApprovedJson = "[\"ghost\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f6b", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
   var ghostCards = RecordsOps.ResolveEvidenceAuthorized(mem, ownerReq, ghostDraft);
   Expect(ghostCards.Count == 0, "f6-ghost-no-cards", "ghost approved id yields no card, count=" + ghostCards.Count);
+  var ghostMixedItems = "[{\"id\":\"g1\",\"text\":\"good\"}]";
+  Expect(EX(ghostMixedItems, "[\"g1\",\"ghost\"]", false) == "" && EX(ghostMixedItems, "[\"g1\",\"ghost\"]", true) == "", "f6-export-fails-both-modes-ghost-mixed", "mixed valid+ghost approvals fail closed");
+  var emptyTextItems = "[{\"id\":\"g1\",\"text\":\"\"}]";
+  Expect(EX(emptyTextItems, "[\"g1\"]", false) == "" && EX(emptyTextItems, "[\"g1\"]", true) == "", "f6-export-fails-both-modes-empty-approved-text", "empty approved text yields no card");
+  var numExcerptItems = "[{\"id\":\"g1\",\"text\":\"good\",\"refs\":[{\"kind\":\"note\",\"ref\":\"x\",\"excerpt\":5}]}]";
+  Expect(EX(numExcerptItems, "[\"g1\"]", false) == "" && EX(numExcerptItems, "[\"g1\"]", true) == "", "f6-export-fails-both-modes-numeric-excerpt", "numeric ref metadata fails closed");
+  var fracExportItems = "[{\"id\":\"g1\",\"text\":\"good\",\"refs\":[{\"kind\":\"source\",\"ref\":\"" + docB.Id + "\",\"version\":1.5}]}]";
+  Expect(EX(fracExportItems, "[\"g1\"]", false) == "" && EX(fracExportItems, "[\"g1\"]", true) == "", "f6-export-fails-both-modes-fractional-version", "fractional version fails closed, never silent-omit");
+  // Referring destinations: a destination that actually references each malformed source
+  // record resolves unavailable through the real resolver (not an empty-available card).
+  var badEmpty = new RecordDraft { BoardId = bid1, MeetingId = recMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"g1\",\"text\":\"\"}]", Hash = "h6e", ApprovedJson = "[\"g1\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f6e", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
+  badEmpty.Hash = H(badEmpty.ItemsJson); mem.Drafts[badEmpty.Id] = badEmpty; mem.Drafts.Flush();
+  var badGhostRec = new RecordDraft { BoardId = bid1, MeetingId = recMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"g1\",\"text\":\"good\"}]", Hash = "h6g", ApprovedJson = "[\"ghost\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f6g", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
+  badGhostRec.Hash = H(badGhostRec.ItemsJson); mem.Drafts[badGhostRec.Id] = badGhostRec; mem.Drafts.Flush();
+  foreach (var (badRec, badName) in new[] { (badEmpty, "empty-approved-text"), (badGhostRec, "ghost-approved") })
+  {
+    var refDest = new RecordDraft { BoardId = bid1, MeetingId = recMeet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"d1\",\"text\":\"cite\",\"refs\":[{\"kind\":\"record\",\"ref\":\"" + badRec.Id + "\"}]}]", Hash = "h6d", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f6d", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = false, Status = "open" };
+    var refCards = RecordsOps.ResolveEvidenceAuthorized(mem, ownerReq, refDest);
+    Expect(refCards.Count == 1 && refCards[0].Missing, "f6-destination-unavailable-" + badName, "referring destination gets unavailable, count=" + refCards.Count);
+  }
 }
 // ---- F2 COMPLETE staged validator: real amend chain + controlled corruptions ----
 {
@@ -286,6 +369,7 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   var itemsA = "[{\"id\":\"s1\",\"text\":\"BUY\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
   var draftA = new RecordDraft { BoardId = bid1, MeetingId = f2Meet.Id, Version = 1, Watermark = 0, ItemsJson = itemsA, Hash = "h2a", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f2-A0", HistoryJson = "[]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = false, Status = "open" };
   mem.Drafts[draftA.Id] = draftA; mem.Drafts.Flush();
+draftA.Hash = H(draftA.ItemsJson);
   var mapA = RecordsOps.ItemMap(draftA.ItemsJson, out var mapAErr);
   Expect(mapAErr == "", "f2-amend-itemmap", mapAErr);
   var histA = "[]";
@@ -308,18 +392,20 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   var mapB = RecordsOps.ItemMap(draftB.ItemsJson, out _);
   var liveB = RecordsOps.ResolveEvidenceAuthorized(mem, ownerReq, draftB);
   Expect(RecordsOps.TryBuildSnapshots("[]", mapB, liveB, new[] { "s1", "s2" }, 2, out var snapsB, out var serrB, refId => OrigOf(mem, refId)), "f2-amend-snapshots-B", serrB);
+draftB.Hash = H(draftB.ItemsJson);
   draftB.EvidenceSnapshotJson = snapsB; RecordsOps.RefreshDecided(draftB); mem.Drafts[draftB.Id] = draftB; mem.Drafts.Flush();
   Expect(RecordsOps.ValidateRestoreEntries(new[] { draftA, draftB }) is null, "f2-healthy-amend-validates", "real amend pair");
   Expect(RecordsOps.BuildExport(draftA.ItemsJson, draftA.ApprovedJson, false).Contains("BUY"), "f2-export-A-concise", "A exports BUY");
   Expect(RecordsOps.BuildExport(draftB.ItemsJson, draftB.ApprovedJson, true).Contains("CUT"), "f2-export-B-detailed", "B exports CUT");
   string SerBatch() => JsonSerializer.Serialize(new[] { draftA, draftB });
   var controlBytes = SerBatch();
-  void Corrupt(string cname, Action<RecordDraft, RecordDraft> mut)
+  void Corrupt(string cname, Action<RecordDraft, RecordDraft> mut, IDictionary<string, int>? mo = null, IDictionary<string, int>? mc = null)
   {
     var aJson = JsonSerializer.Serialize(draftA); var bJson = JsonSerializer.Serialize(draftB);
     var a2 = JsonSerializer.Deserialize<RecordDraft>(aJson)!; var b2 = JsonSerializer.Deserialize<RecordDraft>(bJson)!;
     mut(a2, b2);
-    var err = RecordsOps.ValidateRestoreEntries(new[] { a2, b2 });
+    if (cname != "forged-content-hash") { a2.Hash = H(a2.ItemsJson); b2.Hash = H(b2.ItemsJson); }
+    var err = RecordsOps.ValidateRestoreEntries(new[] { a2, b2 }, mo, mc);
     Expect(err is not null, "f2-reject-" + cname, err ?? "null (must reject)");
     Expect(SerBatch() == controlBytes, "f2-control-unchanged-" + cname, "prewrite control byte-exact");
   }
@@ -332,7 +418,7 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   Corrupt("supersedes-cross-scope", (a2, b2) => { b2.MeetingId = Guid.NewGuid(); });
   Corrupt("undeclared-snapshot-ref", (a2, b2) => { b2.EvidenceSnapshotJson = "[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + Guid.NewGuid() + "\",\"version\":1,\"available\":true,\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]"; });
   Corrupt("snapshot-item-unapproved", (a2, b2) => {
-    b2.ApprovedJson = "[\"s1\"]";
+    b2.ApprovedJson = "[\"s1\"]"; b2.Status = "partially-approved"; b2.Decided = false;
     b2.HistoryJson = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"CUT\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h2b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]";
     b2.EvidenceSnapshotJson = "[{\"itemId\":\"s2\",\"kind\":\"note\",\"ref\":\"" + Guid.NewGuid() + "\",\"version\":null,\"available\":false,\"title\":\"\",\"excerpt\":\"\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]";
   });
@@ -351,11 +437,62 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
   });
   Corrupt("history-approve-outside-approved", (a2, b2) => {
     b2.HistoryJson = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"ghost\",\"oldText\":\"\",\"newText\":\"x\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h2b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]";
-    b2.ItemsJson = "[{\"id\":\"ghost\",\"text\":\"x\"},{\"id\":\"s1\",\"text\":\"CUT\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
+    b2.ItemsJson = "[{\"id\":\"ghost\",\"text\":\"x\"},{\"id\":\"s1\",\"text\":\"CUT\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]"; b2.Status = "partially-approved"; b2.Decided = false;
   });
   Corrupt("unknown-status", (a2, b2) => { b2.Status = "melted"; });
   Corrupt("token-without-history", (a2, b2) => { b2.HistoryJson = "[]"; });
   Corrupt("history-without-token", (a2, b2) => { b2.ReviewToken = ""; });
+  // F2 writer-identity correspondence (status/hash/version/revision monotonicity).
+  Corrupt("status-approved-with-pending", (a2, b2) => {
+    b2.ItemsJson = "[{\"id\":\"s1\",\"text\":\"CUT\"},{\"id\":\"s2\",\"text\":\"KEEP\"},{\"id\":\"s3\",\"text\":\"NEW\"}]";
+  });
+  Corrupt("forged-content-hash", (a2, b2) => { b2.Hash = "0000000000000000"; });
+  Corrupt("version-zero", (a2, b2) => { b2.Version = 0; });
+  Corrupt("history-revision-regress", (a2, b2) => {
+    b2.ReviewRevision = 3; b2.ReviewToken = "tok-f2-B1";
+    b2.HistoryJson = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"CUT\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h2b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":2,\"revision\":5,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s2\",\"oldText\":\"\",\"newText\":\"KEEP\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h2b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":3,\"revision\":3,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s2\",\"oldText\":\"\",\"newText\":\"KEEP\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"h2b\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]";
+  });
+  // Modern blank-review forgeries (F2/P1 provenance): a modern new no-ref rev1 row
+  // carries an explicit FALSE marker, so wiping its history must NOT inherit legacy
+  // acceptance. Bad hash, illegal version, and forged lifecycle under the same blank
+  // shape must also reject; only persisted-true provenance with a genuine base accepts.
+  RecordDraft ModernBlankForgery(Action<RecordDraft> mut)
+  {
+    var items = "[{\"id\":\"s1\",\"text\":\"KEEP\"}]";
+    var g = new RecordDraft { BoardId = bid1, MeetingId = f2Meet.Id, Version = 1, Watermark = 0,
+      ItemsJson = items, Hash = H(items), ApprovedJson = "[]", DiscardedJson = "[]",
+      ReviewRevision = 1, ReviewToken = "tok-modern-blank", HistoryJson = "[]", SupersedesJson = "[]",
+      EvidenceSnapshotJson = "[]", Decided = false, Status = "open", LegacyReview = false };
+    mut(g);
+    return g;
+  }
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { ModernBlankForgery(_ => { }) }) is not null, "f2-reject-modern-blank-history-cleared", "marker-false rev1 no-ref wiped history rejects");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { ModernBlankForgery(g => { g.Hash = "0000000000000000"; }) }) is not null, "f2-reject-modern-blank-bad-hash", "marker-false blank shape with forged hash rejects");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { ModernBlankForgery(g => { g.Version = 0; }) }) is not null, "f2-reject-modern-blank-bad-version", "marker-false blank shape with illegal version rejects");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { ModernBlankForgery(g => { g.Status = "approved"; g.Decided = true; }) }) is not null, "f2-reject-modern-blank-forged-lifecycle", "marker-false blank shape with approved-but-empty lifecycle rejects");
+  var genuineOldBlank = ModernBlankForgery(_ => { }); genuineOldBlank.LegacyReview = true;
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { genuineOldBlank }) is null, "f2-legacy-provenance-blank-accepted", "marker-true rev1 no-ref genuine base accepts, still readonly");
+  Expect(!RecordsOps.StrictStateCheck(mem, genuineOldBlank, out var glStateErr), "f2-legacy-provenance-mutation-closed", glStateErr + " (provenance never approves silently)");
+  // F3 alias with the REAL staged alias map present: requested-1/captured-3 accepts only
+  // for the actual orig-1/canon-3 pair; requested-1/captured-999 and null captures reject.
+  var (stagedOrig, stagedCanon) = MapsOf(mem);
+  Expect(stagedOrig.TryGetValue(docA3.Id.ToString(), out var docA3Orig) && docA3Orig == 1, "f3-map-orig-1-from-event", "orig=" + docA3Orig);
+  Expect(stagedCanon.TryGetValue(docA3.Id.ToString(), out var docA3Canon) && docA3Canon == 3, "f3-map-canon-3-from-head", "canon=" + docA3Canon);
+  RecordDraft AliasDraft(string pinJson, string snapJson)
+  {
+    return new RecordDraft { BoardId = bid1, MeetingId = f2Meet.Id, Version = 1, Watermark = 0, ItemsJson = "[{\"id\":\"s1\",\"text\":\"CUT\",\"refs\":[{\"kind\":\"source\",\"ref\":\"" + docA3.Id + "\",\"version\":" + pinJson + "}]},{\"id\":\"s2\",\"text\":\"KEEP\"}]", Hash = "hx", ApprovedJson = "[\"s1\",\"s2\"]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f2-B1", HistoryJson = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"CUT\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"hx\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":2,\"revision\":2,\"token\":\"tok-f2-B1\",\"action\":\"approve\",\"itemId\":\"s2\",\"oldText\":\"\",\"newText\":\"KEEP\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"hx\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[]", EvidenceSnapshotJson = snapJson, Decided = true, Status = "approved" };
+  }
+  string AliasSnap(int? ver, bool avail) => "[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + docA3.Id + "\",\"version\":" + (ver.HasValue ? ver.Value.ToString() : "null") + ",\"available\":" + (avail ? "true" : "false") + ",\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]";
+  var aliasGood = AliasDraft("1", AliasSnap(3, true)); aliasGood.Hash = H(aliasGood.ItemsJson);
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { aliasGood }, stagedOrig, stagedCanon) is null, "f3-alias-pin1-capture3-accepts", "real orig-1/canon-3 mapping");
+  Corrupt("alias-pin1-capture999", (a2, b2) => {
+    var g = AliasDraft("1", AliasSnap(999, true)); g.Hash = H(g.ItemsJson);
+    b2.ItemsJson = g.ItemsJson; b2.ApprovedJson = g.ApprovedJson; b2.DiscardedJson = g.DiscardedJson; b2.ReviewRevision = g.ReviewRevision; b2.ReviewToken = g.ReviewToken; b2.HistoryJson = g.HistoryJson; b2.EvidenceSnapshotJson = g.EvidenceSnapshotJson; b2.Decided = g.Decided; b2.Status = g.Status;
+  }, stagedOrig, stagedCanon);
+  Corrupt("alias-pin1-capture-null", (a2, b2) => {
+    var g = AliasDraft("1", AliasSnap(null, false)); g.Hash = H(g.ItemsJson);
+    b2.ItemsJson = g.ItemsJson; b2.ApprovedJson = g.ApprovedJson; b2.DiscardedJson = g.DiscardedJson; b2.ReviewRevision = g.ReviewRevision; b2.ReviewToken = g.ReviewToken; b2.HistoryJson = g.HistoryJson; b2.EvidenceSnapshotJson = g.EvidenceSnapshotJson; b2.Decided = g.Decided; b2.Status = g.Status;
+  }, stagedOrig, stagedCanon);
 }
 // ---- F2 genuine old v2 PRIMARY backup: legacy rows accepted, bytes preserved, readonly ----
 {
@@ -384,8 +521,10 @@ Expect(goodVal is null, "f4-restore-validator-accepts-healthy", goodVal ?? "null
     if (restored is not null)
     {
       Expect(restored.version == 2 && restored.boards.Count == 3 && restored.meetings.Count == 2 && restored.drafts.Count == 2, "f2-legacy-backup-shape", "v" + restored.version + " boards=" + restored.boards.Count + " meetings=" + restored.meetings.Count + " drafts=" + restored.drafts.Count);
+      RecordsOps.ApplyLegacyMarkerBackfill(restored.drafts, restored.version);
+      Expect(restored.drafts.All(x => x.LegacyReview == true), "f2-legacy-marker-backfilled", "pre-marker v2 missing markers become true where shape+base validate");
       var legacyErr = RecordsOps.ValidateRestoreEntries(restored.drafts);
-      Expect(legacyErr is null, "f2-legacy-blank-token-accepted", legacyErr ?? "null (genuine pre-review rows accepted, no fabrication)");
+      Expect(legacyErr is null, "f2-legacy-blank-token-accepted", legacyErr ?? "null (genuine pre-review rows accepted via persisted provenance, no fabrication)");
       foreach (var ld in restored.drafts)
       {
         var itemsBefore = ld.ItemsJson; var apprBefore = ld.ApprovedJson;
@@ -418,13 +557,16 @@ static Dictionary<string, string> ParseCs(string cs)
 static string FullSnap(InMemoryStore s)
 {
   var sb = new System.Text.StringBuilder();
-  foreach (var d in s.Sources.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("SRC " + d.Id + "|" + d.BoardId + "|" + d.FileName + "|" + d.Version + "|" + d.ReviewState + "|" + d.Approved + "|" + d.Excluded + "|" + d.Scope + "|" + (d.MeetingId?.ToString() ?? "-") + "|" + d.Origin + "|" + d.FamilyKey + "|" + d.IndexState + "|" + d.IndexGeneration + "|" + (d.IndexError ?? "") + "|" + (d.IndexCompletedAt?.ToString("o") ?? "-") + "|" + (d.ContentHash ?? "") + "|" + (d.ExtractionJson ?? "") + "|orig=" + (d.Original is null ? "-" : Sha(Convert.ToBase64String(d.Original))) + "|" + d.CreatedAt.ToString("o"));
+  // Complete relevant field snapshot (F8): every persisted scalar that rollback must
+  // preserve, including source ResourceId, meeting brief/participants/created, draft
+  // board+meeting scope/created, all message fields, and head floor provenance.
+  foreach (var d in s.Sources.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("SRC " + d.Id + "|" + d.BoardId + "|" + d.FileName + "|" + d.Version + "|" + d.ReviewState + "|" + d.Approved + "|" + d.Excluded + "|" + d.Scope + "|" + (d.MeetingId?.ToString() ?? "-") + "|" + d.Origin + "|" + (d.ResourceId?.ToString() ?? "-") + "|" + d.FamilyKey + "|" + d.IndexState + "|" + d.IndexGeneration + "|" + (d.IndexError ?? "") + "|" + (d.IndexCompletedAt?.ToString("o") ?? "-") + "|" + (d.ContentHash ?? "") + "|" + (d.ExtractionJson ?? "") + "|orig=" + (d.Original is null ? "-" : Sha(Convert.ToBase64String(d.Original))) + "|" + d.CreatedAt.ToString("o"));
   foreach (var x in s.SourceSections.Values.OrderBy(x => x.SourceId.ToString()).ThenBy(x => x.Ordinal)) sb.AppendLine("SEC " + x.Id + "|" + x.SourceId + "|" + x.BoardId + "|" + x.FamilyKey + "|" + x.SourceVersion + "|" + (x.ContentHash ?? "") + "|" + x.Ordinal + "|" + (x.Heading ?? "") + "|" + (x.Location ?? "") + "|g" + x.IndexGeneration + "|" + (x.Text ?? "") + "|" + x.CreatedAt.ToString("o"));
-  foreach (var h in s.SourceHeads.Values.OrderBy(x => x.BoardId.ToString() + x.FamilyKey)) sb.AppendLine("HEAD " + h.Id + "|" + h.BoardId + "|" + h.FamilyKey + "|" + h.HeadVersion + "|" + h.HeadSourceId + "|hw" + h.HighWater + "|" + h.UpdatedAt.ToString("o"));
+  foreach (var h in s.SourceHeads.Values.OrderBy(x => x.BoardId.ToString() + x.FamilyKey)) sb.AppendLine("HEAD " + h.Id + "|" + h.BoardId + "|" + h.FamilyKey + "|" + h.HeadVersion + "|" + h.HeadSourceId + "|hw" + h.HighWater + "|fl" + h.FloorVersion + "|" + h.UpdatedAt.ToString("o"));
   foreach (var e in s.SourceEvents.Values.OrderBy(x => x.CreatedAt).ThenBy(x => x.Id.ToString())) sb.AppendLine("EVT " + e.Id + "|" + e.BoardId + "|" + e.SourceId + "|" + (e.Action ?? "") + "|" + (e.Detail ?? "") + "|" + e.CreatedAt.ToString("o"));
-  foreach (var m in s.Meetings.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("MTG " + m.Id + "|" + m.BoardId + "|" + (m.Title ?? "") + "|" + m.State + "|gen" + m.Generation + "|rev" + m.DeliveredRevision);
-  foreach (var kv in s.Messages.OrderBy(x => x.Key.ToString())) foreach (var m in kv.Value.OrderBy(x => x.Sequence)) sb.AppendLine("MSG " + kv + "#" + m.Sequence + "|" + (m.Sender ?? "") + "|" + (m.AdvisorName ?? "") + "|" + (m.Content ?? "") + "|" + (m.Stance ?? ""));
-  foreach (var d in s.Drafts.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("DRAFT " + d.Id + "|v" + d.Version + "|wm" + d.Watermark + "|" + (d.ItemsJson ?? "") + "|" + (d.Hash ?? "") + "|" + (d.ApprovedJson ?? "") + "|" + (d.DiscardedJson ?? "") + "|rr" + d.ReviewRevision + "|" + (d.ReviewToken ?? "") + "|" + (d.HistoryJson ?? "") + "|" + (d.SupersedesJson ?? "") + "|" + (d.EvidenceSnapshotJson ?? "") + "|" + d.Decided + "|" + (d.Status ?? ""));
+  foreach (var m in s.Meetings.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("MTG " + m.Id + "|" + m.BoardId + "|" + (m.Title ?? "") + "|" + (m.Brief ?? "") + "|" + (m.ParticipantIdsJson ?? "") + "|" + m.State + "|gen" + m.Generation + "|rev" + m.DeliveredRevision + "|" + m.CreatedAt.ToString("o"));
+  foreach (var kv in s.Messages.OrderBy(x => x.Key.ToString())) foreach (var m in kv.Value.OrderBy(x => x.Sequence)) sb.AppendLine("MSG " + kv + "#" + m.Sequence + "|" + (m.Sender ?? "") + "|" + (m.AdvisorName ?? "") + "|" + (m.Content ?? "") + "|" + (m.Stance ?? "") + "|" + (m.Status ?? "") + "|" + (m.ParentSequence?.ToString() ?? "-") + "|" + (m.AdvisorId == Guid.Empty ? "-" : m.AdvisorId.ToString()) + "|" + m.CreatedAt.ToString("o"));
+  foreach (var d in s.Drafts.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("DRAFT " + d.Id + "|" + d.BoardId + "|" + d.MeetingId + "|v" + d.Version + "|wm" + d.Watermark + "|" + (d.ItemsJson ?? "") + "|" + (d.Hash ?? "") + "|" + (d.ApprovedJson ?? "") + "|" + (d.DiscardedJson ?? "") + "|rr" + d.ReviewRevision + "|" + (d.ReviewToken ?? "") + "|" + (d.HistoryJson ?? "") + "|" + (d.SupersedesJson ?? "") + "|" + (d.EvidenceSnapshotJson ?? "") + "|" + d.Decided + "|" + (d.Status ?? "") + "|" + d.CreatedAt.ToString("o"));
   foreach (var a in s.Audit.OrderBy(x => x.CreatedAt).ThenBy(x => (x.Action ?? "") + (x.Detail ?? ""))) sb.AppendLine("AUD " + a.BoardId + "|" + (a.Action ?? "") + "|" + (a.Detail ?? "") + "|" + a.CreatedAt.ToString("o"));
   foreach (var kv in s.ActiveIndexJobs.OrderBy(x => x.Key.ToString())) sb.AppendLine("JOB " + kv.Key + "|" + kv.Value.JobId + "|e" + kv.Value.Epoch + "|g" + kv.Value.Generation);
   return sb.ToString();
@@ -474,13 +616,47 @@ static string RawSqlSource(Microsoft.EntityFrameworkCore.DbContext db, Guid sour
 var pgBase = Environment.GetEnvironmentVariable("PGCS");
 if (string.IsNullOrWhiteSpace(pgBase)) pgBase = "Host=127.0.0.1;Port=15441;Database=postgres;Username=simceo;Password=qa-only";
 var pgParts = ParseCs(pgBase);
-// Single validated OWNED container/connection identity (F7): every connection string in this run derives
-// from this one validated identity. A PGCS override pointing anywhere else is refused, never silently split
-// into a serverA/tests-serverB pair.
-Expect(string.Equals(pgParts.GetValueOrDefault("Host"), "127.0.0.1", StringComparison.OrdinalIgnoreCase), "f7-pg-host-owned", pgParts.GetValueOrDefault("Host") ?? "?");
-Expect(string.Equals(pgParts.GetValueOrDefault("Port"), "15441", StringComparison.OrdinalIgnoreCase), "f7-pg-port-owned", pgParts.GetValueOrDefault("Port") ?? "?");
-Expect(string.Equals(pgParts.GetValueOrDefault("Username"), "simceo", StringComparison.OrdinalIgnoreCase), "f7-pg-user-owned", pgParts.GetValueOrDefault("Username") ?? "?");
-Expect(!string.IsNullOrWhiteSpace(pgParts.GetValueOrDefault("Password")), "f7-pg-password-present", "credential supplied");
+// Single validated if (bb is System.Text.Json.Nodes.JsonObject bo) bo["OwnerKey"] = "-";ED container/connection identity (F7): every connection string in this run derives
+// from this one validated identity. A PGCS override pointing anywhere else is TERMINAL (exit before any
+// connect/DDL), never a soft failure that still connects. The actual full owned container id is verified
+// before any acquisition; every native exit (including docker) is checked.
+var pgHost = pgParts.GetValueOrDefault("Host"); var pgPort = pgParts.GetValueOrDefault("Port"); var pgUser = pgParts.GetValueOrDefault("Username"); var pgPwd = pgParts.GetValueOrDefault("Password");
+var identErr = "";
+if (!string.Equals(pgHost, "127.0.0.1", StringComparison.OrdinalIgnoreCase)) identErr += "host=" + (pgHost ?? "?") + " ";
+if (!string.Equals(pgPort, "15441", StringComparison.OrdinalIgnoreCase)) identErr += "port=" + (pgPort ?? "?") + " ";
+if (!string.Equals(pgUser, "simceo", StringComparison.OrdinalIgnoreCase)) identErr += "user=" + (pgUser ?? "?") + " ";
+if (string.IsNullOrWhiteSpace(pgPwd)) identErr += "password-missing ";
+if (identErr != "")
+{
+  Emit("FAIL f7-pg-identity-terminal :: refused before any connection: " + identErr);
+  failures.Add("f7-pg-identity-terminal");
+  Emit("FAILURES: " + string.Join(",", failures)); return 1;
+}
+Pass("f7-pg-identity-terminal", "127.0.0.1:15441/simceo identity accepted before any acquisition");
+var (inspExit, inspOut, inspErr, inspTo) = RunBounded("docker", "inspect simceo-integration-qa-pg", 30000);
+if (inspExit != 0 || inspTo)
+{
+  Emit("FAIL f7-container-identity-terminal :: docker inspect exit=" + inspExit + " timedOut=" + inspTo + " err=" + inspErr.Trim());
+  failures.Add("f7-container-identity-terminal");
+  Emit("FAILURES: " + string.Join(",", failures)); return 1;
+}
+try
+{
+  using var inspDoc = JsonDocument.Parse(inspOut);
+  var c0 = inspDoc.RootElement.ValueKind == JsonValueKind.Array && inspDoc.RootElement.GetArrayLength() > 0 ? inspDoc.RootElement[0] : default;
+  var cid = c0.ValueKind == JsonValueKind.Object && c0.TryGetProperty("Id", out var cidv) ? (cidv.GetString() ?? "") : "";
+  var cstate = c0.ValueKind == JsonValueKind.Object && c0.TryGetProperty("State", out var csv) && csv.ValueKind == JsonValueKind.Object && csv.TryGetProperty("Status", out var csvs) ? (csvs.GetString() ?? "") : "";
+  if (cid != "14bcfcf7a243e5bc73385da4d24a33475b6eab0b04b8185e1d1534c13d1a1891") throw new InvalidOperationException("container id mismatch: " + cid);
+  if (!string.Equals(cstate, "running", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("container not running: " + cstate);
+  if (!c0.ToString().Contains("15441")) throw new InvalidOperationException("15441 port binding absent in container identity");
+  Pass("f7-container-identity-full", "14bcfcf7...1891 running with 15441");
+}
+catch (Exception cex)
+{
+  Emit("FAIL f7-container-identity-terminal :: " + cex.GetType().Name + " " + cex.Message);
+  failures.Add("f7-container-identity-terminal");
+  Emit("FAILURES: " + string.Join(",", failures)); return 1;
+}
 var pgDb = "essentials_evidence_" + Guid.NewGuid().ToString("N").Substring(0, 12);
 Emit("PG exclusive DB: " + pgDb);
 var artifactDir = Environment.GetEnvironmentVariable("ESSENTIALS_ARTIFACT_DIR");
@@ -542,9 +718,14 @@ try
   var pgHead = ps.SourceHeads.Values.FirstOrDefault(h => h.BoardId == pbid && h.FamilyKey == pdocC.FamilyKey);
   PgExpect(pgHead is not null && pgHead.HeadSourceId == pdocC.Id, "pg-head-persisted", pgHead is null ? "no head" : pgHead.HeadVersion.ToString());
   var fmeet = new Meeting { BoardId = pbid, Title = "fault-m", State = MeetingState.Active, Generation = 0 }; ps.Meetings[fmeet.Id] = fmeet; ps.Meetings.Flush();
+  // Seed meeting messages (F8): rollback must preserve complete message state too.
+  var fmsgs = new List<Message>();
+  for (var fmi = 1; fmi <= 3; fmi++) fmsgs.Add(new Message { BoardId = pbid, MeetingId = fmeet.Id, Sequence = fmi, Sender = "lead", Content = "seed message " + fmi });
+  ps.Messages[fmeet.Id] = MessageList.Detached(fmeet.Id, fmsgs);
   var fitems = "[{\"id\":\"s1\",\"text\":\"BUY\"}]";
   var frecA = new RecordDraft { BoardId = pbid, MeetingId = fmeet.Id, Version = 1, Watermark = 0, ItemsJson = fitems, Hash = "hfA", ApprovedJson = "[\"s1\"]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-pg-A", HistoryJson = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-pg-A\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"BUY\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"hfA\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "approved" };
   ps.Drafts[frecA.Id] = frecA; ps.Drafts.Flush();
+frecA.Hash = H(frecA.ItemsJson);
   SimCEO.Api.Data.Atomic.Audit(ps, new AuditEvent { BoardId = pbid, Action = "seed.audit", Detail = "{\"seed\":1}" });
   // Seed the fault target with a HEALTHY completed index first: rollback below must restore NONEMPTY
   // prior sections/heads/events, not just counts and IndexState.
@@ -603,6 +784,47 @@ try
   PgExpect(!ps.ActiveIndexJobs.ContainsKey(finDoc.Id), "f8-reservation-retired", "retire after success");
   var retrySecs = ps.SourceSections.Values.Where(x => x.SourceId == finDoc.Id).OrderBy(x => x.Ordinal).ToList();
   PgExpect(retrySecs.Count >= 1 && retrySecs.All(x => x.SourceVersion == 1 && x.IndexGeneration == 2 && !string.IsNullOrWhiteSpace(x.Text)), "f8-retry-persisted-complete", "gen2 sections persisted, count=" + retrySecs.Count);
+  // Independent reread after tracking clear (F8): the healthy retry's complete contents
+  // are reread from durable state, not EF-tracked memory: doc, sections, events, heads,
+  // audit entries, and reservation retirement.
+  pgDbCtx.ChangeTracker.Clear();
+  var rereadDoc = pgDbCtx.Sources.FirstOrDefault(x => x.Id == finDoc.Id);
+  PgExpect(rereadDoc is not null && rereadDoc.IndexState == "completed" && rereadDoc.IndexGeneration == 2, "f8-reread-doc-gen2", rereadDoc is null ? "missing" : rereadDoc.IndexState + "/gen" + rereadDoc.IndexGeneration);
+  var rereadSecs = pgDbCtx.SourceSections.Where(x => x.SourceId == finDoc.Id).OrderBy(x => x.Ordinal).ToList();
+  PgExpect(rereadSecs.Count >= 1 && rereadSecs.All(x => x.SourceVersion == finDoc.Version && x.IndexGeneration == 2 && !string.IsNullOrWhiteSpace(x.Text)), "f8-reread-sections-complete", "count=" + rereadSecs.Count);
+  var rereadEvts = pgDbCtx.SourceEvents.Where(x => x.SourceId == finDoc.Id).OrderBy(x => x.CreatedAt).ToList();
+  PgExpect(rereadEvts.Any(e => string.Equals(e.Action ?? "", "index", StringComparison.OrdinalIgnoreCase) && (e.Detail ?? "").Contains("gen2")), "f8-reread-finish-event", "events=" + rereadEvts.Count);
+  var rereadHeads = pgDbCtx.SourceHeads.Where(x => x.BoardId == pbid).ToList();
+  PgExpect(rereadHeads.All(x => x.FloorVersion >= 0 && x.HighWater >= 0), "f8-reread-heads-sane", "heads=" + rereadHeads.Count);
+  PgExpect(ps.Audit.Any(a => string.Equals(a.Action ?? "", "source.index", StringComparison.OrdinalIgnoreCase) && a.BoardId == pbid), "f8-reread-audit-finish", "audit retains finish entry after clear");
+  PgExpect(!ps.ActiveIndexJobs.ContainsKey(finDoc.Id), "f8-reread-reservation-retired", "no reservation after complete retry");
+  // Negative control (throwaway emulation of the predecessor inner catch, QA-only):
+  // stage-then-swallow-then-complete MUST persist partials (the old failure mode the
+  // repair discriminates: the f8 fault test above proves the repaired unit escapes and
+  // rolls back instead). No shipping code is involved: this local emulation lives only
+  // in this probe artifact and its throwaway rows never leave the exclusive test DB.
+  var negDoc = new SourceDoc { BoardId = pbid, FileName = "neg-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt", Origin = "upload", Scope = "board", ContentHash = Sha("neg-bytes"), Version = 1, ReviewState = "pending", IndexState = "queued", IndexGeneration = 0, ExtractionJson = "{}" };
+  negDoc.FamilyKey = SourceGovernance.FamilyKeyFor(pbid, "board", null, "upload", negDoc.FileName);
+  negDoc.Original = System.Text.Encoding.UTF8.GetBytes("negative control body text. one two three four five six seven eight.");
+  ps.Sources[negDoc.Id] = negDoc; ps.Sources.Flush();
+  SourceGovernance.FinishIndexCallbackFault = () => true;
+  var negThrew = false;
+  try
+  {
+    SimCEO.Api.Data.Atomic.Run(ps, () =>
+    {
+      var negSec = new SourceSection { BoardId = pbid, SourceId = negDoc.Id, FamilyKey = negDoc.FamilyKey, SourceVersion = 1, ContentHash = negDoc.ContentHash, Ordinal = 1, Heading = "h", Location = "loc", Text = "negative control staged partial", IndexGeneration = 1 };
+      ps.SourceSections[negSec.Id] = negSec; ps.SourceSections.Flush();
+      try { if (SourceGovernance.FinishIndexCallbackFault?.Invoke() == true) throw new InvalidOperationException("emulated predecessor-swallowed fault"); }
+      catch { }
+    });
+  }
+  catch (Exception negEx) { negThrew = true; Emit("neg-unexpected-escape: " + negEx.GetType().Name); }
+  finally { SourceGovernance.FinishIndexCallbackFault = null; }
+  var negPartial = ps.SourceSections.Values.Any(x => x.SourceId == negDoc.Id && x.Text == "negative control staged partial");
+  PgExpect(!negThrew, "f8-negative-control-swallowed", "old catch swallowed, nothing escaped");
+  PgExpect(negPartial, "f8-negative-control-partials-committed", "swallow-then-commit persisted the staged partial (old failure mode)");
+  try { foreach (var nx in ps.SourceSections.Values.Where(x => x.SourceId == negDoc.Id).ToList()) ps.SourceSections.TryRemove(nx.Id, out _); ps.SourceSections.Flush(); ps.Sources.TryRemove(negDoc.Id, out _); ps.Sources.Flush(); } catch { }
   // RETAINED real PG insert trigger case with CORRECTED classification: PostgresBackend.SaveChanges runs
   // AFTER the FinishIndex callback returns, so this fault fires in the deferred save/commit sequence inside
   // Transact (post-callback, pre-tx.Commit) - it proves commit-sequence rollback, NOT inner-catch discrimination.
@@ -640,6 +862,14 @@ try
   functionCreated = false;
   var (okTrigRetry, _, _, errTrigRetry, stTrigRetry) = SourceGovernance.FinishIndex(ps, ownerReq, trigRes, false, "contribute");
   PgExpect(okTrigRetry, "f8-trigger-healthy-retry", errTrigRetry + " st " + stTrigRetry);
+  // Independent reread of the trigger retry (F8): complete contents reread from durable
+  // state after tracking clear. The trigger fault is honestly a SaveChanges/insert
+  // failure inside the commit sequence (post-callback, pre-tx.Commit), not a failing COMMIT.
+  pgDbCtx.ChangeTracker.Clear();
+  var trigReread = pgDbCtx.Sources.FirstOrDefault(x => x.Id == trigDoc.Id);
+  PgExpect(trigReread is not null && trigReread.IndexState == "completed", "f8-trigger-reread-completed", trigReread is null ? "missing" : trigReread.IndexState + "/gen" + trigReread.IndexGeneration);
+  var trigRereadSecs = pgDbCtx.SourceSections.Where(x => x.SourceId == trigDoc.Id).OrderBy(x => x.Ordinal).ToList();
+  PgExpect(trigRereadSecs.Count >= 1 && trigRereadSecs.All(x => !string.IsNullOrWhiteSpace(x.Text)), "f8-trigger-reread-sections-complete", "count=" + trigRereadSecs.Count);
 }
 catch (Exception ex) { PgFail("pg-fatal", ex.GetType().Name + " " + ex.Message + " " + (ex.StackTrace ?? "").Substring(0, Math.Min(500, (ex.StackTrace ?? "").Length))); }
 finally
@@ -691,18 +921,539 @@ finally
   if (cerrs.Count > 0) PgFail("f7-cleanup-errors", string.Join("; ", cerrs));
   else Emit("CLEANUP ok owned-db-dropped=" + pgDb);
 }
+// ================= HTTP SECTION (actual API workflow proof, mandatory) =================
+Emit("HTTP SECTION START");
+var httpFailed = false;
+void HttpFail(string name, string detail) { Fail(name, detail); httpFailed = true; }
+void HttpExpect(bool ok, string name, string detail) { if (ok) Pass(name, detail); else { Fail(name, detail); httpFailed = true; } }
+static (System.Net.HttpStatusCode status, JsonDocument doc) GetJson(System.Net.Http.HttpClient h, string url)
+{
+  using var resp = h.GetAsync(url).GetAwaiter().GetResult();
+  var txt = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+  return (resp.StatusCode, JsonDocument.Parse(string.IsNullOrWhiteSpace(txt) ? "{}" : txt));
+}
+static (System.Net.HttpStatusCode status, JsonDocument doc) PostJson(System.Net.Http.HttpClient h, string url, object body)
+{
+  var json = JsonSerializer.Serialize(body);
+  using var resp = h.PostAsync(url, new StringContent(json, System.Text.Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+  var txt = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+  return (resp.StatusCode, JsonDocument.Parse(string.IsNullOrWhiteSpace(txt) ? "{}" : txt));
+}
+static string NormExport(string snapshotJson)
+{
+  using var nd = JsonDocument.Parse(snapshotJson);
+  var nsb = new System.Text.StringBuilder();
+  foreach (var prop in nd.RootElement.EnumerateObject())
+  {
+    if (prop.NameEquals("at")) continue;
+    nsb.Append(prop.Name); nsb.Append('='); nsb.Append(prop.Value.GetRawText()); nsb.Append('\n');
+  }
+  return nsb.ToString();
+}
+void EmitNormDiff(string wantNorm, string gotSnap, string artifactDir, string baseName, string testName)
+{
+  try
+  {
+    var gotNorm = NormExportStable(gotSnap);
+    if (gotNorm == wantNorm) return;
+    System.IO.File.WriteAllText(System.IO.Path.Combine(artifactDir, baseName + "-want.norm.txt"), wantNorm);
+    System.IO.File.WriteAllText(System.IO.Path.Combine(artifactDir, baseName + "-got.norm.txt"), gotNorm);
+    var la = wantNorm.Split('\n'); var lb = gotNorm.Split('\n');
+    Emit("NORM-DIFF-COUNT want=" + la.Length + " got=" + lb.Length);
+    for (var di = 0; di < System.Math.Max(la.Length, lb.Length); di++)
+    {
+      var xa = di < la.Length ? la[di] : "<none>"; var xb = di < lb.Length ? lb[di] : "<none>";
+      if (xa != xb) { Emit("NORM-DIFF first@" + di + " WANT=[" + xa.Substring(0, System.Math.Min(500, xa.Length)) + "] GOT=[" + xb.Substring(0, System.Math.Min(500, xb.Length)) + "]"); break; }
+    }
+  }
+  catch (System.Exception dex) { Emit("NORM-DIFF-ERR " + dex.GetType().Name); }
+}
+// Stable export comparison (F2/P1): meeting Generation is advanced by the restore
+// generation floor by design (max(staged,live)+1, no generation reuse), so identity
+// comparison masks it; the floor itself is asserted exactly per meeting.
+static string NormExportStable(string snapshotJson)
+{
+  var snode = System.Text.Json.Nodes.JsonNode.Parse(snapshotJson);
+  if (snode is not System.Text.Json.Nodes.JsonObject sobj) return "";
+  var ssb = new System.Text.StringBuilder();
+  foreach (var kv in sobj)
+  {
+    if (kv.Key == "at") continue;
+    if (kv.Key == "meetings" && kv.Value is System.Text.Json.Nodes.JsonArray marr)
+      foreach (var mm in marr) { if (mm is System.Text.Json.Nodes.JsonObject mo) mo["Generation"] = -1; }
+    if (kv.Key == "boards" && kv.Value is System.Text.Json.Nodes.JsonArray barr)
+      foreach (var bb in barr) { if (bb is System.Text.Json.Nodes.JsonObject bo) bo["OwnerKey"] = "-"; }
+    ssb.Append(kv.Key); ssb.Append('='); ssb.Append(kv.Value is null ? "null" : kv.Value.ToJsonString()); ssb.Append('\n');
+  }
+  return ssb.ToString();
+}
+// Exact failed-restore comparison (F2/P1): ONLY the root generated export timestamp
+// ("at") is excluded. EVERYTHING else is compared byte-identically: meetings INCLUDING
+// Generation, boards INCLUDING OwnerKey, all user bytes, ids, costs, and content. No
+// normalization and no field deletion in failed-state proof. Success comparisons may
+// mask Generation/OwnerKey ONLY together with the CheckGenFloor + CheckBoardOwners
+// exact per-meeting/per-board proofs below.
+static string NormFailedStable(string snapshotJson)
+{
+  var snode = System.Text.Json.Nodes.JsonNode.Parse(snapshotJson);
+  if (snode is not System.Text.Json.Nodes.JsonObject sobj) return "";
+  var ssb = new System.Text.StringBuilder();
+  foreach (var kv in sobj)
+  {
+    if (kv.Key == "at") continue;
+    ssb.Append(kv.Key); ssb.Append('='); ssb.Append(kv.Value is null ? "null" : kv.Value.ToJsonString()); ssb.Append('\n');
+  }
+  return ssb.ToString();
+}
+void EmitFailedDiff(string wantExact, string gotSnap, string artifactDir, string baseName, string testName)
+{
+  try
+  {
+    var gotExact = NormFailedStable(gotSnap);
+    if (gotExact == wantExact) return;
+    System.IO.File.WriteAllText(System.IO.Path.Combine(artifactDir, baseName + "-want.exact.txt"), wantExact);
+    System.IO.File.WriteAllText(System.IO.Path.Combine(artifactDir, baseName + "-got.exact.txt"), gotExact);
+    var la = wantExact.Split('\n'); var lb = gotExact.Split('\n');
+    Emit("FAILED-DIFF-COUNT want=" + la.Length + " got=" + lb.Length);
+    for (var di = 0; di < System.Math.Max(la.Length, lb.Length); di++)
+    {
+      var xa = di < la.Length ? la[di] : "<none>"; var xb = di < lb.Length ? lb[di] : "<none>";
+      if (xa != xb) { Emit("FAILED-DIFF first@" + di + " WANT=[" + xa.Substring(0, System.Math.Min(500, xa.Length)) + "] GOT=[" + xb.Substring(0, System.Math.Min(500, xb.Length)) + "]"); break; }
+    }
+  }
+  catch (System.Exception dex) { Emit("FAILED-DIFF-ERR " + dex.GetType().Name); }
+}
+void CheckBoardOwners(string sentSnap, string gotSnap, string preSnap, string testName)
+{
+  try
+  {
+    using var sd = JsonDocument.Parse(sentSnap);
+    using var gd = JsonDocument.Parse(gotSnap);
+    var sentIds = new HashSet<string>(StringComparer.Ordinal);
+    foreach (var sb in sd.RootElement.GetProperty("boards").EnumerateArray()) sentIds.Add(sb.GetProperty("Id").GetString() ?? "");
+    var gotOwners = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var gb in gd.RootElement.GetProperty("boards").EnumerateArray())
+    {
+      var gid = gb.GetProperty("Id").GetString() ?? "";
+      var go = gb.TryGetProperty("OwnerKey", out var gov) ? (gov.GetString() ?? "") : "";
+      if (!gotOwners.TryAdd(gid, go)) { HttpExpect(false, testName, "duplicate board " + gid); return; }
+    }
+    var pre = new Dictionary<string, string>(StringComparer.Ordinal);
+    if (!string.IsNullOrWhiteSpace(preSnap))
+    {
+      using var pd = JsonDocument.Parse(preSnap);
+      foreach (var pb in pd.RootElement.GetProperty("boards").EnumerateArray()) pre[pb.GetProperty("Id").GetString() ?? ""] = pb.TryGetProperty("OwnerKey", out var pov) ? (pov.GetString() ?? "") : "";
+    }
+    // Exact actual restore contract (ACL preserved): the restored board set must equal
+    // the sent set exactly (no omission, no extras, total counts match). Every restored
+    // board keeps its prior live OwnerKey when present, else the non-secure restore default.
+    var okB = gotOwners.Count == sentIds.Count && sentIds.All(id => gotOwners.ContainsKey(id));
+    var seenB = 0;
+    foreach (var kv in gotOwners)
+    {
+      seenB++;
+      var want = pre.TryGetValue(kv.Key, out var pv) ? pv : "owner";
+      if (kv.Value != want) { okB = false; Emit("OWNER-MISMATCH " + kv.Key + " got=[" + kv.Value + "] want=[" + want + "]"); }
+    }
+    HttpExpect(okB && seenB > 0 && seenB == sentIds.Count, testName, "boards=" + seenB + "/" + sentIds.Count);
+  }
+  catch (Exception bex) { HttpExpect(false, testName, bex.GetType().Name); }
+}
+void CheckGenFloor(string sentSnap, string gotSnap, long liveMaxBefore, string testName)
+{
+  try
+  {
+    using var sd = JsonDocument.Parse(sentSnap); using var gd = JsonDocument.Parse(gotSnap);
+    var want = new Dictionary<string, long>(StringComparer.Ordinal);
+    foreach (var m in sd.RootElement.GetProperty("meetings").EnumerateArray())
+      want[m.GetProperty("Id").GetString() ?? ""] = m.TryGetProperty("Generation", out var gv) && gv.ValueKind == JsonValueKind.Number && gv.TryGetInt64(out var gl) ? gl : 0;
+    var okAll = true; var seen = 0;
+    foreach (var m in gd.RootElement.GetProperty("meetings").EnumerateArray())
+    {
+      var id = m.GetProperty("Id").GetString() ?? ""; seen++;
+      var got = m.TryGetProperty("Generation", out var gv2) && gv2.ValueKind == JsonValueKind.Number && gv2.TryGetInt64(out var gl2) ? gl2 : -1;
+      var expect = want.TryGetValue(id, out var wv) ? System.Math.Max(wv, liveMaxBefore) + 1 : -2;
+      if (got != expect) { okAll = false; Emit("if (mm is System.Text.Json.Nodes.JsonObject mo) FLOOR-MISMATCH " + id + " got=" + got + " expect=" + expect); }
+    }
+    HttpExpect(okAll && seen == want.Count && seen > 0, testName, "meetings=" + seen + " floor=max(staged,live)+1");
+  }
+  catch (System.Exception gex) { HttpExpect(false, testName, gex.GetType().Name + " " + gex.Message); }
+}
+static bool PortFree(int port)
+{
+  try { using var tc = new System.Net.Sockets.TcpClient(); var iar = tc.BeginConnect("127.0.0.1", port, null, null); if (iar.AsyncWaitHandle.WaitOne(2000) && tc.Connected) return false; return true; }
+  catch { return true; }
+}
+System.Diagnostics.Process? apiProc1 = null; System.Diagnostics.Process? apiProc2 = null; System.Diagnostics.Process? apiProc3 = null;
+System.Threading.Tasks.Task? apiDrain1a = null; System.Threading.Tasks.Task? apiDrain1b = null;
+System.Threading.Tasks.Task? apiDrain2a = null; System.Threading.Tasks.Task? apiDrain2b = null;
+System.Threading.Tasks.Task? apiDrain3a = null; System.Threading.Tasks.Task? apiDrain3b = null;
+var apiOut1 = new System.Text.StringBuilder(); var apiErr1 = new System.Text.StringBuilder();
+var apiOut2 = new System.Text.StringBuilder(); var apiErr2 = new System.Text.StringBuilder();
+var apiOut3 = new System.Text.StringBuilder(); var apiErr3 = new System.Text.StringBuilder();
+string? httpA = null; string? httpB = null; string? httpUpg = null;
+var apiDir = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "server", "SimCEO.Api", "bin", "Release", "net10.0"));
+var apiDll = System.IO.Path.Combine(apiDir, "SimCEO.Api.dll");
+System.Diagnostics.Process StartApi(string db, int port, System.Text.StringBuilder o, System.Text.StringBuilder e, string ring, string csBase)
+{
+  var cs = csBase.Replace("Database=postgres;", "Database=" + db + ";");
+  var psi = new System.Diagnostics.ProcessStartInfo("dotnet", "\"" + apiDll + "\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = apiDir };
+  psi.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:" + port;
+  psi.Environment["USE_POSTGRES"] = "1";
+  psi.Environment["ConnectionStrings__App"] = cs;
+  psi.Environment["WIKI_KEYRING_DIR"] = ring;
+  psi.Environment["DOTNET_NOLOGO"] = "1";
+  var pr = new System.Diagnostics.Process { StartInfo = psi };
+  if (!pr.Start()) throw new InvalidOperationException("api start failed on port " + port);
+  return pr;
+}
+bool WaitReady(System.Net.Http.HttpClient h, string baseUrl, int tries)
+{
+  for (var ti = 0; ti < tries; ti++)
+  {
+    try
+    {
+      var (st, dc) = GetJson(h, baseUrl + "/api/backend");
+      if (st == System.Net.HttpStatusCode.OK && dc.RootElement.TryGetProperty("mode", out var mv) && (mv.GetString() ?? "") == "postgres") return true;
+    }
+    catch { }
+    System.Threading.Thread.Sleep(2000);
+  }
+  return false;
+}
+void KillApi(ref System.Diagnostics.Process? pr, System.Threading.Tasks.Task? d1, System.Threading.Tasks.Task? d2, System.Text.StringBuilder o, System.Text.StringBuilder e, string logPath)
+{
+  try
+  {
+    if (pr is not null)
+    {
+      try { if (!pr.HasExited) pr.Kill(true); } catch { }
+      try { pr.WaitForExit(15000); } catch { }
+      try { if (d1 is not null) d1.Wait(10000); } catch { }
+      try { if (d2 is not null) d2.Wait(10000); } catch { }
+      try { pr.Dispose(); } catch { }
+      pr = null;
+    }
+  }
+  catch { }
+  try
+  {
+    var txt = "STDOUT(len=" + o.Length + ")\n" + (o.Length > 200000 ? o.ToString().Substring(0, 200000) : o.ToString()) + "\nSTDERR(len=" + e.Length + ")\n" + (e.Length > 50000 ? e.ToString().Substring(0, 50000) : e.ToString());
+    System.IO.File.WriteAllText(logPath, txt);
+  }
+  catch { }
+}
+var csBaseAdmin = "Host=" + pgParts["Host"] + ";Port=" + pgParts["Port"] + ";Database=postgres;Username=" + pgParts["Username"] + ";Password=" + pgParts["Password"];
+var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+try
+{
+  HttpExpect(System.IO.File.Exists(apiDll), "http-api-dll-present", apiDll);
+  var repoRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+  var apiProj = System.IO.Path.Combine(repoRoot, "server", "SimCEO.Api", "SimCEO.Api.csproj");
+  var (buildExit, buildOut, buildErr, buildTo) = RunBounded("dotnet", "build \"" + apiProj + "\" -c Release --nologo -v q", 600000);
+  HttpExpect(!buildTo && buildExit == 0, "http-api-build-native", "exit=" + buildExit + " timedOut=" + buildTo + " tail=" + (buildOut + buildErr).Trim().Replace("\n", " ").Replace("\r", "")); HttpExpect(PortFree(5146), "http-preflight-5146-free", "own API port must be free");
+  HttpExpect(PortFree(5246), "http-preflight-5246-free", "own second API port must be free");
+  string ExecSql(string cs, string sql)
+  {
+    var opt = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<SimCEO.Postgres.PostgresDb>().UseNpgsql(cs).Options;
+    using var db = new SimCEO.Postgres.PostgresDb(opt);
+    return db.Database.ExecuteSqlRaw(sql).ToString() ?? "";
+  }
+  httpA = "essentials_evidence_httpa_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+  httpB = "essentials_evidence_httpb_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+  httpUpg = "essentials_evidence_httpupg_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\"");
+  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpB + "\"");
+  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpUpg + "\"");
+  Emit("HTTP exclusive DBs: " + httpA + " " + httpB + " " + httpUpg);
+  // ---- P1b: genuine old backup restores through the actual route, then exports ----
+  string? legacyPath = Environment.GetEnvironmentVariable("ESSENTIALS_LEGACY_BACKUP");
+  if (string.IsNullOrWhiteSpace(legacyPath) || !System.IO.File.Exists(legacyPath)) legacyPath = "C:/Users/War/scrach/sim_ceo/.tmp/predecessor-complete-primary-20261103-1021-canonical-backup.json";
+  HttpExpect(!string.IsNullOrWhiteSpace(legacyPath) && System.IO.File.Exists(legacyPath), "http-legacy-backup-present", legacyPath ?? "not found");
+  var legacyRaw = System.IO.File.ReadAllText(legacyPath);
+  using var legacyOuter = JsonDocument.Parse(legacyRaw);
+  var legacySnap = legacyOuter.RootElement.GetProperty("snapshot").GetString() ?? "";
+  var legacyHash = legacyOuter.RootElement.GetProperty("hash").GetString() ?? "";
+  using var legacySnapDoc = JsonDocument.Parse(legacySnap);
+  var preCharters = new Dictionary<string, string>(StringComparer.Ordinal);
+  foreach (var srow in legacySnapDoc.RootElement.GetProperty("sources").EnumerateArray())
+  {
+    if ((srow.TryGetProperty("Scope", out var scp) ? (scp.GetString() ?? "") : "") == "meeting" && (srow.TryGetProperty("Version", out var sv) ? (sv.GetInt32()) : 0) == 3)
+      preCharters[srow.GetProperty("Id").GetString() ?? ""] = (srow.TryGetProperty("ContentHash", out var chx) ? (chx.GetString() ?? "") : "");
+  }
+  HttpExpect(preCharters.Count > 0, "http-legacy-charter-v3-present", "meeting v3 charters=" + preCharters.Count + " (genuine v3, no heads/events)");
+  apiProc1 = StartApi(httpA!, 5146, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "wikiring1"), csBaseAdmin);
+  apiDrain1a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardOutput, apiOut1));
+  apiDrain1b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardError, apiErr1));
+  HttpExpect(WaitReady(http, "http://127.0.0.1:5146", 45), "http-api1-ready-postgres", "boot on fresh exclusive DB");
+  var (rsSt, rsDoc) = PostJson(http, "http://127.0.0.1:5146/api/backup/restore", new { snapshot = legacySnap, hash = legacyHash });
+  HttpExpect(rsSt == System.Net.HttpStatusCode.OK, "http-legacy-restore-200", "status=" + (int)rsSt + " " + rsDoc.RootElement.GetRawText());
+  var (exSt, exDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
+  HttpExpect(exSt == System.Net.HttpStatusCode.OK, "http-legacy-export-200", "status=" + (int)exSt);
+  var e1Snap = exDoc.RootElement.GetProperty("snapshot").GetString() ?? "";
+  using var e1Doc = JsonDocument.Parse(e1Snap);
+  var postCharters = new Dictionary<string, string>(StringComparer.Ordinal);
+  var postFamilies = new HashSet<string>(StringComparer.Ordinal);
+  foreach (var srow in e1Doc.RootElement.GetProperty("sources").EnumerateArray())
+  {
+    var sid = srow.GetProperty("Id").GetString() ?? "";
+    if (preCharters.ContainsKey(sid)) postCharters[sid] = (srow.TryGetProperty("ContentHash", out var ch2) ? (ch2.GetString() ?? "") : "");
+    postFamilies.Add(srow.GetProperty("FamilyKey").GetString() ?? "");
+  }
+  HttpExpect(postCharters.Count == preCharters.Count, "http-charter-v3-preserved-count", "charters=" + postCharters.Count);
+  var charterBytesOk = postCharters.Count == preCharters.Count && postCharters.All(kv => preCharters.TryGetValue(kv.Key, out var pv) && pv == kv.Value);
+  HttpExpect(charterBytesOk, "http-charter-v3-bytes-preserved", "actual v3 bytes/version kept, nothing invented");
+  HttpExpect(postFamilies.All(f => !string.IsNullOrWhiteSpace(f)), "http-families-canonicalized", "legacy blank families migrated to canonical keys");
+  var e1Heads = e1Doc.RootElement.GetProperty("heads");
+  var sparseFloorOk = false;
+  foreach (var hh in e1Heads.EnumerateArray())
+  {
+    if ((hh.TryGetProperty("HeadVersion", out var hv) ? hv.GetInt32() : -1) == 0 && (hh.TryGetProperty("FloorVersion", out var fl) ? fl.GetInt32() : 0) == 3) sparseFloorOk = true;
+  }
+  HttpExpect(sparseFloorOk, "http-sparse-stub-floor3-exported", "single-v3 legacy family carries persisted floor-3 stub");
+  // ---- F2 actual HTTP create->revise->approve/discard->amend->export->restore ----
+  string flowMeeting = "";
+  foreach (var mm in e1Doc.RootElement.GetProperty("meetings").EnumerateArray()) { flowMeeting = mm.GetProperty("Id").GetString() ?? ""; if (!string.IsNullOrWhiteSpace(flowMeeting)) break; }
+  HttpExpect(!string.IsNullOrWhiteSpace(flowMeeting), "http-flow-meeting-found", flowMeeting);
+  JsonDocument GuardOf(JsonDocument getDoc) { return getDoc; }
+  var (dcSt, dcDoc) = PostJson(http, "http://127.0.0.1:5146/api/meetings/" + flowMeeting + "/record/draft", JsonDocument.Parse("[{\"id\":\"s1\",\"text\":\"BUY\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]").RootElement);
+  HttpExpect(dcSt == System.Net.HttpStatusCode.Created, "http-draft-created", "status=" + (int)dcSt + " " + dcDoc.RootElement.GetRawText().Substring(0, Math.Min(300, dcDoc.RootElement.GetRawText().Length)));
+  var flowId = dcDoc.RootElement.TryGetProperty("id", out var fidv) ? (fidv.GetString() ?? "") : (dcDoc.RootElement.TryGetProperty("Id", out var fidv2) ? (fidv2.GetString() ?? "") : "");
+  (System.Net.HttpStatusCode gst, JsonDocument gdoc) GetDraft(string id) { return GetJson(http, "http://127.0.0.1:5146/api/records/" + id); }
+  System.Collections.Generic.Dictionary<string, object?> GuardFor(JsonDocument getDoc)
+  {
+    var r = getDoc.RootElement;
+    string gs(string a, string b) { if (r.TryGetProperty(a, out var xv)) return xv.GetString() ?? ""; if (r.TryGetProperty(b, out var yv)) return yv.GetString() ?? ""; return ""; }
+    long gl(string a, string b) { if (r.TryGetProperty(a, out var xv) && xv.ValueKind == JsonValueKind.Number && xv.TryGetInt64(out var l)) return l; if (r.TryGetProperty(b, out var yv) && yv.ValueKind == JsonValueKind.Number && yv.TryGetInt64(out var l2)) return l2; return 0; }
+    int gi(string a, string b) { if (r.TryGetProperty(a, out var xv) && xv.ValueKind == JsonValueKind.Number && xv.TryGetInt32(out var l)) return l; if (r.TryGetProperty(b, out var yv) && yv.ValueKind == JsonValueKind.Number && yv.TryGetInt32(out var l2)) return l2; return 0; }
+    return new System.Collections.Generic.Dictionary<string, object?> { ["version"] = gi("version", "Version"), ["hash"] = gs("hash", "Hash"), ["reviewToken"] = gs("reviewToken", "ReviewToken"), ["watermark"] = gl("watermark", "Watermark") };
+  }
+  var (_, g0) = GetDraft(flowId); var g0g = GuardFor(g0);
+  var (rvSt, rvDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/revise", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s2", ["text"] = "HOLD", ["version"] = g0g["version"], ["hash"] = g0g["hash"], ["reviewToken"] = g0g["reviewToken"], ["watermark"] = g0g["watermark"] });
+  HttpExpect(rvSt == System.Net.HttpStatusCode.OK, "http-revise-s2-hold", "status=" + (int)rvSt + " " + rvDoc.RootElement.GetRawText().Substring(0, Math.Min(200, rvDoc.RootElement.GetRawText().Length)));
+  var (_, g1) = GetDraft(flowId); var g1g = GuardFor(g1);
+  var (apSt, apDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/approve", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s1", ["version"] = g1g["version"], ["hash"] = g1g["hash"], ["reviewToken"] = g1g["reviewToken"], ["watermark"] = g1g["watermark"] });
+  HttpExpect(apSt == System.Net.HttpStatusCode.OK, "http-approve-s1-partial", "status=" + (int)apSt);
+  HttpExpect(apDoc.RootElement.TryGetProperty("status", out var apstv) && (apstv.GetString() ?? "") == "partially-approved", "http-status-partially-approved", apDoc.RootElement.GetRawText());
+  var (evSt, evDoc) = GetJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/evidence");
+  var evOk = evSt == System.Net.HttpStatusCode.OK && evDoc.RootElement.ValueKind == JsonValueKind.Array;
+  HttpExpect(evOk, "http-evidence-route-200", "evidence route resolves through the real resolver, status=" + (int)evSt);
+  var (_, g2) = GetDraft(flowId); var g2g = GuardFor(g2);
+  var (diSt, diDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/items/discard", new System.Collections.Generic.Dictionary<string, object?> { ["itemId"] = "s2", ["version"] = g2g["version"], ["hash"] = g2g["hash"], ["reviewToken"] = g2g["reviewToken"], ["watermark"] = g2g["watermark"] });
+  HttpExpect(diSt == System.Net.HttpStatusCode.OK, "http-discard-s2-approved", "status=" + (int)diSt);
+  HttpExpect(diDoc.RootElement.TryGetProperty("status", out var distv) && (distv.GetString() ?? "") == "approved" && diDoc.RootElement.TryGetProperty("decided", out var didv) && didv.ValueKind == JsonValueKind.True, "http-status-approved-decided", diDoc.RootElement.GetRawText());
+  var (_, g3) = GetDraft(flowId); var g3g = GuardFor(g3);
+  var (amSt, amDoc) = PostJson(http, "http://127.0.0.1:5146/api/records/" + flowId + "/amend", new System.Collections.Generic.Dictionary<string, object?> { ["version"] = g3g["version"], ["hash"] = g3g["hash"], ["reviewToken"] = g3g["reviewToken"], ["watermark"] = g3g["watermark"] });
+  HttpExpect(amSt == System.Net.HttpStatusCode.Created, "http-amend-successor", "status=" + (int)amSt + " " + amDoc.RootElement.GetRawText().Substring(0, Math.Min(300, amDoc.RootElement.GetRawText().Length)));
+  var succId = amDoc.RootElement.TryGetProperty("id", out var scv) ? (scv.GetString() ?? "") : "";
+  HttpExpect(!string.IsNullOrWhiteSpace(succId) && succId != flowId, "http-amend-new-id", succId);
+  var (_, gs_) = GetDraft(succId);
+  HttpExpect(gs_.RootElement.TryGetProperty("itemsJson", out var sij) && (sij.GetString() ?? "").Contains("HOLD"), "http-amend-inherits-items", "successor inherits revised text");
+  string exportText;
+  using (var eresp = http.GetAsync("http://127.0.0.1:5146/api/records/" + flowId + "/export?format=detailed").GetAwaiter().GetResult())
+  { exportText = eresp.Content.ReadAsStringAsync().GetAwaiter().GetResult(); HttpExpect(eresp.StatusCode == System.Net.HttpStatusCode.OK && exportText.Contains("BUY"), "http-export-A-bytes", "detailed export carries exact amended bytes (HOLD was discarded; inheritance proven separately), status=" + (int)eresp.StatusCode); }
+  var (e0St, e0Doc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
+  HttpExpect(e0St == System.Net.HttpStatusCode.OK, "http-backup-E0-200", "status=" + (int)e0St);
+  var e0Snap = e0Doc.RootElement.GetProperty("snapshot").GetString() ?? "";
+  var e0Norm = NormExportStable(e0Snap);
+  HttpExpect(e0Norm.Contains("s1") && e0Norm.Contains("BUY") && e0Norm.Contains("HOLD"), "http-E0-carries-flow", "export carries actual amended bytes");
+  // ---- F2/P1 round-trip: own export restores with complete preserved data ----
+  static string TamperDropFamilyMember(string snapshotJson, out string detail)
+  {
+    detail = "";
+    var node = System.Text.Json.Nodes.JsonNode.Parse(snapshotJson);
+    if (node is null) { detail = "unparseable"; return snapshotJson; }
+    var srcs = node["sources"] as System.Text.Json.Nodes.JsonArray;
+    if (srcs is null) { detail = "no-sources"; return snapshotJson; }
+    var groups = new Dictionary<string, List<System.Text.Json.Nodes.JsonObject>>(StringComparer.Ordinal);
+    foreach (var s in srcs)
+    {
+      if (s is not System.Text.Json.Nodes.JsonObject o) continue;
+      var k = (o["BoardId"]?.GetValue<string>() ?? "") + "|" + (o["FamilyKey"]?.GetValue<string>() ?? "");
+      if (!groups.TryGetValue(k, out var gl)) { gl = new List<System.Text.Json.Nodes.JsonObject>(); groups[k] = gl; }
+      gl.Add(o);
+    }
+    System.Text.Json.Nodes.JsonObject? victim = null;
+    foreach (var kv in groups.Values)
+    {
+      if (kv.Count < 2) continue;
+      var ordered = kv.OrderBy(o => o["Version"]?.GetValue<int>() ?? 999).ToList();
+      victim = ordered.First();
+      break;
+    }
+    if (victim is null) { detail = "no-dense-family"; return snapshotJson; }
+    var vid = victim["Id"]?.GetValue<string>() ?? "";
+    detail = "drop-source " + vid + " v" + (victim["Version"]?.GetValue<int>() ?? -1);
+    var kept = new System.Text.Json.Nodes.JsonArray();
+    foreach (var s in srcs) { if (s is System.Text.Json.Nodes.JsonObject o && (o["Id"]?.GetValue<string>() ?? "") == vid) continue; if (s is null) continue; kept.Add(System.Text.Json.Nodes.JsonNode.Parse(s!.ToJsonString())); }
+    node["sources"] = kept;
+    var secs = node["sections"] as System.Text.Json.Nodes.JsonArray;
+    if (secs is not null) { var ks = new System.Text.Json.Nodes.JsonArray(); foreach (var s in secs) { if (s is System.Text.Json.Nodes.JsonObject o && (o["SourceId"]?.GetValue<string>() ?? "") == vid) continue; ks.Add(System.Text.Json.Nodes.JsonNode.Parse(s!.ToJsonString())); } node["sections"] = ks; }
+    var evts = node["events"] as System.Text.Json.Nodes.JsonArray;
+    if (evts is not null) { var ke = new System.Text.Json.Nodes.JsonArray(); foreach (var s in evts) { if (s is System.Text.Json.Nodes.JsonObject o && (o["SourceId"]?.GetValue<string>() ?? "") == vid) continue; ke.Add(System.Text.Json.Nodes.JsonNode.Parse(s!.ToJsonString())); } node["events"] = ke; }
+    return node.ToJsonString();
+  }
+  apiProc2 = StartApi(httpB!, 5246, apiOut2, apiErr2, System.IO.Path.Combine(artifactDir, "wikiring2"), csBaseAdmin);
+  apiDrain2a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc2.StandardOutput, apiOut2));
+  apiDrain2b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc2.StandardError, apiErr2));
+  HttpExpect(WaitReady(http, "http://127.0.0.1:5246", 45), "http-api2-ready-postgres", "boot on fresh exclusive DB");
+  var (rtSt, rtDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = e0Snap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(e0Snap)) });
+  HttpExpect(rtSt == System.Net.HttpStatusCode.OK, "http-E0-restore-200", "own export round-trips, status=" + (int)rtSt + " " + rtDoc.RootElement.GetRawText().Substring(0, Math.Min(300, rtDoc.RootElement.GetRawText().Length)));
+  var (reSt, reDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  HttpExpect(reSt == System.Net.HttpStatusCode.OK, "http-roundtrip-export-200", "status=" + (int)reSt);
+  var reSnap = reDoc.RootElement.GetProperty("snapshot").GetString() ?? "";
+  var reNorm = NormExportStable(reSnap); EmitNormDiff(e0Norm, reSnap, artifactDir, "e0-roundtrip", "http-roundtrip-byte-identical"); HttpExpect(reNorm == e0Norm, "http-roundtrip-byte-identical", "export after restore equals sent export (modulo at+generation-floor): exact fields/history/bytes"); CheckGenFloor(e0Snap, reSnap, 0, "http-genfloor-roundtrip"); CheckBoardOwners(e0Snap, reSnap, "", "http-owners-roundtrip");
+  // Malicious partial-family removal rejects with zero mutation: full prior graph
+  // through the actual route is byte-identical before and after the attempt.
+  // Pre-attempt baseline through the actual route: the failed restore must leave this exact graph.
+  var (preSt, preDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var preNorm = preSt == System.Net.HttpStatusCode.OK ? NormExportStable(preDoc.RootElement.GetProperty("snapshot").GetString() ?? "") : "";
+  var preSnapText = preSt == System.Net.HttpStatusCode.OK ? preDoc.RootElement.GetProperty("snapshot").GetString() ?? "" : "";
+  var preFailExact = preSt == System.Net.HttpStatusCode.OK ? NormFailedStable(preSnapText) : "";
+  HttpExpect(preSt == System.Net.HttpStatusCode.OK && preNorm == e0Norm, "http-pre-attempt-baseline", "baseline export matches sent export before tampered attempt");
+  var tampered = TamperDropFamilyMember(e0Snap, out var tamperDetail);
+  HttpExpect(tamperDetail.StartsWith("drop-source"), "http-tamper-constructed", tamperDetail);
+  var (ngSt, ngDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tampered, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tampered)) });
+  HttpExpect(ngSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-tampered-restore-422", "status=" + (int)ngSt + " " + ngDoc.RootElement.GetRawText().Substring(0, Math.Min(300, ngDoc.RootElement.GetRawText().Length)));
+  HttpExpect(ngDoc.RootElement.GetRawText().Contains("skips version"), "http-tamper-error-shape", "dense-gap rejection names the skipped version");
+  var (unSt, unDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var unSnap = unDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var unFailExact = NormFailedStable(unSnap); EmitFailedDiff(preFailExact, unSnap, artifactDir, "e0-prior", "http-prior-unchanged-after-422"); HttpExpect(unSt == System.Net.HttpStatusCode.OK && unFailExact == preFailExact, "http-prior-unchanged-after-422", "rejected restore leaves generations, owners, and every other field byte-identical (only root at excluded)");
+  // Modern v4 wiped-history forgery over the actual route: the first modern draft keeps its
+  // explicit null/false marker but loses its history. Restore must 422 with zero mutation.
+  string wipedSnap = ""; string wipeDetail = "no-draft";
+  try
+  {
+    var wnode = System.Text.Json.Nodes.JsonNode.Parse(e0Snap);
+    var wdrafts = wnode?["drafts"] as System.Text.Json.Nodes.JsonArray;
+    if (wdrafts is not null) foreach (var wd in wdrafts)
+    {
+      if (wd is System.Text.Json.Nodes.JsonObject wdo && (wdo["HistoryJson"] as System.Text.Json.Nodes.JsonArray)?.Count > 0)
+      {
+        wdo["HistoryJson"] = new System.Text.Json.Nodes.JsonArray();
+        wipeDetail = "wiped-history " + (wdo["Id"]?.GetValue<string>() ?? "?");
+        break;
+      }
+    }
+    wipedSnap = wnode?.ToJsonString() ?? "";
+  }
+  catch (Exception wex) { wipeDetail = "unparseable:" + wex.GetType().Name; }
+  HttpExpect(wipeDetail.StartsWith("wiped-history"), "http-wipe-constructed", wipeDetail);
+  var (wSt, wDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = wipedSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(wipedSnap)) });
+  HttpExpect(wSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-wiped-history-422", "status=" + (int)wSt + " " + wDoc.RootElement.GetRawText().Substring(0, Math.Min(300, wDoc.RootElement.GetRawText().Length)));
+  var (wBackSt, wBackDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var wBackSnap = wBackDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var wBackExact = NormFailedStable(wBackSnap); EmitFailedDiff(preFailExact, wBackSnap, artifactDir, "e0-wiped-prior", "http-wiped-prior-unchanged"); HttpExpect(wBackSt == System.Net.HttpStatusCode.OK && wBackExact == preFailExact, "http-wiped-prior-unchanged", "wiped modern v4 export rejects with generations, owners, and every other field unchanged");
+  // ---- P1a: physical upg clone upgrades, exports, and restores through actual routes ----
+  var dumpFile = "/tmp/ess_ev_httpupg_dump.sql";
+  var (dumpExit, dumpOut, dumpErr, dumpTo) = RunBounded("docker", "exec simceo-integration-qa-pg pg_dump -U simceo -d essentials_backend_upg -f " + dumpFile, 300000);
+  HttpExpect(!dumpTo && dumpExit == 0, "http-upg-dump-native", "read-only pg_dump exit=" + dumpExit + " timedOut=" + dumpTo + " err=" + dumpErr.Trim());
+  var (rstExit, rstOut, rstErr, rstTo) = RunBounded("docker", "exec simceo-integration-qa-pg psql -U simceo -d " + httpUpg + " -f " + dumpFile, 300000);
+  HttpExpect(!rstTo && rstExit == 0, "http-upg-clone-native", "clone-into-exclusive-DB exit=" + rstExit + " timedOut=" + rstTo + " err=" + rstErr.Trim());
+  var (rmExit, rmOut, rmErr, rmTo) = RunBounded("docker", "exec simceo-integration-qa-pg rm -f " + dumpFile, 60000);
+  HttpExpect(!rmTo && rmExit == 0, "http-upg-dump-cleaned", "server-side dump removed exit=" + rmExit);
+  var csUpg = csBaseAdmin.Replace("Database=postgres;", "Database=" + httpUpg + ";");
+  // Clone scrub (P1a note): installation security rows are excluded from the domain proof.
+  // Backup/restore ignores Accounts/SecurityStates by design (never resurrects access), so the
+  // scrubbed exclusive clone preserves every domain byte while booting owner-anonymously.
+  try { ExecSql(csUpg, "DELETE FROM \"AuthAccounts\""); ExecSql(csUpg, "DELETE FROM \"SecurityStates\""); HttpExpect(true, "http-upg-scrub-security", "security rows scrubbed on exclusive clone"); }
+  catch (Exception scrubEx) { HttpExpect(false, "http-upg-scrub-security", scrubEx.GetType().Name + " " + scrubEx.Message); }
+  KillApi(ref apiProc1, apiDrain1a, apiDrain1b, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "api1.log"));
+  apiProc3 = StartApi(httpUpg!, 5146, apiOut3, apiErr3, System.IO.Path.Combine(artifactDir, "wikiring3"), csBaseAdmin);
+  apiDrain3a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc3.StandardOutput, apiOut3));
+  apiDrain3b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc3.StandardError, apiErr3));
+  HttpExpect(WaitReady(http, "http://127.0.0.1:5146", 60), "http-api3-ready-postgres", "upgraded clone boots (schema upgrade + floor/stub backfill)");
+  var (ueSt, ueDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
+  HttpExpect(ueSt == System.Net.HttpStatusCode.OK, "http-upg-export-200", "status=" + (int)ueSt);
+  var upgSnap = ueDoc.RootElement.GetProperty("snapshot").GetString() ?? "";
+  var upgNorm = NormExportStable(upgSnap);
+  HttpExpect(upgNorm.Contains("\"Version\":3") || upgNorm.Contains("\\\"Version\\\":3") || upgNorm.Contains("Version") , "http-upg-has-v3", "upgraded export carries v3 families");
+  using var upgDoc = JsonDocument.Parse(upgSnap);
+  var upgSparseFloor = false; var upgDenseFloor1 = false;
+  var upgFams = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+  foreach (var srow in upgDoc.RootElement.GetProperty("sources").EnumerateArray())
+  {
+    var fk = (srow.TryGetProperty("BoardId", out var ub) ? (ub.GetString() ?? "") : "") + "|" + (srow.TryGetProperty("FamilyKey", out var uf) ? (uf.GetString() ?? "") : "");
+    if (!upgFams.TryGetValue(fk, out var gl2)) { gl2 = new List<int>(); upgFams[fk] = gl2; }
+    gl2.Add(srow.TryGetProperty("Version", out var uv) ? uv.GetInt32() : 0);
+    if ((srow.TryGetProperty("Version", out var uv2) ? uv2.GetInt32() : 0) == 3) { }
+  }
+  foreach (var hh in upgDoc.RootElement.GetProperty("heads").EnumerateArray())
+  {
+    var hv = hh.TryGetProperty("HeadVersion", out var hvv) ? hvv.GetInt32() : -1;
+    var fl = hh.TryGetProperty("FloorVersion", out var flv) ? flv.GetInt32() : -1;
+    if (hv == 0 && fl == 3) upgSparseFloor = true;
+    if (hv > 0 && fl == 1) upgDenseFloor1 = true;
+  }
+  HttpExpect(upgSparseFloor, "http-upg-sparse-floor3", "single-v3 legacy family carries persisted floor-3 stub after upgrade");
+  HttpExpect(upgDenseFloor1, "http-upg-dense-floor1", "dense upgraded family carries floor 1");
+  long liveMaxUpg = 0;
+  string preFlSnap = "";
+  { var (preFlSt, preFlDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+    preFlSnap = preFlSt == System.Net.HttpStatusCode.OK ? preFlDoc.RootElement.GetProperty("snapshot").GetString() ?? "" : "";
+    if (preFlSt == System.Net.HttpStatusCode.OK) {
+      using var preFlDoc2 = JsonDocument.Parse(preFlDoc.RootElement.GetProperty("snapshot").GetString() ?? "{}"); foreach (var pm in preFlDoc2.RootElement.GetProperty("meetings").EnumerateArray()) if (pm.TryGetProperty("Generation", out var pgv) && pgv.ValueKind == JsonValueKind.Number && pgv.TryGetInt64(out var pgl) && pgl > liveMaxUpg) liveMaxUpg = pgl; HttpExpect(preFlSt == System.Net.HttpStatusCode.OK, "http-upg-live-max", "liveMaxUpg=" + liveMaxUpg);
+    }
+  }
+  var (urSt, urDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = upgSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(upgSnap)) });
+  HttpExpect(urSt == System.Net.HttpStatusCode.OK, "http-upg-restore-200", "valid upgraded own-export restores (was honest-422), status=" + (int)urSt + " " + urDoc.RootElement.GetRawText().Substring(0, Math.Min(300, urDoc.RootElement.GetRawText().Length)));
+  var (uvSt, uvDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var uvSnap = uvDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var uvNorm = NormExportStable(uvSnap); EmitNormDiff(upgNorm, uvSnap, artifactDir, "upg-roundtrip", "http-upg-roundtrip-identical"); HttpExpect(uvSt == System.Net.HttpStatusCode.OK && uvNorm == upgNorm, "http-upg-roundtrip-identical", "upgraded restore preserves complete data byte-identically (modulo at+generation-floor)"); CheckGenFloor(upgSnap, uvSnap, liveMaxUpg, "http-upg-genfloor"); CheckBoardOwners(upgSnap, uvSnap, preFlSnap, "http-owners-upg-roundtrip");
+  // Pre-attempt baseline + live generation max for the upg floor assertion.
+  var (preUpgSt, preUpgDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  string preUpgFailExact = "";
+  if (preUpgSt == System.Net.HttpStatusCode.OK)
+  {
+    preUpgFailExact = preUpgSt == System.Net.HttpStatusCode.OK ? NormFailedStable(preUpgDoc.RootElement.GetProperty("snapshot").GetString() ?? "") : "";
+  }
+  HttpExpect(preUpgSt == System.Net.HttpStatusCode.OK, "http-upg-pre-baseline", "liveMaxUpg=" + liveMaxUpg);
+  var tamperedUpg = TamperDropFamilyMember(upgSnap, out var tamperUpgDetail);
+  HttpExpect(tamperUpgDetail.StartsWith("drop-source"), "http-upg-tamper-constructed", tamperUpgDetail);
+  var (unSt2, unDoc2) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tamperedUpg, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tamperedUpg)) });
+  HttpExpect(unSt2 == System.Net.HttpStatusCode.UnprocessableEntity, "http-upg-tampered-422", "status=" + (int)unSt2 + " " + unDoc2.RootElement.GetRawText().Substring(0, Math.Min(300, unDoc2.RootElement.GetRawText().Length)));
+  var (ufSt, ufDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var ufSnap = ufDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var ufFailExact = NormFailedStable(ufSnap); EmitFailedDiff(preUpgFailExact, ufSnap, artifactDir, "upg-prior", "http-upg-prior-unchanged"); HttpExpect(ufSt == System.Net.HttpStatusCode.OK && ufFailExact == preUpgFailExact, "http-upg-prior-unchanged", "malicious partial removal rejects with full prior unchanged: generations, owners, and every other field byte-identical");
+}
+catch (Exception hex) { HttpFail("http-fatal", hex.GetType().Name + " " + hex.Message + " " + (hex.StackTrace ?? "").Substring(0, Math.Min(400, (hex.StackTrace ?? "").Length))); }
+finally
+{
+  var hcerrs = new List<string>();
+  try { KillApi(ref apiProc1, apiDrain1a, apiDrain1b, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "api1.log")); } catch (Exception ex) { hcerrs.Add("api1-kill: " + ex.Message); }
+  try { KillApi(ref apiProc2, apiDrain2a, apiDrain2b, apiOut2, apiErr2, System.IO.Path.Combine(artifactDir, "api2.log")); } catch (Exception ex) { hcerrs.Add("api2-kill: " + ex.Message); }
+  try { KillApi(ref apiProc3, apiDrain3a, apiDrain3b, apiOut3, apiErr3, System.IO.Path.Combine(artifactDir, "api3.log")); } catch (Exception ex) { hcerrs.Add("api3-kill: " + ex.Message); }
+  try
+  {
+    var dropOpt = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<SimCEO.Postgres.PostgresDb>().UseNpgsql(csBaseAdmin).Options;
+    using var dropDb = new SimCEO.Postgres.PostgresDb(dropOpt);
+    foreach (var hdb in new[] { httpA, httpB, httpUpg })
+    {
+      if (string.IsNullOrWhiteSpace(hdb)) continue;
+      try { dropDb.Database.ExecuteSqlRaw("DROP DATABASE \"" + hdb + "\" WITH (FORCE)"); } catch (Exception ex) { hcerrs.Add("drop-" + hdb + ": " + ex.Message); }
+    }
+    using var verifyDb = new SimCEO.Postgres.PostgresDb(dropOpt);
+    var vconn = verifyDb.Database.GetDbConnection();
+    if (vconn.State != System.Data.ConnectionState.Open) vconn.Open();
+    using var vcmd = vconn.CreateCommand();
+    vcmd.CommandText = "SELECT datname FROM pg_database WHERE datname LIKE 'essentials_evidence\\_%' ORDER BY 1";
+    using var vrd = vcmd.ExecuteReader();
+    var hafter = new List<string>();
+    while (vrd.Read()) hafter.Add(vrd.GetString(0));
+    if (!hafter.Contains("essentials_evidence_1d7f5f17316d")) hcerrs.Add("prior-proof-db-missing-after-http: 1d7f5f17316d");
+    if (hafter.Any(x => x.StartsWith("essentials_evidence_httpa_") || x.StartsWith("essentials_evidence_httpb_") || x.StartsWith("essentials_evidence_httpupg_"))) hcerrs.Add("http-owned-db-leak: " + string.Join(",", hafter));
+    try { System.IO.File.WriteAllLines(System.IO.Path.Combine(artifactDir, "http-dbs-after.txt"), hafter); } catch { }
+  }
+  catch (Exception ex) { hcerrs.Add("http-owned-db-drop: " + ex.Message); }
+  try { http.Dispose(); } catch (Exception ex) { hcerrs.Add("http-dispose: " + ex.Message); }
+  if (hcerrs.Count > 0) HttpFail("http-cleanup-errors", string.Join("; ", hcerrs));
+  else Emit("HTTP CLEANUP ok apis-stopped dbs-dropped");
+}
 Emit("MEMORY+PG DONE passed=" + passed + " failures=" + failures.Count);
 try
 {
   var srcSha = "";
-  try
-  {
-    var psi = new System.Diagnostics.ProcessStartInfo("git", "rev-parse HEAD") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
-    using var pr = System.Diagnostics.Process.Start(psi);
-    srcSha = pr is null ? "" : (pr.StandardOutput.ReadToEnd() ?? "").Trim();
-    pr?.WaitForExit(10000);
-  }
-  catch { }
+    // Bounded concurrent drain (F7): the retained child is reaped via RunBounded with
+    // an explicit native-exit check, never an unbounded sequential read.
+    var (gitExit, gitOut, gitErr, gitTo) = RunBounded("git", "rev-parse HEAD", 15000);
+    if (gitExit == 0 && !gitTo) srcSha = gitOut.Trim();
+    else Fail("artifact-source-git", "exit=" + gitExit + " timedOut=" + gitTo + " err=" + gitErr.Trim());
   if (string.IsNullOrWhiteSpace(srcSha)) { Fail("artifact-source-sha", "git HEAD unavailable"); }
   var apiHash = "";
   try
