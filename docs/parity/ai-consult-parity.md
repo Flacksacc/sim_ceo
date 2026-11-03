@@ -45,6 +45,8 @@ Checked off with verification evidence as each phase lands.
 - Honest unverified limits preserved: ASR codec path, image-live behavior, readiness/runtime beyond the logged runs, and phase 9 accounting depth are not claimed by this checkpoint.
 
 ## Phase 4 -- Secretary depth
+Historical lane interface/review references remain `.tmp/secretary-fourth-interface.txt` and `.tmp/phase4-third-repair-independent-review.txt`; those checkpoints do not establish current full-phase acceptance.
+
 - [ ] Direct routing (Secretary, ...) bypassing bids; may interrupt unsent work. (Delivered in the essentials checkpoint, with selected API/browser verification; full-phase acceptance remains open pending human feedback and the complete requirement audit.)
 - [ ] Labeled provisional notes with update/reversal + history; never decisions. (Delivered in the essentials checkpoint; earlier rejected lane checkpoints are historical, not the deployed source. Full-phase acceptance remains open.)
 - [ ] Briefings strictly from approved sources + directions + context, with excerpts. (Included in the selected Secretary implementation and evidence checks; full-phase acceptance remains open.)
@@ -56,7 +58,7 @@ Checked off with verification evidence as each phase lands.
 - [ ] Hash/version/watermark + supersession shown; 409 on drift. (Delivered in basic review; the selected browser checks exercise conflict display and an explicit refresh POST. Full-phase acceptance remains open.)
 
 ## Phase 6 -- Source governance depth
-- [ ] pending -> approved/rejected state machine with per-version states. (Backend routes and validators are present in MAIN; selected source/restore checks passed. Full source-governance workflow acceptance is not established by the essentials checkpoint.)
+- [ ] pending -> approved/rejected state machine with per-version states. (Backend routes and validators are present in MAIN; selected source/restore checks passed. Full source-governance workflow acceptance is not established by the essentials checkpoint. PRODUCT skill creation remains owned by phase 6 and is not accepted by this milestone.)
 - [ ] Type policies (wiki-only / allow-all-with-exclusions); changes invalidate pending replies + pause. (Shared policy/publication protections are included in the delivered core; full policy workflow acceptance remains open.)
 - [ ] Per-source indexing state + explicit reindex with completion status. (Source index/reindex endpoints are present; complete phase-specific UI and lifecycle acceptance remains open.)
 - [ ] Section-level persisted excerpts. (Source section/version/history endpoints and selected preservation checks are present; full-phase acceptance remains open.)
