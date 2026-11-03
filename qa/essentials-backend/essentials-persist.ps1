@@ -5,7 +5,8 @@ param(
   [string]$EnvFile = "",
   [string]$PgPassword = "",
   [string]$MetaKey = "",
-  [string]$MetaBase = ""
+  [string]$MetaBase = "",
+  [string]$RollbackTag = ""
 )
 $ErrorActionPreference = "Stop"
 # Repo root derived from THIS file's location (qa/essentials-backend/ -> ../..),
@@ -227,26 +228,53 @@ if ($Action -eq "start") {
   if ($dbSvc -ne "db") { throw "update: live db service label mismatch; refusing." }
   $appRunning = ((docker inspect -f '{{.State.Running}}' $appId 2>$null) | Out-String).Trim()
   if ($appRunning -ne "True") { throw "update: live app container is not running; refusing (fresh boot is owned by start)." }
+  # Exact loopback mapping: EVERY published host mapping for container port
+  # 5080 must be exactly 127.0.0.1:<AppPort>. Membership is not enough; an
+  # extra 0.0.0.0 (or any other) mapping fails the update.
   $portMap = ((docker port $appId 5080 2>$null) | Out-String)
-  $pmPorts = @()
-  foreach ($mm in ([regex]::Matches($portMap, '127\.0\.0\.1:(\d+)'))) { $pmPorts += $mm.Groups[1].Value }
-  if ($pmPorts -notcontains "$AppPort") { throw ("update: live app publishes [" + $portMap.Trim() + "], request is 127.0.0.1:" + $AppPort + "; refusing (wrong holder/project/port).") }
+  $pmLines = @(($portMap -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+  if ($pmLines.Count -eq 0) { throw ("update: live app publishes no host mapping for container port 5080 (need exactly 127.0.0.1:" + $AppPort + "); refusing.") }
+  foreach ($ln in $pmLines) {
+    $pmm = [regex]::Match($ln, '^127\.0\.0\.1:(\d+)')
+    if (-not $pmm.Success -or $pmm.Groups[1].Value -ne "$AppPort") { throw ("update: live app host mapping must be exactly 127.0.0.1:" + $AppPort + " (saw [" + $ln + "]); refusing.") }
+  }
   $dbHealth = ((docker inspect -f '{{.State.Health.Status}}' $dbId 2>$null) | Out-String).Trim()
   if ($dbHealth -ne "healthy") { throw ("update: db health is '" + $dbHealth + "' (need 'healthy'); refusing.") }
   $dbMountsRaw = ((docker inspect -f '{{json .Mounts}}' $dbId 2>$null) | Out-String)
   if ([string]::IsNullOrWhiteSpace($dbMountsRaw)) { throw "update: cannot inspect db mounts; refusing." }
   $appMountsRaw = ((docker inspect -f '{{json .Mounts}}' $appId 2>$null) | Out-String)
   if ([string]::IsNullOrWhiteSpace($appMountsRaw)) { throw "update: cannot inspect app mounts; refusing." }
+  # Effective Compose identities (resolved under the sealed env; never
+  # printed): top-level volume names plus each service's source/target
+  # mapping. Live mounts must match BOTH the resolved Compose volume name
+  # and the resolved Compose destination; a merely-existing volume at the
+  # right path is not enough (Compose could otherwise attach/create its
+  # configured volume during recreation and replace the effective mount).
+  $cfgJson = ((Invoke-ComposeCapture @("config", "--format", "json")) -join "`n")
+  if ([string]::IsNullOrWhiteSpace($cfgJson)) { throw "update: cannot resolve compose config; refusing." }
+  $cfg = ($cfgJson | ConvertFrom-Json)
+  if ($null -eq $cfg -or $null -eq $cfg.services -or $null -eq $cfg.services.db -or $null -eq $cfg.services.app -or $null -eq $cfg.volumes) { throw "update: compose config missing services/volumes; refusing." }
+  $dbSvcVols = @($cfg.services.db.volumes | Where-Object { $_.type -eq "volume" -and $_.target -eq "/var/lib/postgresql/data" })
+  $appSvcVols = @($cfg.services.app.volumes | Where-Object { $_.type -eq "volume" -and $_.target -eq "/app/data" })
+  if ($dbSvcVols.Count -ne 1) { throw "update: compose db service must map exactly one volume at /var/lib/postgresql/data; refusing." }
+  if ($appSvcVols.Count -ne 1) { throw "update: compose app service must map exactly one volume at /app/data; refusing." }
+  $topDb = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -eq $dbSvcVols[0].source })
+  if ($topDb.Count -ne 1) { throw ("update: compose top-level volume '" + $dbSvcVols[0].source + "' not resolved; refusing.") }
+  $expDbName = $topDb[0].Value.name
+  if ([string]::IsNullOrWhiteSpace($expDbName)) { throw ("update: compose top-level volume '" + $dbSvcVols[0].source + "' has no resolved name; refusing.") }
+  $topApp = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -eq $appSvcVols[0].source })
+  if ($topApp.Count -ne 1) { throw ("update: compose top-level volume '" + $appSvcVols[0].source + "' not resolved; refusing.") }
+  $expAppName = $topApp[0].Value.name
+  if ([string]::IsNullOrWhiteSpace($expAppName)) { throw ("update: compose top-level volume '" + $appSvcVols[0].source + "' has no resolved name; refusing.") }
+  $dbTarget = $dbSvcVols[0].target
+  $appTarget = $appSvcVols[0].target
   # Named-volume identity comes from Mount.Name (Source can be a DockerVM
-  # filesystem path, not a volume name). Require the effective compose
-  # mapping: the db container must mount a volume at the db data dir and
-  # the app container a volume at the app data dir; binds or wrong
-  # destinations abort instead of matching any volume that exists.
-  $dbDataVol = @($dbMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq "/var/lib/postgresql/data" } | Select-Object -ExpandProperty Name)
-  $appDataVol = @($appMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq "/app/data" } | Select-Object -ExpandProperty Name)
-  if ($dbDataVol.Count -ne 1) { throw "update: db container must mount exactly one volume at /var/lib/postgresql/data; refusing." }
-  if ($appDataVol.Count -ne 1) { throw "update: app container must mount exactly one volume at /app/data; refusing." }
-  $volNames = @($dbDataVol[0], $appDataVol[0]) | Sort-Object -Unique
+  # filesystem path, not a volume name).
+  $dbLive = @($dbMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq $dbTarget -and $_.Name -eq $expDbName })
+  $appLive = @($appMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq $appTarget -and $_.Name -eq $expAppName })
+  if ($dbLive.Count -ne 1) { throw ("update: live db mount does not match compose mapping (need volume '" + $expDbName + "' at '" + $dbTarget + "'); refusing.") }
+  if ($appLive.Count -ne 1) { throw ("update: live app mount does not match compose mapping (need volume '" + $expAppName + "' at '" + $appTarget + "'); refusing.") }
+  $volNames = @($expDbName, $expAppName) | Sort-Object -Unique
   foreach ($vn in $volNames) {
     & docker volume inspect $vn 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw ("update: live volume missing: " + $vn + "; refusing (volumes are never recreated here).") }
@@ -316,11 +344,50 @@ if ($Action -eq "start") {
   }
   [System.IO.File]::WriteAllText((Join-Path $backupDir "manifest.json"), (ConvertTo-Json -InputObject $manifest -Depth 6), $noBom)
   Write-Host ("backups fresh: pg dump " + $dumpInfo.Length + " bytes sha256 " + $dumpSha.Substring(0, 12) + "... + appdata " + $appdataFiles.Count + " files (" + $appdataBytes + " bytes) under " + (Split-Path -Leaf $backupDir))
+  # Sealed rollback invocation, prepared BEFORE the swap: it re-enters this
+  # helper's rollback action under the same approved env sealing (never a
+  # raw compose --env-file in a fresh coding-profile shell, where inherited
+  # keys would win over the file).
+  $rollbackInvoke = ('powershell -File "' + $PSCommandPath + '" -Action rollback -Project ' + $Project + ' -AppPort ' + $AppPort + ' -EnvFile "' + $EnvFile + '" -RollbackTag "' + $rollbackTag + '"')
+  try {
+    Invoke-Compose -argv @("up", "-d", "--no-deps", "--no-build", "app")
+    Write-Host "app recreated (helper preserved db container and volumes: not recreated or removed)"
+    if (-not (Wait-AppHealthy 180)) { throw "app never healthy after swap" }
+    Write-Host "app container healthy"
+    if (-not (Wait-Ready ("http://localhost:" + $AppPort + "/ready") 120)) { throw "readiness need ready=true store=postgres" }
+    Write-Host ("persistent stack UPDATED: :" + $AppPort + "/health + /ready (postgres store); backups under " + (Split-Path -Leaf $backupDir) + "; rollback ref " + $rollbackTag)
+  } catch {
+    throw ("update FAILED after swap: " + $_.Exception.Message + ". Backups kept at " + $backupDir + ". Sealed rollback (same approved env): " + $rollbackInvoke + ". Helper preserved db container and volumes (not recreated or removed); app-level migrations, if any, are the new image's own doing.")
+  }
+} elseif ($Action -eq "rollback") {
+  # Narrow sealed rollback for a failed update: retag the pinned rollback
+  # image to the compose app image tag, then recreate ONLY app through the
+  # SAME sealed approved env (Initialize-PrivateEnv + Invoke-Compose), so a
+  # fresh coding-profile shell can never inject the wrong key or break db
+  # authentication. The db container and volumes are never recreated or
+  # removed. Schema/data may still change if the restored image runs
+  # migrations; that is the app image's doing, not the helper's.
+  if ([string]::IsNullOrWhiteSpace($EnvFile)) { throw "rollback requires explicit -EnvFile <approved private app .env>; refusing to auto-discover env." }
+  if (-not (Test-Path $EnvFile)) { throw ("rollback: approved env file not found: " + $EnvFile) }
+  if ([string]::IsNullOrWhiteSpace($RollbackTag)) { throw "rollback requires -RollbackTag <pinned rollback image tag from the update run>." }
+  Initialize-PrivateEnv $true
+  & docker image inspect $RollbackTag 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw ("rollback: rollback image not found locally: " + $RollbackTag) }
+  $rbCfgJson = ((Invoke-ComposeCapture @("config", "--format", "json")) -join "`n")
+  if ([string]::IsNullOrWhiteSpace($rbCfgJson)) { throw "rollback: cannot resolve compose config; refusing." }
+  $rbCfg = ($rbCfgJson | ConvertFrom-Json)
+  if ($null -eq $rbCfg -or $null -eq $rbCfg.services -or $null -eq $rbCfg.services.app -or [string]::IsNullOrWhiteSpace($rbCfg.services.app.image)) { throw "rollback: compose app image tag not resolved; refusing." }
+  $appImageTag = $rbCfg.services.app.image
+  $rbId = ((docker inspect -f '{{.Id}}' $RollbackTag 2>$null) | Out-String).Trim()
+  if ([string]::IsNullOrWhiteSpace($rbId)) { throw "rollback: cannot resolve rollback image id; refusing." }
+  & docker tag $RollbackTag $appImageTag | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "rollback: retag failed; refusing to recreate app." }
+  $rtId = ((docker inspect -f '{{.Id}}' $appImageTag 2>$null) | Out-String).Trim()
+  if ($rtId -ne $rbId) { throw "rollback: retagged image does not resolve to the rollback image id; refusing to recreate app." }
+  Write-Host ("rollback: retagged " + $appImageTag + " to pinned rollback image")
   Invoke-Compose -argv @("up", "-d", "--no-deps", "--no-build", "app")
-  Write-Host "app recreated (helper preserved db container and volumes: not recreated or removed)"
-  $rollbackCmd = ('docker tag ' + $rollbackTag + ' simceo-essentials-app:1.0.0; $env:APP_HOST_PORT="' + $AppPort + '"; docker compose --env-file "' + $EnvFile + '" --project-name ' + $Project + ' -f ' + $compose + ' up -d --no-deps --no-build app')
-  if (-not (Wait-AppHealthy 180)) { throw ("update FAILED after app recreate: app never healthy. Backups kept at " + $backupDir + ". Rollback: " + $rollbackCmd + ". Helper preserved db container and volumes (not recreated or removed); app-level migrations, if any, are the new image's own doing.") }
+  if (-not (Wait-AppHealthy 180)) { throw ("rollback FAILED: app never healthy after retag recreate; backups from the update run remain under " + $repo + "/.tmp/update-*/; primary decision required.") }
   Write-Host "app container healthy"
-  if (-not (Wait-Ready ("http://localhost:" + $AppPort + "/ready") 120)) { throw ("update FAILED after app recreate: readiness need ready=true store=postgres. Backups kept at " + $backupDir + ". Rollback: " + $rollbackCmd + ". Helper preserved db container and volumes (not recreated or removed); app-level migrations, if any, are the new image's own doing.") }
-  Write-Host ("persistent stack UPDATED: :" + $AppPort + "/health + /ready (postgres store); backups under " + (Split-Path -Leaf $backupDir) + "; rollback ref " + $rollbackTag)
-} else { throw "unknown -Action $Action (start|status|stop|update)" }
+  if (-not (Wait-Ready ("http://localhost:" + $AppPort + "/ready") 120)) { throw ("rollback FAILED: readiness need ready=true store=postgres after retag recreate; backups from the update run remain under " + $repo + "/.tmp/update-*/; primary decision required.") }
+  Write-Host ("rollback COMPLETE: :" + $AppPort + "/health + /ready (postgres store) on pinned rollback image")
+} else { throw "unknown -Action $Action (start|status|stop|update|rollback)" }

@@ -138,11 +138,17 @@ What update does, in order (minimal downtime; the old app serves until swap):
 1. Sealed approved env first (existing key guard: inherited coding-profile
    keys cleared, allowlisted file values win, compose env source sealed).
 2. Existing-only preflight: exactly one live app and one live db container
-   with matching `com.docker.compose.project` / `service` labels, the live
-   app publishing exactly `127.0.0.1:<AppPort>`, the db container `healthy`, and the
-   live named volumes mounted at the db/app data dirs inspected to exist (by volume name, not filesystem path). Anything else aborts.
+   with matching `com.docker.compose.project` / `service` labels; EVERY
+   host mapping for container port 5080 must be exactly
+   `127.0.0.1:<AppPort>` (an extra `0.0.0.0` mapping fails); the db
+   container `healthy`; and the live mounts must match the resolved Compose
+   mapping on BOTH volume name and destination (top-level `volumes.<key>.name`
+   plus the service `source`/`target` for the db/app data dirs, compared
+   against live mount `Name`/`Destination`, never the DockerVM `Source`
+   path). Anything else aborts.
 3. Preserves a rollback image ref
-   (`simceo-essentials-app:rollback-<UTC>-<id>`) from the running app image.
+   (`simceo-essentials-app:rollback-<UTC>-<id>`) pinned to the immutable
+   live image id (verified before build, never the mutable tag).
 4. Builds the new app image while the old app stays up (verified still
    running after build; nothing recreated yet).
 5. Takes fresh backups into a NEW gitignored private
@@ -157,18 +163,25 @@ What update does, in order (minimal downtime; the old app serves until swap):
    `{ready:true, store:postgres}`.
 
 What update never does: `down` (with or without `-v`), volume
-create/remove, db build/recreate, secret or response-body printing, or
-overwriting an existing backup dir. On post-swap failure it throws an
-explicit rollback (retags the pinned rollback image, then recreates app
-with the same approved env file and port, so the command is directly
-usable):
+create/remove, db build/recreate, rollback outside the sealed helper
+action, secret or response-body printing, or overwriting an existing
+backup dir. The sealed rollback invocation is prepared BEFORE the swap,
+and the swap plus container-health plus `/ready` checks run under one
+catch, so every post-swap failure reports the same usable sealed rollback
+plus the exact backup location. On post-swap failure the helper throws
+that sealed rollback (same approved env sealing, never a raw
+`compose --env-file` that a fresh coding-profile shell could shadow):
 
 ```powershell
-docker tag <rollback-tag> simceo-essentials-app:1.0.0; $env:APP_HOST_PORT="5173"; docker compose --env-file "C:/Users/War/scrach/sim_ceo/.env" --project-name simceo-essentials -f <helper-root>/qa/essentials-backend/simceo-essentials.compose.yaml up -d --no-deps --no-build app
+powershell -File qa/essentials-backend/essentials-persist.ps1 -Action rollback -Project simceo-essentials -AppPort 5173 -EnvFile C:/Users/War/scrach/sim_ceo/.env -RollbackTag "<rollback-tag from the update run>"
 ```
 
-and leaves all backups in place. The helper preserves the db container and
-volumes without recreating or removing them, but the new app image itself
-may run migrations on first boot, so schema/data can change through the app
-(a `psql` restore from the kept dump stays a primary-only explicit
-decision, not part of update).
+`-Action rollback` requires the explicit `-EnvFile` and `-RollbackTag`,
+retags the pinned rollback image to the resolved Compose app image tag
+(verified by image id), then recreates ONLY app under the sealed approved
+env and re-checks health plus `/ready`. It never recreates or removes the
+db container or volumes. All backups stay in place; the helper preserves
+the db container and volumes without recreating or removing them, but the
+new app image itself may run migrations on first boot, so schema/data can
+change through the app (a `psql` restore from the kept dump stays a
+primary-only explicit decision, not part of update).
