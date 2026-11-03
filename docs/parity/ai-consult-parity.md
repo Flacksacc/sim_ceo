@@ -82,6 +82,16 @@ Historical lane interface/review references remain `.tmp/secretary-fourth-interf
 ## Explicit non-goals
 Telegram transport, group/topic mechanics, BotFather UI, verbatim command grammar, separate ai_consult web UI, new paid-service requirements.
 
+## Human feedback: incremental releases (2026-11-03)
+
+The user now requests deployment of small verified changes as they become ready, without waiting for the complete feedback batch. Muse remains the sole code author; dedicated AI review and primary checks still apply to each affected slice.
+
+First UI slice is live at http://localhost:5173: `New meeting` creates a separate conversation, while `Request advisor responses` requests replies in the current meeting. Both actions now have explanatory text. Profile and setup background, familiar subjects, simpler explanations, and communication preferences use resizable multiline fields. New forms receive editable communication defaults; saved custom or empty preferences retain their values. Source: Muse `09638f6`, MAIN `f3c6650`.
+
+Dedicated review: `.tmp/quick-ui-independent-review.txt` PASS for the small diff; primary independently inspected the complete changes and reran the frontend production build successfully. Docker image `82aa968e51e70b19d25c915b635bbf8080a6438e81d1f76e92948ebc2f5d729f` is serving the matching built assets. The app container is healthy and `/ready` reports PostgreSQL readiness. The existing database container and both project volumes were retained. Counts before/after match: 3 boards, 2 meetings, 6 messages, 13 roster members, 1 profile, 0 registered accounts. Full database dumps, app files, and before/after counts are retained privately in `.tmp/quick-release-preservation-20261103-2130/`; previous image retained as `simceo-essentials-app:rollback-20261103-2130`.
+
+Rendered smoke verification is still pending at this checkpoint. Shared account-default profile saving, canonical roster reconciliation, unified advisor creation, roster-only chat, the full conversation layout/settings, and remaining human-readable UI changes are in separate unaccepted worktrees. They are not included in this deployed slice. Independent review rejected the first profile backend for embedded snapshot disclosure, incomplete inherited-profile interview behavior, and skipped QA assertions; those findings were returned to Muse. Do not claim those features delivered until their integrated checks pass.
+
 ## Navigation + secure UI completion (Muse lane, unaccepted)
 
 Scope: entire-app navigation (hash routes, normalization, board/meeting/record scope, wrong-parent, unknown/missing/archived/deleted/denied, public invite join, recovery, back/forward) and secure UI (fail-closed private queries/rendering, canonical Bearer-first applied identity + auth epoch, server-derived role caps for every tab/action, server stateValid-gated record approval, identity-aware transport/downloads/refresh/exports, held-response and A-B-A invalidation).
