@@ -472,7 +472,7 @@ $HttpClient.Dispose()
 $HttpHandler.Dispose()
 
 # --- Nonsecret manifest (statuses/hashes/counts ONLY) ---
-# Per-route status/hash/count/error-note rows. Ledger-route ok flags reflect
+# Per-route status/hash/count/error-note rows. Ledger-route and voice-route ok
 # array-count success: a 200 non-array body is NOT ok and is never empty.
 $RouteRows = @()
 foreach ($f in $FetchLog) {
@@ -481,6 +481,15 @@ foreach ($f in $FetchLog) {
   elseif ($f['name'] -eq 'usage') { $row['count'] = $UsageSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$UsageSummary['ok']) }
   elseif ($f['name'] -eq 'activity-audit') { $row['count'] = $AuditSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$AuditSummary['ok']) }
   elseif ($f['name'] -eq 'models-calls') { $row['count'] = $CallsSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$CallsSummary['ok']) }
+  elseif ($f['name'] -like 'voice-*') {
+    $vMatch = $null
+    foreach ($v in $VoiceLog) { if ($v['file'] -eq $f['file']) { $vMatch = $v; break } }
+    if ($null -ne $vMatch) {
+      $row['count'] = $vMatch['count']
+      $row['ok'] = ([bool]$f['ok'] -and [bool]$vMatch['ok'])
+      $row['note'] = $vMatch['note']
+    }
+  }
   $RouteRows += $row
 }
 
@@ -519,7 +528,7 @@ $Manifest = [ordered]@{
     snapshotDataCaptured = $BackupVerified
     authStateExported = $false
     complete = $false
-    note = 'Capture success (even when complete) is NOT cutover readiness and does NOT authorize stopping the old in-memory API. The snapshot is valid for domain restore (legacy v2 domain restore passed the 315 probe) but NOT for full auth/policy state. Cutover/start remain BLOCKED on Docker startup approval.'
+    note = 'Capture success (even when complete) is NOT cutover readiness and does NOT authorize stopping the old in-memory API. The snapshot is valid for domain restore (legacy v2 domain restore passed the 315 probe) but NOT for full auth/policy state. Cutover/start require separate verification; isolated Docker startup is user-authorized with a reviewed manual fallback, but runtime execution is currently rejected pre-process by external execution policy.'
   }
 }
 $Manifest['verdict']['complete'] = ($AllOk -and $BackupVerified)

@@ -107,8 +107,7 @@ capture (native exit 0) means read-only data capture only and is NOT cutover
 readiness: the old in-memory API MUST NOT be stopped solely because a
 domain snapshot exists (the snapshot is valid for domain restore - legacy v2
 domain restore passed the 315 probe - but NOT for full auth/policy state,
-and is only one preflight input). Cutover/start remain BLOCKED on Docker
-startup approval.
+and is only one preflight input). Cutover/start require separate verification; isolated Docker startup is user-authorized with a reviewed manual fallback, but runtime execution is currently rejected pre-process by external execution policy.
 
 Do NOT overwrite the older checkpoint
 `.tmp/dev-app-preservation-20261103-141739-UTC-backup.json`, and leave the
