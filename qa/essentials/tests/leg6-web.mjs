@@ -656,12 +656,380 @@ try {
     } catch (e) { ctx.ok("secretary-second-renders", false, "second provisional body never rendered within 30s"); }
     const secDom2 = await page.evaluate(() => document.body.innerText);
     ctx.ok("secretary-new-clears-old", /provisional/i.test(secDom2), secDom2.slice(0, 400));
-    // Phase4 offline Retry/Resume/newer-question hydration is NOT browser-proven
-    // here (no fault-injection/mock server in this leg): FIRST-answer success,
-    // current-failure surfacing, Clear-saved-retry, Resume-with-0-requests, and
-    // newer-question hydration stay RUNTIME-PENDING. No phase4 browser-done
-    // claim is made; artifact records the pending scope.
-    writeArt("secretary-phase4-pending.json", { pending: ["offline-retry-before-resume", "resume-0-requests", "newer-question-hydration", "clear-saved-retry-wire"], note: "FIRST-answer success covered above via real composer; failure/retry/resume hydration not browser-exercised in this leg" });
+    // --- P6b FIRST clarification answer: real question -> typed answer, ACTUAL
+    // wire requestId + exact bytes, exactly one provisional note, UI clears, no
+    // ordinary-message autosend; then a genuine provider 502 on the SAME
+    // request stays visible with same-request retry, and the retry reuses the
+    // requestId. Every claim counts ACTUAL browser POSTs after barriers. ---
+    {
+      const secPostsB = [];
+      const ansPostsB = [];
+      const onSecReqB = (req) => {
+        if (req.method() !== "POST") return;
+        const u = req.url();
+        if (/\/api\/meetings\/[^/]+\/secretary$/.test(u)) secPostsB.push(req.postData() || "");
+        else if (/\/api\/meetings\/[^/]+\/secretary\/answer$/.test(u)) ansPostsB.push(req.postData() || "");
+      };
+      page.on("request", onSecReqB);
+      const idSetOf = (arr) => new Set(arr.map((m) => String(camel(m, "sequence") ?? camel(m, "id"))));
+      const readSecEnvelope = () => page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+              const p = JSON.parse(localStorage.getItem(k) || "null");
+              if (p && p.requestId) return p;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }, { b: bid, m: mid });
+      const askA = "secretary: FIRST-ANSWER SECRETARY-AMBIGUOUS budget scope " + run + "?";
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      const askScopeB = page.locator("section[aria-label='Meetings and conversation']");
+      await askScopeB.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      const msgsB0 = mustArray(ctx, "secB-msgs-before", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const notesB0 = mustArray(ctx, "secB-notes-before", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      const secKindB0 = notesB0.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+      await askScopeB.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askA);
+      await askScopeB.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeB.getByRole("button", { name: "Send" }).click();
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("Secretary clarification") && document.body.innerText.includes("QA clarify budget scope?"), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secB-question-renders", false, "clarification card never rendered within 30s"); }
+      const qDomB = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secB-question-visible", qDomB.includes("Secretary clarification") && qDomB.includes("QA clarify budget scope?"), qDomB.slice(0, 300));
+      const envB = await readSecEnvelope();
+      ctx.ok("secB-envelope-present", !!envB && !!envB.requestId && !!envB.nonce, "req=" + (envB ? String(envB.requestId).slice(0, 8) : "?"));
+      ctx.ok("secB-ask-posted-once", secPostsB.length === 1, "actual browser secretary POSTs=" + secPostsB.length);
+      let askBodyB = null;
+      try { askBodyB = JSON.parse(secPostsB[0] || "{}"); } catch (e) {}
+      ctx.ok("secB-ask-exact-bytes", !!askBodyB && askBodyB.input === askA && !!envB && askBodyB.clientNonce === envB.nonce, "input-match=" + (!!askBodyB && askBodyB.input === askA));
+      const msgsB1 = mustArray(ctx, "secB-msgs-asked", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const idsB0 = idSetOf(msgsB0);
+      const newAskB = msgsB1.filter((m) => !idsB0.has(String(camel(m, "sequence") ?? camel(m, "id"))));
+      ctx.ok("secB-ask-echoed-as-lead", newAskB.length === 1 && String(camel(newAskB[0], "sender") || "") === "lead" && String(camel(newAskB[0], "content") || "") === askA.slice(10), "new=" + newAskB.length + " echo-strips-one-prefix");
+      const answerB = "Range 10 to 20 " + run;
+      const clarCardB = page.locator("div.card[role=status]", { hasText: "Secretary clarification" });
+      ctx.ok("secB-answer-control-present", await clarCardB.getByLabel("Answer", { exact: true }).count() >= 1, "real Answer control rendered for the live question");
+      await clarCardB.getByLabel("Answer", { exact: true }).fill(answerB);
+      await clarCardB.getByRole("button", { name: "Send answer" }).click();
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("QA provisional note body for testing after clarification."), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secB-note-renders", false, "provisional note never rendered within 30s"); }
+      ctx.ok("secB-answer-posted-once", ansPostsB.length === 1, "actual browser answer POSTs=" + ansPostsB.length);
+      let ansBodyB = null;
+      try { ansBodyB = JSON.parse(ansPostsB[0] || "{}"); } catch (e) {}
+      ctx.ok("secB-answer-wire", !!ansBodyB && !!envB && ansBodyB.requestId === envB.requestId && ansBodyB.answer === answerB, "same-requestId=" + (!!ansBodyB && !!envB && ansBodyB.requestId === envB.requestId));
+      const rowB = await get("/api/meetings/" + mid + "/secretary/requests/" + (envB ? envB.requestId : "missing"), { token: tokA });
+      const rowBReq = camel(rowB.json, "request") || {};
+      ctx.ok("secB-request-completed", rowB.status === 200 && String(camel(rowBReq, "status") || "") === "completed" && String(camel(rowBReq, "answer") || "") === answerB, "status=" + rowB.status);
+      const msgsB2 = mustArray(ctx, "secB-msgs-after", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const newAnsB = msgsB2.filter((m) => !idSetOf(msgsB1).has(String(camel(m, "sequence") ?? camel(m, "id"))));
+      ctx.ok("secB-answer-echoed-once", newAnsB.length === 1 && String(camel(newAnsB[0], "sender") || "") === "lead" && String(camel(newAnsB[0], "content") || "") === answerB, "new=" + newAnsB.length);
+      const advB = newAnsB.filter((m) => String(camel(m, "sender") || "") !== "lead").length;
+      ctx.ok("secB-no-ordinary-autosend", advB === 0, "non-lead new messages=" + advB);
+      const notesB1 = mustArray(ctx, "secB-notes-after", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      const secKindB1 = notesB1.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+      ctx.ok("secB-note-created-once", secKindB1 === secKindB0 + 1, "secretary-notes " + secKindB0 + "->" + secKindB1);
+      const qDomB2 = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secB-ui-clears", !qDomB2.includes("Secretary clarification"), qDomB2.slice(0, 300));
+      // Genuine current provider failure on the SAME request: arm ONE 502 AFTER
+      // the clarification renders (so the ask itself is untouched), then answer.
+      const askF = "secretary: FAIL-RETRY SECRETARY-AMBIGUOUS scope " + run + "?";
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      const askScopeF = page.locator("section[aria-label='Meetings and conversation']");
+      await askScopeF.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeF.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askF);
+      await askScopeF.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeF.getByRole("button", { name: "Send" }).click();
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("Secretary clarification") && document.body.innerText.includes("QA clarify budget scope?"), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secF-question-renders", false, "second clarification never rendered within 30s"); }
+      const envF = await readSecEnvelope();
+      ctx.ok("secF-new-attempt", !!envF && !!envB && envF.requestId !== envB.requestId && envF.nonce !== envB.nonce, "distinct requestId + nonce per attempt (once-generation)");
+      const armF = await fakeJson("/__ess/arm", { method: "POST", body: { route: "chat", times: 1, status: 502 } });
+      ctx.ok("secF-fake-armed", armF.status === 200, "status=" + armF.status);
+      const msgsF0 = mustArray(ctx, "secF-msgs-before", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const notesF0 = mustArray(ctx, "secF-notes-before", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      const secKindF0 = notesF0.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+      const ansCountF0 = ansPostsB.length;
+      const answerF = "Between 30 and 40 " + run;
+      const clarCardF = page.locator("div.card[role=status]", { hasText: "Secretary clarification" });
+      await clarCardF.getByLabel("Answer", { exact: true }).fill(answerF);
+      await clarCardF.getByRole("button", { name: "Send answer" }).click();
+      try {
+        await page.waitForFunction(() => { const t = document.body.innerText; return t.includes("Secretary error") && t.includes("502"); }, null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secF-error-visible", false, "genuine 502 Secretary error never rendered within 30s"); }
+      const errDomF = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secF-error-genuine", errDomF.includes("Secretary error") && /502/.test(errDomF), errDomF.slice(0, 300));
+      ctx.ok("secF-same-request-retry-offered", await page.getByRole("button", { name: "Retry answer (same request)" }).count() >= 1, "same-request retry control present on genuine failure");
+      ctx.ok("secF-question-retained", errDomF.includes("Secretary clarification") && errDomF.includes("QA clarify budget scope?"), errDomF.slice(0, 300));
+      ctx.ok("secF-failed-wire-posted", ansPostsB.length === ansCountF0 + 1, "actual browser answer POSTs=" + ansPostsB.length);
+      let ansBodyF = null;
+      try { ansBodyF = JSON.parse(ansPostsB[ansPostsB.length - 1] || "{}"); } catch (e) {}
+      ctx.ok("secF-failed-wire-same-request", !!ansBodyF && !!envF && ansBodyF.requestId === envF.requestId && ansBodyF.answer === answerF, "failed attempt carried same requestId + exact bytes");
+      const msgsF1 = mustArray(ctx, "secF-msgs-failed", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const newFailF = msgsF1.filter((m) => !idSetOf(msgsF0).has(String(camel(m, "sequence") ?? camel(m, "id"))));
+      ctx.ok("secF-failed-echo-only", newFailF.length === 1 && String(camel(newFailF[0], "sender") || "") === "lead" && String(camel(newFailF[0], "content") || "") === answerF, "new=" + newFailF.length);
+      const notesF1 = mustArray(ctx, "secF-notes-failed", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      ctx.ok("secF-failed-no-note", notesF1.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length === secKindF0, "no partial note on genuine failure");
+      await page.getByRole("button", { name: "Retry answer (same request)" }).click();
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("QA provisional note body for testing after clarification."), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secF-retry-note-renders", false, "retry note never rendered within 30s"); }
+      ctx.ok("secF-retry-posted-once-more", ansPostsB.length === ansCountF0 + 2, "actual browser answer POSTs=" + ansPostsB.length);
+      let ansBodyR = null;
+      try { ansBodyR = JSON.parse(ansPostsB[ansPostsB.length - 1] || "{}"); } catch (e) {}
+      ctx.ok("secF-retry-same-request", !!ansBodyR && !!envF && ansBodyR.requestId === envF.requestId && ansBodyR.answer === answerF, "retry reused the SAME requestId + exact bytes");
+      const rowF = await get("/api/meetings/" + mid + "/secretary/requests/" + (envF ? envF.requestId : "missing"), { token: tokA });
+      const rowFReq = camel(rowF.json, "request") || {};
+      ctx.ok("secF-request-completed", rowF.status === 200 && String(camel(rowFReq, "status") || "") === "completed" && String(camel(rowFReq, "answer") || "") === answerF, "status=" + rowF.status);
+      const msgsF2 = mustArray(ctx, "secF-msgs-retry", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      ctx.ok("secF-retry-no-dup-echo", msgsF2.length === msgsF1.length, "msgs " + msgsF1.length + "->" + msgsF2.length);
+      const notesF2 = mustArray(ctx, "secF-notes-retry", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      ctx.ok("secF-retry-note-once", notesF2.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length === secKindF0 + 1, "retry created exactly one note");
+      const errDomF2 = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secF-retry-clears", !errDomF2.includes("Secretary error") && !errDomF2.includes("Secretary clarification"), errDomF2.slice(0, 300));
+      const resetF = await fakeJson("/__ess/reset", { method: "POST", body: {} });
+      ctx.ok("secF-fake-reset", resetF.status === 200, "status=" + resetF.status);
+      writeArt("secretary-first-answer-wire.json", { ask: askA, requestA: envB ? envB.requestId : null, answerA, requestF: envF ? envF.requestId : null, answerF, ansPosts: ansPostsB.length });
+      try { page.off("request", onSecReqB); } catch (e) {}
+    }
+    // --- P6c offline Retry -> Clear -> online: ZERO cleared posts, then a
+    // FRESH positive ask MUST succeed (absence is never credit for never
+    // resumed). Counts ACTUAL finished browser POSTs after barriers. ---
+    {
+      const finC = [];
+      const failC = [];
+      const isSecPost = (req) => req.method() === "POST" && /\/api\/meetings\/[^/]+\/secretary(\/answer)?$/.test(req.url());
+      const onFinC = (req) => { if (isSecPost(req)) finC.push(req.url()); };
+      const onFailC = (req) => { if (isSecPost(req)) failC.push(req.url()); };
+      page.on("requestfinished", onFinC);
+      page.on("requestfailed", onFailC);
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      const offScope = page.locator("section[aria-label='Meetings and conversation']");
+      await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      const msgsO0 = mustArray(ctx, "secC-msgs-before", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const notesO0 = mustArray(ctx, "secC-notes-before", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
+      const secKindO0 = notesO0.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+      const askO = "secretary: OFFLINE-QUEUED scope " + run + "?";
+      await offScope.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askO);
+      await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await page.context().setOffline(true);
+      await offScope.getByRole("button", { name: "Send" }).click();
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("Secretary error"), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secC-offline-error-visible", false, "offline Secretary error never rendered within 30s"); }
+      const errDomO = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secC-offline-error-visible", errDomO.includes("Secretary error"), errDomO.slice(0, 300));
+      ctx.ok("secC-offline-error-genuine", /Failed to fetch|fetch failed|NetworkError|network|offline/i.test(errDomO), errDomO.slice(0, 300));
+      ctx.ok("secC-retry-offered", await page.getByRole("button", { name: "Retry secretary (same envelope)" }).count() >= 1, "same-envelope retry control present while offline");
+      const envO = await page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+              const p = JSON.parse(localStorage.getItem(k) || "null");
+              if (p && p.nonce) return p;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }, { b: bid, m: mid });
+      ctx.ok("secC-envelope-saved-offline", !!envO && !!envO.nonce && envO.requestId === "", "fresh offline attempt envelope present, requestId unassigned");
+      await page.getByRole("button", { name: "Retry secretary (same envelope)" }).click();
+      await page.waitForTimeout(3000);
+      const errDomO2 = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secC-retry-still-offline", errDomO2.includes("Secretary error"), errDomO2.slice(0, 300));
+      ctx.ok("secC-zero-finished-offline", finC.length === 0, "finished POSTs=" + finC.length);
+      ctx.ok("secC-attempts-never-left", failC.length >= 1, "failed browser attempts=" + failC.length);
+      const msgsO1 = mustArray(ctx, "secC-msgs-offline", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      ctx.ok("secC-offline-no-publish", msgsO1.length === msgsO0.length, "msgs " + msgsO0.length + "->" + msgsO1.length);
+      await page.getByRole("button", { name: "Clear saved retry" }).click();
+      await page.waitForTimeout(1000);
+      const errDomO3 = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secC-clear-removes-error", !errDomO3.includes("Secretary error"), errDomO3.slice(0, 300));
+      const leftKeys = await page.evaluate((args) => {
+        const out = [];
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if ((k.indexOf("sec-envelope:") === 0 || k.indexOf("sec-answer-envelope:") === 0 || k.indexOf("sec-pending:") === 0) && k.endsWith(":" + args.b + ":" + args.m)) out.push(k.split(":")[0]);
+          }
+        } catch (e) {}
+        return out;
+      }, { b: bid, m: mid });
+      ctx.ok("secC-clear-removes-envelope", leftKeys.length === 0, "leftover keys=" + leftKeys.join(","));
+      await page.context().setOffline(false);
+      const finAtResume = finC.length;
+      await page.waitForTimeout(2500);
+      ctx.ok("secC-resume-posts-zero", finC.length === finAtResume, "finished POSTs after Clear+online=" + finC.length);
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      const askP = "secretary: ONLINE-RESUME scope " + run + "?";
+      await offScope.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askP);
+      await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await offScope.getByRole("button", { name: "Send" }).click();
+      const wP = await waitFor("secC-positive-note", async () => {
+        const ns = await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA });
+        if (!Array.isArray(ns.json)) return { done: false, note: "status=" + ns.status };
+        const k = ns.json.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+        if (k !== secKindO0 + 1) return { done: false, note: "secretary-notes=" + k };
+        return { done: true, value: ns.json };
+      }, { timeoutMs: 60000 });
+      ctx.ok("secC-positive-note", wP.ok, String(wP.last || "").slice(0, 200));
+      const idsO0 = new Set(notesO0.map((n) => String(camel(n, "id") || "")));
+      const posNotes = Array.isArray(wP.value) ? wP.value.filter((n) => !idsO0.has(String(camel(n, "id") || "")) && String(camel(n, "body") || "").includes("QA provisional note body for testing.") && !String(camel(n, "body") || "").includes("after clarification")) : [];
+      ctx.ok("secC-positive-exact", posNotes.length === 1, "fresh resume note exact body hits=" + posNotes.length);
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1500);
+      const domP = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secC-positive-renders", domP.includes("QA provisional note body for testing."), domP.slice(0, 300));
+      ctx.ok("secC-positive-single-post", finC.length === finAtResume + 1, "finished POSTs after fresh ask=" + finC.length);
+      writeArt("secretary-offline-wire.json", { finished: finC.length, failed: failC.length, atResume: finAtResume });
+      try { page.off("requestfinished", onFinC); } catch (e) {}
+      try { page.off("requestfailed", onFailC); } catch (e) {}
+    }
+    // --- P6d HELD initial-requests hydration vs NEW ask C: the older held GET
+    // must not replace C's question/envelope, and per-attempt generation stays
+    // exact (one POST + one nonce per attempt, C envelope wins). ---
+    {
+      const secPostsD = [];
+      const secRespD = [];
+      const onSecReqD = (req) => {
+        if (req.method() === "POST" && /\/api\/meetings\/[^/]+\/secretary$/.test(req.url())) secPostsD.push(req.postData() || "");
+      };
+      const onSecRespD = (resp) => {
+        try {
+          const rq = resp.request();
+          if (rq.method() === "POST" && /\/api\/meetings\/[^/]+\/secretary$/.test(resp.url())) {
+            resp.json().then((j) => { secRespD.push({ input: rq.postData() || "", requestId: (j && (j.requestId || j.RequestId)) || "" }); }).catch(() => {});
+          }
+        } catch (e) {}
+      };
+      page.on("request", onSecReqD);
+      page.on("response", onSecRespD);
+      const askHB = "secretary: HELD-B SECRETARY-AMBIGUOUS budget " + run + "?";
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      const askScopeD = page.locator("section[aria-label='Meetings and conversation']");
+      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askHB);
+      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeD.getByRole("button", { name: "Send" }).click();
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      try {
+        await page.waitForFunction(() => document.body.innerText.includes("Secretary clarification") && document.body.innerText.includes("QA clarify budget scope?"), null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secD-Bold-renders", false, "older B clarification never rendered within 30s"); }
+      const envHB = await page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+              const p = JSON.parse(localStorage.getItem(k) || "null");
+              if (p && p.requestId) return p;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }, { b: bid, m: mid });
+      ctx.ok("secD-Bold-present", !!envHB && !!envHB.requestId && !!envHB.nonce, "req=" + (envHB ? String(envHB.requestId).slice(0, 8) : "?"));
+      const heldRoutes = [];
+      const heldPred = (url) => String((url && url.pathname) || "").endsWith("/secretary/requests");
+      const heldHandler = async (route) => { heldRoutes.push(route); };
+      await page.route(heldPred, heldHandler);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1500);
+      const wH = await waitFor("secD-hold", async () => (heldRoutes.length >= 1 ? { done: true, value: heldRoutes.length } : { done: false, note: "held=0" }), { timeoutMs: 15000 });
+      ctx.ok("secD-hydration-held", wH.ok, String(wH.last || ("held=" + heldRoutes.length)).slice(0, 120));
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      const askHC = "secretary: HELD-C SECRETARY-AMBIGUOUS scope " + run + " QA-SLEEP:6000?";
+      await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askHC);
+      await page.waitForTimeout(800);
+      const boxD = await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").inputValue().catch(() => "<no-composer>");
+      const draftSavedD = await page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("simceo-draft:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) return localStorage.getItem(k) || "";
+          }
+        } catch (e) {}
+        return "";
+      }, { b: bid, m: mid });
+      ctx.ok("secD-draft-untouched", boxD === askHC && draftSavedD === askHC, "held hydration never clobbered the saved composer draft");
+      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeD.getByRole("button", { name: "Send" }).click();
+      await page.waitForTimeout(1500);
+      for (const r of heldRoutes.splice(0)) { try { await r.continue(); } catch (e) {} }
+      try {
+        await page.waitForFunction((args) => {
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i) || "";
+              if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+                const p = JSON.parse(localStorage.getItem(k) || "null");
+                if (p && p.requestId && p.requestId !== args.reqB) return true;
+              }
+            }
+          } catch (e) {}
+          return false;
+        }, { b: bid, m: mid, reqB: envHB ? envHB.requestId : "" }, { timeout: 60000 });
+      } catch (e) { ctx.ok("secD-C-arrives", false, "C envelope never superseded the released B hydration"); }
+      const wD = await waitFor("secD-C-response", async () => {
+        const hit = secRespD.find((e) => String(e.input || "").includes("HELD-C") && e.requestId);
+        if (!hit) return { done: false, note: "captured-responses=" + secRespD.length };
+        return { done: true, value: hit };
+      }, { timeoutMs: 60000 });
+      ctx.ok("secD-C-response-captured", wD.ok, String(wD.last || "").slice(0, 200));
+      const hitC = wD.ok ? wD.value : null;
+      let nonceC = "";
+      try { nonceC = JSON.parse((hitC ? hitC.input : "") || "{}").clientNonce || ""; } catch (e) {}
+      const postsC = secPostsD.filter((d) => d.includes("HELD-C"));
+      const postsB = secPostsD.filter((d) => d.includes("HELD-B"));
+      ctx.ok("secD-each-ask-once", postsB.length === 1 && postsC.length === 1, "actual browser POSTs B=" + postsB.length + " C=" + postsC.length);
+      let nonceB2 = "";
+      try { nonceB2 = JSON.parse(postsB[0] || "{}").clientNonce || ""; } catch (e) {}
+      ctx.ok("secD-nonce-per-attempt", !!nonceB2 && !!nonceC && nonceB2 !== nonceC, "one distinct nonce generated per attempt");
+      const envHC = await page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+              const p = JSON.parse(localStorage.getItem(k) || "null");
+              if (p && p.requestId) return p;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }, { b: bid, m: mid });
+      ctx.ok("secD-envelope-is-C", !!envHC && !!hitC && envHC.requestId === hitC.requestId && envHC.nonce === nonceC, "released B hydration did not keep C envelope stale");
+      const listD = mustArray(ctx, "secD-requests", await get("/api/meetings/" + mid + "/secretary/requests", { token: tokA }));
+      const rowsC = listD.filter((r) => String(camel(r, "clientNonce") || "") === nonceC);
+      ctx.ok("secD-server-C-distinct", !!hitC && rowsC.length === 1 && String(camel(rowsC[0], "id") || "") === hitC.requestId && String(camel(rowsC[0], "status") || "") === "needs-clarification", "server rows for C nonce=" + rowsC.length);
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1500);
+      const domD = await page.evaluate(() => document.body.innerText);
+      ctx.ok("secD-C-question-shown", domD.includes("Secretary clarification") && domD.includes("QA clarify budget scope?"), domD.slice(0, 300));
+      writeArt("secretary-hydration-wire.json", { reqB: envHB ? envHB.requestId : null, reqC: hitC ? hitC.requestId : null, nonceB: nonceB2, nonceC });
+      await page.unroute(heldPred);
+      try { page.off("request", onSecReqD); } catch (e) {}
+      try { page.off("response", onSecRespD); } catch (e) {}
+    }
+    // Phase4 remainder: answer-held X->Z->X ordering cannot be UI-exercised
+    // (answer Send disables while pending, and the server pins the FIRST answer
+    // per request with 409 on conflict), so no honest browser control exists.
+    // Explicit PENDING, not softened; everything else above is browser-proven.
+    writeArt("secretary-phase4-pending.json", { covered: ["first-clarification-answer-wire", "genuine-502-same-request-retry", "offline-retry-clear-resume-zero", "positive-fresh-ask-after-resume", "held-hydration-new-ask-C", "per-attempt-once-generation"], pending: ["answer-held-ordering"], note: "Answer held X->Z->X has no honest browser control in this leg; reported PENDING" });
   }
 
   // --- P7 voice through the REAL composer: this-attempt permission denial,
