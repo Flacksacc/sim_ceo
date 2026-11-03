@@ -1262,21 +1262,46 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
   if (!httpACreated || !httpBCreated || !httpUpgCreated) HttpTerminal("http-db-acquire-terminal", "exclusive DB acquisition failed; refusing dependent boot/mutation and never dropping a colliding name.");
   Emit("HTTP exclusive DBs: " + httpA + " " + httpB + " " + httpUpg);
   // ---- P1b: genuine old backup restores through the actual route, then exports ----
-  string? legacyPath = Environment.GetEnvironmentVariable("ESSENTIALS_LEGACY_BACKUP");
+  string? legacyPath = Environment.GetEnvironmentVariable("ESSENTIALS_HTTP_LEGACY_BACKUP");
+  if (string.IsNullOrWhiteSpace(legacyPath) || !System.IO.File.Exists(legacyPath))
+  {
+    var probeDirH = AppContext.BaseDirectory;
+    var rootH = new System.IO.DirectoryInfo(probeDirH);
+    for (var hi = 0; hi < 8 && rootH is not null; hi++)
+    {
+      var candH = System.IO.Path.Combine(rootH.FullName, ".tmp", "predecessor-complete-primary-20261103-1021-canonical-backup.json");
+      if (System.IO.File.Exists(candH)) { legacyPath = candH; break; }
+      candH = System.IO.Path.Combine(rootH.FullName, "sim_ceo", ".tmp", "predecessor-complete-primary-20261103-1021-canonical-backup.json");
+      if (System.IO.File.Exists(candH)) { legacyPath = candH; break; }
+      rootH = rootH.Parent;
+    }
+  }
   if (string.IsNullOrWhiteSpace(legacyPath) || !System.IO.File.Exists(legacyPath)) legacyPath = "C:/Users/War/scrach/sim_ceo/.tmp/predecessor-complete-primary-20261103-1021-canonical-backup.json";
   HttpExpect(!string.IsNullOrWhiteSpace(legacyPath) && System.IO.File.Exists(legacyPath), "http-legacy-backup-present", legacyPath ?? "not found");
+  var memEnvPath = Environment.GetEnvironmentVariable("ESSENTIALS_LEGACY_BACKUP") ?? "";
+  HttpExpect(string.IsNullOrWhiteSpace(memEnvPath) || !string.Equals(memEnvPath, legacyPath, StringComparison.OrdinalIgnoreCase), "http-fixture-separated-from-memory", "http=" + (legacyPath ?? "?") + " memory=" + (string.IsNullOrWhiteSpace(memEnvPath) ? "(unset)" : memEnvPath));
   var legacyRaw = System.IO.File.ReadAllText(legacyPath);
   using var legacyOuter = JsonDocument.Parse(legacyRaw);
   var legacySnap = legacyOuter.RootElement.GetProperty("snapshot").GetString() ?? "";
   var legacyHash = legacyOuter.RootElement.GetProperty("hash").GetString() ?? "";
   using var legacySnapDoc = JsonDocument.Parse(legacySnap);
+  var legacyBoardsN = legacySnapDoc.RootElement.TryGetProperty("boards", out var lbv) && lbv.ValueKind == JsonValueKind.Array ? lbv.GetArrayLength() : -1;
+  var legacyMeetingsN = legacySnapDoc.RootElement.TryGetProperty("meetings", out var lmv) && lmv.ValueKind == JsonValueKind.Array ? lmv.GetArrayLength() : -1;
+  var legacyDraftsN = legacySnapDoc.RootElement.TryGetProperty("drafts", out var ldv) && ldv.ValueKind == JsonValueKind.Array ? ldv.GetArrayLength() : -1;
+  var legacySourcesN = legacySnapDoc.RootElement.TryGetProperty("sources", out var lsv) && lsv.ValueKind == JsonValueKind.Array ? lsv.GetArrayLength() : -1;
+  var legacySnapVer = legacySnapDoc.RootElement.TryGetProperty("version", out var lvv) && lvv.ValueKind == JsonValueKind.Number ? lvv.GetInt32() : -1;
+  var legacyFileHash = Sha(legacyRaw);
+  Emit("HTTP legacy fixture path=" + (legacyPath ?? "?") + " sha256=" + legacyFileHash + " version=" + legacySnapVer + " boards=" + legacyBoardsN + " meetings=" + legacyMeetingsN + " drafts=" + legacyDraftsN + " sources=" + legacySourcesN);
+  HttpExpect(legacySnapVer == 2 && legacyBoardsN == 79 && legacyMeetingsN == 79 && legacyDraftsN == 75 && legacySourcesN == 138, "http-legacy-source-rich-shape", "v" + legacySnapVer + " boards=" + legacyBoardsN + " meetings=" + legacyMeetingsN + " drafts=" + legacyDraftsN + " sources=" + legacySourcesN + " (memory USER 3/2/2 stays separate)");
   var preCharters = new Dictionary<string, string>(StringComparer.Ordinal);
   foreach (var srow in legacySnapDoc.RootElement.GetProperty("sources").EnumerateArray())
   {
     if ((srow.TryGetProperty("Scope", out var scp) ? (scp.GetString() ?? "") : "") == "meeting" && (srow.TryGetProperty("Version", out var sv) ? (sv.GetInt32()) : 0) == 3)
       preCharters[srow.GetProperty("Id").GetString() ?? ""] = (srow.TryGetProperty("ContentHash", out var chx) ? (chx.GetString() ?? "") : "");
   }
-  HttpExpect(preCharters.Count > 0, "http-legacy-charter-v3-present", "meeting v3 charters=" + preCharters.Count + " (genuine v3, no heads/events)");
+  Emit("HTTP legacy fixture v3charters=" + preCharters.Count + " snapshotHash=" + legacyHash.Substring(0, Math.Min(16, legacyHash.Length)));
+  HttpExpect(preCharters.Count == 23, "http-legacy-charter-v3-present", "meeting v3 charters=" + preCharters.Count + " (genuine v3, no heads/events)");
+  HttpExpect(preCharters.Count > 0 && legacySourcesN == 138, "http-legacy-source-rich-positive", "source-rich positive fixture required before dependent E0/tamper checks: charters=" + preCharters.Count + " sources=" + legacySourcesN);
   apiProc1 = StartApi(httpA!, 5146, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "wikiring1"), csBaseAdmin);
   apiDrain1a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardOutput, apiOut1));
   apiDrain1b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardError, apiErr1));
@@ -1411,13 +1436,27 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
   var preFailExact = preSt == System.Net.HttpStatusCode.OK ? NormFailedStable(preSnapText) : "";
   HttpExpect(preSt == System.Net.HttpStatusCode.OK && preNorm == e0Norm, "http-pre-attempt-baseline", "baseline export matches sent export before tampered attempt");
   var tampered = TamperDropFamilyMember(e0Snap, out var tamperDetail);
+  var tamperPosted = false;
+  var ngSt = System.Net.HttpStatusCode.ServiceUnavailable; var ngDoc = JsonDocument.Parse("{\"error\":\"tamper construction failed; restore not attempted\"}");
   HttpExpect(tamperDetail.StartsWith("drop-source"), "http-tamper-constructed", tamperDetail);
-  HttpRequireListener(apiProc2, 5246, "http-own-5246-before-e0-tamper");
-  var (ngSt, ngDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tampered, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tampered)) });
-  HttpExpect(ngSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-tampered-restore-422", "status=" + (int)ngSt + " " + ngDoc.RootElement.GetRawText().Substring(0, Math.Min(300, ngDoc.RootElement.GetRawText().Length)));
-  HttpExpect(ngDoc.RootElement.GetRawText().Contains("skips version"), "http-tamper-error-shape", "dense-gap rejection names the skipped version");
+  if (tamperDetail.StartsWith("drop-source"))
+  {
+    HttpRequireListener(apiProc2, 5246, "http-own-5246-before-e0-tamper");
+    (ngSt, ngDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tampered, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tampered)) });
+    tamperPosted = true;
+  }
+  else
+  {
+    HttpExpect(false, "http-tampered-restore-422", "construction failed (" + tamperDetail + "); restore not attempted so unchanged valid snapshot is never POSTed");
+    HttpExpect(false, "http-tamper-error-shape", "construction failed (" + tamperDetail + "); no restore attempted, no rejection to shape-check");
+  }
+  if (tamperPosted)
+  {
+    HttpExpect(ngSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-tampered-restore-422", "status=" + (int)ngSt + " " + ngDoc.RootElement.GetRawText().Substring(0, Math.Min(300, ngDoc.RootElement.GetRawText().Length)));
+    HttpExpect(ngDoc.RootElement.GetRawText().Contains("skips version"), "http-tamper-error-shape", "dense-gap rejection names the skipped version");
+  }
   var (unSt, unDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
-  var unSnap = unDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var unFailExact = NormFailedStable(unSnap); EmitFailedDiff(preFailExact, unSnap, artifactDir, "e0-prior", "http-prior-unchanged-after-422"); HttpExpect(unSt == System.Net.HttpStatusCode.OK && unFailExact == preFailExact, "http-prior-unchanged-after-422", "rejected restore leaves generations, owners, and every other field byte-identical (only root at excluded)");
+  var unSnap = unDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var unFailExact = NormFailedStable(unSnap); EmitFailedDiff(preFailExact, unSnap, artifactDir, "e0-prior", "http-prior-unchanged-after-422"); HttpExpect(tamperPosted && unSt == System.Net.HttpStatusCode.OK && unFailExact == preFailExact, "http-prior-unchanged-after-422", "rejected restore leaves generations, owners, and every other field byte-identical (only root at excluded)");
   // Modern v4 wiped-history forgery over the actual route: HistoryJson is a STRING
   // (backup serializes draft entities directly), so select a known modern row with an
   // explicit false marker, verify its history STRING is nonempty, then assign the
@@ -1462,8 +1501,17 @@ try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = 
   }
   HttpExpect(wSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-wiped-history-422", "status=" + (int)wSt + " " + wDoc.RootElement.GetRawText().Substring(0, Math.Min(300, wDoc.RootElement.GetRawText().Length)));
   HttpExpect(wDoc.RootElement.GetRawText().Contains("without decision history"), "http-wiped-history-reason", "modern wiped row must fail for the exact history reason");
+  var (wipePreSt, wipePreDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var wipePreSnap = wipePreSt == System.Net.HttpStatusCode.OK ? wipePreDoc.RootElement.GetProperty("snapshot").GetString() ?? "" : "";
+  var wipePreFailExact = wipePreSt == System.Net.HttpStatusCode.OK ? NormFailedStable(wipePreSnap) : "";
+  HttpExpect(wipePreSt == System.Net.HttpStatusCode.OK, "http-wipe-pre-baseline", "fresh immediate baseline captured before wiped-history POST");
   var (wBackSt, wBackDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
-  var wBackSnap = wBackDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var wBackExact = NormFailedStable(wBackSnap); EmitFailedDiff(preFailExact, wBackSnap, artifactDir, "e0-wiped-prior", "http-wiped-prior-unchanged"); HttpExpect(wipePosted && wBackSt == System.Net.HttpStatusCode.OK && wBackExact == preFailExact, "http-wiped-prior-unchanged", "wiped modern v4 export rejects with generations, owners, and every other field unchanged");
+  var wBackSnap = "";
+  // Fresh immediate baseline: re-read AFTER the wiped POST attempt so any accidental
+  // earlier mutation cannot false-credit this check; compare post-state to the
+  // immediate pre-wipe graph, and also require it to equal the pre-tamper graph.
+  if (wBackSt == System.Net.HttpStatusCode.OK) { wBackSnap = wBackDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; }
+  var wBackExact = string.IsNullOrWhiteSpace(wBackSnap) ? "" : NormFailedStable(wBackSnap); EmitFailedDiff(wipePreFailExact, wBackSnap, artifactDir, "e0-wiped-prior", "http-wiped-prior-unchanged"); HttpExpect(wipePosted && wBackSt == System.Net.HttpStatusCode.OK && wBackExact == wipePreFailExact && wBackExact == preFailExact, "http-wiped-prior-unchanged", "wiped modern v4 export rejects with generations, owners, and every other field unchanged");
   // ---- P1a: physical upg clone upgrades, exports, and restores through actual routes ----
   var dumpFile = "/tmp/ess_ev_httpupg_dump.sql";
   var (dumpExit, dumpOut, dumpErr, dumpTo) = RunBounded("docker", "exec simceo-integration-qa-pg pg_dump -U simceo -d essentials_backend_upg -f " + dumpFile, 300000);
