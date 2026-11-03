@@ -26,16 +26,24 @@ public static class PolicyStore
   {
     var b = Pg.Backend;
     if (b is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, s.Spend.Mode); }
-    InstallationPolicy? row;
-    try
+    // Root-held projection: lookup AND scalar copy happen under the root gate
+    // (outer) and the single backend gate (inner), preserving ROOT -> backend
+    // order. Scalars are detached: a concurrent writer that later rolls back
+    // can never leak uncommitted or torn values into this reader. Never hold
+    // the root across a provider await: this path is fully synchronous.
+    lock (s.RootGate)
     {
-      if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
-      row = b.Find<InstallationPolicy>(SingletonId);
+      try
+      {
+        if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
+        (decimal? cap, string mode)? snap = b.Project<InstallationPolicy, (decimal? cap, string mode)?>(
+          SingletonId, row => row is null ? null : (row.MonthlyCapUsd, string.IsNullOrWhiteSpace(row.Mode) ? "warn" : row.Mode));
+        if (snap is null) return (s.Spend.MonthlyCapUsd, s.Spend.Mode);
+        return snap.Value;
+      }
+      catch (PolicyUnavailableException) { throw; }
+      catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting defaults.", ex); }
     }
-    catch (PolicyUnavailableException) { throw; }
-    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting defaults.", ex); }
-    if (row is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, s.Spend.Mode); }
-    return (row.MonthlyCapUsd, string.IsNullOrWhiteSpace(row.Mode) ? "warn" : row.Mode);
   }
 
   public static void WriteSpend(InMemoryStore s, decimal? cap, string mode)
@@ -45,13 +53,14 @@ public static class PolicyStore
     decimal? oldCap; string oldMode;
     lock (s.RootGate) { oldCap = s.Spend.MonthlyCapUsd; oldMode = s.Spend.Mode; }
     try { Atomic.Compensate(s, () => { lock (s.RootGate) { s.Spend.MonthlyCapUsd = oldCap; s.Spend.Mode = oldMode; } }); } catch { }
-    InstallationPolicy row;
-    try { row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId }; }
-    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; spend update refused.", ex); }
-    row.MonthlyCapUsd = cap;
-    row.Mode = mode;
-    b.Upsert(row);
-    if (!b.IsTransacting) b.Save();
+    // Gated mutation under the root gate (ROOT -> backend order): field
+    // assignments never race a gated reader copy.
+    lock (s.RootGate)
+    {
+      try { b.Mutate<InstallationPolicy>(SingletonId, () => new InstallationPolicy { Id = SingletonId }, row => { row.MonthlyCapUsd = cap; row.Mode = mode; }); }
+      catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; spend update refused.", ex); }
+      if (!b.IsTransacting) b.Save();
+    }
     lock (s.RootGate) { s.Spend.MonthlyCapUsd = cap; s.Spend.Mode = mode; }
   }
 
@@ -64,16 +73,22 @@ public static class PolicyStore
   {
     var b = Pg.Backend;
     if (b is null) { lock (s.RootGate) return s.ModelChatOverride; }
-    InstallationPolicy? row;
-    try
+    // Same root-held projection contract as ReadSpend: no observable
+    // uncommitted, torn, or rejected policy. Fully synchronous: the root is
+    // never held across a provider await.
+    lock (s.RootGate)
     {
-      if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
-      row = b.Find<InstallationPolicy>(SingletonId);
+      try
+      {
+        if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
+        string? snap = b.Project<InstallationPolicy, string?>(
+          SingletonId, row => row is null ? null : (row.ModelChatOverride ?? ""));
+        if (snap is null) return s.ModelChatOverride;
+        return snap;
+      }
+      catch (PolicyUnavailableException) { throw; }
+      catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting a different model.", ex); }
     }
-    catch (PolicyUnavailableException) { throw; }
-    catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting a different model.", ex); }
-    if (row is null) { lock (s.RootGate) return s.ModelChatOverride; }
-    return row.ModelChatOverride ?? "";
   }
 
   public static void WriteConnection(InMemoryStore s, string apiKey, string chatModel)
@@ -100,12 +115,15 @@ public static class PolicyStore
     catch { }
     if (b is not null)
     {
-      InstallationPolicy row;
-      try { row = b.Find<InstallationPolicy>(SingletonId) ?? new InstallationPolicy { Id = SingletonId }; }
-      catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; connection update refused.", ex); }
-      row.ModelChatOverride = chatModel;
-      b.Upsert(row);
-      if (!b.IsTransacting) b.Save();
+      // Gated mutation under the root gate (ROOT -> backend order): the
+      // durable chat-model write never races a gated reader copy. Key
+      // material stays memory-only by contract (never persisted here).
+      lock (s.RootGate)
+      {
+        try { b.Mutate<InstallationPolicy>(SingletonId, () => new InstallationPolicy { Id = SingletonId }, row => { row.ModelChatOverride = chatModel; }); }
+        catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; connection update refused.", ex); }
+        if (!b.IsTransacting) b.Save();
+      }
     }
     lock (s.RootGate)
     {

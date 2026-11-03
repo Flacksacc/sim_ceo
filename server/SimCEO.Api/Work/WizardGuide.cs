@@ -126,8 +126,9 @@ public static class WizardGuide
           catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
-          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
-          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "Draft is gone.")) { return Results.NotFound("wizard draft"); }
+          catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard interview", iox); }
+          catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard interview") ?? Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(draftId0, out var saved0) || saved0 is null) return Results.NotFound("wizard draft");
           return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = saved0.Version, fields = FieldStates(saved0), blockers = Blockers(saved0), checkpoints = ReadCheckpoints(saved0), turns, done = Blockers(saved0).Count == 0 });
         }
@@ -159,8 +160,9 @@ public static class WizardGuide
           catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
-          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
-          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "Draft is gone.")) { return Results.NotFound("wizard draft"); }
+          catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard interview", iox); }
+          catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard interview") ?? Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(draftIdP, out var savedP) || savedP is null) return Results.NotFound("wizard draft");
           var pendingVersion = savedP.Version;
           var gw = new ModelGateway(s);
@@ -255,8 +257,9 @@ public static class WizardGuide
           catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
           catch (InvalidOperationException iox) when (iox.Message == "changed") { return Results.Conflict("Draft changed during interview; retry with the latest version."); }
           catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during interview; retry with the latest version."); }
-          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
-          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound("wizard draft"); }
+          catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard interview", iox); }
+          catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard interview") ?? Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(completionId, out var doneIv) || doneIv is null) return Results.NotFound("wizard draft");
           return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = doneIv.Version, fields = FieldStates(doneIv), blockers = Blockers(doneIv), checkpoints = ReadCheckpoints(doneIv), turns, done = Blockers(doneIv).Count == 0 });
         }
@@ -374,6 +377,11 @@ public static class WizardGuide
       }
       catch (Exception ex)
       {
+        // Honest outcome first: an unknown commit may have succeeded, so it must
+        // never be reported as rolled back. Determinate failures fall through to
+        // the compensation below and keep the original rolled-back wording.
+        var createOutcome = CommitOutcome.MapCommitFailure(ex, "Board creation");
+        if (createOutcome is not null) return createOutcome;
         foreach (var imgId in createdImages) s.Images.TryRemove(imgId, out _);
         foreach (var rid in createdRoster) s.Roster.TryRemove(rid, out _);
         foreach (var aid in createdAdvisors) s.Advisors.TryRemove(aid, out _);

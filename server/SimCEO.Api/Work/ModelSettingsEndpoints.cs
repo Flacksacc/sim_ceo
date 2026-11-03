@@ -109,11 +109,17 @@ public static class ModelSettingsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can test the model connection." }, statusCode: 403);
-      string keyBefore, chatBefore;
+      string keyBefore, chatBefore; (Guid epochId, long epochRev) testPin;
       try
       {
+        // Authoritative connection capture INSIDE one root boundary BEFORE the
+        // dispatch: the restore pin and the effective key/model describe the
+        // same instant. The bound key below dispatches EXACTLY this key, so an
+        // A->B-before-header->A sequence cannot claim A tested when B was used.
+        // Key material is request-scoped here, never logged or serialized.
         lock (s.RootGate)
         {
+          testPin = SimCEO.Api.Work.PublicationGuard.Capture(s);
           var ov = PolicyStore.ReadApiKey(s);
           keyBefore = !string.IsNullOrWhiteSpace(ov) ? ov : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
           chatBefore = PolicyStore.ReadChatModel(s);
@@ -124,7 +130,8 @@ public static class ModelSettingsEndpoints
       var gw = new ModelGateway(s);
       var sw = System.Diagnostics.Stopwatch.StartNew();
       Exception? callEx = null;
-      try { await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 512, ct, ownerOverride: true); }
+      // Bound dispatch: the header carries exactly keyBefore, not a re-resolved key.
+      try { await gw.CompleteAsync(model, "model-test", "Reply with exactly: OK", 100, 512, ct, ownerOverride: true, boundKey: keyBefore); }
       catch (Exception cex) { callEx = cex; }
       sw.Stop();
       var callKind = callEx is null ? "ok"
@@ -146,6 +153,15 @@ public static class ModelSettingsEndpoints
             if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, tsIn, StringComparison.OrdinalIgnoreCase)) { testGuardErr = Results.Json(new { error = "Only the installation admin can test the model connection." }, statusCode: 403); return; }
           }
           else if (!PeopleOps.IsOwner(req)) { testGuardErr = PeopleOps.Denied(); return; }
+          // Restore epoch is checked INSIDE the publication unit: a restore
+          // during the test discards the stale result instead of publishing it
+          // under the new epoch (actual dispatched attempts keep their billing
+          // pair in the usage ledger regardless).
+          if (s.RestoreEpochId != testPin.epochId || s.RestoreEpochRev != testPin.epochRev)
+          {
+            testGuardErr = Results.Conflict("Domain was restored during the test; the stale result was discarded, not published.");
+            return;
+          }
           string keyNow, chatNow;
           try
           {
@@ -190,6 +206,7 @@ public static class ModelSettingsEndpoints
         });
       }
       catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
+      catch (SimCEO.Api.Data.CommitUnknownException cux) { return Results.Json(new { error = "Model test outcome is unknown (the commit may have succeeded); re-read the status before retrying: " + cux.Message }, statusCode: 500); }
       catch (SimCEO.Api.Data.PostCommitException pcx) { return Results.Json(new { error = "Model test committed, but a post-commit effect failed: " + pcx.Message }, statusCode: 500); }
       catch (AggregateException agx) { return Results.Json(new { error = "Model test failed and rollback is uncertain: " + agx.Message }, statusCode: 500); }
       catch (Exception tex) { return Results.Json(new { error = "Model test status not recorded: " + tex.Message }, statusCode: 500); }

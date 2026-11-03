@@ -164,6 +164,21 @@ public sealed class PostgresBackend : IPgBackend
     lock (_gate) return _db.Set<T>().Find(id);
   }
 
+  public TResult? Project<T, TResult>(Guid id, Func<T?, TResult?> project) where T : class
+  {
+    lock (_gate) return project(_db.Set<T>().Find(id));
+  }
+
+  public void Mutate<T>(Guid id, Func<T> create, Action<T> mutate) where T : class
+  {
+    lock (_gate)
+    {
+      var existing = _db.Set<T>().Find(id);
+      if (existing is null) { var e = create(); _db.Set<T>().Add(e); mutate(e); }
+      else mutate(existing);
+    }
+  }
+
   public List<T> All<T>() where T : class
   {
     lock (_gate)

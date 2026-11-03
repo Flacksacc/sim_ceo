@@ -409,8 +409,9 @@ public static class RosterEndpoints
           Atomic.Audit(s, new AuditEvent { Action = "roster.edit", Detail = JsonSerializer.Serialize(new { entry = applied!.Id, version = applied!.Version }) });
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Roster edit failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Roster edit", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster edit") ?? Results.Json(new { error = "Roster edit failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (applied is null) return Results.NotFound();
         return Results.Ok(applied);
       }
@@ -440,8 +441,9 @@ public static class RosterEndpoints
           });
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Roster archive failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Roster archive", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster archive") ?? Results.Json(new { error = "Roster archive failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (saved is null) return Results.NotFound();
         return Results.Ok(saved);
       }
@@ -492,7 +494,7 @@ public static class RosterEndpoints
       {
         Atomic.Run(s, () => { s.Roster[newEntry.Id] = newEntry; });
       }
-      catch (Exception ex) { return Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster creation") ?? Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/roster/{newEntry.Id}", newEntry);
     });
 
@@ -540,7 +542,7 @@ public static class RosterEndpoints
           Atomic.Audit(s, new AuditEvent { Action = "roster.quick", Detail = JsonSerializer.Serialize(new { entry = quickEntry.Id, name }) });
         });
       }
-      catch (Exception ex) { return Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster creation") ?? Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/roster/{quickEntry.Id}", quickEntry);
     });
 
@@ -616,7 +618,7 @@ public static class RosterEndpoints
           Atomic.Audit(s, new AuditEvent { Action = "roster.ai-draft", Detail = JsonSerializer.Serialize(new { entry = aiEntry.Id, name, role, searches = dossier.SearchCalls }) });
         });
       }
-      catch (Exception ex) { return Results.Json(new { error = "Roster draft failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster draft") ?? Results.Json(new { error = "Roster draft failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = dossier.RanSearch, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
     });
 
@@ -734,8 +736,9 @@ public static class RosterEndpoints
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
         catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Conflict("Research is already running for this advisor; wait for it to finish."); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Research start", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Research start") ?? Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
         RosterOps.MarkLiveResearchJob(jobId);
       }
       try
@@ -799,7 +802,7 @@ public static class RosterEndpoints
           catch (InvalidOperationException iox) when (iox.Message == "res-restored") { failCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
           catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { failCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
           catch (UnauthorizedAccessException) { failCleanupErr = PeopleOps.Denied(); }
-          catch (Exception fex) { failCleanupErr = Results.Json(new { error = "Research failure cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
+          catch (Exception fex) { failCleanupErr = CommitOutcome.MapCommitFailure(fex, "Research failure cleanup") ?? Results.Json(new { error = "Research failure cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
           RosterOps.ClearLiveResearchJob(jobId);
           if (failCleanupErr is not null) return failCleanupErr;
         }
@@ -839,7 +842,7 @@ public static class RosterEndpoints
           catch (InvalidOperationException iox) when (iox.Message == "res-restored") { staleCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
           catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { staleCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
           catch (UnauthorizedAccessException) { staleCleanupErr = PeopleOps.Denied(); }
-          catch (Exception fex) { staleCleanupErr = Results.Json(new { error = "Research cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
+          catch (Exception fex) { staleCleanupErr = CommitOutcome.MapCommitFailure(fex, "Research cleanup") ?? Results.Json(new { error = "Research cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
           RosterOps.ClearLiveResearchJob(jobId);
           if (staleCleanupErr is not null) return staleCleanupErr;
           return Results.Conflict("Advisor profile changed during research; rerun research on the new version.");
@@ -889,8 +892,9 @@ public static class RosterEndpoints
         }
         catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (UnauthorizedAccessException) { RosterOps.ClearLiveResearchJob(jobId); return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { RosterOps.ClearLiveResearchJob(jobId); return Results.NotFound(); }
-        catch (Exception ex) { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Research completion failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { RosterOps.ClearLiveResearchJob(jobId); return Results.NotFound(); }
+        catch (InvalidOperationException iox) { RosterOps.ClearLiveResearchJob(jobId); return CommitOutcome.StorageFault("Research completion", iox); }
+        catch (Exception ex) { RosterOps.ClearLiveResearchJob(jobId); return CommitOutcome.MapCommitFailure(ex, "Research completion") ?? Results.Json(new { error = "Research completion failed; no state changed: " + ex.Message }, statusCode: 500); }
         dossier = built;
       }
       return Results.Ok(dossier);
@@ -979,8 +983,9 @@ public static class RosterEndpoints
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Image upload failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image upload", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image upload") ?? Results.Json(new { error = "Image upload failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/images/{newImg.Id}", new { newImg.Id, newImg.Kind, newImg.Provenance });
     }).DisableAntiforgery(); // token-less API: no cookie auth to forge against
 
@@ -1019,8 +1024,9 @@ public static class RosterEndpoints
           });
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Image fetch failed to store; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image fetch", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image fetch") ?? Results.Json(new { error = "Image fetch failed to store; no state changed: " + ex.Message }, statusCode: 500); }
         return Results.Created($"/api/images/{newImg2.Id}", new { newImg2.Id, newImg2.Kind, newImg2.Provenance });
       }
     });
@@ -1070,8 +1076,9 @@ public static class RosterEndpoints
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Image generation store failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image generation", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image generation") ?? Results.Json(new { error = "Image generation store failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Ok(created);
     });
 
@@ -1125,8 +1132,9 @@ public static class RosterEndpoints
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Image delete failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image delete", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image delete") ?? Results.Json(new { error = "Image delete failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.NoContent();
     });
 
@@ -1177,8 +1185,9 @@ public static class RosterEndpoints
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
         catch (InvalidOperationException iox) when (iox.Message == "mismatch") { return Results.BadRequest("Image does not belong to this advisor roster entry."); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Image select failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image select", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image select") ?? Results.Json(new { error = "Image select failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (savedAdv is null) return Results.NotFound();
         Atomic.Audit(s, new AuditEvent { BoardId = savedAdv.BoardId, Action = "image.select", Detail = JsonSerializer.Serialize(new { imgId, advisor = advisorId }) });
         return Results.Ok(savedAdv);
@@ -1248,8 +1257,9 @@ public static class RosterEndpoints
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
         catch (InvalidOperationException iox) when (iox.Message == "bad-decision") { return Results.BadRequest("decision must be accept or retry."); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Image review failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image review", iox); }
+        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image review") ?? Results.Json(new { error = "Image review failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (savedImg is null) return Results.NotFound();
         Guid? rb = null;
         if (savedImg.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(savedImg.BoardAdvisorId.Value, out var rba)) rb = rba.BoardId;

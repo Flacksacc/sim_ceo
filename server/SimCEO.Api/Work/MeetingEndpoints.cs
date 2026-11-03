@@ -76,8 +76,9 @@ public static class MeetingEndpoints
       catch (UnauthorizedAccessException uex) when (uex.Message == "denied") { return PeopleOps.Denied(); }
       catch (UnauthorizedAccessException) { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during transcription; retry."); }
-      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
-      catch (Exception ex) { return Results.Json(new { error = "Transcription store failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound("meeting"); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Transcription store", iox); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Transcription store") ?? Results.Json(new { error = "Transcription store failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/voice/{turn.Id}", new { turn = turn.Id, transcript });
     }).DisableAntiforgery();
 
@@ -91,7 +92,7 @@ public static class MeetingEndpoints
         {
         // Recheck CURRENT authority against a fresh fetch inside the unit (TOCTOU).
         if (!s.Meetings.TryGetValue(id, out var curP)) throw new InvalidOperationException("Meeting is gone.");
-        if (PeopleOps.Check(s, req, curP.BoardId, id, "contribute") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+        if (PeopleOps.Check(s, req, curP.BoardId, id, "contribute") is not null) throw PeopleOps.AuthFault(s, req);
         if (body.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String)
         {
           var title = t.GetString() ?? "";
@@ -116,9 +117,12 @@ public static class MeetingEndpoints
         s.Meetings[curP.Id] = curP;
         });
       }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
-      catch (Exception ex) { return Results.Json(new { error = "Meeting update failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Meeting is gone.")) { return Results.NotFound("meeting"); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Meeting update", iox); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Meeting update") ?? Results.Json(new { error = "Meeting update failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (!s.Meetings.TryGetValue(id, out var savedP) || savedP is null) return Results.NotFound("meeting");
       return Results.Ok(savedP);
     });
@@ -133,16 +137,19 @@ public static class MeetingEndpoints
         Atomic.Run(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur)) throw new InvalidOperationException("Meeting is gone.");
-          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw PeopleOps.AuthFault(s, req);
           cur.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
           cur.Generation++;
           s.Meetings[cur.Id] = cur;
           Atomic.Audit(s, new AuditEvent { BoardId = cur.BoardId, Action = "meeting.close", Detail = JsonSerializer.Serialize(new { meeting = id, withRecord }) });
         });
       }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
-      catch (Exception ex) { return Results.Json(new { error = "Meeting close failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Meeting is gone.")) { return Results.NotFound("meeting"); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Meeting close", iox); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Meeting close") ?? Results.Json(new { error = "Meeting close failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (!s.Meetings.TryGetValue(id, out var closed) || closed is null) return Results.NotFound("meeting");
       return Results.Ok(closed);
     });
@@ -156,16 +163,19 @@ public static class MeetingEndpoints
         Atomic.Run(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur)) throw new InvalidOperationException("Meeting is gone.");
-          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw PeopleOps.AuthFault(s, req);
           cur.State = MeetingState.Active;
           cur.Generation++;
           s.Meetings[cur.Id] = cur;
           Atomic.Audit(s, new AuditEvent { BoardId = cur.BoardId, Action = "meeting.reopen", Detail = JsonSerializer.Serialize(new { meeting = id }) });
         });
       }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
-      catch (Exception ex) { return Results.Json(new { error = "Meeting reopen failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Meeting is gone.")) { return Results.NotFound("meeting"); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Meeting reopen", iox); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Meeting reopen") ?? Results.Json(new { error = "Meeting reopen failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (!s.Meetings.TryGetValue(id, out var reopened) || reopened is null) return Results.NotFound("meeting");
       return Results.Ok(reopened);
     });
@@ -336,6 +346,8 @@ public static class MeetingEndpoints
       {
         lock (s.MessageLock)
         {
+          try
+          {
           return Atomic.Run<IResult>(s, () =>
           {
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
@@ -364,6 +376,8 @@ public static class MeetingEndpoints
             s.Notes.Flush(); s.NoteHistories.Flush();
             return Results.Created($"/api/notes/{note.Id}", note);
           });
+          }
+          catch (Exception brEx) { var brMapped = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(brEx, "Briefing"); if (brMapped is not null) return brMapped; throw; }
         }
       }
     });
@@ -424,8 +438,9 @@ public static class MeetingEndpoints
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Direction adoption failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Board is gone.", "Meeting is gone.")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Direction adoption", iox); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Direction adoption") ?? Results.Json(new { error = "Direction adoption failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/notes/{newNote.Id}", newNote);
     });
   }

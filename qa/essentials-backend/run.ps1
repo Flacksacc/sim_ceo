@@ -12,7 +12,7 @@ $pgPort = "15441"
 $pgUser = "simceo"
 $pgPw = "qa-only"
 $pgCtn = "simceo-integration-qa-pg"
-$pgCtnIdFull = "14bcfcf7a243e5bc73385da4d24a33475b6eab0b04b8185e1d53a4c13d1a1891"
+$pgCtnIdFull = "14bcfcf7a243e5bc73385da4d24a33475b6eab0b04b8185e1d1534c13d1a1891"
 $procs = @()
 $subs = @()
 $fail = 0
@@ -24,20 +24,43 @@ function Check([string]$name, [bool]$cond, [string]$detail) {
 function PortFree([int]$port) {
   try { $c = New-Object System.Net.Sockets.TcpClient; $iar = $c.BeginConnect("127.0.0.1", $port, $null, $null); $ok = $iar.AsyncWaitHandle.WaitOne(400); $conn = $c.Connected; $c.Close(); return -not ($ok -and $conn) } catch { return $true }
 }
+function PgTimeoutArgs() {
+  # Bounded native SQL: every psql call carries a process deadline (via Invoke-Bounded)
+  # AND in-engine lock/statement timeouts (via PGOPTIONS), so an ALTER TABLE waiting
+  # on an outstanding transaction fails fast instead of hanging the runner forever.
+  # Checked native exits are preserved: any failure throws and owned cleanup still runs.
+  return @("-e", "PGOPTIONS=-c lock_timeout=10000 -c statement_timeout=60000")
+}
+function PgReadLog([string]$logf) {
+  # Invoke-Bounded logs stdout, a marker line, then stderr; Pg callers get
+  # stdout only (stderr stays attributed in the per-call log file).
+  $raw = Get-Content -Raw (Join-Path $art $logf)
+  $mark = "`n--- STDERR ---`n"
+  $ix = $raw.IndexOf($mark)
+  if ($ix -ge 0) { return $raw.Substring(0, $ix) } else { return $raw }
+}
 function PgExec([string]$db, [string]$sql) {
-  # Checked native exit: every SQL helper call is an attributed gate step.
-  $out = docker exec $pgCtn psql -v ON_ERROR_STOP=1 -U $pgUser -d $db -t -A -c $sql 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "psql failed (exit $LASTEXITCODE) db=$db sql=$sql :: $out" }
-  return $out
+  # Checked native exit AND BOUNDED: the existing Invoke-Bounded process
+  # deadline plus in-engine lock/statement timeouts (PgTimeoutArgs) bound both
+  # the docker round-trip and any lock wait. stdout is returned; the log keeps
+  # stdout + stderr. Any failure throws and owned cleanup still runs.
+  $tag = "pgexec-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+  $logf = "pgexec-" + $tag + ".log"
+  $pgArgs = @("exec") + (PgTimeoutArgs) + @($pgCtn, "psql", "-v", "ON_ERROR_STOP=1", "-U", $pgUser, "-d", $db, "-t", "-A", "-c", $sql)
+  $code = Invoke-Bounded "docker" $pgArgs $root $null 120 $tag $logf
+  if ($code -ne 0) { throw "psql failed (exit $code) db=$db sql=$sql :: see $logf" }
+  return (PgReadLog $logf)
 }
 function PgExecQ([string]$db, [string]$sql) {
-  $f = Join-Path $tmp ("essddl-" + [Guid]::NewGuid().ToString("N") + ".sql")
-  Set-Content -Path $f -Value $sql -NoNewline
-  try {
-    $out = Get-Content -Raw $f | docker exec -i $pgCtn psql -v ON_ERROR_STOP=1 -U $pgUser -d $db -t -A -q 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "psql(Q) failed (exit $LASTEXITCODE) db=$db sql=$sql :: $out" }
-    return $out
-  } finally { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+  # Same bounded contract as PgExec; the SQL text travels via the existing
+  # Invoke-Bounded stdin feed (same ArgumentList + concurrent-drain +
+  # bounded-exit/EOF guarantees, no new framework) with -i attached.
+  $tag = "pgexecq-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+  $logf = "pgexecq-" + $tag + ".log"
+  $pgArgs = @("exec", "-i") + (PgTimeoutArgs) + @($pgCtn, "psql", "-v", "ON_ERROR_STOP=1", "-U", $pgUser, "-d", $db, "-t", "-A", "-q")
+  $code = Invoke-Bounded "docker" $pgArgs $root $null 120 $tag $logf $sql
+  if ($code -ne 0) { throw "psql(Q) failed (exit $code) db=$db sql=$sql :: see $logf" }
+  return (PgReadLog $logf)
 }
 function Preflight() {
   # Fail BEFORE acquisition: a busy port, a down PG, or a wrong container
@@ -134,7 +157,7 @@ function Stop-Hidden($entry) {
   if (-not $ok) { Fail ("cleanup-stop:" + $entry.tag) "process escaped bounded stop/drain" }
   return $ok
 }
-function Invoke-Bounded([string]$file, [string[]]$argList, [string]$workdir, $envmap, [int]$secs, [string]$tag, [string]$logf) {
+function Invoke-Bounded([string]$file, [string[]]$argList, [string]$workdir, $envmap, [int]$secs, [string]$tag, [string]$logf, [string]$stdinText = "") {
   # Bounded direct invocation: any hang becomes a bounded failure, never a
   # stuck runner. BOTH streams drain CONCURRENTLY from first start via
   # ReadToEndAsync (no WaitForExit-before-ReadToEnd deadlock when pipes fill).
@@ -156,6 +179,19 @@ function Invoke-Bounded([string]$file, [string[]]$argList, [string]$workdir, $en
     Fail $tag ("spawn failed :: " + $_.Exception.Message)
     try { $p.Dispose() } catch {}
     return 127
+  }
+  # Optional stdin feed (existing contract extension for PgExecQ): small SQL
+  # text is written synchronously BEFORE the concurrent drain starts, then
+  # stdin closes, so a piped psql still sees EOF. Callers without stdin pass
+  # nothing and keep the exact previous behavior.
+  if ($stdinText -ne "") {
+    try { $p.StandardInput.Write($stdinText); $p.StandardInput.Close() }
+    catch {
+      Fail $tag ("stdin feed failed :: " + $_.Exception.Message)
+      try { $p.Kill($true) } catch {}
+      try { $p.Dispose() } catch {}
+      return 124
+    }
   }
   try {
     $outTask = $p.StandardOutput.ReadToEndAsync()

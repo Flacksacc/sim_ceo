@@ -695,13 +695,19 @@ public sealed class ModelGateway
     statusCode is < 200 or >= 300 ? ErrorBoundBytes
     : string.Equals(path, "/images/generations", StringComparison.Ordinal) ? ImageBoundBytes
     : TextBoundBytes;
-  private async Task<JsonDocument> PostJson(string path, object body, CancellationToken ct)
+  // boundKey pins the ACTUAL dispatched connection: when supplied, the
+  // Authorization header uses exactly this captured key instead of
+  // re-resolving EffectiveKey at dispatch time. This binds the tested key to
+  // the actual request (A->B-before-header->A can never claim A tested when B
+  // was dispatched). The bound key is request-scoped (a per-test immutable
+  // string), never a process-wide cached config, and is never logged.
+  private async Task<JsonDocument> PostJson(string path, object body, CancellationToken ct, string? boundKey = null)
   {
     using var opCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
     opCts.CancelAfter(WholeOperationTimeoutOverride ?? WholeOperationTimeout);
     var op = opCts.Token;
     using var req = new HttpRequestMessage(HttpMethod.Post, $"{Base}{path}");
-    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", EffectiveKey);
+    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", boundKey ?? EffectiveKey);
     req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
     using var res = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, op).ConfigureAwait(false);
     var bound = BoundFor(path, (int)res.StatusCode);
@@ -716,10 +722,14 @@ public sealed class ModelGateway
 
   public async Task<string> CompleteAsync(string model, string purpose, string prompt,
     int inputBudget, int outputBudget, CancellationToken ct = default, bool ownerOverride = false,
-    Guid? boardId = null, Guid? meetingId = null, bool truncatePrompt = true)
+    Guid? boardId = null, Guid? meetingId = null, bool truncatePrompt = true, string? boundKey = null)
   {
     ThrowIfCapped(ownerOverride);
-    EnsureAvailable();
+    if (boundKey is not null)
+    {
+      if (string.IsNullOrWhiteSpace(boundKey)) throw new ProviderNotConfiguredException();
+    }
+    else EnsureAvailable();
     ThrowIfPrecancelled(ct);
     var effort = ReasoningEffortFor(purpose);
     var ensured = EnsureOutputBudget(purpose, outputBudget);
@@ -736,7 +746,7 @@ public sealed class ModelGateway
         max_completion_tokens = Math.Clamp(ensured, 16, 16000),
         reasoning_effort = effort,
         stream = false,
-      }, ct);
+      }, ct, boundKey);
     }
     catch (OversizedBodyException obex)
     {

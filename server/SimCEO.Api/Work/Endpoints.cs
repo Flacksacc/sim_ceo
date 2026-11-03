@@ -60,6 +60,146 @@ public static class SimCEOEndpoints
       commPrefs = lead.CommPrefs ?? "",
     });
 
+  // Finding 2: atomic authoritative discussion capture. The restore pin AND the
+  // FULL context it protects (meeting, board, policy, lead, candidates,
+  // eligibility, connection model, generation, fingerprints, lead floor,
+  // invitations, reviewed-input prints, effective cap) are read inside ONE root
+  // boundary BEFORE any dependent read, eligibility decision, or bookkeeping.
+  // A restore before this block is fully described by the fresh context (the
+  // pin matches the new epoch); a restore after it fails the pin at the first
+  // pin-checked bookkeeping write, so stale context never acquires the new
+  // restore identity. Snapshots are carried unchanged through every async
+  // branch; live re-reads happen only inside commit units that compare
+  // against them. Never hold the root across a provider await: this capture
+  // is fully synchronous (policy/store reads only, no dispatch).
+  private sealed record DiscussionCapture(
+    Meeting Meeting,
+    Board? RunBoard,
+    string Policy,
+    LeadProfile? Lead,
+    int LeadVersion,
+    string LeadFingerprint,
+    List<BoardAdvisor> Candidates,
+    List<BoardAdvisor> Eligible,
+    List<object> Yielded,
+    int PickedCount,
+    string Spark,
+    (Guid epochId, long epochRev) PublishPin,
+    long EpochBefore,
+    Guid RestoreBefore,
+    long Gen,
+    string DirBefore,
+    string EffBefore,
+    long LeadFloor,
+    HashSet<Guid> InvitedIds,
+    Dictionary<Guid, string> LaneBPrints,
+    int RequestedCap,
+    int EffectiveCap,
+    Guid PriorCapNoteId);
+
+  private static bool TryCaptureDiscussionContext(InMemoryStore s, Guid id, Meeting m, JsonElement body, HttpRequest req,
+    out DiscussionCapture? cap, out IResult? error)
+  {
+    cap = null; error = null;
+    Meeting snapM = m;
+    Board? runBoard = null;
+    string policy = "balanced";
+    LeadProfile? lead = null;
+    List<BoardAdvisor> candidates = new();
+    List<object> yielded = new();
+    int pickedCount = 0;
+    List<BoardAdvisor> eligible = new();
+    string spark = "";
+    (Guid epochId, long epochRev) publishPin = default;
+    long epochBefore = 0; Guid restoreBefore = Guid.Empty;
+    long gen = 0; string dirBefore = ""; string effBefore = ""; long leadFloor = 0;
+    var invitedIds = new HashSet<Guid>();
+    var laneBPrints = new Dictionary<Guid, string>();
+    int requestedCap = 10; int effectiveCap = 10; Guid priorCapNoteId = Guid.Empty;
+    lock (s.RootGate)
+    {
+      publishPin = PublicationGuard.Capture(s); epochBefore = s.SourceEpoch; restoreBefore = s.RestoreEpochId;
+      // Fresh meeting handle inside the same boundary: the context below must
+      // describe the pinned instant, not a pre-restore reference.
+      if (!s.Meetings.TryGetValue(id, out var freshM) || freshM is null)
+      {
+        error = Results.NotFound("meeting");
+        return false;
+      }
+      snapM = freshM;
+      policy = EffectiveDiscussionPolicy(s, snapM.BoardId);
+      try { if (!PeopleOps.Can(s, req, snapM.BoardId, id, "contribute") && s.Boards.TryGetValue(snapM.BoardId, out var polB)) { policy = polB.DiscussionPolicy; try { if (polB.ActiveConfig && !string.IsNullOrWhiteSpace(polB.ActiveJson)) { using var __aj = System.Text.Json.JsonDocument.Parse(polB.ActiveJson); if (__aj.RootElement.TryGetProperty("discussionPolicy", out var __dp) && __dp.ValueKind == System.Text.Json.JsonValueKind.String && !string.IsNullOrWhiteSpace(__dp.GetString())) policy = __dp.GetString()!; } } catch { } } } catch { }
+      if (policy is not ("focused" or "balanced" or "open")) policy = "balanced";
+      s.Boards.TryGetValue(snapM.BoardId, out runBoard);
+      lead = runBoard is null ? LeadSetup.ResolveLeadFor(s, snapM.BoardId) : LeadSetup.ResolveLeadForBoard(s, runBoard);
+      candidates = s.Advisors.Values.Where(a => a.BoardId == snapM.BoardId && !a.Removed && a.Approved).ToList();
+      try
+      {
+        using var pdoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(snapM.ParticipantIdsJson) ? "[]" : snapM.ParticipantIdsJson);
+        if (pdoc.RootElement.ValueKind == JsonValueKind.Array)
+        {
+          var picked = new HashSet<Guid>();
+          foreach (var pe in pdoc.RootElement.EnumerateArray())
+            if (pe.ValueKind == JsonValueKind.String && Guid.TryParse(pe.GetString(), out var pg)) picked.Add(pg);
+          if (picked.Count > 0) { pickedCount = picked.Count; candidates = s.Advisors.Values.Where(a => a.BoardId == snapM.BoardId && !a.Removed && picked.Contains(a.Id)).ToList(); }
+        }
+      }
+      catch (JsonException) { }
+      foreach (var cand in candidates)
+      {
+        var gate = RosterOps.ApprovalGate(s, cand);
+        if (gate is null) eligible.Add(cand);
+        else yielded.Add(new { advisor = cand.BoardRole, reason = gate });
+      }
+      try { spark = ModelPolicy.SparkFor(s, snapM.BoardId); }
+      catch (SimCEO.Api.Data.PolicyUnavailableException)
+      {
+        error = Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503);
+        return false;
+      }
+      gen = snapM.Generation;
+      dirBefore = DiscussionDirFingerprint(s, snapM.BoardId, id);
+      effBefore = DiscussionEffFingerprint(s, snapM.BoardId, id);
+      leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
+      try
+      {
+        using var inviteDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(snapM.ParticipantIdsJson) ? "[]" : snapM.ParticipantIdsJson);
+        if (inviteDoc.RootElement.ValueKind == JsonValueKind.Array)
+          foreach (var inviteEl in inviteDoc.RootElement.EnumerateArray())
+            if (inviteEl.ValueKind == JsonValueKind.String && Guid.TryParse(inviteEl.GetString(), out var inviteGuid)) invitedIds.Add(inviteGuid);
+      }
+      catch (JsonException) { }
+      foreach (var ea in eligible)
+        laneBPrints[ea.Id] = RosterOps.ReviewedInputFingerprint(s, ea);
+      requestedCap = DiscussionPolicy.MaxReplies(policy);
+      effectiveCap = requestedCap;
+      int? priorCap = null;
+      foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
+      {
+        try
+        {
+          using var capDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(capNote.Body) ? "{}" : capNote.Body);
+          if (capDoc.RootElement.TryGetProperty("leadSeq", out var capSeq) && capSeq.ValueKind == JsonValueKind.Number
+            && capSeq.GetInt64() == leadFloor
+            && capDoc.RootElement.TryGetProperty("cap", out var capVal) && capVal.ValueKind == JsonValueKind.Number
+            && capVal.TryGetInt32(out var capInt))
+          {
+            priorCap = priorCap.HasValue ? Math.Min(priorCap.Value, capInt) : capInt;
+            if (priorCapNoteId == Guid.Empty) priorCapNoteId = capNote.Id;
+          }
+        }
+        catch (JsonException) { }
+      }
+      if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
+    }
+    var leadVersion = lead?.Version ?? 0;
+    var leadFingerprint = LeadIdentityFingerprint(lead);
+    cap = new DiscussionCapture(snapM, runBoard, policy, lead, leadVersion, leadFingerprint,
+      candidates, eligible, yielded, pickedCount, spark, publishPin, epochBefore, restoreBefore,
+      gen, dirBefore, effBefore, leadFloor, invitedIds, laneBPrints, requestedCap, effectiveCap, priorCapNoteId);
+    return true;
+  }
+
     private static string EffectiveDiscussionPolicy(InMemoryStore s, Guid boardId)
     {
       try
@@ -121,7 +261,7 @@ public static class SimCEOEndpoints
       catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (Exception ex) { return Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Lead save") ?? Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return saved is not null ? Results.Ok(saved) : Results.Json(new { error }, statusCode: status);
     });
     app.MapGet("/api/lead", (InMemoryStore s, HttpRequest req) =>
@@ -149,7 +289,7 @@ public static class SimCEOEndpoints
       catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (UnauthorizedAccessException) { return Results.Json(new { error = "Installation admin only." }, statusCode: 403); }
       catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
-      catch (Exception ex) { return Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Lead save") ?? Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return gsaved is not null ? Results.Ok(gsaved) : Results.Json(new { error = gerror }, statusCode: gstatus);
     });
 
@@ -187,8 +327,9 @@ public static class SimCEOEndpoints
         catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Board update failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Board is gone.")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Board update", iox); }
+        catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Board update") ?? Results.Json(new { error = "Board update failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (!s.Boards.TryGetValue(id, out var saved) || saved is null) return Results.NotFound();
         return Results.Ok(saved);
       }
@@ -230,7 +371,7 @@ public static class SimCEOEndpoints
       catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (Exception ex) { return Results.Json(new { error = "Activation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Activation") ?? Results.Json(new { error = "Activation failed; no state changed: " + ex.Message }, statusCode: 500); }
       return actBoard is not null ? Results.Ok(actBoard) : Results.Json(new { error = actError }, statusCode: actStatus);
     });
 
@@ -295,7 +436,7 @@ public static class SimCEOEndpoints
         }
         catch (Exception ex)
         {
-          return Results.Json(new { error = "Wizard save failed; no state changed: " + ex.Message }, statusCode: 500);
+          return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Wizard save") ?? Results.Json(new { error = "Wizard save failed; no state changed: " + ex.Message }, statusCode: 500);
         }
         if (wizDenied is not null) return wizDenied;
         if (!s.WizardDrafts.TryGetValue(id, out var saved) || saved is null) return Results.NotFound();
@@ -329,8 +470,9 @@ public static class SimCEOEndpoints
         catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Wizard read failed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Wizard read", iox); }
+        catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Wizard read") ?? Results.Json(new { error = "Wizard read failed: " + ex.Message }, statusCode: 500); }
         if (!s.WizardDrafts.TryGetValue(normId, out var nd) || nd is null) return Results.NotFound();
         return Results.Ok(nd);
       }
@@ -366,7 +508,7 @@ public static class SimCEOEndpoints
           s.VoiceTurns[newTurn.Id] = newTurn;
         });
       }
-      catch (Exception ex) { return Results.Json(new { error = "Voice draft failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Voice draft") ?? Results.Json(new { error = "Voice draft failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (gateErrVd is not null) return gateErrVd;
       return Results.Created($"/api/voice/{newTurn.Id}", newTurn);
     });
@@ -384,6 +526,8 @@ public static class SimCEOEndpoints
         // Unsent drafts are creator-private (no manager bypass); exactly once.
         Message? doneMsg = null;
         IResult? gateErr = null;
+        try
+        {
         Atomic.Run(s, () =>
         {
           if (!s.VoiceTurns.TryGetValue(id, out var vt) || vt is null) { gateErr = Results.NotFound(); return; }
@@ -420,6 +564,8 @@ public static class SimCEOEndpoints
           s.Meetings.Flush();
           doneMsg = msg;
         });
+        }
+        catch (Exception finEx2) { var finMapped2 = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(finEx2, "Voice finalize"); if (finMapped2 is not null) return finMapped2; throw; }
         if (gateErr is not null) return gateErr;
         return Results.Ok(doneMsg);
       }
@@ -560,6 +706,7 @@ public static class SimCEOEndpoints
       JobRow? created = null;
       string? submitError = null;
       int submitStatus = 400;
+      IResult? submitOutcomeErr = null;
       try
       {
         Atomic.Run(s, () =>
@@ -627,8 +774,10 @@ public static class SimCEOEndpoints
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
       catch (InvalidOperationException iox) when (iox.Message == "conflict") { return Results.Json(new { error = "Conflicting payload for the same idempotency key." }, statusCode: 409); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { submitError = ex.Message; submitStatus = 500; }
+      catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Job submission", iox); }
+      catch (Exception ex) { submitOutcomeErr = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Job submission"); submitError = ex.Message; submitStatus = 500; }
+      if (submitOutcomeErr is not null) return submitOutcomeErr;
       if (submitError is not null) return Results.Json(new { error = "Job submission failed; no state changed: " + submitError }, statusCode: submitStatus);
       if (dup is not null) return Results.Ok(dup);
       return Results.Created($"/api/jobs/{created!.Id}", created);
@@ -857,8 +1006,9 @@ public static class SimCEOEndpoints
         catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
         catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException) { return Results.NotFound(); }
-        catch (Exception ex) { return Results.Json(new { error = "Meeting control failed; no state changed: " + ex.Message }, statusCode: 500); }
+        catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Meeting is gone.")) { return Results.NotFound(); }
+        catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Meeting control", iox); }
+        catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Meeting control") ?? Results.Json(new { error = "Meeting control failed; no state changed: " + ex.Message }, statusCode: 500); }
         if (!s.Meetings.TryGetValue(id, out var done) || done is null) return Results.NotFound();
         return Results.Ok(done);
       });
@@ -876,105 +1026,51 @@ public static class SimCEOEndpoints
       }
       try
       {
-      var policy = EffectiveDiscussionPolicy(s, m.BoardId);
-      try { if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute") && s.Boards.TryGetValue(m.BoardId, out var polB)) { policy = polB.DiscussionPolicy; try { if (polB.ActiveConfig && !string.IsNullOrWhiteSpace(polB.ActiveJson)) { using var __aj = System.Text.Json.JsonDocument.Parse(polB.ActiveJson); if (__aj.RootElement.TryGetProperty("discussionPolicy", out var __dp) && __dp.ValueKind == System.Text.Json.JsonValueKind.String && !string.IsNullOrWhiteSpace(__dp.GetString())) policy = __dp.GetString()!; } } catch { } } } catch { }
-      if (policy is not ("focused" or "balanced" or "open")) policy = "balanced";
+      // Finding 2: the authoritative context and the restore pin are captured
+      // together inside one root boundary (TryCaptureDiscussionContext above)
+      // BEFORE any dependent read, eligibility decision, or bookkeeping write.
+      // The snapshots below are carried unchanged through every async branch;
+      // live re-reads happen only inside commit units that compare against
+      // them. A restore before the capture is fully described by the fresh
+      // context; a restore after it fails the pin at the first pin-checked
+      // bookkeeping write (stale run rejected before any domain write).
       var prompt = body.TryGetProperty("prompt", out var q) ? (q.GetString() ?? "") : "";
-      s.Boards.TryGetValue(m.BoardId, out var runBoard);
-    var lead = runBoard is null ? LeadSetup.ResolveLeadFor(s, m.BoardId) : LeadSetup.ResolveLeadForBoard(s, runBoard);
-    var leadVersion = lead?.Version ?? 0;
-    // P1 #5: capture the full effective-lead identity/content fingerprint BEFORE
-    // model work; commit compares the fresh fingerprint under the publication
-    // locks. Version-only comparison would pass a same-version identity swap.
-    var leadFingerprint = LeadIdentityFingerprint(lead);
+      if (!TryCaptureDiscussionContext(s, id, m, body, req, out var dx, out var dxError)) return dxError;
+      m = dx!.Meeting;
+      var policy = dx.Policy;
+      var lead = dx.Lead;
+      var leadVersion = dx.LeadVersion;
+      var leadFingerprint = dx.LeadFingerprint;
+      var eligible = dx.Eligible;
+      var yielded = dx.Yielded;
+      var pickedCount = dx.PickedCount;
+      var spark = dx.Spark;
+      var publishPin = dx.PublishPin;
+      var epochBefore = dx.EpochBefore;
+      var restoreBefore = dx.RestoreBefore;
+      var gen = dx.Gen;
+      var dirBefore = dx.DirBefore;
+      var effBefore = dx.EffBefore;
+      var leadFloor = dx.LeadFloor;
+      var invitedIds = dx.InvitedIds;
+      var laneBPrints = dx.LaneBPrints;
+      string LaneBFingerprint(BoardAdvisor laneBAdv) => RosterOps.ReviewedInputFingerprint(s, laneBAdv);
+      var effectiveCap = dx.EffectiveCap;
+      var priorCapNoteId = dx.PriorCapNoteId;
+      Board? board = dx.RunBoard;
       if (body.TryGetProperty("leadVersion", out var lv) && lv.ValueKind == JsonValueKind.Number
           && lv.GetInt32() != leadVersion)
         return Results.Conflict("Lead profile changed; refresh and retry with the current version.");
       if (m.State == MeetingState.Paused)
         return Results.Conflict("Meeting is paused; resume to run discussion.");
-      var yielded = new List<object>();
-      var candidates = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && a.Approved).ToList();
-      var pickedCount = 0;
-      try
-      {
-        using var pdoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(m.ParticipantIdsJson) ? "[]" : m.ParticipantIdsJson);
-        if (pdoc.RootElement.ValueKind == JsonValueKind.Array)
-        {
-          var picked = new HashSet<Guid>();
-          foreach (var pe in pdoc.RootElement.EnumerateArray())
-            if (pe.ValueKind == JsonValueKind.String && Guid.TryParse(pe.GetString(), out var pg)) picked.Add(pg);
-          if (picked.Count > 0) { pickedCount = picked.Count; candidates = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && picked.Contains(a.Id)).ToList(); }
-        }
-      }
-      catch (JsonException) { }
-      var eligible = new List<BoardAdvisor>();
-      foreach (var cand in candidates)
-      {
-        var gate = RosterOps.ApprovalGate(s, cand);
-        if (gate is null) eligible.Add(cand);
-        else yielded.Add(new { advisor = cand.BoardRole, reason = gate });
-      }
       if (eligible.Count == 0)
         return Results.Json(new { error = "No advisors available for discussion.", fixes = pickedCount > 0 ? new[] { "Re-pick participants from this board's current advisors." } : new[] { "Approve at least one advisor on this board before running discussion." }, yielded }, statusCode: 409);
       var ownerOverride = PeopleOps.IsOwner(req);
-      string spark;
-      try { spark = ModelPolicy.SparkFor(s, m.BoardId); }
-      catch (SimCEO.Api.Data.PolicyUnavailableException) { return Results.Json(new { error = "Installation policy store unavailable." }, statusCode: 503); }
-      Board? board = runBoard;
-      // Pin FIRST, context second, both under the root boundary: the pin and
-      // the authoritative context below describe the same instant. A restore
-      // after the pin invalidates every later bookkeeping write (stale run
-      // rejected); a restore before the pin is fully described by the context
-      // read after it. The reverse order (context then pin) would let stale
-      // initialization bookkeeping acquire the newer restore identity.
-      long epochBefore; Guid restoreBefore; (Guid epochId, long epochRev) publishPin;
-      lock (s.RootGate) { publishPin = PublicationGuard.Capture(s); epochBefore = s.SourceEpoch; restoreBefore = s.RestoreEpochId; }
-      var gen = m.Generation;
-      var dirBefore = DiscussionDirFingerprint(s, m.BoardId, id);
-      var effBefore = DiscussionEffFingerprint(s, m.BoardId, id);
-      var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
-      // Lane B: capture which candidates were explicitly invited; non-invited must stay Approved at commit.
-      var invitedIds = new HashSet<Guid>();
+      var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
       try
       {
-        using var inviteDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(m.ParticipantIdsJson) ? "[]" : m.ParticipantIdsJson);
-        if (inviteDoc.RootElement.ValueKind == JsonValueKind.Array)
-          foreach (var inviteEl in inviteDoc.RootElement.EnumerateArray())
-            if (inviteEl.ValueKind == JsonValueKind.String && Guid.TryParse(inviteEl.GetString(), out var inviteGuid)) invitedIds.Add(inviteGuid);
-      }
-      catch (JsonException) { }
-      // Lane B: reviewed-input fingerprint per candidate via shared RosterOps.ReviewedInputFingerprint.
-      string LaneBFingerprint(BoardAdvisor laneBAdv) => RosterOps.ReviewedInputFingerprint(s, laneBAdv);
-      var laneBPrints = eligible.ToDictionary(a => a.Id, a => LaneBFingerprint(a));
-      // Lane B: per-lead cap cannot increase across runs. Persist the effective minimum selected cap
-      // in a durable run-cap note keyed to the actual lead sequence; a new human lead resets the turn.
-      var requestedCap = DiscussionPolicy.MaxReplies(policy);
-      var effectiveCap = requestedCap;
+      Atomic.Run(s, () =>
       {
-        int? priorCap = null;
-        Guid priorCapNoteId = Guid.Empty;
-        foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
-        {
-          try
-          {
-            using var capDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(capNote.Body) ? "{}" : capNote.Body);
-            if (capDoc.RootElement.TryGetProperty("leadSeq", out var capSeq) && capSeq.ValueKind == JsonValueKind.Number
-              && capSeq.GetInt64() == leadFloor
-              && capDoc.RootElement.TryGetProperty("cap", out var capVal) && capVal.ValueKind == JsonValueKind.Number
-              && capVal.TryGetInt32(out var capInt))
-            {
-              priorCap = priorCap.HasValue ? Math.Min(priorCap.Value, capInt) : capInt;
-              if (priorCapNoteId == Guid.Empty) priorCapNoteId = capNote.Id;
-            }
-          }
-          catch (JsonException) { }
-        }
-        if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
-        var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
-        try
-        {
-        Atomic.Run(s, () =>
-        {
           PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss");
           var capBoard = m.BoardId;
           if (s.Meetings.TryGetValue(id, out var capMtg) && capMtg is not null) capBoard = capMtg.BoardId;
@@ -990,10 +1086,9 @@ public static class SimCEOEndpoints
             s.Notes[freshCapNote.Id] = freshCapNote;
           }
           s.Notes.Flush();
-        });
-        }
-        catch (Exception capEx) { var capMapped = PublicationGuard.MapGuardFailure(capEx); if (capMapped is not null) return capMapped; throw; }
+      });
       }
+      catch (Exception capEx) { var capMapped = PublicationGuard.MapGuardFailure(capEx); if (capMapped is not null) return capMapped; throw; }
       int CommittedThisTurn()
       {
         lock (s.MessageLock)

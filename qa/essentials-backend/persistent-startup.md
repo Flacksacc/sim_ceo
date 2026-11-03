@@ -15,7 +15,7 @@ are separate and never mounted here.
   (`POSTGRES_PASSWORD`, private `META_API_KEY` app key, `META_API_BASE`),
   loaded by the helper into its PRIVATE process environment so the values
   always win over any inherited coding-profile key (compose `--env-file`
-  has LOWER precedence than process env, so the helper never uses it).
+  has LOWER precedence than process env, so process env always wins, and every Compose call additionally passes an explicit env file (the selected approved file, or a controlled empty file), so a missing field is never backfilled from another discovered repo env).
   Never commit `.env`; never print keys, full `config`, or container env;
   the helper logs set/empty status only (never values, suffixes, full config, or container env).
 - Ports: API `${APP_HOST_PORT:-5080}` (human default 5080, matches dev API + Vite 5173 origin). The human entry point :5173 must match API :5080 after cutover (Vite/proper forwarder or concrete start below). Stop any dev API on the chosen port first; the helper preflights this and fails before acquisition if busy.
@@ -42,7 +42,9 @@ are separate and never mounted here.
 # review-only render (quiet; no containers, no volumes, no secrets printed):
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
 # start with the selected existing app .env (private; never modified). Concrete final start (primary cutover only): -File qa/essentials-backend/essentials-persist.ps1 -Action start -EnvFile .env
-# status / stop:
+# status / stop (same explicit config works from a fresh shell; without
+# private config, status lists owned containers by label and stop halts them
+# by label, secret-free, volumes preserved):
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action stop
 ```

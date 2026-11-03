@@ -49,8 +49,9 @@ public static class OpsEndpoints
       }
       catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Job retry failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "Job is gone.")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Job retry", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Job retry") ?? Results.Json(new { error = "Job retry failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (!s.Jobs.TryGetValue(id, out var done) || done is null) return Results.NotFound();
       return Results.Ok(done);
     });
@@ -467,8 +468,9 @@ public static class OpsEndpoints
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
       catch (InvalidOperationException iox) when (iox.Message == "Source changed during extraction; retry.") { return Results.Conflict(iox.Message); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Wizard extraction failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "Draft is gone.", "Source is gone.")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard extraction", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard extraction") ?? Results.Json(new { error = "Wizard extraction failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Ok(new { checkpoints = (addedLog ?? new List<object>()).Count, latest = addedCheckpoint });
     });
 
@@ -908,8 +910,9 @@ public static class OpsEndpoints
       catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Json(new { error = "Job is already running; wait for its attempt." }, statusCode: 409); }
       catch (InvalidOperationException iox) when (iox.Message == "terminal") { return Results.Json(new { error = "Only pending, failed, or interrupted jobs execute." }, statusCode: 409); }
       catch (InvalidOperationException iox) when (iox.Message == "badkind") { return Results.Json(new { error = "Unknown job kind." }, statusCode: 422); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
-      catch (Exception ex) { return Results.Json(new { error = "Job claim failed; no state changed: " + ex.Message }, statusCode: 500); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone", "gone-target")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Job claim", iox); }
+      catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Job claim") ?? Results.Json(new { error = "Job claim failed; no state changed: " + ex.Message }, statusCode: 500); }
       if (claimT is null) return Results.NotFound();
       // Domain work runs OUTSIDE every lock/gate (async provider/extractor/network
       // stays outside the unit). Only the claim above and the commit below are units.
@@ -993,7 +996,8 @@ public static class OpsEndpoints
       catch (SimCEO.Api.Data.PostCommitException pcx) { return Results.Json(new { error = "Job completion committed, but a post-commit effect failed: " + pcx.Message }, statusCode: 500); }
       catch (AggregateException agx) { return Results.Json(new { error = "Job completion failed and rollback is uncertain: " + agx.Message }, statusCode: 500); }
       catch (InvalidOperationException iox) when (iox.Message == "superseded" || iox.Message == "restored") { return Results.Conflict("Job moved on during execution; re-read before retrying."); }
-      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
+      catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Job completion", iox); }
       catch (Exception ex) { return Results.Json(new { error = "Job completion failed: " + ex.Message }, statusCode: 500); }
       if (!s.Jobs.TryGetValue(id, out var done) || done is null) return Results.NotFound();
       if (done.State == "succeeded") return Results.Ok(new { job = done, detail = wdetail });

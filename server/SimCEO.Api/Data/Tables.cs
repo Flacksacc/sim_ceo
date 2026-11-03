@@ -41,6 +41,15 @@ public static class MemFaults
 public interface IPgBackend
 {
   T? Find<T>(Guid id) where T : class;
+  /// <summary>Find one row and project detached scalars inside the single backend gate.
+  /// Lookup AND field copy are atomic here: a concurrent writer that later rolls back
+  /// can never leak uncommitted or torn values into the projection. Callers hold the
+  /// store root gate across this call, preserving ROOT -> backend lock order.</summary>
+  TResult? Project<T, TResult>(Guid id, Func<T?, TResult?> project) where T : class;
+  /// <summary>Find-or-create one row and mutate it inside the single backend gate, so
+  /// field assignments never race a gated reader copy. Callers hold the store root gate
+  /// across this call, preserving ROOT -> backend lock order.</summary>
+  void Mutate<T>(Guid id, Func<T> create, Action<T> mutate) where T : class;
   List<T> All<T>() where T : class;
   void Upsert<T>(T entity) where T : class;
   bool Remove<T>(Guid id) where T : class;
