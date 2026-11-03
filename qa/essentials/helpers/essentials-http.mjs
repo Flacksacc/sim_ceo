@@ -4,6 +4,9 @@
 // - Auth: Bearer when opts.token is set, else demo x-user header.
 // - Tokens are NEVER logged; use digest() (12-char sha256) for correlation.
 // - Every request is bounded (default 30s); AbortController enforced.
+// - Ledger windows are OrderByDescending(At): NEVER take the last row as "new".
+//   Compare ID sets; the billed pair shares ONE nonzero GUID (same Id in both
+//   ModelCalls and Usage) plus matching scope/model/purpose/status/cost/basis.
 import crypto from "node:crypto";
 
 export const API = process.env.QA_API || "http://127.0.0.1:5142";
@@ -12,6 +15,10 @@ export const TIMEOUT_MS = Number(process.env.QA_HTTP_TIMEOUT_MS || "30000");
 
 export function digest(s) {
   return crypto.createHash("sha256").update(String(s ?? "")).digest("hex").slice(0, 12);
+}
+
+export function sha256(s) {
+  return crypto.createHash("sha256").update(String(s ?? "")).digest("hex");
 }
 
 export function camel(o, k) {
@@ -96,6 +103,63 @@ export async function registerOrLogin(ctx, postFn, email, password) {
   return tok;
 }
 
+// Bounded poll for correlated completion (API + proxy + ledger ALL done).
+// The fake /__counts counter increments BEFORE completion and is NOT
+// synchronization: always wait for the correlated ledger/state predicate.
+export async function waitFor(label, fn, { timeoutMs = 60000, intervalMs = 750 } = {}) {
+  const start = Date.now();
+  let last = null;
+  for (;;) {
+    try {
+      const out = await fn();
+      if (out && out.done) return { ok: true, value: out.value, last };
+      last = out && out.note ? out.note : last;
+    } catch (e) { last = String((e && e.message) || e).slice(0, 200); }
+    if (Date.now() - start > timeoutMs) return { ok: false, last };
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+// Ledger snapshot: full ordered rows for one meeting scope, serialized for
+// exact prior-row comparison. Never picks "last row" as new.
+export async function ledgerSnapshot(ctx, label, token, mid) {
+  const calls = mustArray(ctx, label + "-calls", await get("/api/models/calls?limit=200&meetingId=" + mid, { token }));
+  const usage = mustArray(ctx, label + "-usage", await get("/api/usage?limit=500&meetingId=" + mid, { token }));
+  ctx.ok(label + "-complete-window", calls.length < 200 && usage.length < 500, "calls=" + calls.length + " usage=" + usage.length);
+  return { calls, usage, callsJson: JSON.stringify(calls), usageJson: JSON.stringify(usage) };
+}
+
+export function idSet(rows) {
+  const s = new Set();
+  for (const r of rows) { const id = String(camel(r, "id") || ""); if (id && id !== "00000000-0000-0000-0000-000000000000") s.add(id); }
+  return s;
+}
+
+// Exactly one NEW id shared by both after-sets (ModelCalls + Usage share ONE
+// nonzero call GUID per billed attempt). Returns the shared id or null.
+export function sharedNewId(beforeCalls, beforeUsage, afterCalls, afterUsage) {
+  const bC = idSet(beforeCalls), bU = idSet(beforeUsage);
+  const nC = afterCalls.filter((r) => !bC.has(String(camel(r, "id"))));
+  const nU = afterUsage.filter((r) => !bU.has(String(camel(r, "id"))));
+  if (nC.length !== 1 || nU.length !== 1) return { ok: false, note: "newCalls=" + nC.length + " newUsage=" + nU.length };
+  const idC = String(camel(nC[0], "id")), idU = String(camel(nU[0], "id"));
+  if (!idC || idC !== idU) return { ok: false, note: "shared-id-mismatch " + idC + " vs " + idU };
+  return { ok: true, id: idC, call: nC[0], row: nU[0] };
+}
+
+// All prior full rows must be byte-identical below actual caps (no silent rewrite).
+export function priorRowsIntact(before, after) {
+  if (after.length < before.length) return false;
+  const bIds = new Set(before.map((r) => String(camel(r, "id"))));
+  const aById = new Map(after.map((r) => [String(camel(r, "id")), JSON.stringify(r)]));
+  for (const r of before) {
+    const a = aById.get(String(camel(r, "id")));
+    if (a === undefined || a !== JSON.stringify(r)) return false;
+  }
+  void bIds;
+  return true;
+}
+
 export async function fakeJson(path, opts = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15000);
@@ -106,4 +170,26 @@ export async function fakeJson(path, opts = {}) {
     try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };
   } finally { clearTimeout(t); }
+}
+// All NEW pairs complete: every new ModelCall id has a matching new Usage
+// row with equal scope/model/purpose/status/cost/basis. Never last-row-as-new.
+export function newPairsComplete(beforeCalls, beforeUsage, afterCalls, afterUsage) {
+  const bC = idSet(beforeCalls), bU = idSet(beforeUsage);
+  const nC = afterCalls.filter((r) => !bC.has(String(camel(r, "id"))));
+  const nU = afterUsage.filter((r) => !bU.has(String(camel(r, "id"))));
+  if (nC.length !== nU.length) return { ok: false, note: "newCalls=" + nC.length + " newUsage=" + nU.length, pairs: [] };
+  const uById = new Map(nU.map((r) => [String(camel(r, "id")), r]));
+  const pairs = [];
+  for (const c of nC) {
+    const id = String(camel(c, "id"));
+    const u = uById.get(id);
+    if (!id || !u) return { ok: false, note: "unpaired call id=" + id.slice(0, 8), pairs: [] };
+    if (String(camel(u, "kind")) !== String(camel(c, "purpose"))) return { ok: false, note: "purpose-mismatch " + id.slice(0, 8), pairs: [] };
+    if (String(camel(u, "model")) !== String(camel(c, "model"))) return { ok: false, note: "model-mismatch " + id.slice(0, 8), pairs: [] };
+    if (String(camel(u, "status")) !== String(camel(c, "status"))) return { ok: false, note: "status-mismatch " + id.slice(0, 8), pairs: [] };
+    if (String(camel(u, "meetingId")) !== String(camel(c, "meetingId"))) return { ok: false, note: "scope-mismatch " + id.slice(0, 8), pairs: [] };
+    if (String(camel(u, "cost") ?? "") !== String(camel(c, "cost") ?? "") || String(camel(u, "costBasis") ?? "") !== String(camel(c, "costBasis") ?? "")) return { ok: false, note: "cost-mismatch " + id.slice(0, 8), pairs: [] };
+    pairs.push({ id, call: c, row: u });
+  }
+  return { ok: true, note: "pairs=" + pairs.length, pairs };
 }

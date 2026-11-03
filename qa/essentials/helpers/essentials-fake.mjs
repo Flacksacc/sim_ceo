@@ -82,7 +82,10 @@ function parseMultipart(buf, ctype) {
   return { parts };
 }
 function chatContent(prompt) {
-  if (/(board secretary|OWNER REQUEST|OWNER QUESTION)/.test(prompt || "")) {
+  if (/(board secretary|OWNER REQUEST|OWNER QUESTION)/.test(prompt || "") || (prompt || "").includes("BRIEFING TOPIC:")) {
+    const bi = String(prompt).lastIndexOf("BRIEFING TOPIC:");
+    const scope = bi >= 0 ? String(prompt).slice(bi) : String(prompt);
+    if (bi >= 0 && scope.includes("SECRETARY-BRIEFING")) return { content: JSON.stringify({ kind: "briefing", title: "QA briefing", body: "QA briefing body with grounded support." }) };
     const ri = String(prompt).lastIndexOf("RAW OWNER INPUT:");
     const rawSeg = ri >= 0 ? String(prompt).slice(ri) : String(prompt);
     if (rawSeg.includes("SECRETARY-BAD")) return { envelope: { choices: [] } };
