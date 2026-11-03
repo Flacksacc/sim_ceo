@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
 
@@ -129,7 +130,7 @@ public static class LeadSetup
   public static string EffectiveDataUse(InMemoryStore s, Board board) => EffectiveView(s, board).dataUse;
 
   public static (LeadProfile? saved, string? error, int status) SaveLead(
-    InMemoryStore s, Guid boardId, LeadProfile input)
+    InMemoryStore s, Guid boardId, LeadProfile input, HttpRequest? req = null, string? need = null)
   {
     if (boardId != Guid.Empty && !s.Boards.TryGetValue(boardId, out _))
       return (null, "board not found", 404);
@@ -143,6 +144,9 @@ public static class LeadSetup
     {
       Atomic.Run(s, () =>
       {
+        // Fresh authority INSIDE the mutation unit.
+        if (req is not null && need == "admin") { if (PeopleOps.IsSecure(s)) { if (!AuthOps.TrySession(s, req, out var leIn)) throw new UnauthorizedAccessException("revoked"); var admIn = PeopleOps.AdminEmail(s); if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, leIn, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("denied"); } else if (!PeopleOps.IsOwner(req)) throw new UnauthorizedAccessException("denied"); }
+        if (req is not null && need == "contribute") { if (PeopleOps.Check(s, req, boardId, null, "contribute") is not null) throw new UnauthorizedAccessException("revoked"); }
         // Fresh fetch + version guard inside the unit: a concurrent save between
         // the route check and this commit cannot silently overwrite.
         Board? freshBoard = null;
@@ -182,12 +186,13 @@ public static class LeadSetup
       return (null, "Stale lead profile; refresh and re-apply your edit.", 409);
     }
     catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (UnauthorizedAccessException) { throw; }
     catch (Exception ex) { return (null, "Lead save failed; no state changed: " + ex.Message, 500); }
     return (savedOut, null, 200);
   }
 
   public static (Board? board, string? error, int status) Activate(
-    InMemoryStore s, Guid boardId, string? expectedHash)
+    InMemoryStore s, Guid boardId, string? expectedHash, HttpRequest? req = null)
   {
     if (!s.Boards.TryGetValue(boardId, out var board))
       return (null, "board not found", 404);
@@ -197,6 +202,7 @@ public static class LeadSetup
     {
       Atomic.Run(s, () =>
       {
+        if (req is not null && PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("revoked");
         // Fresh fetch + full activation guard inside the unit: name, own lead,
         // eligible advisor, and exact reviewed hash are rechecked against
         // current rows so a concurrent edit cannot activate a stale draft.
@@ -247,6 +253,7 @@ public static class LeadSetup
       return (null, "Setup draft changed; refresh review.", 409);
     }
     catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (UnauthorizedAccessException) { throw; }
     catch (Exception ex) { return (null, "Activation failed; no state changed: " + ex.Message, 500); }
     return (activatedOut, null, 200);
   }

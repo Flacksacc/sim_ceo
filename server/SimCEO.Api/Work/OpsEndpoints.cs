@@ -482,7 +482,10 @@ public static class OpsEndpoints
       // Deterministic canonical ordering: every collection is sorted by
       // identity (dictionaries by key) so backups hash stably and restores
       // round-trip byte-identically (modulo the fresh export timestamp).
-      var snapshot = new
+      // Coherent capture: the whole graph is read under the shared serialization gate.
+      object snapshot;
+      lock (s.SetupLock) { lock (s.MessageLock) {
+      snapshot = new
       {
         version = 4,
         at = DateTime.UtcNow,
@@ -506,6 +509,7 @@ public static class OpsEndpoints
         secretaryRequests = s.SecretaryRequests.Values.OrderBy(x => x.Id).ToList(),
         noteHistories = s.NoteHistories.Values.OrderBy(x => x.Id).ToList(),
       };
+      } }
       var json = JsonSerializer.Serialize(snapshot);
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)), bytes = json.Length });
     });
@@ -528,7 +532,7 @@ public static class OpsEndpoints
       JsonDocument doc;
       try { doc = JsonDocument.Parse(snapshot); }
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
-      if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2 or 3 or 4))
+      if (!doc.RootElement.TryGetProperty("version", out var v) || v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vv) || vv is not (1 or 2 or 3 or 4))
         return Results.BadRequest("Unsupported backup version.");
       BackupSnapshot? restored;
       try
@@ -548,7 +552,7 @@ public static class OpsEndpoints
         {
           if (j is null || j.Id == Guid.Empty) return Results.BadRequest("Backup job is null or missing id.");
           if (!seenJ.Add(j.Id)) return Results.BadRequest("Backup job ids are not unique.");
-          if (!string.IsNullOrWhiteSpace(j.Payload)) { try { using var _ = JsonDocument.Parse(j.Payload); } catch { return Results.BadRequest("Backup job payload is not valid JSON."); } }
+          if (Work.JobWorker.KnownKinds.Contains(j.Kind ?? "")) { if (!string.IsNullOrWhiteSpace(j.Payload)) { try { using var _ = JsonDocument.Parse(j.Payload); } catch { return Results.BadRequest("Backup job payload is not valid JSON."); } } }
         }
       }
       if (restored.voiceTurns is not null)
@@ -616,6 +620,10 @@ public static class OpsEndpoints
           {
             restoredCount = Atomic.Run(s, () =>
             {
+              var priorBoards = s.Boards.Values.ToDictionary(b => b.Id, b => (b.OwnerKey, b.AccessEnforced));
+              string restoreAdmin = "";
+              try { if (PeopleOps.IsSecure(s)) { if (AuthOps.TrySession(s, req, out var radm)) restoreAdmin = radm; } else restoreAdmin = PeopleOps.UserOf(s, req); } catch { }
+              if (string.IsNullOrWhiteSpace(restoreAdmin)) { try { restoreAdmin = PeopleOps.AdminEmail(s) ?? ""; } catch { } }
               s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
               s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
               s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
@@ -623,7 +631,7 @@ public static class OpsEndpoints
               s.SecretaryRequests.Clear(); s.NoteHistories.Clear();
               if (restored.jobs is not null) s.Jobs.Clear();
               if (restored.voiceTurns is not null) s.VoiceTurns.Clear();
-              foreach (var b in restored.boards) s.Boards[b.Id] = b;
+              foreach (var b in restored.boards) { if (priorBoards.TryGetValue(b.Id, out var prior)) { b.OwnerKey = prior.OwnerKey; b.AccessEnforced = prior.AccessEnforced; } else if (!string.IsNullOrWhiteSpace(restoreAdmin)) { b.OwnerKey = restoreAdmin; } s.Boards[b.Id] = b; }
               foreach (var r in restored.roster) s.Roster[r.Id] = r;
               foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
               foreach (var m in restored.meetings)
@@ -731,6 +739,7 @@ public static class OpsEndpoints
             // No manual restore here: the store-bound unit above already
             // restored exact deep state (memory mode) or rolled back the PG
             // transaction. A shallow re-fill would reintroduce shared row refs.
+            if (__ex is AggregateException) return Results.Json(new { error = "Restore failed and rollback is uncertain; prior state may be partial: " + __ex.Message }, statusCode: 500);
             return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
           }
         }
@@ -976,13 +985,25 @@ public static class OpsEndpoints
         return Results.Json(new { error = "Only the owner can change spending controls." }, statusCode: 403);
       lock (s.SpendLock)
       {
-        if (body.TryGetProperty("monthlyCapUsd", out var c))
+        IResult gateErrSp = null;
+        Atomic.Run(s, () =>
+        {
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var sppIn)) { gateErrSp = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+            var admSpIn = PeopleOps.AdminEmail(s);
+            if (string.IsNullOrWhiteSpace(admSpIn) || !string.Equals(admSpIn, sppIn, StringComparison.OrdinalIgnoreCase)) { gateErrSp = Results.Json(new { error = "Only the installation admin can change spending controls." }, statusCode: 403); return; }
+          }
+          else if (!PeopleOps.IsOwner(req)) { gateErrSp = Results.Json(new { error = "Only the owner can change spending controls." }, statusCode: 403); return; }
+          if (body.TryGetProperty("monthlyCapUsd", out var c))
           s.Spend.MonthlyCapUsd = c.ValueKind == JsonValueKind.Number ? c.GetDecimal()
             : c.ValueKind == JsonValueKind.Null ? null : s.Spend.MonthlyCapUsd;
         if (body.TryGetProperty("mode", out var m) && m.GetString() is { } mode
             && (mode == "warn" || mode == "block"))
           s.Spend.Mode = mode;
-        Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { s.Spend.MonthlyCapUsd, s.Spend.Mode }) });
+          Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { s.Spend.MonthlyCapUsd, s.Spend.Mode }) });
+        });
+        if (gateErrSp is not null) return gateErrSp;
         return Results.Ok(new { s.Spend.MonthlyCapUsd, s.Spend.Mode });
       }
     });
@@ -1144,8 +1165,8 @@ public static class BackupGraphValidator
     foreach (var iv in r.invites ?? Enumerable.Empty<Invite>()) if (iv is null || Empty(iv.Id)) return "Backup invite missing id.";
     if (r.jobs is not null) { var sj = new HashSet<Guid>(); foreach (var j in r.jobs) { if (j is null || Empty(j.Id)) return "Backup job missing id."; if (!sj.Add(j.Id)) return "Backup job ids are not unique."; } }
     if (r.voiceTurns is not null) { var sv = new HashSet<Guid>(); foreach (var vt in r.voiceTurns) { if (vt is null || Empty(vt.Id)) return "Backup voice turn missing id."; if (!sv.Add(vt.Id)) return "Backup voice turn ids are not unique."; } }
-    foreach (var g in r.grants) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
-    foreach (var i in r.invites) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
+    foreach (var g in r.grants ?? Enumerable.Empty<Grant>()) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
+    foreach (var i in r.invites ?? Enumerable.Empty<Invite>()) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
     foreach (var w in r.wizardDrafts ?? new List<Domain.WizardDraft>()) if (w is null || Empty(w.Id)) return "Backup wizard draft is null or missing id.";
     foreach (var hh in r.heads ?? new List<Domain.SourceFamilyHead>()) if (hh is null || Empty(hh.Id)) return "Backup source head is null or missing id.";
     foreach (var ee in r.events ?? new List<Domain.SourceEvent>()) if (ee is null || Empty(ee.Id)) return "Backup source event is null or missing id.";

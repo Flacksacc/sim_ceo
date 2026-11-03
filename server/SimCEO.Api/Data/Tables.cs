@@ -109,6 +109,7 @@ public static class Atomic
     public List<Action>? Deferred;
     public List<Action>? Compensations;
     public InMemoryStore.MemoryCapture? MemSnap;
+    public int OwnerThread;
   }
   private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<InMemoryStore, UnitState> UnitStates = new();
   private static readonly object UnitGate = new();
@@ -136,14 +137,14 @@ public static class Atomic
       if (st.Depth > 0) outer = false;
       else if (Pg.Backend?.IsTransacting == true)
         throw new InvalidOperationException("Store-bound Atomic unit entered inside a foreign active backend transaction; hoist it outermost so commit effects and rollback own the whole unit.");
-      else { outer = true; st.Depth = 1; st.Aborted = false; }
+      else { outer = true; st.Depth = 1; st.Aborted = false; st.OwnerThread = Environment.CurrentManagedThreadId; }
       if (!outer) st.Depth++;
     }
     if (outer && Pg.Backend is null)
     {
       // Capture fault must unwind cleanly: depth reset, no snapshot, no state.
       try { st.MemSnap = s.CaptureMemory(); }
-      catch { lock (UnitGate) { st.Depth = 0; st.Aborted = false; } throw; }
+      catch { lock (UnitGate) { st.Depth = 0; st.Aborted = false; st.OwnerThread = 0; } throw; }
     }
     bool succeeded = false;
     try
@@ -173,6 +174,7 @@ public static class Atomic
           fx = st.Deferred;
           st.Deferred = null; st.Compensations = null; st.MemSnap = null;
           st.Aborted = false;
+          st.OwnerThread = 0;
         }
       }
       if (aborted)
@@ -221,7 +223,7 @@ public static class Atomic
       cp = st.Compensations; st.Compensations = null;
       st.Deferred = null;
       snap = st.MemSnap; st.MemSnap = null;
-      st.Depth = 0; st.Aborted = false;
+      st.Depth = 0; st.Aborted = false; st.OwnerThread = 0;
     }
     Exception? restoreError = null;
     if (snap is not null && Pg.Backend is null)
@@ -255,6 +257,7 @@ public static class Atomic
     lock (UnitGate)
     {
       if (st.Depth <= 0) throw new InvalidOperationException("Atomic.Defer requires an active store-bound unit; post-commit effects must not run uncommitted.");
+      if (st.OwnerThread != Environment.CurrentManagedThreadId) throw new InvalidOperationException("Atomic.Defer requires the calling execution to own the active store-bound unit.");
       st.Deferred ??= new List<Action>();
       st.Deferred.Add(effect);
     }
@@ -266,7 +269,7 @@ public static class Atomic
   {
     UnitState st = UnitStates.GetOrCreateValue(s);
     bool inside;
-    lock (UnitGate) { inside = st.Depth > 0; }
+    lock (UnitGate) { inside = st.Depth > 0 && st.OwnerThread == Environment.CurrentManagedThreadId; }
     if (inside) Defer(s, effect); else effect();
   }
 
@@ -279,6 +282,7 @@ public static class Atomic
     lock (UnitGate)
     {
       if (st.Depth <= 0) throw new InvalidOperationException("Atomic.Compensate requires an active store-bound unit.");
+      if (st.OwnerThread != Environment.CurrentManagedThreadId) throw new InvalidOperationException("Atomic.Compensate requires the calling execution to own the active store-bound unit.");
       st.Compensations ??= new List<Action>();
       st.Compensations.Add(rollback);
     }
