@@ -69,19 +69,37 @@ public static class RecordEndpoints
     app.MapGet("/api/meetings/{id:guid}/records", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
-      return Results.Ok(s.Drafts.Values.Where(d => d.MeetingId == id)
-        .OrderByDescending(d => d.Version).Take(50));
+      if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedRL) return deniedRL;
+      var isMgr = PeopleOps.Can(s, req, m.BoardId, null, "manage") || PeopleOps.Can(s, req, m.BoardId, id, "contribute");
+      var rows = s.Drafts.Values.Where(d => d.MeetingId == id).OrderByDescending(d => d.Version).Take(50).ToList();
+      if (!isMgr)
+      {
+        // Meeting-only guests: approved records only, approved items/content only.
+        rows = rows.Where(d => d.Decided && !string.IsNullOrWhiteSpace(d.ApprovedJson) && d.ApprovedJson.Trim() != "[]").ToList();
+        var out_ = new System.Collections.Generic.List<object>();
+        foreach (var d in rows) { out_.Add(new { d.Id, d.BoardId, d.MeetingId, d.Version, d.Decided, d.Status, ApprovedJson = d.ApprovedJson, d.CreatedAt }); }
+        return Results.Ok(out_);
+      }
+      return Results.Ok(rows);
     });
 
     app.MapGet("/api/records/{draftId:guid}", (InMemoryStore s, HttpRequest req, Guid draftId) =>
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedRD) return deniedRD;
+      var isMgrD = PeopleOps.Can(s, req, d.BoardId, null, "manage") || PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute");
+      if (!isMgrD)
+      {
+        // Non-managers (incl. meeting guests): decided + approved items/content only,
+        // even on direct detail reads. Pending/discarded/superseded payloads never leak.
+        if (!d.Decided || string.IsNullOrWhiteSpace(d.ApprovedJson) || d.ApprovedJson.Trim() == "[]")
+          return PeopleOps.Denied();
+        return Results.Ok(new { d.Id, d.BoardId, d.MeetingId, d.Version, d.Decided, d.Status, ApprovedJson = d.ApprovedJson, d.CreatedAt });
+      }
       return Results.Ok(d);
     });
 
-    IResult NewVersion(InMemoryStore s, Guid draftId, JsonElement body, string[] extraSupersedes, bool amend)
+    IResult NewVersion(InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body, string[] extraSupersedes, bool amend)
     {
       if (!s.Drafts.TryGetValue(draftId, out var preOld)) return Results.NotFound();
       if (!s.Meetings.TryGetValue(preOld.MeetingId, out var preMeeting)) return Results.NotFound("meeting");
@@ -89,6 +107,7 @@ public static class RecordEndpoints
       {
         if (!s.Drafts.TryGetValue(draftId, out var old)) return Results.NotFound();
         if (!s.Meetings.TryGetValue(old.MeetingId, out var meeting)) return Results.NotFound("meeting");
+        if (PeopleOps.Check(s, req, old.BoardId, old.MeetingId, "contribute") is { } deniedNV2) return deniedNV2;
         // Distinct guards: revise continues an undecided draft; amend succeeds an approved record.
         if (!amend && old.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
         if (amend && (!old.Decided || old.Status != "approved"))
@@ -138,28 +157,29 @@ public static class RecordEndpoints
     app.MapPost("/api/records/{draftId:guid}/revise", (InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body) =>
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedRev) return deniedRev;
       if (d.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
-      return NewVersion(s, draftId, body, Array.Empty<string>(), amend: false);
+      return NewVersion(s, req, draftId, body, Array.Empty<string>(), amend: false);
     });
 
     app.MapPost("/api/records/{draftId:guid}/amend", (InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body) =>
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedAm) return deniedAm;
       var extra = body.TryGetProperty("supersedes", out var se) && se.ValueKind == JsonValueKind.Array
         ? se.EnumerateArray().Select(e => e.GetString() ?? "").Where(x => x != "").ToArray()
         : Array.Empty<string>();
-      return NewVersion(s, draftId, body, extra, amend: true);
+      return NewVersion(s, req, draftId, body, extra, amend: true);
     });
 
     app.MapPost("/api/records/{draftId:guid}/discard", (InMemoryStore s, HttpRequest req, Guid draftId) =>
     {
       if (!s.Drafts.TryGetValue(draftId, out var preD)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, preD.BoardId, preD.MeetingId, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, preD.BoardId, preD.MeetingId, "contribute") is { } deniedDis) return deniedDis;
       lock (s.MessageLock)
       {
         if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
+        if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedDis2) return deniedDis2;
         if (d.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
         d.Decided = true;
         d.Status = "discarded";
@@ -172,7 +192,7 @@ public static class RecordEndpoints
     app.MapGet("/api/records/{draftId:guid}/export", (InMemoryStore s, HttpRequest req, Guid draftId, string format = "concise") =>
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedEx) return deniedEx;
       if (string.Equals(d.Status, "discarded", StringComparison.OrdinalIgnoreCase))
         return Results.Conflict("Draft discarded; conversation preserved, nothing to export.");
       var text = RecordsOps.BuildExport(d.ItemsJson, d.ApprovedJson, format == "detailed");

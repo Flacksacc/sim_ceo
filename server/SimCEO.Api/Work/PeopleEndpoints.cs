@@ -5,36 +5,111 @@ using SimCEO.Api.Work;
 
 namespace SimCEO.Api;
 
-// Board-scoped invitations and grants. No login system ships in this slice:
-// the caller identifies with an `X-User` header (default "owner").
-// "owner" always manages; other users are bound by stored grants.
-// When a board has no grants at all, every check passes (single-user default).
-// Revoking the last matching grant promptly stops new reads and live updates.
 public static class PeopleOps
 {
   public static string UserOf(InMemoryStore s, HttpRequest req) =>
     AuthOps.ResolveUser(s, req);
 
+  public static bool IsSecure(InMemoryStore s)
+  {
+    // Security availability: storage failure must throw so callers return 503,
+    // never silently downgrade to demo/owner mode.
+    bool sec;
+    try { sec = s.Security.Values.Any(x => x.AuthRequired); }
+    catch (Exception ex) { throw new InvalidOperationException("Security state unavailable.", ex); }
+    if (sec) return true;
+    try { return s.Accounts.Values.Any(); }
+    catch (Exception ex) { throw new InvalidOperationException("Account state unavailable.", ex); }
+  }
+  public static bool TryIsSecure(InMemoryStore s, out bool secure)
+  {
+    try { secure = IsSecure(s); return true; }
+    catch { secure = false; return false; }
+  }
+  public static bool IsInstallationAdmin(InMemoryStore s, string email)
+  {
+    try
+    {
+      var adm = AdminEmail(s);
+      return !string.IsNullOrWhiteSpace(adm) && !string.IsNullOrWhiteSpace(email)
+        && string.Equals(adm.Trim(), email.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+    catch { throw new InvalidOperationException("Security state unavailable."); }
+  }
+
+  public static string AdminEmail(InMemoryStore s)
+  {
+    try
+    {
+      var st = s.Security.Values.FirstOrDefault();
+      if (st is not null && !string.IsNullOrWhiteSpace(st.AdminEmail)) return st.AdminEmail;
+    }
+    catch { }
+    return "";
+  }
+
   private static int Rank(string a) => a switch
   {
-    "open" or "manage" => 3,
-    "contribute" => 2,
-    "read" => 1,
+    "open" or "manage" => 30,
+    "contribute" => 20,
+    "read" => 10,
+    "discuss" => 5,
     _ => 0,
   };
 
   public static string AccessFor(InMemoryStore s, Guid boardId, Guid? meetingId, string user)
   {
-    if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return "manage";
-    var boardGrants = s.Grants.Values.Where(g => g.BoardId == boardId).ToList();
-    // Adding the first collaborator opts the board into enforcement permanently:
-    // revoking the last grant still denies strangers instead of reopening.
-    if (boardGrants.Count == 0 && !s.Invites.Values.Any(i => i.BoardId == boardId)) return "open";
-    var scoped = boardGrants.Where(g => meetingId == null || g.MeetingId == null || g.MeetingId == meetingId).ToList();
+    var secure = IsSecure(s);
+    var u = (user ?? "").Trim();
+    if (secure && (string.Equals(u, "owner", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(u)))
+      return "none";
+    Board? board = null;
+    try { s.Boards.TryGetValue(boardId, out board); } catch { board = null; }
+    if (board is not null && !string.IsNullOrWhiteSpace(board.OwnerKey)
+        && string.Equals(board.OwnerKey, u, StringComparison.OrdinalIgnoreCase))
+      return "manage";
+    var admin = AdminEmail(s);
+    if (secure && !string.IsNullOrWhiteSpace(admin)
+        && string.Equals(admin, u, StringComparison.OrdinalIgnoreCase))
+      return "manage";
+    List<Grant> boardGrants;
+    try { boardGrants = s.Grants.Values.Where(g => g.BoardId == boardId).ToList(); }
+    catch { boardGrants = new List<Grant>(); }
+    List<Invite> boardInvites;
+    try { boardInvites = s.Invites.Values.Where(i => i.BoardId == boardId).ToList(); }
+    catch { boardInvites = new List<Invite>(); }
+    if (board is not null && board.AccessEnforced && boardGrants.Count == 0 && boardInvites.Count == 0) return "none";
+    if (!secure && boardGrants.Count == 0 && boardInvites.Count == 0) return "open";
+    if (board is not null && !board.AccessEnforced && boardGrants.Count == 0 && boardInvites.Count == 0)
+      return secure ? "none" : "open";
+    IEnumerable<Grant> scoped;
+    if (meetingId == null)
+      scoped = boardGrants.Where(g => g.MeetingId == null);
+    else
+      scoped = boardGrants.Where(g => g.MeetingId == null || g.MeetingId == meetingId);
     var best = 0;
-    foreach (var g in scoped.Where(g => string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase)))
-      best = Math.Max(best, Rank(g.Access));
-    return best >= 3 ? "manage" : best == 2 ? "contribute" : best == 1 ? "read" : "none";
+    var bestStr = "none";
+    foreach (var g in scoped.Where(g => string.Equals(g.UserKey, u, StringComparison.OrdinalIgnoreCase)))
+    {
+      var r = Rank(g.Access);
+      if (r > best) { best = r; bestStr = g.Access; }
+    }
+    if (meetingId != null && bestStr == "none")
+    {
+      try
+      {
+        var mem = s.Memberships.Values.FirstOrDefault(m => m.BoardId == boardId && m.MeetingId == meetingId
+          && string.Equals(m.UserKey, u, StringComparison.OrdinalIgnoreCase) && m.Active);
+        if (mem is not null)
+        {
+          var mg = boardGrants.FirstOrDefault(g => g.BoardId == boardId && g.MeetingId == meetingId
+            && string.Equals(g.UserKey, u, StringComparison.OrdinalIgnoreCase));
+          if (mg is not null) { best = Rank(mg.Access); bestStr = mg.Access; }
+        }
+      }
+      catch { }
+    }
+    return best >= 30 ? "manage" : best >= 20 ? "contribute" : best >= 10 ? "read" : best >= 5 ? "discuss" : "none";
   }
 
   public static bool HasInvalidToken(InMemoryStore s, HttpRequest req)
@@ -86,13 +161,222 @@ public static class PeopleOps
   public static bool Can(InMemoryStore s, HttpRequest req, Guid boardId, Guid? meetingId, string need)
   {
     if (HasInvalidToken(s, req)) return false;
+    if (IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return false;
     var have = AccessFor(s, boardId, meetingId, UserOf(s, req));
     if (have == "open") return true;
-    return Rank(have) >= Rank(need);
+    return need switch
+    {
+      "manage" => have == "manage",
+      "contribute" => have == "contribute" || have == "manage",
+      "read" => have == "read" || have == "contribute" || have == "manage"
+        || (have == "discuss" && meetingId != null),
+      "discuss" => have == "discuss" || have == "contribute" || have == "manage",
+      _ => false,
+    };
+  }
+
+  public static IResult? Check(InMemoryStore s, HttpRequest req, Guid boardId, Guid? meetingId, string need)
+  {
+    if (HasInvalidToken(s, req))
+      return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
+    if (IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+      return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+    if (!Can(s, req, boardId, meetingId, need))
+      return Denied();
+    return null;
   }
 
   public static IResult Denied() =>
     Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+
+  public static bool HasMeetingGrant(InMemoryStore s, string user, Guid boardId, Guid meetingId)
+  {
+    try
+    {
+      return s.Grants.Values.Any(g => g.BoardId == boardId && g.MeetingId == meetingId
+        && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
+    }
+    catch { return false; }
+  }
+
+  public static List<Guid> GuestMeetingIds(InMemoryStore s, string user, Guid boardId)
+  {
+    try
+    {
+      return s.Grants.Values.Where(g => g.BoardId == boardId && g.MeetingId != null
+        && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase))
+        .Select(g => g.MeetingId!.Value).Distinct().ToList();
+    }
+    catch { return new List<Guid>(); }
+  }
+
+  public static void MarkEnforced(InMemoryStore s, Guid boardId)
+  {
+    try
+    {
+      if (s.Boards.TryGetValue(boardId, out var b) && !b.AccessEnforced)
+      {
+        b.AccessEnforced = true;
+        s.Boards[boardId] = b;
+        s.Boards.Flush();
+      }
+    }
+    catch { }
+  }
+
+  public static void BumpMeeting(InMemoryStore s, Guid meetingId)
+  {
+    try
+    {
+      lock (s.MessageLock)
+      {
+        if (s.Meetings.TryGetValue(meetingId, out var m))
+        {
+          m.Generation++;
+          s.Meetings.Flush();
+        }
+      }
+    }
+    catch { }
+  }
+
+  public static bool WasExplicitlyLeft(InMemoryStore s, Guid boardId, Guid meetingId, string user) { try { var m = s.Memberships.Values.FirstOrDefault(x => x.BoardId == boardId && x.MeetingId == meetingId && string.Equals(x.UserKey, user, StringComparison.OrdinalIgnoreCase)); return m is not null && !m.Active; } catch { return false; } }
+  public static void RevokeLive(string userKey, Guid? boardId = null, Guid? meetingId = null)
+  {
+    try { SimCEO.Api.Hubs.BoardHub.RevokeUser(userKey, boardId, meetingId); } catch { }
+  }
+}
+
+public static class SecurityOps
+{
+  public static void EnsureMigrated(InMemoryStore s)
+  {
+      bool hasAccounts;
+      try { hasAccounts = s.Accounts.Values.Any(); } catch (Exception ex) { throw new InvalidOperationException("Account state unavailable.", ex); }
+      Domain.SecurityState? state;
+      try { state = s.Security.Values.FirstOrDefault(); } catch (Exception ex) { throw new InvalidOperationException("Security state unavailable.", ex); }
+      if (state is not null && state.AuthRequired && state.MigrationDone) return;
+      if (!hasAccounts) return;
+      lock (s.SetupLock)
+      {
+        string adminEmail = "";
+        bool didMigrate = false;
+        var narrowed = 0; var reviewed = 0;
+        var bumpAfter = new System.Collections.Generic.HashSet<System.Guid>();
+        var wizAdopted = 0;
+        Atomic.Run(() =>
+        {
+        try { state = s.Security.Values.FirstOrDefault(); } catch (Exception ex) { throw new InvalidOperationException("Security state unavailable.", ex); }
+        if (state is not null && state.AuthRequired && state.MigrationDone) return;
+        bool anyAccounts = false;
+        try { anyAccounts = s.Accounts.Values.Any(); } catch (Exception ex) { throw new InvalidOperationException("Account state unavailable.", ex); }
+        if (!anyAccounts) return;
+        var oldest = s.Accounts.Values.OrderBy(a => a.CreatedAt).First();
+        adminEmail = (oldest.Email ?? "").Trim().ToLowerInvariant();
+        state ??= new SecurityState { Id = Guid.Empty };
+        state.AuthRequired = true;
+        state.AdminEmail = adminEmail;
+        state.AdminAccountId = oldest.Id;
+        state.UpdatedAt = DateTime.UtcNow;
+        if (state.Id == Guid.Empty) state.Id = Guid.NewGuid();
+        s.Security[state.Id] = state;
+        s.Security.Flush();
+        foreach (var b in s.Boards.Values.Where(b => string.IsNullOrWhiteSpace(b.OwnerKey) || string.Equals(b.OwnerKey, "owner", System.StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+          b.OwnerKey = adminEmail;
+          if (s.Grants.Values.Any(g => g.BoardId == b.Id) || s.Invites.Values.Any(i => i.BoardId == b.Id))
+            b.AccessEnforced = true;
+          s.Boards[b.Id] = b;
+        }
+        s.Boards.Flush();
+        foreach (var r in s.Roster.Values.Where(r => string.IsNullOrWhiteSpace(r.OwnerKey) || string.Equals(r.OwnerKey, "owner", System.StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+          r.OwnerKey = adminEmail;
+          s.Roster[r.Id] = r;
+        }
+        s.Roster.Flush();
+        foreach (var wdz in s.WizardDrafts.Values.Where(x => string.IsNullOrWhiteSpace(x.OwnerKey)).ToList())
+        {
+          wdz.OwnerKey = adminEmail;
+          s.WizardDrafts[wdz.Id] = wdz;
+          wizAdopted++;
+        }
+        s.WizardDrafts.Flush();
+        foreach (var inv in s.Invites.Values.Where(i => i.State == "accepted" && i.MeetingId != null).ToList())
+        {
+          var user = !string.IsNullOrWhiteSpace(inv.UserKey) ? inv.UserKey : inv.Email;
+          if (string.IsNullOrWhiteSpace(user)) continue;
+          // Non-destructive: validate current parent; respect explicit leave/revocation.
+          if (!s.Meetings.TryGetValue(inv.MeetingId.Value, out var __pm) || __pm.BoardId != inv.BoardId) { reviewed++; continue; }
+          var __mem = s.Memberships.Values.FirstOrDefault(mm => mm.BoardId == inv.BoardId && mm.MeetingId == inv.MeetingId.Value
+            && string.Equals(mm.UserKey, user, StringComparison.OrdinalIgnoreCase));
+          if (__mem is not null && !__mem.Active) continue; // left/revoked: never resurrect
+          var hasScoped = s.Grants.Values.Any(g => g.BoardId == inv.BoardId && g.MeetingId == inv.MeetingId
+            && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
+          if (!hasScoped)
+          {
+            var g = new Grant { BoardId = inv.BoardId, MeetingId = inv.MeetingId, UserKey = user, Access = "discuss", CreatedAt = DateTime.UtcNow };
+            s.Grants[g.Id] = g;
+            narrowed++;
+            if (__mem is null)
+            {
+              var mem = new Membership { BoardId = inv.BoardId, MeetingId = inv.MeetingId.Value, UserKey = user, Active = true, JoinedAt = DateTime.UtcNow };
+              s.Memberships[mem.Id] = mem;
+            }
+          }
+          // Independent board-wide grants are NEVER deleted here; explicit narrowing is a separate admin action.
+          var hasBoardWide = s.Grants.Values.Any(g => g.BoardId == inv.BoardId && g.MeetingId == null
+            && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
+          if (hasBoardWide) reviewed++;
+          PeopleOps.MarkEnforced(s, inv.BoardId);
+          try { if (inv.MeetingId.HasValue) bumpAfter.Add(inv.MeetingId.Value); } catch { }
+        }
+        s.Grants.Flush();
+        try { s.Memberships.Flush(); } catch { }
+        try { var __st = s.Security.Values.FirstOrDefault(); if (__st is not null) { __st.MigrationDone = true; s.Security[__st.Id] = __st; s.Security.Flush(); } } catch (Exception ex) { throw new InvalidOperationException("Migration commit failed.", ex); }
+        didMigrate = true;
+        }); // end Atomic: account/admin/security/ownership commit together
+        // Generation bumps happen AFTER the atomic commit (SetupLock -> MessageLock order; never MessageLock while holding the backend gate).
+        foreach (var __bm in bumpAfter) { try { PeopleOps.BumpMeeting(s, __bm); } catch { } }
+        if (didMigrate) s.Audit.Add(new AuditEvent { Action = "security.migrate", Detail = JsonSerializer.Serialize(new { admin = adminEmail, scopedAdded = narrowed, needsReview = reviewed }) });
+      }
+  }
+
+  public static (SecurityState state, bool first) EnsureFirstAdmin(InMemoryStore s, string email, Guid accountId)
+  {
+    lock (s.SetupLock)
+    {
+      var existing = s.Security.Values.FirstOrDefault();
+      if (existing is not null && existing.AuthRequired) return (existing, false);
+      if (s.Accounts.Values.Count > 1) { EnsureMigrated(s); existing = s.Security.Values.FirstOrDefault(); return (existing!, false); }
+      var st = existing ?? new SecurityState { Id = Guid.NewGuid() };
+      Atomic.Run(() =>
+      {
+        st.AuthRequired = true;
+        st.AdminEmail = email;
+        st.AdminAccountId = accountId;
+        st.UpdatedAt = DateTime.UtcNow;
+        s.Security[st.Id] = st;
+        s.Security.Flush();
+        foreach (var b in s.Boards.Values.Where(b => string.IsNullOrWhiteSpace(b.OwnerKey) || string.Equals(b.OwnerKey, "owner", System.StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+          b.OwnerKey = email;
+          if (s.Grants.Values.Any(g => g.BoardId == b.Id) || s.Invites.Values.Any(i => i.BoardId == b.Id))
+            b.AccessEnforced = true;
+          s.Boards[b.Id] = b;
+        }
+        s.Boards.Flush();
+        foreach (var r in s.Roster.Values.Where(r => string.IsNullOrWhiteSpace(r.OwnerKey) || string.Equals(r.OwnerKey, "owner", System.StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+          r.OwnerKey = email;
+          s.Roster[r.Id] = r;
+        }
+        s.Roster.Flush();
+      });
+      s.Audit.Add(new AuditEvent { Action = "security.first-admin", Detail = JsonSerializer.Serialize(new { admin = email }) });
+      return (st, true);
+    }
+  }
 }
 
 public static class PeopleEndpoints
@@ -101,89 +385,456 @@ public static class PeopleEndpoints
   {
     "manager" => "manage",
     "viewer" => "read",
+    "guest" or "discuss" => "discuss",
     _ => "contribute",
   };
 
   public static void MapPeople(this WebApplication app)
   {
     app.MapGet("/api/boards/{bid:guid}/invites", (InMemoryStore s, HttpRequest req, Guid bid) =>
-      !PeopleOps.Can(s, req, bid, null, "manage") ? PeopleOps.Denied()
-      : Results.Ok(s.Invites.Values.Where(i => i.BoardId == bid).OrderByDescending(i => i.CreatedAt)));
+      PeopleOps.Check(s, req, bid, null, "manage") ?? Results.Ok(s.Invites.Values.Where(i => i.BoardId == bid).OrderByDescending(i => i.CreatedAt)));
 
     app.MapPost("/api/boards/{bid:guid}/invites", (InMemoryStore s, HttpRequest req, Guid bid, Invite input) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "manage") is { } denied) return denied;
       if (string.IsNullOrWhiteSpace(input.Email)) return Results.BadRequest("Email is required.");
-      input.Id = Guid.NewGuid();
-      input.BoardId = bid;
-      input.State = "pending";
-      input.CreatedAt = DateTime.UtcNow;
-      s.Invites[input.Id] = input;
-      s.Audit.Add(new AuditEvent { BoardId = bid, Action = "invite.create", Detail = JsonSerializer.Serialize(new { input.Email, input.Role }) });
-      return Results.Created($"/api/invites/{input.Id}", input);
-    });
-
-    app.MapPost("/api/invites/{id:guid}/accept", (InMemoryStore s, Guid id, JsonElement body) =>
-    {
-      if (!s.Invites.TryGetValue(id, out var inv) || inv.State != "pending")
-        return Results.Conflict("Invite is not pending.");
-      var user = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("userKey", out var u)
-        ? (u.GetString() ?? inv.Email) : inv.Email;
-      inv.State = "accepted";
-    s.Invites.Flush();
-      inv.UserKey = user;
-      var grant = new Grant
+      try { if (input.MeetingId.HasValue && !PeopleOps.IsSecure(s)) return Results.Json(new { error = "Registration required: guest collaboration needs a secure account. Register to continue." }, statusCode: 403); } catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      if (input.MeetingId.HasValue)
       {
-        BoardId = inv.BoardId, UserKey = user,
-        Access = AccessForRole(inv.Role), CreatedAt = DateTime.UtcNow,
-      };
-      s.Grants[grant.Id] = grant;
-      s.Audit.Add(new AuditEvent { BoardId = inv.BoardId, Action = "invite.accept", Detail = JsonSerializer.Serialize(new { user }) });
-      return Results.Ok(grant);
+        if (!s.Meetings.TryGetValue(input.MeetingId.Value, out var mm) || mm.BoardId != bid)
+          return Results.NotFound("meeting");
+      }
+      var role = (input.Role ?? "").Trim().ToLowerInvariant();
+      if (string.IsNullOrWhiteSpace(role)) role = input.MeetingId.HasValue ? "guest" : "contributor";
+      if (role is not ("manager" or "viewer" or "contributor" or "guest" or "discuss"))
+        return Results.BadRequest("role must be manager, viewer, contributor, or guest.");
+      // ONE critical section: validate, recheck CURRENT authority, and insert atomically.
+      lock (s.SetupLock)
+      {
+        if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedInner2) return deniedInner2;
+        if (input.MeetingId.HasValue)
+        {
+          if (!s.Meetings.TryGetValue(input.MeetingId.Value, out var mm2) || mm2.BoardId != bid)
+            return Results.NotFound("meeting");
+        }
+        input.Id = Guid.NewGuid();
+        input.BoardId = bid;
+        input.Role = role == "discuss" ? "guest" : role;
+        input.State = "pending";
+        input.CreatedAt = DateTime.UtcNow;
+        try
+        {
+          Atomic.Run(() =>
+          {
+            if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedAtomic) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            s.Invites[input.Id] = input;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (Exception ex) { return Results.Json(new { error = "Invite could not be stored: " + ex.Message }, statusCode: 500); }
+        PeopleOps.MarkEnforced(s, bid);
+        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "invite.create", Detail = JsonSerializer.Serialize(new { input.Email, input.Role, input.MeetingId }) });
+        return Results.Created($"/api/invites/{input.Id}", input);
+      }
     });
 
-    app.MapPost("/api/invites/{id:guid}/revoke", (InMemoryStore s, HttpRequest req, Guid id) =>
+    app.MapGet("/api/invites/{id:guid}/public", (InMemoryStore s, Guid id) =>
     {
       if (!s.Invites.TryGetValue(id, out var inv)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, inv.BoardId, null, "manage")) return PeopleOps.Denied();
-      inv.State = "revoked";
-    s.Invites.Flush();
-      foreach (var g in s.Grants.Values.Where(g => g.BoardId == inv.BoardId
-        && (string.Equals(g.UserKey, inv.Email, StringComparison.OrdinalIgnoreCase)
-          || (!string.IsNullOrWhiteSpace(inv.UserKey) && string.Equals(g.UserKey, inv.UserKey, StringComparison.OrdinalIgnoreCase)))).ToList())
-        s.Grants.TryRemove(g.Id, out _);
-      s.Audit.Add(new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { inv.Email }) });
-      return Results.Ok(inv);
+      string boardName = "";
+      string meetingTitle = "";
+      try { if (s.Boards.TryGetValue(inv.BoardId, out var b)) boardName = b.Name; } catch { }
+      try { if (inv.MeetingId.HasValue && s.Meetings.TryGetValue(inv.MeetingId.Value, out var m)) meetingTitle = m.Title; } catch { }
+      return Results.Ok(new { id = inv.Id, boardId = inv.BoardId, meetingId = inv.MeetingId, state = inv.State, boardName, meetingTitle });
+    });
+
+    app.MapPost("/api/invites/{id:guid}/accept", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } bad) return bad;
+      string sessEmail = "";
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var se)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        sessEmail = se;
+      }
+      if (!s.Invites.TryGetValue(id, out var inv) || inv.State != "pending")
+        return Results.Conflict("Invite is not pending.");
+      var sessionUser = PeopleOps.IsSecure(s) ? sessEmail : (AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req));
+      string? claimed = null;
+      if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("userKey", out var u) && u.ValueKind == JsonValueKind.String)
+        claimed = (u.GetString() ?? "").Trim();
+      if (PeopleOps.IsSecure(s) && !string.IsNullOrWhiteSpace(claimed)
+          && !string.Equals(claimed, sessionUser, StringComparison.OrdinalIgnoreCase))
+        return Results.Json(new { error = "Invite acceptance binds the signed-in identity; caller userKey mismatch." }, statusCode: 403);
+      var user = sessionUser;
+      if (string.IsNullOrWhiteSpace(user)) user = (!string.IsNullOrWhiteSpace(claimed) ? claimed : inv.Email);
+      if (string.IsNullOrWhiteSpace(user)) return Results.BadRequest("No identity to bind.");
+      if (inv.MeetingId.HasValue)
+      {
+        if (!s.Meetings.TryGetValue(inv.MeetingId.Value, out var mm) || mm.BoardId != inv.BoardId)
+          return Results.Conflict("Invite meeting is missing or belongs to another board.");
+      }
+      else if (string.Equals(inv.Role, "guest", StringComparison.OrdinalIgnoreCase))
+        return Results.Conflict("Guest invite requires a meeting.");
+      lock (s.SetupLock)
+      {
+        if (!s.Invites.TryGetValue(id, out inv) || inv.State != "pending")
+          return Results.Conflict("Invite is not pending.");
+        // No tracked mutation before the durable unit: the accept flip, grant and
+        // membership writes commit together inside ONE Atomic unit. Storage failure
+        // rolls back and returns 500; never partial state or false success.
+        Grant? acceptedGrant = null;
+        var acceptBid = inv.BoardId; var acceptMid = inv.MeetingId;
+        try
+        {
+          Atomic.Run(() =>
+          {
+            if (!s.Invites.TryGetValue(id, out var curA) || curA.State != "pending")
+              throw new InvalidOperationException("Invite is not pending.");
+            curA.State = "accepted";
+            curA.UserKey = user;
+            s.Invites[id] = curA;
+            foreach (var old in s.Grants.Values.Where(g => g.BoardId == curA.BoardId
+              && g.MeetingId == curA.MeetingId
+              && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase)).ToList())
+              s.Grants.TryRemove(old.Id, out _);
+            var ng = new Grant
+            {
+              BoardId = curA.BoardId, MeetingId = curA.MeetingId, UserKey = user,
+              Access = AccessForRole(curA.Role), CreatedAt = DateTime.UtcNow,
+            };
+            s.Grants[ng.Id] = ng;
+            if (curA.MeetingId.HasValue)
+            {
+              var exA = s.Memberships.Values.FirstOrDefault(m => m.BoardId == curA.BoardId && m.MeetingId == curA.MeetingId.Value
+                && string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase));
+              if (exA is null)
+              {
+                var nm = new Membership { BoardId = curA.BoardId, MeetingId = curA.MeetingId.Value, UserKey = user, Active = true, JoinedAt = DateTime.UtcNow };
+                s.Memberships[nm.Id] = nm;
+              }
+              else { exA.Active = true; exA.LeftAt = null; exA.JoinedAt = DateTime.UtcNow; s.Memberships[exA.Id] = exA; }
+            }
+            PeopleOps.MarkEnforced(s, curA.BoardId);
+            acceptedGrant = ng;
+          });
+        }
+        catch (InvalidOperationException iox) when (iox.Message == "Invite is not pending.") { return Results.Conflict(iox.Message); }
+        catch (Exception ex) { return Results.Json(new { error = "Invite acceptance could not be stored: " + ex.Message }, statusCode: 500); }
+        try { if (acceptMid.HasValue) PeopleOps.BumpMeeting(s, acceptMid.Value); } catch { }
+        s.Audit.Add(new AuditEvent { BoardId = acceptBid, Action = "invite.accept", Detail = JsonSerializer.Serialize(new { user, meeting = acceptMid }) });
+        return Results.Ok(new { grant = acceptedGrant, meetingId = acceptMid, user });
+      }
+    });
+
+    app.MapPost("/api/invites/{id:guid}/revoke", (InMemoryStore s, HttpRequest req, Guid id, string? scope) =>
+    {
+      if (!s.Invites.TryGetValue(id, out var inv)) return Results.NotFound();
+      var boardWide = string.Equals(scope, "board", StringComparison.OrdinalIgnoreCase);
+      if (boardWide)
+      {
+        if (PeopleOps.Check(s, req, inv.BoardId, null, "manage") is { } deniedB) return deniedB;
+        if (!s.Boards.TryGetValue(inv.BoardId, out var __bo) || (!string.Equals(__bo.OwnerKey, PeopleOps.UserOf(s, req), StringComparison.OrdinalIgnoreCase) && !PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req)))) return PeopleOps.Denied();
+      }
+      else if (PeopleOps.Check(s, req, inv.BoardId, inv.MeetingId, "manage") is { } denied) return denied;
+      lock (s.SetupLock)
+      {
+        // Recheck CURRENT authority inside the mutation lock (TOCTOU).
+        if (boardWide)
+        {
+          if (PeopleOps.Check(s, req, inv.BoardId, null, "manage") is { } deniedB2) return deniedB2;
+        }
+        else if (PeopleOps.Check(s, req, inv.BoardId, inv.MeetingId, "manage") is { } denied2) return denied2;
+        if (!s.Invites.TryGetValue(id, out inv)) return Results.NotFound();
+        // Identity-bound: the accepted UserKey is authoritative; email alone is not.
+        var target = !string.IsNullOrWhiteSpace(inv.UserKey) ? inv.UserKey : inv.Email;
+        if (string.IsNullOrWhiteSpace(target)) return Results.BadRequest("Invite has no bound identity.");
+        // NOTE: do NOT mutate the tracked invite here; the state flip happens exactly once
+        // inside the Atomic unit below (pre-Atomic tracked mutation would poison the in-gate check).
+        var removedUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+          Atomic.Run(() =>
+          {
+            // Recheck once more inside the durable unit.
+            if (boardWide)
+            {
+              if (PeopleOps.Check(s, req, inv.BoardId, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            }
+            else if (PeopleOps.Check(s, req, inv.BoardId, inv.MeetingId, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (!s.Invites.TryGetValue(id, out var cur) || (cur.State != "pending" && cur.State != "accepted")) throw new InvalidOperationException("Invite is not active.");
+            cur.State = "revoked";
+            s.Invites[id] = cur;
+            // Default scope: EXACT meeting (or board-only when invite has no meeting).
+            foreach (var g in s.Grants.Values.Where(g => g.BoardId == inv.BoardId
+              && (boardWide || g.MeetingId == inv.MeetingId)
+              && string.Equals(g.UserKey, target, StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+              removedUsers.Add(g.UserKey);
+              s.Grants.TryRemove(g.Id, out _);
+            }
+            foreach (var m in s.Memberships.Values.Where(m => m.BoardId == inv.BoardId
+              && (boardWide || m.MeetingId == (inv.MeetingId ?? Guid.Empty))
+              && string.Equals(m.UserKey, target, StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+              m.Active = false; m.LeftAt = DateTime.UtcNow; s.Memberships[m.Id] = m;
+            }
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException iox) { return Results.Conflict(iox.Message); }
+        catch (Exception ex) { return Results.Json(new { error = "Revocation could not be stored: " + ex.Message }, statusCode: 500); }
+        try { if (inv.MeetingId.HasValue) PeopleOps.BumpMeeting(s, inv.MeetingId.Value); else if (boardWide) foreach (var __mm in s.Meetings.Values.Where(mm => mm.BoardId == inv.BoardId).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
+        foreach (var u in removedUsers) PeopleOps.RevokeLive(u, inv.BoardId, boardWide ? null : inv.MeetingId);
+        s.Audit.Add(new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { target, scope = boardWide ? "board" : "meeting", meeting = inv.MeetingId }) });
+        return Results.Ok(inv);
+      }
     });
 
     app.MapGet("/api/boards/{bid:guid}/grants", (InMemoryStore s, HttpRequest req, Guid bid) =>
-      !PeopleOps.Can(s, req, bid, null, "manage") ? PeopleOps.Denied()
-      : Results.Ok(s.Grants.Values.Where(g => g.BoardId == bid).OrderByDescending(g => g.CreatedAt)));
+      PeopleOps.Check(s, req, bid, null, "manage") ?? Results.Ok(s.Grants.Values.Where(g => g.BoardId == bid).OrderByDescending(g => g.CreatedAt)));
 
     app.MapPost("/api/boards/{bid:guid}/grants", (InMemoryStore s, HttpRequest req, Guid bid, Grant input) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, input.MeetingId, "manage") is { } denied) return denied;
+      // Secure-account prerequisite for meeting collaboration (parity with invites).
+      try { if (input.MeetingId.HasValue && !PeopleOps.IsSecure(s)) return Results.Json(new { error = "Registration required: meeting collaboration needs a secure account. Register to continue." }, statusCode: 403); } catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       if (string.IsNullOrWhiteSpace(input.UserKey)) return Results.BadRequest("userKey is required.");
-      if (input.Access is not ("read" or "contribute" or "manage")) return Results.BadRequest("access must be read, contribute, or manage.");
-      foreach (var old in s.Grants.Values.Where(g => g.BoardId == bid
-        && g.MeetingId == input.MeetingId
-        && string.Equals(g.UserKey, input.UserKey, StringComparison.OrdinalIgnoreCase)).ToList())
-        s.Grants.TryRemove(old.Id, out _);
-      input.Id = Guid.NewGuid();
-      input.BoardId = bid;
-      input.CreatedAt = DateTime.UtcNow;
-      s.Grants[input.Id] = input;
-      s.Audit.Add(new AuditEvent { BoardId = bid, Action = "grant.set", Detail = JsonSerializer.Serialize(new { input.UserKey, input.MeetingId, input.Access }) });
-      return Results.Created($"/api/grants/{input.Id}", input);
+      var access = (input.Access ?? "").Trim().ToLowerInvariant();
+      if (access is not ("read" or "contribute" or "manage" or "discuss" or "guest"))
+        return Results.BadRequest("access must be read, contribute, manage, or discuss.");
+      if (access == "guest") access = "discuss";
+      if (input.MeetingId.HasValue)
+      {
+        if (!s.Meetings.TryGetValue(input.MeetingId.Value, out var mm) || mm.BoardId != bid)
+          return Results.NotFound("meeting");
+      }
+      else if (access == "discuss")
+        return Results.BadRequest("discuss grants require a meeting.");
+      lock (s.SetupLock)
+      {
+        // Recheck CURRENT authorization inside the mutation critical section (TOCTOU).
+        if (PeopleOps.Check(s, req, bid, input.MeetingId, "manage") is { } deniedInner) return deniedInner;
+        // ONE durable unit: recheck CURRENT authority inside the commit; storage
+        // failure rolls back and returns 500 instead of a false Created.
+        Grant? created = null;
+        try
+        {
+          Atomic.Run(() =>
+          {
+            if (PeopleOps.Check(s, req, bid, input.MeetingId, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            foreach (var old in s.Grants.Values.Where(g => g.BoardId == bid
+              && g.MeetingId == input.MeetingId
+              && string.Equals(g.UserKey, input.UserKey, StringComparison.OrdinalIgnoreCase)).ToList())
+              s.Grants.TryRemove(old.Id, out _);
+            var ng = new Grant { Id = Guid.NewGuid(), BoardId = bid, MeetingId = input.MeetingId, UserKey = input.UserKey.Trim(), Access = access, CreatedAt = DateTime.UtcNow };
+            s.Grants[ng.Id] = ng;
+            PeopleOps.MarkEnforced(s, bid);
+            created = ng;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (Exception ex) { return Results.Json(new { error = "Grant could not be stored: " + ex.Message }, statusCode: 500); }
+        var g = created!;
+        try { if (g.MeetingId.HasValue) PeopleOps.BumpMeeting(s, g.MeetingId.Value); else foreach (var mm in s.Meetings.Values.Where(m => m.BoardId == g.BoardId).ToList()) PeopleOps.BumpMeeting(s, mm.Id); } catch { }
+        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "grant.set", Detail = JsonSerializer.Serialize(new { g.UserKey, g.MeetingId, g.Access }) });
+        return Results.Created($"/api/grants/{g.Id}", g);
+      }
     });
 
     app.MapDelete("/api/grants/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Grants.TryGetValue(id, out var g)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, g.BoardId, g.MeetingId, "manage")) return PeopleOps.Denied();
-      s.Grants.TryRemove(id, out _);
-      s.Audit.Add(new AuditEvent { BoardId = g.BoardId, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { g.UserKey, g.MeetingId }) });
-      return Results.NoContent();
+      if (PeopleOps.Check(s, req, g.BoardId, g.MeetingId, "manage") is { } denied) return denied;
+      lock (s.SetupLock)
+      {
+        // Recheck CURRENT authority inside the mutation lock (TOCTOU).
+        if (!s.Grants.TryGetValue(id, out var gg0)) return Results.NotFound();
+        if (PeopleOps.Check(s, req, gg0.BoardId, gg0.MeetingId, "manage") is { } deniedD0) return deniedD0;
+        if (!s.Grants.TryGetValue(id, out g)) return Results.NotFound();
+        var mid = g.MeetingId; var bid = g.BoardId; var user = g.UserKey;
+        // ONE durable unit: grant removal + membership deactivation commit together;
+        // storage failure returns 500 with no partial commit and no false NoContent.
+        try
+        {
+          Atomic.Run(() =>
+          {
+            if (PeopleOps.Check(s, req, bid, mid, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (!s.Grants.TryGetValue(id, out _)) throw new InvalidOperationException("Grant is gone.");
+            s.Grants.TryRemove(id, out _);
+            foreach (var m in s.Memberships.Values.Where(m => m.BoardId == bid && m.MeetingId == mid
+              && string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase)).ToList())
+            { m.Active = false; m.LeftAt = DateTime.UtcNow; s.Memberships[m.Id] = m; }
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException iox) when (iox.Message == "Grant is gone.") { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Grant revocation could not be stored: " + ex.Message }, statusCode: 500); }
+        try { if (mid.HasValue) PeopleOps.BumpMeeting(s, mid.Value); else foreach (var __mm in s.Meetings.Values.Where(m => m.BoardId == bid).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
+        PeopleOps.RevokeLive(user, bid, mid);
+        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { user, meeting = mid }) });
+        return Results.NoContent();
+      }
+    });
+
+    app.MapGet("/api/boards/{bid:guid}/memberships", (InMemoryStore s, HttpRequest req, Guid bid) =>
+      PeopleOps.Check(s, req, bid, null, "manage") ?? Results.Ok(s.Memberships.Values.Where(m => m.BoardId == bid).OrderByDescending(m => m.JoinedAt)));
+
+    app.MapGet("/api/me/memberships", (InMemoryStore s, HttpRequest req) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } bad) return bad;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
+      try { return Results.Ok(s.Memberships.Values.Where(m => string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase) && m.Active).ToList()); }
+      catch { return Results.Ok(Array.Empty<Membership>()); }
+    });
+
+    app.MapPost("/api/meetings/{meetingId:guid}/join", (InMemoryStore s, HttpRequest req, Guid meetingId) =>
+    {
+      if (!s.Meetings.TryGetValue(meetingId, out var mtg)) return Results.NotFound("meeting");
+      if (PeopleOps.BadToken(s, req) is { } bad) return bad;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
+      var access = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, user);
+      if (access == "none" || access == "open" && PeopleOps.IsSecure(s))
+        return PeopleOps.Denied();
+      lock (s.SetupLock)
+      {
+        // Recheck CURRENT session + authority inside the mutation lock (TOCTOU).
+        if (PeopleOps.BadToken(s, req) is { } badJ) return badJ;
+        if (PeopleOps.IsSecure(s))
+        {
+          if (!AuthOps.TrySession(s, req, out var je) || !string.Equals(je, user, StringComparison.OrdinalIgnoreCase))
+            return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        }
+        var freshAccess = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, user);
+        if (freshAccess == "none" || freshAccess == "open" && PeopleOps.IsSecure(s))
+          return PeopleOps.Denied();
+        Membership? joined = null;
+        try
+        {
+          Atomic.Run(() =>
+          {
+            if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("Invalid or expired session token.");
+            var ju = PeopleOps.IsSecure(s) && AuthOps.TrySession(s, req, out var jeJ) ? jeJ : PeopleOps.UserOf(s, req);
+            if (!string.Equals(ju, user, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("Authentication required.");
+            var faJ = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, ju);
+            if (faJ == "none" || (faJ == "open" && PeopleOps.IsSecure(s))) throw new InvalidOperationException("Access revoked or not granted for this scope.");
+            var exJ = s.Memberships.Values.FirstOrDefault(m => m.BoardId == mtg.BoardId && m.MeetingId == meetingId
+              && string.Equals(m.UserKey, ju, StringComparison.OrdinalIgnoreCase));
+            if (exJ is null)
+            {
+              exJ = new Membership { BoardId = mtg.BoardId, MeetingId = meetingId, UserKey = ju, Active = true, JoinedAt = DateTime.UtcNow };
+              s.Memberships[exJ.Id] = exJ;
+            }
+            else { exJ.Active = true; exJ.LeftAt = null; exJ.JoinedAt = DateTime.UtcNow; s.Memberships[exJ.Id] = exJ; }
+            joined = exJ;
+          });
+        }
+        catch (UnauthorizedAccessException uae) { return Results.Json(new { error = uae.Message }, statusCode: 401); }
+        catch (InvalidOperationException iox) when (iox.Message == "Access revoked or not granted for this scope.") { return PeopleOps.Denied(); }
+        catch (Exception ex) { return Results.Json(new { error = "Join could not be stored: " + ex.Message }, statusCode: 500); }
+        return Results.Ok(joined);
+      }
+    });
+
+    app.MapPost("/api/meetings/{meetingId:guid}/leave", (InMemoryStore s, HttpRequest req, Guid meetingId) =>
+    {
+      if (!s.Meetings.TryGetValue(meetingId, out var mtg)) return Results.NotFound("meeting");
+      if (PeopleOps.BadToken(s, req) is { } bad) return bad;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
+      lock (s.SetupLock)
+      {
+        // Recheck CURRENT session identity inside the mutation lock: a stale
+        // pre-lock session must not mutate another identity's access state.
+        if (PeopleOps.BadToken(s, req) is { } badL2) return badL2;
+        var lu = PeopleOps.IsSecure(s) && AuthOps.TrySession(s, req, out var le2) ? le2 : PeopleOps.UserOf(s, req);
+        if (!string.Equals(lu, user, StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        try
+        {
+          Atomic.Run(() =>
+          {
+            foreach (var g in s.Grants.Values.Where(g => g.BoardId == mtg.BoardId && g.MeetingId == meetingId
+              && string.Equals(g.UserKey, lu, StringComparison.OrdinalIgnoreCase)).ToList())
+              s.Grants.TryRemove(g.Id, out _);
+            foreach (var m in s.Memberships.Values.Where(m => m.BoardId == mtg.BoardId && m.MeetingId == meetingId
+              && string.Equals(m.UserKey, lu, StringComparison.OrdinalIgnoreCase)).ToList())
+            { m.Active = false; m.LeftAt = DateTime.UtcNow; s.Memberships[m.Id] = m; }
+          });
+        }
+        catch (Exception ex) { return Results.Json(new { error = "Leave could not be stored: " + ex.Message }, statusCode: 500); }
+        try { PeopleOps.BumpMeeting(s, meetingId); } catch { }
+        PeopleOps.RevokeLive(lu, mtg.BoardId, meetingId);
+        s.Audit.Add(new AuditEvent { BoardId = mtg.BoardId, Action = "membership.leave", Detail = JsonSerializer.Serialize(new { user = lu, meeting = meetingId }) });
+        return Results.Ok(new { left = true, meetingId });
+      }
+    });
+
+    app.MapPost("/api/boards/{bid:guid}/repair-access", (InMemoryStore s, HttpRequest req, Guid bid) =>
+    {
+      var admin = PeopleOps.AdminEmail(s);
+      var user = PeopleOps.UserOf(s, req);
+      var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, user, StringComparison.OrdinalIgnoreCase);
+      if (!isAdmin)
+      {
+        if (PeopleOps.Check(s, req, bid, null, "manage") is { } denied) return denied;
+        if (!s.Boards.TryGetValue(bid, out var bchk) || !string.Equals(bchk.OwnerKey, user, StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Only the installation admin or board owner can repair access." }, statusCode: 403);
+      }
+      if (!s.Boards.TryGetValue(bid, out var board)) return Results.NotFound();
+      var repaired = new List<object>();
+      lock (s.SetupLock)
+      {
+        var revokedLive = new List<string>();
+        try
+        {
+          Atomic.Run(() =>
+          {
+            // Recheck CURRENT repair authority inside the durable unit.
+            var __adm2 = PeopleOps.AdminEmail(s); var __me2 = PeopleOps.UserOf(s, req);
+            var __isAdm2 = !string.IsNullOrWhiteSpace(__adm2) && string.Equals(__adm2, __me2, StringComparison.OrdinalIgnoreCase);
+            if (!__isAdm2)
+            {
+              if (PeopleOps.Check(s, req, bid, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (!s.Boards.TryGetValue(bid, out var __b2) || !string.Equals(__b2.OwnerKey, __me2, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("Only the installation admin or board owner can repair access.");
+            }
+            if (!s.Boards.TryGetValue(bid, out var __board2)) throw new InvalidOperationException("Board is gone.");
+            foreach (var inv in s.Invites.Values.Where(i => i.BoardId == bid && i.State == "accepted" && i.MeetingId != null).ToList())
+            {
+              var u = !string.IsNullOrWhiteSpace(inv.UserKey) ? inv.UserKey : inv.Email;
+              if (string.IsNullOrWhiteSpace(u)) continue;
+              // Respect explicit leave/revoke and current meeting parent: an old accepted invite
+              // must NOT silently reissue a revoked grant. Only a genuinely NEW explicit invitation
+              // (state pending -> accept) grants access.
+              if (!s.Meetings.TryGetValue(inv.MeetingId.Value, out var __pm) || __pm.BoardId != bid) continue;
+              { var __ex = s.Memberships.Values.FirstOrDefault(x => x.BoardId == bid && x.MeetingId == inv.MeetingId.Value && string.Equals(x.UserKey, u, StringComparison.OrdinalIgnoreCase)); if (__ex is not null && !__ex.Active) continue; }
+              if (PeopleOps.WasExplicitlyLeft(s, bid, inv.MeetingId.Value, u)) continue;
+              var widened = s.Grants.Values.Where(g => g.BoardId == bid && g.MeetingId == null
+                && string.Equals(g.UserKey, u, StringComparison.OrdinalIgnoreCase)).ToList();
+              foreach (var w in widened)
+              {
+                s.Grants.TryRemove(w.Id, out _);
+                repaired.Add(new { user = u, removedBoardGrant = w.Id });
+                revokedLive.Add(u);
+              }
+              // No reissue: repair never grants access. A NEW explicit invitation + accept binds access;
+              // repair only narrows widened board grants and never resurrects revoked/leave state.
+            }
+            PeopleOps.MarkEnforced(s, bid);
+          });
+        }
+        catch (UnauthorizedAccessException) { return Results.Json(new { error = "Only the installation admin or board owner can repair access." }, statusCode: 403); }
+        catch (InvalidOperationException iox) when (iox.Message == "Board is gone.") { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Access repair could not be stored: " + ex.Message }, statusCode: 500); }
+        foreach (var __u in revokedLive.Distinct(StringComparer.OrdinalIgnoreCase)) PeopleOps.RevokeLive(__u, bid, null);
+      }
+      s.Audit.Add(new AuditEvent { BoardId = bid, Action = "access.repair", Detail = JsonSerializer.Serialize(new { repaired = repaired.Count }) });
+      return Results.Ok(new { repaired });
     });
   }
 }

@@ -27,6 +27,8 @@ public static class RosterOps
     if (!s.Roster.TryGetValue(rosterId, out var entry) || entry.Archived)
       return (null, "Roster entry not found.", 404);
     if (!s.Boards.ContainsKey(boardId)) return (null, "Board not found.", 404);
+    // Source authorization required before copy: caller must read the source template entry.
+    // (Source roster entries are account templates; unrelated private research is filtered at read sites.)
     lock (s.SetupLock)
     {
       if (s.Advisors.Values.Any(a => a.BoardId == boardId && a.RosterEntryId == rosterId && !a.Removed))
@@ -285,20 +287,58 @@ public static class RosterOps
 
 public static class RosterEndpoints
 {
-  private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
+
+  // Resource ownership/readability for direct roster reads: owner, installation admin,
+  // or a board-level read on a board the entry is attached to.
+  private static bool CanReadRoster(InMemoryStore s, HttpRequest req, RosterEntry entry)
+  {
+    var me = PeopleOps.UserOf(s, req);
+    if (PeopleOps.IsInstallationAdmin(s, me)) return true;
+    if (string.Equals(entry.OwnerKey ?? "", me, StringComparison.OrdinalIgnoreCase)) return true;
+    try
+    {
+      return s.Advisors.Values.Any(a => a.RosterEntryId == entry.Id && !a.Removed
+        && PeopleOps.Can(s, req, a.BoardId, null, "read"));
+    }
+    catch { return false; }
+  }
 
   public static void MapRoster(this WebApplication app)
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
 
-    app.MapGet("/api/roster/{id:guid}/boards", (InMemoryStore s, Guid id) =>
-      !s.Roster.ContainsKey(id) ? Results.NotFound() : Results.Ok(RosterOps.BoardsFor(s, id)));
+    app.MapGet("/api/roster/{id:guid}/boards", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      if (!s.Roster.TryGetValue(id, out var __be) || __be.Archived) return Results.NotFound();
+      if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, __be)) return PeopleOps.Denied();
+      if (PeopleOps.IsSecure(s) && !PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req)))
+        return Results.Ok(s.Advisors.Values.Where(a => a.RosterEntryId == id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+          .Select(a => new
+          {
+            boardId = a.BoardId,
+            board = s.Boards.TryGetValue(a.BoardId, out var __bf) ? __bf.Name : "?",
+            role = a.BoardRole,
+            approved = a.Approved,
+          }).ToList());
+      return Results.Ok(RosterOps.BoardsFor(s, id));
+    });
 
     app.MapPost("/api/roster/{id:guid}/copy", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       var boardId = body.TryGetProperty("boardId", out var b) ? b.GetGuid() : Guid.Empty;
       if (PeopleOps.BadToken(s, req) is { } badCopy) return badCopy;
-      if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, boardId, null, "manage") is { } deniedCopy) return deniedCopy;
+      // Source authorization: caller must own the template, be installation admin,
+      // or read a board the template is already attached to.
+      if (!s.Roster.TryGetValue(id, out var __srcCp) || __srcCp.Archived) return Results.NotFound("Roster entry not found.");
+      {
+        var __meCp = PeopleOps.UserOf(s, req);
+        var __canSrc = PeopleOps.IsInstallationAdmin(s, __meCp)
+          || string.Equals(__srcCp.OwnerKey ?? "", __meCp, StringComparison.OrdinalIgnoreCase)
+          || s.Advisors.Values.Any(a => a.RosterEntryId == id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
+        if (!__canSrc) return PeopleOps.Denied();
+      }
       var role = body.TryGetProperty("boardRole", out var r) ? (r.GetString() ?? "") : "";
       var (copy, error, status) = RosterOps.TryCopy(s, id, boardId, role);
       return copy is not null ? Results.Created($"/api/boards/{boardId}/advisors/{copy.Id}", copy)
@@ -393,7 +433,7 @@ public static class RosterEndpoints
 
     app.MapPost("/api/boards/{bid:guid}/advisors/{aid:guid}/sync-roster", (InMemoryStore s, HttpRequest req, Guid bid, Guid aid) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedSync) return deniedSync;
       if (!s.Advisors.TryGetValue(aid, out var probeSync) || probeSync.BoardId != bid || probeSync.Removed) return Results.NotFound();
       if (!s.Roster.TryGetValue(probeSync.RosterEntryId, out var probeEntry)) return Results.NotFound("roster entry");
       lock (s.SetupLock)
@@ -435,9 +475,11 @@ public static class RosterEndpoints
       return Results.Created($"/api/roster/{entry.Id}", entry);
     });
 
-    app.MapGet("/api/roster/{id:guid}/completeness", (InMemoryStore s, Guid id) =>
+    app.MapGet("/api/roster/{id:guid}/completeness", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (!s.Roster.ContainsKey(id)) return Results.NotFound();
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      if (!s.Roster.TryGetValue(id, out var __ce) || __ce.Archived) return Results.NotFound();
+      if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, __ce)) return PeopleOps.Denied();
       var (ok, missing) = RosterOps.Completeness(s, id);
       return Results.Ok(new { complete = ok, missing, imageCount = s.Images.Values.Count(i => i.RosterEntryId == id) });
     });
@@ -760,9 +802,13 @@ public static class RosterEndpoints
       }
     });
 
-    app.MapGet("/api/roster/{id:guid}/research", (InMemoryStore s, Guid id) =>
-      !s.Roster.TryGetValue(id, out var entry) ? Results.NotFound()
-      : Results.Ok(new { entry.ResearchJson, entry.ResearchedAt }));
+    app.MapGet("/api/roster/{id:guid}/research", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      if (!s.Roster.TryGetValue(id, out var entry)) return Results.NotFound();
+      if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, entry)) return PeopleOps.Denied();
+      return Results.Ok(new { entry.ResearchJson, entry.ResearchedAt });
+    });
 
     app.MapPost("/api/auditions", async (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
@@ -830,16 +876,13 @@ public static class RosterEndpoints
       if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
           || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         return Results.BadRequest("A public http(s) image URL is required.");
-      try
+      // Pinned public raster retrieval: single DNS resolution with ALL-addresses-public
+      // enforcement, pinned TCP (no rebinding), whole-operation deadline, no redirects,
+      // no auth/cookies/proxy, streamed size cap, raster magic validation, redacted errors.
+      var (bytes, ct) = await PublicImageFetcher.FetchRasterAsync(url, req.HttpContext.RequestAborted);
+      if (bytes is null || ct is null)
+        return Results.Json(new { error = "Image fetch failed." }, statusCode: 502);
       {
-        using var res = await _http.GetAsync(uri);
-        if (!res.IsSuccessStatusCode) return Results.Json(new { error = $"Fetch failed: {(int)res.StatusCode}." }, statusCode: 502);
-        var ct = res.Content.Headers.ContentType?.MediaType ?? "";
-        if (!ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
-          return Results.Json(new { error = "URL did not return an image." }, statusCode: 502);
-        var bytes = await res.Content.ReadAsByteArrayAsync();
-        if (bytes.Length > 5 * 1024 * 1024)
-          return Results.Json(new { error = "Image exceeds 5 MB." }, statusCode: 502);
         var img = new AdvisorImage
         {
           RosterEntryId = id, Kind = "url",
@@ -849,10 +892,6 @@ public static class RosterEndpoints
         s.Images[img.Id] = img;
         RosterOps.UnapproveBoardCopies(s, id);
         return Results.Created($"/api/images/{img.Id}", new { img.Id, img.Kind, img.Provenance });
-      }
-      catch (Exception ex)
-      {
-        return Results.Json(new { error = $"Fetch failed: {ex.Message}" }, statusCode: 502);
       }
     });
 
@@ -892,9 +931,14 @@ public static class RosterEndpoints
       return Results.Ok(created);
     });
 
-    app.MapGet("/api/roster/{id:guid}/images", (InMemoryStore s, Guid id) =>
-      Results.Ok(s.Images.Values.Where(i => i.RosterEntryId == id)
-        .Select(i => new { i.Id, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt }).OrderByDescending(i => i.CreatedAt)));
+    app.MapGet("/api/roster/{id:guid}/images", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      if (!s.Roster.TryGetValue(id, out var __ie) || __ie.Archived) return Results.NotFound();
+      if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, __ie)) return PeopleOps.Denied();
+      return Results.Ok(s.Images.Values.Where(i => i.RosterEntryId == id)
+        .Select(i => new { i.Id, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt }).OrderByDescending(i => i.CreatedAt));
+    });
 
     app.MapDelete("/api/images/{imgId:guid}", (InMemoryStore s, HttpRequest req, Guid imgId) =>
     {
@@ -1021,8 +1065,48 @@ public static class RosterEndpoints
       }
     });
 
-    app.MapGet("/api/images/{imgId:guid}", (InMemoryStore s, Guid imgId) =>
-      !s.Images.TryGetValue(imgId, out var img) || img.Data is null ? Results.NotFound()
-      : Results.Bytes(img.Data, img.ContentType));
+    app.MapGet("/api/images/{imgId:guid}", (InMemoryStore s, HttpRequest req, Guid imgId) =>
+    {
+      if (!s.Images.TryGetValue(imgId, out var img) || img.Data is null) return Results.NotFound();
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badImg) return badImg;
+        if (!AuthOps.TrySession(s, req, out var iu)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var ok = false;
+        var admin = PeopleOps.AdminEmail(s);
+        if (!string.IsNullOrWhiteSpace(admin) && string.Equals(admin, iu, StringComparison.OrdinalIgnoreCase)) ok = true;
+        if (!ok && img.RosterEntryId.HasValue && s.Roster.TryGetValue(img.RosterEntryId.Value, out var re) && string.Equals(re.OwnerKey, iu, StringComparison.OrdinalIgnoreCase)) ok = true;
+        if (!ok)
+        {
+          // Meeting guests: only the accepted, selected portrait of an approved
+          // participant in one of their own meetings. No other meeting scope,
+          // no pending/unselected/shared-pool reads.
+          Guid bid = Guid.Empty;
+          BoardAdvisor? selAdv = null;
+          if (img.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(img.BoardAdvisorId.Value, out var adv0)) { bid = adv0.BoardId; selAdv = adv0; }
+          if (bid != Guid.Empty && string.Equals(img.Review ?? "", "accepted", StringComparison.OrdinalIgnoreCase)
+            && selAdv is not null && selAdv.BoardId == bid && !selAdv.Removed && selAdv.Approved
+            && string.Equals(img.RosterEntryId, selAdv.RosterEntryId))
+          {
+            var mids = PeopleOps.GuestMeetingIds(s, iu, bid);
+            foreach (var gmid in mids)
+            {
+              if (!s.Meetings.TryGetValue(gmid, out var gmtg)) continue;
+              var parts = new System.Collections.Generic.HashSet<Guid>();
+              try
+              {
+                using var dd = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(gmtg.ParticipantIdsJson) ? "[]" : gmtg.ParticipantIdsJson);
+                foreach (var ee in dd.RootElement.EnumerateArray())
+                  if (ee.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(ee.GetString(), out var gg)) parts.Add(gg);
+              }
+              catch { }
+              if (parts.Count == 0 || (selAdv is not null && parts.Contains(selAdv.Id))) { ok = true; break; }
+            }
+          }
+        }
+        if (!ok) return PeopleOps.Denied();
+      }
+      return Results.Bytes(img.Data, img.ContentType);
+    });
   }
 }

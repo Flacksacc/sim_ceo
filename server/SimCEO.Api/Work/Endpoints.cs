@@ -29,6 +29,22 @@ public static class SimCEOEndpoints
       commPrefs = lead.CommPrefs ?? "",
     });
 
+    private static string EffectiveDiscussionPolicy(InMemoryStore s, Guid boardId)
+    {
+      try
+      {
+        if (!s.Boards.TryGetValue(boardId, out var b) || b is null) return "balanced";
+        if (b.ActiveConfig && !string.IsNullOrWhiteSpace(b.ActiveJson))
+        {
+          using var aj = System.Text.Json.JsonDocument.Parse(b.ActiveJson);
+          if (aj.RootElement.TryGetProperty("discussionPolicy", out var dp) && dp.ValueKind == System.Text.Json.JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(dp.GetString())) return dp.GetString()!;
+        }
+        return string.IsNullOrWhiteSpace(b.DiscussionPolicy) ? "balanced" : b.DiscussionPolicy;
+      }
+      catch { return "balanced"; }
+    }
+
   public static void MapExtended(this WebApplication app)
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
@@ -38,27 +54,60 @@ public static class SimCEOEndpoints
       PresetLibrary.Find(key) is { } p ? Results.Ok(p) : Results.NotFound());
 
     // ---- Board lead profile ("Your Profile"): explicit versioned save ----
-    app.MapGet("/api/boards/{bid:guid}/lead", (InMemoryStore s, Guid bid) =>
+    app.MapGet("/api/boards/{bid:guid}/lead", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
-      // Lane B: board-owned else global fallback, consistent with ResolveLeadFor; never another board.
-      var cur = LeadSetup.ResolveLeadFor(s, bid);
-      return cur is null ? Results.NotFound() : Results.Ok(cur);
+      if (PeopleOps.BadToken(s, req) is { } badLG) return badLG;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = PeopleOps.UserOf(s, req);
+      if (!PeopleOps.Can(s, req, bid, null, "read") && PeopleOps.GuestMeetingIds(s, user, bid).Count == 0) return PeopleOps.Denied();
+      var owned = LeadSetup.ResolveLeadForStrict(s, bid);
+      var fb = owned is null ? LeadSetup.ResolveLead(s) : null;
+      var cur = owned ?? LeadSetup.ResolveLeadFor(s, bid);
+      if (cur is null) return Results.NotFound();
+      var fallback = LeadSetup.IsFallback(cur, bid);
+      var caller = PeopleOps.UserOf(s, req);
+      bool isInstAdmin = false;
+      try { isInstAdmin = PeopleOps.IsInstallationAdmin(s, caller); }
+      catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      if (!PeopleOps.Can(s, req, bid, null, "read"))
+      {
+        // Meeting guests: minimal board-owned identity only; never global fallback content.
+        if (fallback) return Results.NotFound();
+        return Results.Ok(new { cur.Id, cur.BoardId, cur.Version, cur.Name, cur.RoleLabel });
+      }
+      // Board readers+: full board-owned profile; global fallback is installation data.
+      if (fallback && !isInstAdmin)
+        return Results.Json(new { error = "No board lead profile saved; save the board lead profile to continue." }, statusCode: 404);
+      return Results.Ok(cur);
     });
     app.MapPost("/api/boards/{bid:guid}/lead", (InMemoryStore s, HttpRequest req, Guid bid, LeadProfile input) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badLead) return badLead;
-      if (!PeopleOps.Can(s, req, bid, null, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedLead) return deniedLead;
       var (saved, error, status) = LeadSetup.SaveLead(s, bid, input);
       return saved is not null ? Results.Ok(saved) : Results.Json(new { error }, statusCode: status);
     });
-    app.MapGet("/api/lead", (InMemoryStore s) =>
+    app.MapGet("/api/lead", (InMemoryStore s, HttpRequest req) =>
     {
+      try {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var le)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        if (!PeopleOps.IsInstallationAdmin(s, le)) return Results.Json(new { error = "Installation admin only." }, statusCode: 403);
+      }} catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       var cur = LeadSetup.ResolveLead(s);
       return cur is null ? Results.NotFound() : Results.Ok(cur);
     });
     app.MapPost("/api/lead", (InMemoryStore s, HttpRequest req, LeadProfile input) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badGlead) return badGlead;
+      try {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var le2)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        if (!PeopleOps.IsInstallationAdmin(s, le2)) return Results.Json(new { error = "Installation admin only." }, statusCode: 403);
+      }} catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       var (gsaved, gerror, gstatus) = LeadSetup.SaveLead(s, Guid.Empty, input);
       return gsaved is not null ? Results.Ok(gsaved) : Results.Json(new { error = gerror }, statusCode: gstatus);
     });
@@ -68,7 +117,7 @@ public static class SimCEOEndpoints
     {
       if (PeopleOps.BadToken(s, req) is { } badBoard) return badBoard;
       if (!s.Boards.TryGetValue(id, out var b)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, id, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, id, null, "manage") is { } deniedBoard) return deniedBoard;
       lock (s.SetupLock)
       {
         if (body.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) b.Name = n.GetString() ?? "";
@@ -88,10 +137,17 @@ public static class SimCEOEndpoints
     });
 
     // ---- Setup review + activation (exact reviewed draft only) ----
-    app.MapGet("/api/boards/{bid:guid}/setup", (InMemoryStore s, Guid bid) =>
+    app.MapGet("/api/boards/{bid:guid}/setup", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
+      if (PeopleOps.Check(s, req, bid, null, "read") is { } deniedSetup) return deniedSetup;
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
-      var lead = LeadSetup.ResolveLeadFor(s, bid);
+      // Board-owned lead only; global fallback content is installation data (admin-only).
+      var leadOwned = LeadSetup.ResolveLeadForStrict(s, bid);
+      object? lead = leadOwned;
+      if (lead is null)
+      {
+        try { if (PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) lead = LeadSetup.ResolveLead(s); } catch { lead = null; }
+      }
       var total = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed);
       var approved = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed && a.Approved);
       var canonical = LeadSetup.CanonicalDraftJson(s, b);
@@ -108,7 +164,7 @@ public static class SimCEOEndpoints
     app.MapPost("/api/boards/{bid:guid}/setup/activate", (InMemoryStore s, HttpRequest req, Guid bid, JsonElement body) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badAct) return badAct;
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedAct) return deniedAct;
       string? hash = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("hash", out var h)
         ? h.GetString() : null;
       var (board, error, status) = LeadSetup.Activate(s, bid, hash);
@@ -126,7 +182,16 @@ public static class SimCEOEndpoints
       try
       {
         var has = s.WizardDrafts.TryGetValue(id, out var d);
+        if (has)
+        {
+          if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedSv)) return deniedSv;
+        }
         d ??= new WizardDraft { Id = id, Version = 1 };
+        if (!has)
+        {
+          if (!WizardGuide.TryWizardUser(s, req, null, out var newOwner, out var deniedNew)) return deniedNew;
+          d.OwnerKey = newOwner;
+        }
         // Lane B: existing saves require an explicitly present integer expected version.
         if (has)
         {
@@ -156,9 +221,10 @@ public static class SimCEOEndpoints
       }
       finally { sem.Release(); }
     });
-    app.MapGet("/api/wizard/{id:guid}", (InMemoryStore s, Guid id) =>
+    app.MapGet("/api/wizard/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
+      if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedWg)) return deniedWg;
       var before = d.InterviewJson;
       WizardGuide.NormalizeInterview(d);
       if (!string.Equals(before, d.InterviewJson, StringComparison.Ordinal))
@@ -174,9 +240,11 @@ public static class SimCEOEndpoints
     {
       if (PeopleOps.BadToken(s, req) is { } badVoice) return badVoice;
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
+      if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedVoice) return deniedVoice;
+      var __vc = PeopleOps.UserOf(s, req);
       var t = new VoiceTurn
       {
-        BoardId = m.BoardId, MeetingId = id, State = "draft",
+        BoardId = m.BoardId, MeetingId = id, CreatorKey = __vc, State = "draft",
         Transcript = body.TryGetProperty("partial", out var p) ? (p.GetString() ?? "") : "",
         AudioRetained = body.TryGetProperty("retainAudio", out var r) && r.GetBoolean(),
       };
@@ -187,40 +255,69 @@ public static class SimCEOEndpoints
     app.MapPost("/api/voice/{id:guid}/finalize", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.VoiceTurns.TryGetValue(id, out var t)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, t.BoardId, t.MeetingId, "contribute")) return PeopleOps.Denied();
-      if (t.State != "draft") return Results.Conflict("Already finalized.");
-      t.Transcript = body.TryGetProperty("transcript", out var x) ? (x.GetString() ?? t.Transcript) : t.Transcript;
-      t.State = "sent";
-      if (s.Meetings.TryGetValue(t.MeetingId, out var fm)) fm.Generation++;
-      if (s.Boards.TryGetValue(t.BoardId, out var vb) && !vb.RetainAudio) t.AudioRetained = false;
+      if (PeopleOps.Check(s, req, t.BoardId, t.MeetingId, "discuss") is { } deniedFin) return deniedFin;
+      { var __fu = PeopleOps.UserOf(s, req); var __fmgr = PeopleOps.Can(s, req, t.BoardId, null, "manage"); if (!__fmgr && !string.Equals(t.CreatorKey ?? "", __fu, System.StringComparison.OrdinalIgnoreCase)) return PeopleOps.Denied(); }
       lock (s.MessageLock)
       {
-        var list = s.Messages.GetOrAdd(t.MeetingId, _ => new List<Message>());
-        var msg = new Message
-        {
-          MeetingId = t.MeetingId, BoardId = t.BoardId,
-          Sequence = (list.Count == 0 ? 0 : list.Max(m => m.Sequence)) + 1,
-          Sender = "lead", Content = t.Transcript, Status = "committed",
-        };
+        // Authoritative finalize inside the backend transaction gate: fresh fetch,
+        // session + permission + creator check, single state flip, single commit.
+        // Unsent drafts are creator-private (no manager bypass); exactly once.
+        Message? doneMsg = null;
+        IResult? gateErr = null;
         Atomic.Run(() =>
         {
+          if (!s.VoiceTurns.TryGetValue(id, out var vt) || vt is null) { gateErr = Results.NotFound(); return; }
+          if (PeopleOps.BadToken(s, req) is { }) { gateErr = Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401); return; }
+          string vu = "";
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var vs)) { gateErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+            vu = vs;
+          }
+          else vu = PeopleOps.UserOf(s, req);
+          if (PeopleOps.Check(s, req, vt.BoardId, vt.MeetingId, "discuss") is { } deniedV) { gateErr = deniedV; return; }
+          if (!string.Equals(vt.CreatorKey ?? "", vu, System.StringComparison.OrdinalIgnoreCase)) { gateErr = PeopleOps.Denied(); return; }
+          if (vt.State != "draft") { gateErr = Results.Conflict("Already finalized."); return; }
+          vt.Transcript = body.TryGetProperty("transcript", out var x) && x.ValueKind == System.Text.Json.JsonValueKind.String ? (x.GetString() ?? vt.Transcript) : vt.Transcript;
+          vt.State = "sent";
+          if (!s.Meetings.TryGetValue(vt.MeetingId, out var fm) || fm is null) { gateErr = Results.NotFound("meeting"); return; }
+          fm.Generation++;
+          if (s.Boards.TryGetValue(vt.BoardId, out var vb) && !vb.RetainAudio) vt.AudioRetained = false;
+          var list = s.Messages.GetOrAdd(vt.MeetingId, _ => new List<Message>());
+          var msg = new Message
+          {
+            MeetingId = vt.MeetingId, BoardId = vt.BoardId,
+            Sequence = (list.Count == 0 ? 0 : list.Max(m => m.Sequence)) + 1,
+            Sender = "lead", Content = vt.Transcript, Status = "committed",
+          };
           list.Add(msg);
-          if (s.Meetings.TryGetValue(t.MeetingId, out var mtg)) mtg.DeliveredRevision = msg.Sequence;
+          fm.DeliveredRevision = msg.Sequence;
           s.VoiceTurns.Flush();
           s.Meetings.Flush();
+          doneMsg = msg;
         });
-        return Results.Ok(msg);
+        if (gateErr is not null) return gateErr;
+        return Results.Ok(doneMsg);
       }
     });
 
     // ---- Sources: approval inbox; excluded/replaced never current ----
-    app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, Guid bid) =>
-      Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid).OrderByDescending(x => x.Version)));
+    app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } badSL) return badSL;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      if (PeopleOps.Can(s, req, bid, null, "read"))
+        return Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid).OrderByDescending(x => x.Version));
+      var user = PeopleOps.UserOf(s, req);
+      var allowed = PeopleOps.GuestMeetingIds(s, user, bid);
+      if (allowed.Count == 0) return PeopleOps.Denied();
+      return Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid && x.Approved && !x.Excluded && (x.Scope == "board" || (x.MeetingId.HasValue && allowed.Contains(x.MeetingId.Value)))).OrderByDescending(x => x.Version));
+    });
     app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badSrc) return badSrc;
       if (!s.Boards.ContainsKey(bid)) return Results.NotFound("Board not found.");
-      if (!PeopleOps.Can(s, req, bid, null, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedSrc) return deniedSrc;
       d.Id = Guid.NewGuid();
       d.BoardId = bid;
       d.Version = 1;
@@ -233,17 +330,35 @@ public static class SimCEOEndpoints
     {
       if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badEx) return badEx;
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedEx) return deniedEx;
       d.Excluded = true;
       s.Sources.Flush();
       return Results.Ok(d);
     });
 
     // ---- Jobs with idempotency + safe retry ----
-    app.MapGet("/api/activity/jobs", (InMemoryStore s) => Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100)));
+    app.MapGet("/api/activity/jobs", (InMemoryStore s, HttpRequest req) =>
+    {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badJ) return badJ;
+        if (!AuthOps.TrySession(s, req, out var ju)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admin = PeopleOps.AdminEmail(s);
+        var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, ju, StringComparison.OrdinalIgnoreCase);
+        if (!isAdmin) return PeopleOps.Denied();
+      }
+      return Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100));
+    });
     app.MapPost("/api/jobs", (InMemoryStore s, HttpRequest req, JobRow j) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badJob) return badJob;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var ju2)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admin2 = PeopleOps.AdminEmail(s);
+        var isAdmin2 = !string.IsNullOrWhiteSpace(admin2) && string.Equals(admin2, ju2, StringComparison.OrdinalIgnoreCase);
+        if (!isAdmin2) return PeopleOps.Denied();
+      }
       var existing = s.Jobs.Values.FirstOrDefault(x => x.IdempotencyKey == j.IdempotencyKey && j.IdempotencyKey != "");
       if (existing is not null) return Results.Ok(existing); // no duplicates
       j.Id = Guid.NewGuid();
@@ -253,8 +368,26 @@ public static class SimCEOEndpoints
     });
 
     // ---- Usage + audit + model-call ledger ----
-    app.MapGet("/api/usage", (InMemoryStore s, Guid? boardId, Guid? meetingId, string? day, string? from, string? to) =>
+    app.MapGet("/api/usage", (InMemoryStore s, HttpRequest req, Guid? boardId, Guid? meetingId, string? day, string? from, string? to) =>
     {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badU) return badU;
+        if (!AuthOps.TrySession(s, req, out var uu)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var adminU = PeopleOps.AdminEmail(s);
+        var isAdminU = !string.IsNullOrWhiteSpace(adminU) && string.Equals(adminU, uu, StringComparison.OrdinalIgnoreCase);
+        if (boardId.HasValue)
+        {
+          if (!s.Meetings.TryGetValue(meetingId ?? Guid.Empty, out _) && meetingId.HasValue) { }
+          var bid = boardId.Value;
+          var mid = meetingId;
+          if (!PeopleOps.Can(s, req, bid, mid, "read")) return PeopleOps.Denied();
+        }
+        else
+        {
+          if (!isAdminU) return PeopleOps.Denied();
+        }
+      }
       var q = s.Usage.AsEnumerable();
       if (boardId.HasValue) q = q.Where(u => u.BoardId == boardId);
       if (meetingId.HasValue) q = q.Where(u => u.MeetingId == meetingId);
@@ -266,8 +399,30 @@ public static class SimCEOEndpoints
         q = q.Where(u => DateOnly.FromDateTime(u.At) <= t);
       return Results.Ok(q.OrderByDescending(u => u.At).Take(500));
     });
-    app.MapGet("/api/activity/audit", (InMemoryStore s) => Results.Ok(s.Audit.OrderByDescending(a => a.CreatedAt).Take(200)));
-    app.MapGet("/api/models/calls", (InMemoryStore s) => Results.Ok(s.ModelCalls.Take(200)));
+    app.MapGet("/api/activity/audit", (InMemoryStore s, HttpRequest req) =>
+    {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badAu) return badAu;
+        if (!AuthOps.TrySession(s, req, out var au)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var adminA = PeopleOps.AdminEmail(s);
+        var isAdminA = !string.IsNullOrWhiteSpace(adminA) && string.Equals(adminA, au, StringComparison.OrdinalIgnoreCase);
+        if (!isAdminA) return PeopleOps.Denied();
+      }
+      return Results.Ok(s.Audit.OrderByDescending(a => a.CreatedAt).Take(200));
+    });
+    app.MapGet("/api/models/calls", (InMemoryStore s, HttpRequest req) =>
+    {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badMc) return badMc;
+        if (!AuthOps.TrySession(s, req, out var mu)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var adminM = PeopleOps.AdminEmail(s);
+        var isAdminM = !string.IsNullOrWhiteSpace(adminM) && string.Equals(adminM, mu, StringComparison.OrdinalIgnoreCase);
+        if (!isAdminM) return PeopleOps.Denied();
+      }
+      return Results.Ok(s.ModelCalls.Take(200));
+    });
 
     // ---- Meeting controls ----
     foreach (var (path, state) in new[] { ("pause", MeetingState.Paused), ("resume", MeetingState.Active), ("end", MeetingState.WrappingUp) })
@@ -275,10 +430,11 @@ public static class SimCEOEndpoints
       {
         if (PeopleOps.BadToken(s, req) is { } badCtl) return badCtl;
         if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound();
-        if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
+        if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedCtl) return deniedCtl;
         lock (s.MessageLock)
         {
           if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound();
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedCtl2) return deniedCtl2;
           cur.State = state;
           cur.Generation++;
           s.Meetings.Flush();
@@ -291,7 +447,7 @@ public static class SimCEOEndpoints
     app.MapPost("/api/meetings/{id:guid}/run", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedRun) return deniedRun;
       if (PeopleOps.Guard(gw, req) is { } cappedRun) return cappedRun;
       lock (s.MessageLock)
       {
@@ -300,7 +456,9 @@ public static class SimCEOEndpoints
       }
       try
       {
-      var policy = body.TryGetProperty("policy", out var p) ? (p.GetString() ?? "balanced") : "balanced";
+      var policy = EffectiveDiscussionPolicy(s, m.BoardId);
+      try { if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute") && s.Boards.TryGetValue(m.BoardId, out var polB)) { policy = polB.DiscussionPolicy; try { if (polB.ActiveConfig && !string.IsNullOrWhiteSpace(polB.ActiveJson)) { using var __aj = System.Text.Json.JsonDocument.Parse(polB.ActiveJson); if (__aj.RootElement.TryGetProperty("discussionPolicy", out var __dp) && __dp.ValueKind == System.Text.Json.JsonValueKind.String && !string.IsNullOrWhiteSpace(__dp.GetString())) policy = __dp.GetString()!; } } catch { } } } catch { }
+      if (policy is not ("focused" or "balanced" or "open")) policy = "balanced";
       var prompt = body.TryGetProperty("prompt", out var q) ? (q.GetString() ?? "") : "";
       s.Boards.TryGetValue(m.BoardId, out var runBoard);
     var lead = LeadSetup.ResolveLeadFor(s, m.BoardId);
@@ -543,16 +701,24 @@ public static class SimCEOEndpoints
         {
           lock (s.MessageLock)
           {
+            // Authoritative commit inside the actual backend transaction gate: fetch, authorize,
+            // validate and mutate here so a concurrent failed transaction cannot detach our objects.
+            IResult? laneBGate = null;
+            Atomic.Run(() =>
+            {
             List<string> LaneBRemaining() => rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
-              return LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining());
+              { laneBGate = LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
             if (cur.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
-              return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining());
+              { laneBGate = LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
+            { var __tok = ""; try { var __ah = req.Headers["Authorization"].ToString(); if (__ah.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok = __ah["Bearer ".Length..].Trim(); } catch { } string __em = ""; bool __sessOk = false; try { if (!string.IsNullOrEmpty(__tok) && s.Sessions.TryGetValue(__tok, out var __ss) && __ss.ExpiresAt > System.DateTime.UtcNow) { __sessOk = true; __em = __ss.Email; } } catch { } if (PeopleOps.IsSecure(s) && !__sessOk) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have = PeopleOps.AccessFor(s, cur.BoardId, id, __em); bool __ok = PeopleOps.IsSecure(s) ? (__have is "manage" or "contribute" or "discuss") : (__have == "open" || __have is "manage" or "contribute" or "discuss"); if (!__ok) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } } }
             var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
             var curLeadVersion = curLead?.Version ?? 0;
             if (curLeadVersion != leadVersion
                 || !string.Equals(LeadIdentityFingerprint(curLead), leadFingerprint, StringComparison.Ordinal))
-              return LaneBFail("lead profile changed; refresh and retry with the current version", rounds.Count, LaneBRemaining());
+              { laneBGate = LaneBFail("lead profile changed; refresh and retry with the current version", rounds.Count, LaneBRemaining()); return; }
+            var policyNow = EffectiveDiscussionPolicy(s, cur.BoardId);
+            if (!string.Equals(policyNow, policy, StringComparison.Ordinal)) { laneBGate = LaneBFail("discussion policy changed; refresh and retry with the current version", rounds.Count, LaneBRemaining()); return; }
             // Lane B: re-derive the durable minimum at commit; it can only stay equal or shrink.
             var commitCap = effectiveCap;
             foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
@@ -618,13 +784,15 @@ public static class SimCEOEndpoints
               s.Notes[outcome.Id] = outcome;
               s.Notes.Flush();
             });
-            completedGroups++;
+            if (laneBGate is null) completedGroups++;
+            }); // end Atomic gate: authoritative fetch/authorize/validate/mutate in one backend transaction
+            if (laneBGate is not null) return laneBGate;
           }
         }
       }
       s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
-      await hub.Clients.Group($"meeting:{id}").SendAsync("run-complete",
-        new { meetingId = id, published = published.Count, revision = m.DeliveredRevision });
+      await hub.Clients.Group($"meeting:{id:N}".ToLowerInvariant()).SendAsync("run-complete",
+        new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) });
       outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
       outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
       s.Notes[outcome.Id] = outcome;
@@ -643,7 +811,7 @@ public static class SimCEOEndpoints
     app.MapPost("/api/meetings/{id:guid}/secretary", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedSec) return deniedSec;
       var setupFixes = new List<string>();
       if (LeadSetup.ResolveLeadFor(s, m.BoardId) is null) setupFixes.Add("Save the board-lead profile.");
       if (!s.Advisors.Values.Any(a => a.BoardId == m.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");

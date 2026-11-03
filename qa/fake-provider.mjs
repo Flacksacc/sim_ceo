@@ -147,7 +147,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/asr/transcribe") {
     counts.transcribe++;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ text: "qa transcript" }));
+    res.end(JSON.stringify({ text: "qa transcript", transcript: "qa transcript" }));
     return;
   }
   if (req.method === "POST" && url.pathname === "/images/generations") {

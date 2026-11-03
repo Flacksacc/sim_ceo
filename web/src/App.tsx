@@ -292,28 +292,117 @@ async function j<T>(r: Response): Promise<T> {
   return r.json() as Promise<T>;
 }
 let actAs = "";
+function epochNow(): number {
+  try { return (window as unknown as { __simceoEpoch?: number }).__simceoEpoch ?? 0; } catch { return 0; }
+}
+function currentToken(): string {
+  try { return localStorage.getItem("simceo-token") ?? ""; } catch { return ""; }
+}
+function currentUser(): string {
+  try { return localStorage.getItem("simceo-user") ?? ""; } catch { return ""; }
+}
+function scopedKey(base: string): string {
+  try { const u = localStorage.getItem("simceo-user") ?? "anon"; return base + ":" + (u || "anon"); } catch { return base; }
+}
 const withUser = (): Record<string, string> => {
-  const h: Record<string, string> = actAs ? { "X-User": actAs } : {};
-  const t = localStorage.getItem("simceo-token");
-  if (t) h["Authorization"] = `Bearer ${t}`;
+  const h: Record<string, string> = {};
+  if (currentToken()) h["Authorization"] = `Bearer ${currentToken()}`;
+  else if (actAs) h["X-User"] = actAs;
   return h;
 };
+function setAuthSession(email: string, token: string): void {
+  try {
+    if (token) localStorage.setItem("simceo-token", token);
+    else localStorage.removeItem("simceo-token");
+    if (email) localStorage.setItem("simceo-user", email);
+    else localStorage.removeItem("simceo-user");
+  } catch {}
+  try { window.dispatchEvent(new Event("simceo-auth-change")); } catch {}
+}
+function isPublicUrl(u: string): boolean {
+  // Credential-free routes: stale bearers must never block re-authentication or public lookup.
+  // /api/auth/me stays credential-carrying: it reports the CURRENT session and tolerates stale bearers server-side.
+  return u.startsWith("/api/auth/login") || u.startsWith("/api/auth/register") || u.startsWith("/api/auth/status") || u.includes("/invites/") && u.endsWith("/public");
+}
+async function fetchAuth<T>(u: string, init: RequestInit, wantJson = true): Promise<T> {
+  const myEpoch = epochNow();
+  const myToken = currentToken();
+  const myUser = currentUser();
+  const r = await fetch(u, init);
+  // Consume full body first, then recheck epoch/identity BEFORE callbacks/storage/download side effects.
+  let text = "";
+  try { text = await r.text(); } catch { text = ""; }
+  if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) throw Object.assign(new Error("stale response discarded (identity changed)"), { stale: true });
+  if (r.status === 401) {
+    const latest = currentToken();
+    if (latest && latest !== myToken) { const e = Object.assign(new Error("stale 401 discarded (signed in as another identity)"), { stale: true }); throw e; }
+    if (latest === myToken) {
+      // Current-session failure: let the app expire this identity (stop hub, purge
+      // private state, gate rendering, navigate safe). Never auto-clear the token here.
+      try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
+    }
+  }
+  if (!r.ok) throw new Error(`${r.status} ${text}`);
+  if (!wantJson) return undefined as unknown as T;
+  if (!text) throw Object.assign(new Error("empty response discarded"), { stale: false });
+  try { return JSON.parse(text) as T; } catch { throw new Error("malformed response discarded"); }
+}
+async function fetchPublic<T>(u: string, init: RequestInit): Promise<T> {
+  const myEpoch = epochNow();
+  const myToken = currentToken();
+  const myUser = currentUser();
+  const r = await fetch(u, init);
+  let text = "";
+  try { text = await r.text(); } catch { text = ""; }
+  if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) throw Object.assign(new Error("stale response discarded (identity changed)"), { stale: true });
+  if (!r.ok) throw new Error(`${r.status} ${text}`);
+  if (!text) throw new Error("empty response discarded");
+  try { return JSON.parse(text) as T; } catch { throw new Error("malformed response discarded"); }
+}
+const stripAuth = (h: Record<string, string>): Record<string, string> => {
+  const c = { ...h };
+  delete c["Authorization"]; delete c["X-User"];
+  return c;
+};
 const get = <T,>(u: string): Promise<T> =>
-  fetch(u, { headers: withUser() }).then(j<T>);
+  fetchAuth<T>(u, { headers: isPublicUrl(u) ? stripAuth(withUser()) : withUser() });
 const post = <T,>(u: string, b: unknown): Promise<T> =>
-  fetch(u, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...withUser() },
-    body: JSON.stringify(b ?? {}),
-  }).then(j<T>);
+  fetchAuth<T>(u, { method: "POST", headers: { "Content-Type": "application/json", ...withUser() }, body: JSON.stringify(b ?? {}) });
 const patch = <T,>(u: string, b: unknown): Promise<T> =>
-  fetch(u, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", ...withUser() },
-    body: JSON.stringify(b ?? {}),
-  }).then(j<T>);
+  fetchAuth<T>(u, { method: "PATCH", headers: { "Content-Type": "application/json", ...withUser() }, body: JSON.stringify(b ?? {}) });
+const postPublic = <T,>(u: string, b: unknown): Promise<T> =>
+  fetchPublic<T>(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b ?? {}) });
+const getPublic = <T,>(u: string): Promise<T> =>
+  fetchPublic<T>(u, {});
 const upload = <T,>(u: string, f: FormData): Promise<T> =>
-  fetch(u, { method: "POST", headers: withUser(), body: f }).then(j<T>);
+  fetchAuth<T>(u, { method: "POST", headers: withUser(), body: f });
+const put = <T,>(u: string, b: unknown): Promise<T> =>
+  fetchAuth<T>(u, { method: "PUT", headers: { "Content-Type": "application/json", ...withUser() }, body: JSON.stringify(b ?? {}) });
+const del = <T,>(u: string): Promise<T> =>
+  fetchAuth<T>(u, { method: "DELETE", headers: withUser() });
+const authedBlobUrl = async (u: string): Promise<string> => {
+  const myEpoch = epochNow();
+  const myToken = currentToken();
+  const myUser = currentUser();
+  const ctrl = new AbortController();
+  try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl; } catch {}
+  const r = await fetch(u, { headers: withUser(), signal: ctrl.signal });
+  const buf = await r.arrayBuffer();
+  if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) throw Object.assign(new Error("stale blob discarded"), { stale: true });
+  if (!r.ok) { let tx = ""; try { tx = new TextDecoder().decode(buf); } catch {} throw new Error(`${r.status} ${tx}`); }
+  const b = new Blob([buf]);
+  const url = URL.createObjectURL(b);
+  // Track for late revocation even if unmounted.
+  try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = [...(((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs) ?? []), url]; setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 60000); } catch {}
+  return url;
+};
+const authedDownload = async (u: string, filename: string): Promise<void> => {
+  const url = await authedBlobUrl(u);
+  try {
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  } finally { setTimeout(() => URL.revokeObjectURL(url), 10000); }
+};
 type Tab =
   | "boards"
   | "wizard"
@@ -711,6 +800,158 @@ function DossierView({ raw }: { raw: string }) {
     </div>
   );
 }
+function AuthPanel() {
+  const qcPanel = useQueryClient();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [msg, setMsg] = useState("");
+  const status = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
+  const meQ = useQuery({ queryKey: ["me"], queryFn: () => get<{ user: string; authenticated: boolean }>("/api/auth/me") });
+  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<{ id: string; boardId: string; meetingId: string; userKey: string }[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  const doRegister = async () => {
+    setMsg("");
+    try {
+      const r = await postPublic<{ email: string; token: string }>("/api/auth/register", { email, password });
+      setAuthSession(r.email, r.token);
+      setMsg("Registered and signed in as " + r.email);
+    } catch (e) { setMsg(String(e)); }
+  };
+  const doLogin = async () => {
+    setMsg("");
+    try {
+      const r = await postPublic<{ email: string; token: string }>("/api/auth/login", { email, password });
+      setAuthSession(r.email, r.token);
+      setMsg("Signed in as " + r.email);
+    } catch (e) { setMsg(String(e)); }
+  };
+  const doLogout = async () => {
+    const myEpoch = epochNow(); const myToken = currentToken(); const myUser = currentUser();
+    try { await post<unknown>("/api/auth/logout", {}); } catch (e) { if ((e as Error & { stale?: boolean })?.stale) return; }
+    if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) return;
+    try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort?.abort(); } catch {}
+    try { for (const u of ((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs ?? [])) { try { URL.revokeObjectURL(u); } catch {} } } catch {}
+    try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
+    setAuthSession("", "");
+    try { window.location.hash = "#/boards"; } catch {}
+    setMsg("Signed out.");
+  };
+  const leave = async (mid: string) => {
+    try {
+      await post<unknown>(`/api/meetings/${mid}/leave`, {});
+      try { qcPanel.invalidateQueries({ queryKey: ["messages", mid] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["delivery", mid] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["my-memberships"] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
+      try { qcPanel.removeQueries({ queryKey: ["messages", mid] }); } catch {}
+      try { window.dispatchEvent(new CustomEvent("simceo-meeting-left", { detail: { mid } })); } catch {}
+      try { const h = window.location.hash; if (h.includes(mid)) window.location.hash = "#/boards"; } catch {}
+      setMsg("Left meeting.");
+    } catch (e) { setMsg(String(e)); }
+  };
+  return (
+    <div className="card">
+      <h3>Accounts</h3>
+      <p role="status">
+        {status.data ? (status.data.authRequired ? `Secure mode · admin ${status.data.admin || "(migrating)"} · ${status.data.accountCount} account(s)` : "Local demo (no accounts yet)") : "…"}
+        {meQ.data ? ` · ${meQ.data.user}${meQ.data.authenticated ? " · signed in" : " · demo identity"}` : ""}
+      </p>
+      <div className="row">
+        <label>Email <input aria-label="Account email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></label>
+        <label>Password (12+ chars) <input aria-label="Account password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      </div>
+      <div className="row">
+        <button type="button" onClick={doRegister}>Register</button>
+        <button type="button" onClick={doLogin}>Sign in</button>
+        <button type="button" onClick={doLogout}>Sign out</button>
+      </div>
+      {msg && <p role="status">{msg}</p>}
+      {(mine.data ?? []).length > 0 && (
+        <div>
+          <h4>My meetings</h4>
+          {(mine.data ?? []).map((m) => (
+            <div key={m.id} className="row"><span>{m.meetingId}</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button></div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+function AuthedImg({ id, alt, className }: { id: string; alt: string; className?: string }) {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    let live = true;
+    let obj = "";
+    authedBlobUrl(`/api/images/${id}`).then((u) => { if (live) { obj = u; setUrl(u); } }).catch(() => { if (live) setUrl(""); });
+    return () => { live = false; if (obj) URL.revokeObjectURL(obj); };
+  }, [id]);
+  if (!url) return <span className="muted">loading portrait…</span>;
+  return <img src={url} alt={alt} className={className} />;
+}
+function InviteClaim() {
+  const qcInvite = useQueryClient();
+  const [inviteId, setInviteId] = useState(() => {
+    try {
+      const h = window.location.hash;
+      const hm = h.match(/invite=([0-9a-f-]{36})/i);
+      if (hm) { try { sessionStorage.setItem("simceo-pending-invite", hm[1]); } catch {} return hm[1]; }
+      const sq = new URLSearchParams(window.location.search);
+      const sqv = sq.get("invite") ?? "";
+      if (sqv) { try { sessionStorage.setItem("simceo-pending-invite", sqv); } catch {} return sqv; }
+      try { return sessionStorage.getItem("simceo-pending-invite") ?? ""; } catch { return ""; }
+    } catch { return ""; }
+  });
+  const [msg, setMsg] = useState("");
+  const [opened, setOpened] = useState<{ board: string; meeting: string | null } | null>(null);
+  useEffect(() => { try { if (inviteId) sessionStorage.setItem("simceo-pending-invite", inviteId); } catch {} }, [inviteId]);
+  useEffect(() => {
+    try {
+      const onHash = () => { try { const h = window.location.hash; const m = h.match(/invite=([0-9a-f-]{36})/i); if (m && m[1] !== inviteId) { setInviteId(m[1]); try { sessionStorage.setItem("simceo-pending-invite", m[1]); } catch {} } } catch {} };
+      window.addEventListener("hashchange", onHash);
+      return () => window.removeEventListener("hashchange", onHash);
+    } catch { return; }
+  }, [inviteId]);
+  const pub = useQuery({
+    queryKey: ["invite-public", inviteId],
+    queryFn: () => getPublic<{ id: string; boardId: string; meetingId: string | null; state: string; boardName: string; meetingTitle: string }>(`/api/invites/${inviteId}/public`),
+    enabled: !!inviteId,
+    retry: false,
+  });
+  const accept = async () => {
+    setMsg("");
+    setOpened(null);
+    try {
+      // Lookup must complete before accept so binding uses the current board/meeting.
+      let info = pub.data;
+      if (!info) {
+        try { const rr = await pub.refetch(); info = rr.data ?? undefined; } catch {}
+      }
+      if (!info) { setMsg("Invite lookup failed; check the ID and try again."); return; }
+      const r = await post<{ meetingId: string | null }>(`/api/invites/${inviteId}/accept`, {});
+      const bid = info.boardId ?? "";
+      if (r.meetingId) {
+        try { await post<unknown>(`/api/meetings/${r.meetingId}/join`, {}); }
+        catch (je) { setMsg("Invite accepted but join failed: " + String(je)); return; }
+      }
+      try { qcInvite.invalidateQueries({ queryKey: ["boards"] }); } catch {}
+      try { qcInvite.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
+      try { qcInvite.invalidateQueries({ queryKey: ["my-memberships"] }); } catch {}
+      try { qcInvite.invalidateQueries({ queryKey: ["invite-public"] }); } catch {}
+      try { sessionStorage.removeItem("simceo-pending-invite"); } catch {}
+      setOpened({ board: bid, meeting: r.meetingId });
+      setMsg("Invite accepted" + (r.meetingId ? " for meeting " + r.meetingId : "") + ".");
+    } catch (e) { setMsg(String(e)); }
+  };
+  return (
+    <div className="card">
+      <h3>Guest invite</h3>
+      <label>Invite ID <input aria-label="Invite ID" value={inviteId} onChange={(e) => { const v = e.target.value.trim(); setInviteId(v); try { if (v) sessionStorage.setItem("simceo-pending-invite", v); else sessionStorage.removeItem("simceo-pending-invite"); } catch {} }} placeholder="paste invite id" /></label>
+      <div className="row"><button type="button" onClick={accept} disabled={!inviteId || pub.isPending || pub.isFetching}>Accept invite</button></div>
+      {pub.data && <p role="status">Board: {pub.data.boardName} Meeting: {pub.data.meetingTitle} {pub.data.state}</p>}
+      {msg && <p role="status">{msg}</p>}
+      {opened && opened.meeting && <div className="row"><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: opened.board, meeting: opened.meeting ?? "", mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open meeting</button></div>}
+    </div>
+  );
+}
 export default function App() {
   const qc = useQueryClient();
   const initialRoute = useRef<NavRoute | null>(null);
@@ -778,8 +1019,8 @@ export default function App() {
       setHits([]);
     }
   }, [boardId]);
-  const [draft, setDraftState] = useState("");
-  const draftKey = `simceo-draft:${boardId}:${meetingId}`;
+  const draftKey = `simceo-draft:${boardId}:${meetingId}:${(() => { try { return localStorage.getItem("simceo-user") ?? "anon"; } catch { return "anon"; } })()}`;
+  const [draft, setDraftState] = useState(() => { try { return localStorage.getItem(draftKey) ?? ""; } catch { return ""; } });
   const setDraft = (v: string | ((prev: string) => string)) =>
     setDraftState((prev) =>
       typeof v === "function" ? (v as (prev: string) => string)(prev) : v,
@@ -840,6 +1081,59 @@ export default function App() {
   // Selected-board authority is the singular detail lookup, never the
   // bounded (newest-100) board list. A 404 clears the route; absence from
   // the list window means nothing. Non-404 errors gate without clearing.
+  const sessQ = useQuery({ queryKey: ["sess"], queryFn: () => get<{ user: string; authenticated: boolean }>(`/api/auth/me`), retry: false, refetchInterval: 30000 });
+  const [sessExpiredFlag, setSessExpiredFlag] = useState(false);
+  useEffect(() => { try { if (sessQ.data && sessQ.data.authenticated) setSessExpiredFlag(false); } catch {} }, [sessQ.data]);
+  const sessExpired = sessExpiredFlag || (() => { try { return !!currentToken() && !!sessQ.data && !sessQ.data.authenticated; } catch { return false; } })();
+  // Central private-state purge: stop hub/media, drop ALL private caches and
+  // selections, navigate to a safe view. Used by expiry, revocation, and leave.
+  const purgePrivate = (why: string) => {
+    try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
+    try {
+      qc.removeQueries({ queryKey: ["messages"] });
+      qc.removeQueries({ queryKey: ["delivery"] });
+      qc.removeQueries({ queryKey: ["meeting-detail"] });
+      qc.removeQueries({ queryKey: ["board-detail"] });
+      qc.removeQueries({ queryKey: ["meetings"] });
+      qc.removeQueries({ queryKey: ["records"] });
+      qc.removeQueries({ queryKey: ["record"] });
+      qc.removeQueries({ queryKey: ["setup"] });
+      qc.removeQueries({ queryKey: ["guest-settings"] });
+      qc.removeQueries({ queryKey: ["lead"] });
+      qc.invalidateQueries({ queryKey: ["my-memberships"] });
+      qc.invalidateQueries({ queryKey: ["sess"] });
+    } catch {}
+    try { resetMeetingOwnedState(); } catch {}
+    try { resetBoardOwnedState(); } catch {}
+    try { setMeetingId(""); } catch {}
+    try { window.location.hash = "#/boards"; } catch {}
+    try { setLive(false); } catch {}
+  };
+  useEffect(() => {
+    const onAuthFailed = (e: Event) => {
+      try {
+        const d = (e as CustomEvent<{ epoch: number; token: string; user: string }>).detail;
+        if (!d) return;
+        if (epochNow() !== d.epoch || currentToken() !== d.token) return; // stale failure; ignore
+        setSessExpiredFlag(true);
+        purgePrivate("expired");
+      } catch {}
+    };
+    const onMeetingLeft = (e: Event) => {
+      try {
+        purgePrivate("left");
+      } catch {}
+    };
+    try {
+      window.addEventListener("simceo-auth-failed", onAuthFailed);
+      window.addEventListener("simceo-meeting-left", onMeetingLeft);
+    } catch {}
+    return () => {
+      try { window.removeEventListener("simceo-auth-failed", onAuthFailed); } catch {}
+      try { window.removeEventListener("simceo-meeting-left", onMeetingLeft); } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qc]);
   const boardDetail = useQuery({
     queryKey: ["board-detail", boardId],
     queryFn: () => get<Board>(`/api/boards/${boardId}`),
@@ -855,6 +1149,7 @@ export default function App() {
     boardId === "" ||
     (boardDetail.isSuccess && (boardDetail.data as Board | undefined)?.id === boardId);
   const boardOk = boardValid;
+  const guestView = !!boardId && !!((boardDetail.data as unknown as { guest?: boolean } | undefined)?.guest);
   const presets = useQuery({
     queryKey: ["presets"],
     queryFn: () => get<Preset[]>("/api/presets"),
@@ -876,7 +1171,7 @@ export default function App() {
   const allMeetings = useQuery({
     queryKey: ["meetings", boardId, "all"],
     queryFn: () => get<MeetingFull[]>(`/api/boards/${boardId}/meetings`),
-    enabled: !!boardId && boardOk,
+    enabled: !!boardId && boardOk && !sessExpired,
   });
   // Selected-meeting authority is the scoped singular lookup, which also
   // verifies the parent board. Absence from capped lists never clears.
@@ -884,7 +1179,7 @@ export default function App() {
     queryKey: ["meeting-detail", boardId, meetingId],
     queryFn: () =>
       get<MeetingFull>(`/api/boards/${boardId}/meetings/${meetingId}`),
-    enabled: !!boardId && !!meetingId && boardValid,
+    enabled: !!boardId && !!meetingId && boardValid && !sessExpired,
     retry: false,
   });
   // Bounded meeting windows (newest 200, filtered views) never establish
@@ -912,19 +1207,43 @@ export default function App() {
   const messages = useQuery({
     queryKey: ["messages", meetingId],
     queryFn: () => get<Msg[]>(`/api/meetings/${meetingId}/messages?take=60`),
-    enabled: !!meetingId && meetingOk,
+    enabled: !!meetingId && meetingOk && !sessExpired,
     refetchInterval: 4000,
   });
   const hubRef = useRef<HubConnection | null>(null);
   const [live, setLive] = useState(false);
   useEffect(() => {
+    const onStop = () => { try { hubRef.current?.stop(); } catch {} try { setLive(false); } catch {} };
+    const onLeft = (e: Event) => { try { const mid = (e as CustomEvent<{ mid: string }>).detail?.mid; if (mid) { try { qc.removeQueries({ queryKey: ["messages", mid] }); } catch {} try { qc.invalidateQueries({ queryKey: ["my-memberships"] }); } catch {} } } catch {} onStop(); };
+    try { window.addEventListener("simceo-hub-stop", onStop); window.addEventListener("simceo-meeting-left", onLeft); } catch {}
+    return () => { try { window.removeEventListener("simceo-hub-stop", onStop); window.removeEventListener("simceo-meeting-left", onLeft); } catch {} };
+  }, [qc]);
+  useEffect(() => {
     if (!meetingId || !meetingOk) return;
     let cancelled = false;
     const conn = new HubConnectionBuilder()
-      .withUrl("/hubs/board")
+      .withUrl("/hubs/board", { accessTokenFactory: () => currentToken() })
       .withAutomaticReconnect()
       .build();
     hubRef.current = conn;
+    const onRevoked = (payload?: { boardId?: string; meetingId?: string }) => {
+      try {
+        const mid = (payload as { meetingId?: string } | undefined)?.meetingId ?? meetingId;
+        const bid = (payload as { boardId?: string } | undefined)?.boardId ?? boardId;
+        const affectsCurrent = (mid && mid === meetingId) || (bid && bid === boardId && !mid);
+        if (affectsCurrent) {
+          try { conn.stop(); } catch {}
+          purgePrivate("revoked");
+        } else {
+          try { qc.invalidateQueries({ queryKey: ["messages", meetingId] }); } catch {}
+          try { qc.invalidateQueries({ queryKey: ["delivery", meetingId] }); } catch {}
+          try { qc.invalidateQueries({ queryKey: ["my-memberships"] }); } catch {}
+          try { setLive(false); } catch {}
+        }
+      } catch {
+        try { setLive(false); } catch {}
+      }
+    };
     const onMsg = () => {
       qc.invalidateQueries({ queryKey: ["messages", meetingId] });
     };
@@ -934,21 +1253,31 @@ export default function App() {
     };
     conn.on("message", onMsg);
     conn.on("run-complete", onRun);
+    conn.on("access-revoked", onRevoked);
     conn
       .start()
-      .then(() => {
-        if (cancelled) {
-          conn.stop();
-          return;
-        }
-        setLive(true);
-        conn.invoke("JoinMeeting", meetingId).catch(() => {});
+      .then(async () => {
+        if (cancelled) { try { await conn.stop(); } catch {} return; }
+        try {
+          await conn.invoke("JoinMeeting", meetingId);
+          if (!cancelled) setLive(true);
+        } catch { if (!cancelled) setLive(false); }
       })
       .catch(() => {
         if (!cancelled) setLive(false);
       });
-    conn.onreconnected(() => {
-      conn.invoke("JoinMeeting", meetingId).catch(() => {});
+    conn.onreconnected(async () => {
+      if (cancelled) return;
+      try {
+        await conn.invoke("JoinMeeting", meetingId);
+        if (!cancelled) setLive(true);
+      } catch {
+        // Rejoin rejected (revoked/expired): reset live state instead of staying stale-live.
+        if (!cancelled) {
+          try { setLive(false); } catch {}
+          try { onRevoked(); } catch {}
+        }
+      }
     });
     return () => {
       cancelled = true;
@@ -1249,6 +1578,7 @@ export default function App() {
       localStorage.removeItem("simceo-fb-user-v2");
     } catch {}
     setFbUser("");
+    try { if (currentToken()) { const myEpoch = epochNow(); const myToken = currentToken(); const myUser = currentUser(); post<unknown>("/api/auth/logout", {}).catch((e) => { if ((e as Error & { stale?: boolean })?.stale) return; }).finally(() => { if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) return; try { hubRef.current?.stop(); } catch {} setAuthSession("", ""); }); } } catch {}
     notify("Signed out.");
   };
   useEffect(() => {
@@ -1323,6 +1653,12 @@ export default function App() {
     queryKey: ["setup", boardId],
     queryFn: () => get<Setup>(`/api/boards/${boardId}/setup`),
     enabled: !!boardId && boardOk && tab === "boards",
+  });
+  const guestSettings = useQuery({
+    queryKey: ["guest-settings", boardId],
+    queryFn: () => get<{ id: string; name: string; mission: string; stage: string; discussionPolicy: string; dataUse: string; lead: { name: string; roleLabel: string } | null; meetingIds: string[] }>(`/api/boards/${boardId}/guest-settings`),
+    enabled: !!boardId && boardOk && (tab === "boards" || tab === "meet"),
+    retry: false,
   });
   const [leadForm, setLeadForm] = useState({
     name: "",
@@ -1444,7 +1780,7 @@ export default function App() {
     enabled: !!boardId && boardOk && tab === "boards",
   });
   const [wizId, setWizId] = useState(
-    () => localStorage.getItem("simceo-wizard") ?? "",
+    () => { try { const u = localStorage.getItem("simceo-user") ?? "anon"; return localStorage.getItem("simceo-wizard:"+(u||"anon")) ?? ""; } catch { return ""; } },
   );
   const [wizVersion, setWizVersion] = useState<number | null>(null);
   // P2 finding2: latest-value refs keep the wizard save/hydrate lifecycles
@@ -1465,6 +1801,8 @@ export default function App() {
   // a sentinel mismatch so the next hydration also keeps local progress
   // until the user successfully saves again.
   const wizLastSentRef = useRef<{ step: number; presetKey: string; fields: string } | null>(null);
+  const wizSaveIdentityRef = useRef<{ epoch: number; token: string; user: string } | null>(null);
+  const wizOwnerRef = useRef<string>("");
   // Version-only refresh after a rejected save: adopts the fresh strict
   // version guard without touching local fields/step, so the next save
   // retries with the current inputs instead of silently discarding them.
@@ -1504,6 +1842,8 @@ export default function App() {
         advisors: w.seats,
       });
       wizLastSentRef.current = { step: stepToSave, presetKey: presetToSave, fields: fieldsJson };
+      wizSaveIdentityRef.current = { epoch: epochNow(), token: currentToken(), user: currentUser() };
+      wizOwnerRef.current = currentUser();
       return post<{ id: string; version: number }>("/api/wizard", {
         id: wizIdRef.current || undefined,
         ...(wizVersionRef.current != null ? { version: wizVersionRef.current } : {}),
@@ -1514,9 +1854,12 @@ export default function App() {
       });
     },
     onSuccess: (r) => {
+      // Identity-carried callback: ignore late success after an account switch.
+      const cap = wizSaveIdentityRef.current;
+      if (!cap || epochNow() !== cap.epoch || currentToken() !== cap.token || currentUser() !== cap.user) return;
       setWizId(r.id);
       if (typeof r.version === "number") setWizVersion(r.version);
-      localStorage.setItem("simceo-wizard", r.id);
+      { try { const u = cap.user || "anon"; localStorage.setItem("simceo-wizard:"+u, r.id); localStorage.removeItem("simceo-wizard"); } catch {} }
       refresh("wizreview");
     },
     onError: (e) => {
@@ -1681,7 +2024,7 @@ export default function App() {
       // id, storage, fields and interview state so the next New board is a
       // fresh Step 1 that creates a DISTINCT board. Unfinished drafts survive
       // logo/ordinary navigation because this runs solely on success.
-      try { localStorage.removeItem("simceo-wizard"); } catch { /* private-mode */ }
+      try { const ou = wizOwnerRef.current || currentUser() || "anon"; localStorage.removeItem("simceo-wizard:"+ou); localStorage.removeItem("simceo-wizard"); wizOwnerRef.current = ""; } catch { /* private-mode */ }
       setWizId("");
       setWizVersion(null);
       // Retire the save baseline with the completed draft: a late hydration
@@ -2203,11 +2546,7 @@ const tabCount = (k: Tab): number | null => {
   };
   const savePolicy = useMutation({
     mutationFn: () =>
-      fetch(`/api/boards/${boardId}/source-policy`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json", ...withUser() },
-        body: JSON.stringify({ blockedTypes: blocked }),
-      }).then(j<unknown>),
+      put<unknown>(`/api/boards/${boardId}/source-policy`, { blockedTypes: blocked }),
     onSuccess: () => refresh("sources"),
   });
   const scopeDlg = useRef<HTMLDialogElement | null>(null);
@@ -2472,12 +2811,13 @@ const tabCount = (k: Tab): number | null => {
     enabled: !!boardId && boardOk && tab === "people",
   });
   const [iemail, setIemail] = useState("");
-  const [irole, setIrole] = useState("collaborator");
+  const [irole, setIrole] = useState("contributor");
   const invite = useMutation({
     mutationFn: () =>
       post<Invite>(`/api/boards/${boardId}/invites`, {
         email: iemail,
         role: irole,
+        meetingId: meetingId || undefined,
       }),
     onSuccess: () => {
       setIemail("");
@@ -2547,14 +2887,10 @@ const tabCount = (k: Tab): number | null => {
   }, [spending.data, capLoaded]);
   const saveSpending = useMutation({
     mutationFn: () =>
-      fetch("/api/spending", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json", ...withUser() },
-        body: JSON.stringify({
-          monthlyCapUsd: capInput.trim() === "" ? null : Number(capInput),
-          mode: capMode,
-        }),
-      }).then(j<unknown>),
+      put<unknown>("/api/spending", {
+        monthlyCapUsd: capInput.trim() === "" ? null : Number(capInput),
+        mode: capMode,
+      }),
     onSuccess: () => refresh("spending"),
     onError: (e) => alert(String(e)),
   });
@@ -2575,11 +2911,7 @@ useEffect(() => {
 }, [modelStatus.data, modelChatLoaded]);
 const saveModel = useMutation({
   mutationFn: () =>
-    fetch("/api/model/settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", ...withUser() },
-      body: JSON.stringify({ apiKey: modelKey, chatModel: modelChat }),
-    }).then(j<unknown>),
+    put<unknown>("/api/model/settings", { apiKey: modelKey, chatModel: modelChat }),
   onSuccess: () => {
     setModelKey("");
     setModelMsg("Saved. Run Test connection to verify.");
@@ -2610,15 +2942,36 @@ const testModel = useMutation({
   });
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micMetaRef = useRef<{ epoch: number; token: string; user: string; meeting: string } | null>(null);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  // Mic lifecycle: stop recorder + release tracks on unmount/identity change.
+  useEffect(() => {
+    return () => {
+      try { recRef.current?.stop(); } catch {}
+      try { recRef.current = null; } catch {}
+      try { micStreamRef.current?.getTracks().forEach((tr) => { try { tr.stop(); } catch {} }); } catch {}
+      try { micStreamRef.current = null; } catch {}
+      try { setRecording(false); } catch {}
+    };
+  }, []);
   const toggleRec = async () => {
     if (recording) {
       recRef.current?.stop();
       return;
     }
+    // Capture originating identity; late permission/callbacks recheck it.
+    const micEpoch = epochNow(); const micToken = currentToken(); const micUser = currentUser();
+    const micMeeting = meetingId;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (epochNow() !== micEpoch || currentToken() !== micToken || currentUser() !== micUser || meetingId !== micMeeting) {
+        try { stream.getTracks().forEach((tr) => { try { tr.stop(); } catch {} }); } catch {}
+        return;
+      }
+      micStreamRef.current = stream;
+      micMetaRef.current = { epoch: micEpoch, token: micToken, user: micUser, meeting: micMeeting };
       const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(
         (t) => {
           try {
@@ -2636,8 +2989,12 @@ const testModel = useMutation({
         if (e.data.size) chunksRef.current.push(e.data);
       };
       mr.onstop = async () => {
+        const meta = micMetaRef.current;
         setRecording(false);
         stream.getTracks().forEach((t) => t.stop());
+        try { if (micStreamRef.current === stream) micStreamRef.current = null; } catch {}
+        // Late callback guard: identity or meeting changed while recording.
+        if (!meta || epochNow() !== meta.epoch || currentToken() !== meta.token || currentUser() !== meta.user || meetingId !== meta.meeting) return;
         const fd = new FormData();
         fd.append(
           "audio",
@@ -2721,7 +3078,7 @@ const testModel = useMutation({
     const existing = (advisors.data ?? []).find((a) => a.rosterEntryId === row.entry.id);
     try {
       if (existing) {
-        await fetch(`/api/boards/${boardId}/advisors/${existing.id}`, { method: "DELETE", headers: withUser() }).then(j<unknown>);
+        await del<unknown>(`/api/boards/${boardId}/advisors/${existing.id}`);
       } else {
         await post<unknown>(`/api/roster/${row.entry.id}/copy`, { boardId, boardRole: row.entry.name });
       }
@@ -3299,8 +3656,11 @@ const testModel = useMutation({
         </div>{" "}
         <main className="main" id="main" tabIndex={-1}>
           {" "}
+          {sessExpired && (<p role="alert">Session expired. Sign in again to continue; private data is hidden until re-authentication.</p>)}
           {tab === "boards" && (
             <section aria-label="Boards">
+              <AuthPanel />
+              <InviteClaim />
               {" "}
               <h2>Boards</h2>{" "}
               {boardId && (
@@ -3526,6 +3886,18 @@ const testModel = useMutation({
                           </option>{" "}
                         </select>{" "}
                       </label>{" "}
+                    </>
+                  )}{" "}
+                  {!setup.data && guestSettings.data && (
+                    <>
+                      <p role="status">Read-only guest settings for your assigned meeting.</p>
+                      <dl>
+                        <dt>Board</dt><dd>{guestSettings.data.name}</dd>
+                        <dt>Mission</dt><dd>{guestSettings.data.mission}</dd>
+                        <dt>Stage</dt><dd>{guestSettings.data.stage}</dd>
+                        <dt>Discussion rhythm</dt><dd>{guestSettings.data.discussionPolicy}</dd>
+                        <dt>Lead</dt><dd>{guestSettings.data.lead ? `${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : "\u2014"}</dd>
+                      </dl>
                     </>
                   )}{" "}
                 </div>
@@ -4516,7 +4888,7 @@ const testModel = useMutation({
                             const status = !im.review || im.review === "accepted" ? "accepted" : im.review === "pending" ? "pending" : "rejected";
                             return (
                               <div className="card portrait-review" key={im.id}>
-                                <img src={`/api/images/${im.id}`} alt="Portrait option" className="portrait-thumb" />
+                                <AuthedImg id={im.id} alt="Portrait option" className="portrait-thumb" />
                                 <div>
                                   <div>
                                     <span className="badge">{im.kind}</span>
@@ -4655,7 +5027,7 @@ const testModel = useMutation({
                     roster v{a.rosterVersion} Â· {a.imageProvenance}{" "}
                   {(() => { const re = (rosterNames.data ?? []).find((r) => r.entry.id === a.rosterEntryId); return re && re.entry.version > a.rosterVersion ? (<span className="badge">{" "}roster updated â€” sync first{" "}</span>) : null; })()}
                   </span>{" "}
-                  {!a.approved && (
+                  {!a.approved && !guestView && (
                     <button
                       onClick={() =>
                         post<unknown>(
@@ -4797,15 +5169,15 @@ const testModel = useMutation({
                     {" "}
                     <div className="meetctl">
                       {" "}
-                      <button
+                      {!guestView && (<button
                         type="button"
                         className="primary"
                         onClick={() => createMeeting.mutate()}
                       >
                         {" "}
                         Start meeting{" "}
-                      </button>{" "}
-                    <div className="card">{" "}
+                      </button>)}{" "}
+                    {!guestView && (<div className="card">{" "}
                       Advisors for the next meeting (all when untouched){" "}
                       {(advisors.data ?? []).map((a) => (
                         <label key={a.id}>{" "}
@@ -4813,7 +5185,7 @@ const testModel = useMutation({
                           {a.boardRole}{" "}
                         </label>
                       ))}{" "}
-                    </div>{" "}
+                    </div>)}{" "}
                     </div>{" "}
                     <input
                       aria-label="Search meetings"
@@ -4888,6 +5260,7 @@ const testModel = useMutation({
                           {" "}
                           <div>
                             {" "}
+                            {guestView && guestSettings.data && (<p role="status">Read-only guest settings: {guestSettings.data.name} &middot; {guestSettings.data.mission} &middot; {guestSettings.data.discussionPolicy}{guestSettings.data.lead ? ` \u00b7 Lead ${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : ""}</p>)}
                             <div className="eyebrow">Discussion</div>{" "}
                             <h2>{curMeeting?.title ?? "Meeting"}</h2>{" "}
                             {curMeeting?.brief && (
@@ -4896,7 +5269,7 @@ const testModel = useMutation({
                           </div>{" "}
                           <div className="meetctl">
                             {" "}
-                            <button
+                            {!guestView && (<button
                               type="button"
                               onClick={() => meetingCtl("pause")}
                               disabled={curMeeting?.state !== 1}
@@ -4908,8 +5281,8 @@ const testModel = useMutation({
                             >
                               {" "}
                               Pause{" "}
-                            </button>{" "}
-                            <button
+                            </button>)}{" "}
+                            {!guestView && (<button
                               type="button"
                               onClick={() => meetingCtl("resume")}
                               disabled={curMeeting?.state !== 3}
@@ -4921,8 +5294,8 @@ const testModel = useMutation({
                             >
                               {" "}
                               Resume{" "}
-                            </button>{" "}
-                            <button
+                            </button>)}{" "}
+                            {!guestView && (<button
                               type="button"
                               onClick={() => meetingCtl("end")}
                               disabled={
@@ -4932,8 +5305,8 @@ const testModel = useMutation({
                             >
                               {" "}
                               End discussion{" "}
-                            </button>{" "}
-                            <button
+                            </button>)}{" "}
+                            (<button
                               type="button"
                               className="primary"
                               onClick={() => runDiscussion.mutate()}
@@ -4973,7 +5346,7 @@ const testModel = useMutation({
                             )}{" "}
                           </p>
                         )}{" "}
-                        <details className="setup">
+                        {!guestView && (<details className="setup">
                           {" "}
                           <summary>Meeting setup</summary>{" "}
                           <label>
@@ -5042,7 +5415,7 @@ const testModel = useMutation({
                               Reopen (history intact){" "}
                             </button>{" "}
                           </div>{" "}
-                        </details>{" "}
+                        </details>)} {" "}
                         <div
                           className="ctabs"
                           role="tablist"
@@ -5346,10 +5719,9 @@ const testModel = useMutation({
                                     {" "}
                                     Everyone{" "}
                                   </option>{" "}
-                                  <option value="secretary">
+                                  {!guestView && (<option value="secretary">
                                     {" "}
-                                    Secretary (direct){" "}
-                                  </option>{" "}
+                                    Secretary (direct){" "}</option>)}
                                 </select>{" "}
                                 <span className="muted">
                                   {" "}
@@ -5518,13 +5890,13 @@ const testModel = useMutation({
                                 onChange={(e) => setBtopic(e.target.value)}
                               />{" "}
                             </label>{" "}
-                            <button
+                            {!guestView && (<button
                               type="button"
                               onClick={() => askBriefing.mutate()}
                             >
                               {" "}
                               Prepare briefing{" "}
-                            </button>{" "}
+                            </button>)}{" "}
                             <h3>Working notes</h3>{" "}
                             {(notes.data ?? [])
                               .filter((n) => n.kind !== "briefing")
@@ -5551,13 +5923,13 @@ const testModel = useMutation({
                                 onChange={(e) => setNbody(e.target.value)}
                               />{" "}
                             </label>{" "}
-                            <button
+                            {!guestView && (<button
                               type="button"
                               onClick={() => addNote.mutate()}
                             >
                               {" "}
                               Save note{" "}
-                            </button>{" "}
+                            </button>)}{" "}
                           </div>
                         )}{" "}
                         {meetTab === "options" && (
@@ -5926,7 +6298,7 @@ const testModel = useMutation({
               </p>{" "}
               <div className="meetctl">
                 {" "}
-                <label>
+                {!guestView && (<label>
                   {" "}
                   Upload file{" "}
                   <input
@@ -5938,7 +6310,7 @@ const testModel = useMutation({
                       )
                     }
                   />{" "}
-                </label>{" "}
+                </label>)}{" "}
               </div>{" "}
               {(sources.data ?? []).map((s) => (
                 <div className="card" key={s.id}>
@@ -5955,20 +6327,20 @@ const testModel = useMutation({
                   {s.excluded && <span className="badge">excluded</span>}{" "}
                   <div>
                     {" "}
-                    <button
+                    {!guestView && (<button
                       onClick={() => srcOp(s.id, "approve")}
                       disabled={s.approved}
                     >
                       {" "}
                       Approve{" "}
-                    </button>{" "}
-                    <button
+                    </button>)}{" "}
+                    {!guestView && (<button
                       onClick={() => srcOp(s.id, "exclude")}
                       disabled={s.excluded}
                     >
                       {" "}
                       Exclude{" "}
-                    </button>{" "}
+                    </button>)}{" "}
                     <button
                       onClick={() => srcOp(s.id, "restore")}
                       disabled={!s.excluded}
@@ -5980,7 +6352,7 @@ const testModel = useMutation({
                       {" "}
                       Retry extraction{" "}
                     </button>{" "}
-                    <button
+                    {!guestView && (<button
                       onClick={() => {
                         setScopeId(s.id);
                         setScopeSel(s.scope);
@@ -5990,11 +6362,11 @@ const testModel = useMutation({
                     >
                       {" "}
                       Set scopeâ€¦{" "}
-                    </button>{" "}
-                    <a href={`/api/sources/${s.id}/download`}>
+                    </button>)}{" "}
+                    <button type="button" onClick={() => authedDownload(`/api/sources/${s.id}/download`, s.fileName || "source.bin")}>
                       {" "}
                       Download original{" "}
-                    </a>{" "}
+                    </button>{" "}
                   </div>{" "}
                 </div>
               ))}{" "}
@@ -6123,10 +6495,10 @@ const testModel = useMutation({
                         onChange={(e) => setDraftItems(e.target.value)}
                       />{" "}
                     </label>{" "}
-                    <button onClick={prepareDraft}>
+                    {!guestView && (<button onClick={prepareDraft}>
                       {" "}
                       Prepare draft from items{" "}
-                    </button>{" "}
+                    </button>)}{" "}
                   </div>{" "}
                   {(recs.data ?? []).map((r) => (
                     <div className="card" key={r.id}>
@@ -6239,27 +6611,23 @@ const testModel = useMutation({
                       </div>{" "}
                       <div>
                         {" "}
-                        <button onClick={() => approveRec(false)}>
+                        {!guestView && (<button onClick={() => approveRec(false)}>
                           {" "}
                           Approve selected{" "}
-                        </button>{" "}
-                        <button onClick={() => approveRec(true)}>
+                        </button>)}{" "}
+                        {!guestView && (<button onClick={() => approveRec(true)}>
                           {" "}
                           Approve all{" "}
-                        </button>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=concise`}
-                        >
+                        </button>)}{" "}
+                        <button type="button" onClick={() => authedDownload(`/api/records/${recDetail.data.id}/export?format=concise`, "record-concise.txt")}>
                           {" "}
                           Export concise{" "}
-                        </a>{" "}
+                        </button>{" "}
                         <span> </span>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=detailed`}
-                        >
+                        <button type="button" onClick={() => authedDownload(`/api/records/${recDetail.data.id}/export?format=detailed`, "record-detailed.txt")}>
                           {" "}
                           Export detailed{" "}
-                        </a>{" "}
+                        </button>{" "}
                       </div>{" "}
                       <label>
                         {" "}
@@ -6269,15 +6637,15 @@ const testModel = useMutation({
                           onChange={(e) => setRevText(e.target.value)}
                         />{" "}
                       </label>{" "}
-                      <button onClick={() => reviseRec(false)}>
+                      {!guestView && (<button onClick={() => reviseRec(false)}>
                         {" "}
                         Request revision (new version){" "}
-                      </button>{" "}
-                      <button onClick={() => reviseRec(true)}>
+                      </button>)}{" "}
+                      {!guestView && (<button onClick={() => reviseRec(true)}>
                         {" "}
                         Amend (name superseded IDs){" "}
-                      </button>{" "}
-                      <button onClick={discardRec}>Discard draft</button>{" "}
+                      </button>)}{" "}
+                      {!guestView && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
                   )}{" "}
                 </>
@@ -6296,6 +6664,8 @@ const testModel = useMutation({
               {!boardId && <p>Pick a board first.</p>}{" "}
               <div className="card">
                 {" "}
+                <AuthPanel />
+              <InviteClaim />
                 <h3>Identity</h3>{" "}
                 <p role="status">
                   {" "}
@@ -6351,11 +6721,12 @@ const testModel = useMutation({
                       >
                         {" "}
                         <option value="viewer">Viewer (read)</option>{" "}
-                        <option value="collaborator">
+                        <option value="contributor">
                           {" "}
                           Collaborator (contribute){" "}
                         </option>{" "}
-                        <option value="manager">Manager (manage)</option>{" "}
+                        <option value="manager">Manager (manage)</option>
+                        <option value="guest">Guest (discuss one meeting)</option>{" "}
                       </select>{" "}
                     </label>{" "}
                     <button onClick={() => invite.mutate()}>Invite</button>{" "}
@@ -6364,6 +6735,8 @@ const testModel = useMutation({
                         {" "}
                         {i.email} Â· {i.role} Â·{" "}
                         <span className="badge">{i.state}</span>{" "}
+                        <code>{i.id}</code>{" "}
+                        <button type="button" onClick={() => { try { const link = window.location.origin + window.location.pathname + "#/boards?invite=" + i.id; if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(link).catch(() => {}); } catch {} }}>Copy app link</button>{" "}
                         {i.state === "pending" && (
                           <button
                             onClick={() =>
@@ -6427,10 +6800,7 @@ const testModel = useMutation({
                           : " Â· board"}{" "}
                         <button
                           onClick={() =>
-                            fetch(`/api/grants/${g.id}`, {
-                              method: "DELETE",
-                              headers: withUser(),
-                            }).then(() => refresh("grants"))
+                            del<unknown>(`/api/grants/${g.id}`).then(() => refresh("grants"))
                           }
                         >
                           {" "}

@@ -13,8 +13,16 @@ public static class ModelSettingsEndpoints
 {
   public static void MapModelSettings(this WebApplication app)
   {
-    app.MapGet("/api/model/status", (InMemoryStore s) =>
+    app.MapGet("/api/model/status", (InMemoryStore s, HttpRequest req) =>
     {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badMs) return badMs;
+        if (!AuthOps.TrySession(s, req, out var ms)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admMs = PeopleOps.AdminEmail(s);
+        var isAdmMs = !string.IsNullOrWhiteSpace(admMs) && string.Equals(admMs, ms, StringComparison.OrdinalIgnoreCase);
+        if (!isAdmMs) return PeopleOps.Denied();
+      }
       var key = !string.IsNullOrWhiteSpace(s.ModelApiKeyOverride)
         ? s.ModelApiKeyOverride
         : Environment.GetEnvironmentVariable("META_API_KEY") ?? string.Empty;
@@ -35,7 +43,15 @@ public static class ModelSettingsEndpoints
 
     app.MapPut("/api/model/settings", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
-      if (!PeopleOps.IsOwner(req))
+      if (PeopleOps.BadToken(s, req) is { } badSet) return badSet;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var ss)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admSs = PeopleOps.AdminEmail(s);
+        if (string.IsNullOrWhiteSpace(admSs) || !string.Equals(admSs, ss, StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Only the installation admin can change model settings." }, statusCode: 403);
+      }
+      else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403);
       var allowed = new[] { ModelPolicy.SparkStandard, ModelPolicy.SparkContributor, ModelPolicy.Wonder };
       lock (s.ModelLock)
@@ -61,7 +77,15 @@ public static class ModelSettingsEndpoints
 
     app.MapPost("/api/model/test", async (InMemoryStore s, HttpRequest req, CancellationToken ct) =>
     {
-      if (!PeopleOps.IsOwner(req))
+      if (PeopleOps.BadToken(s, req) is { } badTest) return badTest;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var ts)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admTs = PeopleOps.AdminEmail(s);
+        if (string.IsNullOrWhiteSpace(admTs) || !string.Equals(admTs, ts, StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Only the installation admin can test the model connection." }, statusCode: 403);
+      }
+      else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can test the model connection." }, statusCode: 403);
       var gw = new ModelGateway(s);
       var model = !string.IsNullOrWhiteSpace(s.ModelChatOverride) ? s.ModelChatOverride : ModelPolicy.SparkStandard;

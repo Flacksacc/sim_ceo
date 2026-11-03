@@ -16,7 +16,7 @@ public static class MeetingEndpoints
     app.MapPost("/api/meetings/{id:guid}/transcribe", async (InMemoryStore s, HttpRequest req, Guid id, IFormFile audio) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedTr) return deniedTr;
       if (PeopleOps.Guard(gw, req) is { } capped) return capped;
       if (audio is null || audio.Length == 0) return Results.BadRequest("No audio.");
       if (audio.Length > 10 * 1024 * 1024) return Results.BadRequest("Audio exceeds 10 MB.");
@@ -32,9 +32,19 @@ public static class MeetingEndpoints
       catch (Exception ex) when (ex is CapExceededException or ProviderException) { return PeopleOps.ModelError(ex); }
       if (string.IsNullOrWhiteSpace(transcript))
         return Results.Json(new { error = "No speech recognized; nothing posted." }, statusCode: 422);
+      // Re-authorize AFTER the model await: the caller may have been revoked during transcription.
+      if (PeopleOps.BadToken(s, req) is { } badTr2) return badTr2;
+      string trUser = "";
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var tru)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        trUser = tru;
+      }
+      else trUser = PeopleOps.UserOf(s, req);
+      if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedTr2) return deniedTr2;
       var turn = new VoiceTurn
       {
-        BoardId = m.BoardId, MeetingId = id, State = "draft",
+        BoardId = m.BoardId, MeetingId = id, CreatorKey = trUser, State = "draft",
         Transcript = transcript, AudioRetained = false,
       };
       s.VoiceTurns[turn.Id] = turn;
@@ -44,43 +54,47 @@ public static class MeetingEndpoints
     app.MapPatch("/api/meetings/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedPatch) return deniedPatch;
       lock (s.MessageLock)
       {
+        // Recheck CURRENT authority against a fresh fetch inside the lock (TOCTOU).
+        if (!s.Meetings.TryGetValue(id, out var curP)) return Results.NotFound("meeting");
+        if (PeopleOps.Check(s, req, curP.BoardId, id, "contribute") is { } deniedPatch2) return deniedPatch2;
         if (body.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String)
         {
           var title = t.GetString() ?? "";
-          if (!string.IsNullOrWhiteSpace(title)) m.Title = title.Trim();
+          if (!string.IsNullOrWhiteSpace(title)) curP.Title = title.Trim();
         }
         if (body.TryGetProperty("participantIds", out var parts) && parts.ValueKind == JsonValueKind.Array)
       {
         var ids = new List<Guid>();
         foreach (var e in parts.EnumerateArray())
           if (e.ValueKind == JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)
-            && s.Advisors.TryGetValue(g, out var pa) && pa.BoardId == m.BoardId && !pa.Removed) ids.Add(g);
+            && s.Advisors.TryGetValue(g, out var pa) && pa.BoardId == curP.BoardId && !pa.Removed) ids.Add(g);
         var nextParts = JsonSerializer.Serialize(ids);
         // Lane B: participant-set change invalidates any in-flight generation so it discards.
-        if (!string.Equals(m.ParticipantIdsJson, nextParts, StringComparison.Ordinal)) { m.ParticipantIdsJson = nextParts; m.Generation++; }
+        if (!string.Equals(curP.ParticipantIdsJson, nextParts, StringComparison.Ordinal)) { curP.ParticipantIdsJson = nextParts; curP.Generation++; }
       }
       if (body.TryGetProperty("brief", out var b) && b.ValueKind == JsonValueKind.String)
         {
-          m.Brief = b.GetString() ?? "";
-          if (!string.IsNullOrWhiteSpace(m.Brief) && m.State == MeetingState.AwaitingBrief)
-            m.State = MeetingState.Active;
+          curP.Brief = b.GetString() ?? "";
+          if (!string.IsNullOrWhiteSpace(curP.Brief) && curP.State == MeetingState.AwaitingBrief)
+            curP.State = MeetingState.Active;
         }
+        s.Meetings.Flush();
+        return Results.Ok(curP);
       }
-      s.Meetings.Flush();
-      return Results.Ok(m);
     });
 
     app.MapPost("/api/meetings/{id:guid}/close", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedClose) return deniedClose;
       var withRecord = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("withRecord", out var w) && w.GetBoolean();
       lock (s.MessageLock)
       {
         if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
+        if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedClose2) return deniedClose2;
         cur.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
         cur.Generation++;
         s.Meetings.Flush();
@@ -92,10 +106,11 @@ public static class MeetingEndpoints
     app.MapPost("/api/meetings/{id:guid}/reopen", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedReopen) return deniedReopen;
       lock (s.MessageLock)
       {
         if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
+        if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedReopen2) return deniedReopen2;
         cur.State = MeetingState.Active;
         cur.Generation++;
         s.Meetings.Flush();
@@ -107,7 +122,7 @@ public static class MeetingEndpoints
     app.MapGet("/api/meetings/{id:guid}/messages/search", (InMemoryStore s, HttpRequest req, Guid id, string q, int context = 3) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedSearch) return deniedSearch;
       if (string.IsNullOrWhiteSpace(q)) return Results.BadRequest("q is required.");
       context = Math.Clamp(context, 0, 10);
       lock (s.MessageLock)
@@ -129,7 +144,7 @@ public static class MeetingEndpoints
     app.MapGet("/api/meetings/{id:guid}/delivery", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedDel) return deniedDel;
       lock (s.MessageLock)
       {
         var list = s.Messages.TryGetValue(id, out var l) ? l : new List<Message>();
@@ -144,7 +159,7 @@ public static class MeetingEndpoints
     app.MapGet("/api/meetings/{id:guid}/notes", (InMemoryStore s, HttpRequest req, Guid id, string? kind) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedNotes) return deniedNotes;
       var notes = s.Notes.Values.Where(n => n.MeetingId == id);
       if (!string.IsNullOrWhiteSpace(kind)) notes = notes.Where(n => n.Kind == kind);
       return Results.Ok(notes.OrderByDescending(n => n.CreatedAt).Take(100));
@@ -153,7 +168,7 @@ public static class MeetingEndpoints
     app.MapPost("/api/meetings/{id:guid}/notes", (InMemoryStore s, HttpRequest req, Guid id, Note input) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedNotePost) return deniedNotePost;
       input.Id = Guid.NewGuid();
       input.BoardId = m.BoardId;
       input.MeetingId = id;
@@ -168,7 +183,7 @@ public static class MeetingEndpoints
     app.MapPost("/api/meetings/{id:guid}/briefings", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "contribute")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedBr) return deniedBr;
       if (PeopleOps.Guard(gw, req) is { } cappedBr) return cappedBr;
       var topic = body.TryGetProperty("topic", out var t) ? (t.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
@@ -180,6 +195,10 @@ public static class MeetingEndpoints
         ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
+      // Re-authorize AFTER the model await: the caller may have been revoked during generation.
+      if (PeopleOps.BadToken(s, req) is { } badBr2) return badBr2;
+      if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedBr2) return deniedBr2;
+      if (!s.Meetings.TryGetValue(id, out m)) return Results.NotFound("meeting");
       var note = new Note
       {
         BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
@@ -193,14 +212,16 @@ public static class MeetingEndpoints
     app.MapGet("/api/meetings/{id:guid}/voice", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
-      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
-      return Results.Ok(s.VoiceTurns.Values.Where(v => v.MeetingId == id)
+      if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedVoiceList) return deniedVoiceList;
+      var __vu = PeopleOps.UserOf(s, req);
+      // Unsent drafts are visible only to their creator (no manager bypass); sent content stays readable.
+      return Results.Ok(s.VoiceTurns.Values.Where(v => v.MeetingId == id && (v.State == "sent" || string.Equals(v.CreatorKey ?? "", __vu, StringComparison.OrdinalIgnoreCase)))
         .Select(v => new { v.Id, v.State, v.Transcript, v.AudioRetained }).OrderByDescending(v => v.Id));
     });
 
     app.MapGet("/api/boards/{bid:guid}/directions", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "read") is { } deniedDir) return deniedDir;
       return Results.Ok(s.Notes.Values
         .Where(n => n.BoardId == bid && n.Kind == "direction" && !n.Provisional)
         .OrderByDescending(n => n.CreatedAt).Take(200));
@@ -208,7 +229,7 @@ public static class MeetingEndpoints
 
     app.MapPost("/api/boards/{bid:guid}/directions", (InMemoryStore s, HttpRequest req, Guid bid, JsonElement body) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedDirPost) return deniedDirPost;
       var text = body.TryGetProperty("text", out var t) ? (t.GetString() ?? "") : "";
       var scope = body.TryGetProperty("scope", out var sc) ? (sc.GetString() ?? "meeting") : "meeting";
       if (string.IsNullOrWhiteSpace(text)) return Results.BadRequest("Exact direction text is required and shown back before commit.");

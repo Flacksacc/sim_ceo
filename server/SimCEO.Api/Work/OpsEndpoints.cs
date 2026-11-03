@@ -18,6 +18,11 @@ public static class OpsEndpoints
     app.MapPost("/api/jobs/{id:guid}/retry", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badRetry) return badRetry;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var jr)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        if (!PeopleOps.IsInstallationAdmin(s, jr)) return PeopleOps.Denied();
+      }
       if (!s.Jobs.TryGetValue(id, out var job)) return Results.NotFound();
       if (job.State != "failed")
         return Results.Conflict("Only a failed step offers Retry; otherwise the last checkpoint stands.");
@@ -28,9 +33,16 @@ public static class OpsEndpoints
       return Results.Ok(job);
     });
 
-    app.MapGet("/api/boards/{bid:guid}/status", (InMemoryStore s, Guid bid) =>
+    app.MapGet("/api/boards/{bid:guid}/status", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
+      if (PeopleOps.BadToken(s, req) is { } badSt) return badSt;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var stUser = PeopleOps.UserOf(s, req);
+      var stGuest = !PeopleOps.Can(s, req, bid, null, "read") && PeopleOps.GuestMeetingIds(s, stUser, bid).Count > 0;
+      if (!PeopleOps.Can(s, req, bid, null, "read") && !stGuest) return PeopleOps.Denied();
+      var stIsAdmin = PeopleOps.IsInstallationAdmin(s, stUser);
+      var stCanContrib = PeopleOps.Can(s, req, bid, null, "contribute") || PeopleOps.Can(s, req, bid, null, "manage");
       var advisors = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList();
       var meetings = s.Meetings.Values.Where(m => m.BoardId == bid).ToList();
       return Results.Ok(new
@@ -44,20 +56,23 @@ public static class OpsEndpoints
         advisors = new { total = advisors.Count, approved = advisors.Count(a => a.Approved) },
         meetings = new
         {
-          total = meetings.Count,
-          active = meetings.Count(m => m.State is MeetingState.Active or MeetingState.Paused),
+          total = stGuest ? PeopleOps.GuestMeetingIds(s, stUser, bid).Count : meetings.Count,
+          active = stGuest ? 0 : meetings.Count(m => m.State is MeetingState.Active or MeetingState.Paused),
         },
-        sourcesPending = s.Sources.Values.Count(x => x.BoardId == bid && !x.Approved && !x.Excluded),
-        jobsFailed = s.Jobs.Values.Count(j => j.State == "failed"),
+        sourcesPending = stCanContrib ? s.Sources.Values.Count(x => x.BoardId == bid && !x.Approved && !x.Excluded) : 0,
+        jobsFailed = stIsAdmin ? s.Jobs.Values.Count(j => j.State == "failed") : 0,
         policy = b.DiscussionPolicy,
         retainAudio = b.RetainAudio,
+        guest = stGuest,
       });
     });
 
-    app.MapGet("/api/boards/{bid:guid}/recall", async (InMemoryStore s, HttpRequest req, Guid bid, string q, int take = 8) =>
+    app.MapGet("/api/boards/{bid:guid}/recall", async (InMemoryStore s, HttpRequest req, Guid bid, string q, int take = 8, Guid? meetingId = null) =>
     {
-      if (!PeopleOps.Can(s, req, bid, null, "read")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, meetingId, "read") is { } deniedRecall) return deniedRecall;
       if (string.IsNullOrWhiteSpace(q)) return Results.BadRequest("q is required.");
+      var isBoardReader = PeopleOps.Can(s, req, bid, null, "read");
+      if (!isBoardReader) return PeopleOps.Denied();
       var local = ContextCurator.Recall(s, bid, q, take);
       var remote = await Hindsight.SearchAsync(bid, q, take);
       if (remote.Count == 0) return Results.Ok(local);
@@ -68,11 +83,15 @@ public static class OpsEndpoints
     app.MapGet("/api/boards/{bid:guid}/export", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
-      if (!PeopleOps.Can(s, req, bid, null, "manage")) return PeopleOps.Denied();
+      if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedExp) return deniedExp;
       var copies = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList();
       var rosterIds = copies.Select(a => a.RosterEntryId).ToHashSet();
       var ownLead = s.LeadProfiles.Values.Where(l => l.BoardId == bid).OrderByDescending(l => l.Version).FirstOrDefault();
-      var effLead = ownLead ?? LeadSetup.ResolveLead(s);
+      object? effLead = ownLead;
+      if (effLead is null)
+      {
+        try { if (PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) effLead = LeadSetup.ResolveLead(s); } catch { effLead = null; }
+      }
       var rosterRows = s.Roster.Values.Where(r => rosterIds.Contains(r.Id)).ToList();
       var topAccount = rosterRows.Where(r => r.AccountId != Guid.Empty).Select(r => r.AccountId).FirstOrDefault();
       var snapshot = new
@@ -201,6 +220,7 @@ public static class OpsEndpoints
       var board = new Board
       {
         Name = bn.GetString()!,
+        OwnerKey = PeopleOps.UserOf(s, req),
         Mission = src.TryGetProperty("mission", out var mi) ? mi.GetString() ?? "" : "",
         Stage = src.TryGetProperty("stage", out var st) ? st.GetString() ?? "" : "",
         ActiveConfig = false,
@@ -307,12 +327,14 @@ public static class OpsEndpoints
 
     app.MapPost("/api/wizard/{id:guid}/extract", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badExt) return badExt;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
+      if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedWx)) return deniedWx;
       if (!body.TryGetProperty("sourceId", out var se) || se.ValueKind != JsonValueKind.String
         || !Guid.TryParse(se.GetString(), out var sourceId) || sourceId == Guid.Empty)
         return Results.BadRequest("sourceId is required.");
       if (!s.Sources.TryGetValue(sourceId, out var doc)) return Results.NotFound("source");
+      // Authorize the referenced source: caller must read its actual scope.
+      if (PeopleOps.Check(s, req, doc.BoardId, doc.MeetingId, "read") is { } deniedDoc) return deniedDoc;
       List<object> log;
       try
       {
@@ -337,13 +359,23 @@ public static class OpsEndpoints
       return Results.Ok(new { checkpoints = log.Count, latest = checkpoint });
     });
 
-    app.MapGet("/api/wizard/{id:guid}/extract", (InMemoryStore s, Guid id) =>
-      !s.WizardDrafts.TryGetValue(id, out var d) ? Results.NotFound()
-      : Results.Ok(new { checkpoints = d.ProvenanceJson }));
+    app.MapGet("/api/wizard/{id:guid}/extract", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
+      if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedWxg)) return deniedWxg;
+      return Results.Ok(new { checkpoints = d.ProvenanceJson });
+    });
 
     app.MapGet("/api/backup", (InMemoryStore s, HttpRequest req) =>
     {
-      if (!PeopleOps.IsOwner(req))
+      if (PeopleOps.BadToken(s, req) is { } badBk) return badBk;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var bk)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admBk = PeopleOps.AdminEmail(s);
+        if (string.IsNullOrWhiteSpace(admBk) || !string.Equals(admBk, bk, StringComparison.OrdinalIgnoreCase)) return Results.Json(new { error = "Only the installation admin can export backups." }, statusCode: 403);
+      }
+      else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can export backups." }, statusCode: 403);
       var snapshot = new
       {
@@ -371,7 +403,14 @@ public static class OpsEndpoints
 
     app.MapPost("/api/backup/restore", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
-      if (!PeopleOps.IsOwner(req))
+      if (PeopleOps.BadToken(s, req) is { } badBr) return badBr;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var br)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admBr = PeopleOps.AdminEmail(s);
+        if (string.IsNullOrWhiteSpace(admBr) || !string.Equals(admBr, br, StringComparison.OrdinalIgnoreCase)) return Results.Json(new { error = "Only the installation admin can restore backups." }, statusCode: 403);
+      }
+      else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can restore backups." }, statusCode: 403);
       var snapshot = body.TryGetProperty("snapshot", out var sn) ? sn.GetString() ?? "" : "";
       var hash = body.TryGetProperty("hash", out var h) ? h.GetString() ?? "" : "";
@@ -385,51 +424,124 @@ public static class OpsEndpoints
       var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
         new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
       if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
+      // Restore boundary (explicit, documented): domain backup restores ONLY domain entities.
+      // Installation security authority (Accounts/Sessions/SecurityStates), current ACL
+      // (Grants/Invites/Memberships) and revocation decisions are NEVER cleared or replaced
+      // by an old snapshot. Snapshot grant/invite rows are IGNORED so old snapshots cannot
+      // resurrect revoked or left access. No credentials or session tokens are exported.
+      if (restored.boards is null || restored.roster is null || restored.advisors is null || restored.meetings is null || restored.messages is null || restored.notes is null || restored.drafts is null || restored.sources is null || restored.leads is null || restored.blobs is null || restored.images is null) return Results.BadRequest("Backup is missing required collections.");
+      // Deep graph validation BEFORE any destructive mutation: non-null entries, unique
+      // IDs, complete parent relationships, valid GUID keys and strict base64 binaries.
+      var graphError = ValidateRestoreGraph(restored);
+      if (graphError is not null) return Results.BadRequest(graphError);
+      // Fresh generation base: in-flight publications captured gen <= live max. Restored
+      // meetings restart strictly above it, so stale runs can never commit (no snapshot reuse).
+      var liveMaxGen = 0L;
+      try { liveMaxGen = s.Meetings.Values.Any() ? s.Meetings.Values.Max(m => m.Generation) : 0L; } catch { liveMaxGen = 0L; }
+      var memMode = SimCEO.Api.Data.Pg.Backend is null;
+      var snapBoards = memMode ? s.Boards.Values.ToList() : new System.Collections.Generic.List<Domain.Board>();
+      var snapRoster = memMode ? s.Roster.Values.ToList() : new System.Collections.Generic.List<Domain.RosterEntry>();
+      var snapAdvisors = memMode ? s.Advisors.Values.ToList() : new System.Collections.Generic.List<Domain.BoardAdvisor>();
+      var snapMeetings = memMode ? s.Meetings.Values.ToList() : new System.Collections.Generic.List<Domain.Meeting>();
+      var snapNotes = memMode ? s.Notes.Values.ToList() : new System.Collections.Generic.List<Domain.Note>();
+      var snapDrafts = memMode ? s.Drafts.Values.ToList() : new System.Collections.Generic.List<Domain.RecordDraft>();
+      var snapSources = memMode ? s.Sources.Values.ToList() : new System.Collections.Generic.List<Domain.SourceDoc>();
+      var snapLeads = memMode ? s.LeadProfiles.Values.ToList() : new System.Collections.Generic.List<Domain.LeadProfile>();
+      var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
+      var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
+      var snapMessages = memMode ? s.Messages.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()) : new System.Collections.Generic.Dictionary<Guid, System.Collections.Generic.List<Domain.Message>>();
+      int restoredCount = 0;
       lock (s.SetupLock)
       {
-        s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
-        s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear();
-        s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
-        foreach (var b in restored.boards) s.Boards[b.Id] = b;
-        foreach (var r in restored.roster) s.Roster[r.Id] = r;
-        foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
-        foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
-        foreach (var kv in restored.messages)
-          if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
-        foreach (var n in restored.notes) s.Notes[n.Id] = n;
-        foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
-        foreach (var x in restored.sources) s.Sources[x.Id] = x;
-        foreach (var kv in restored.blobs)
-          if (Guid.TryParse(kv.Key, out var bid2))
-            if (s.Sources.TryGetValue(bid2, out var bdoc))
-              try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
-        s.Sources.Flush();
-        foreach (var img in restored.images)
+        try
         {
-          byte[]? data = null;
-          if (img.data is not null) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
-          s.Images[img.id] = new AdvisorImage
+          restoredCount = Atomic.Run(() =>
           {
-            Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
-            Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
-            Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
-            ContentType = img.contentType ?? "image/png", Data = data,
-            CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
-          };
+            s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
+            s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear();
+            s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
+            foreach (var b in restored.boards) s.Boards[b.Id] = b;
+            foreach (var r in restored.roster) s.Roster[r.Id] = r;
+            foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
+            foreach (var m in restored.meetings)
+            {
+              m.Generation = System.Math.Max(m.Generation, liveMaxGen) + 1;
+              s.Meetings[m.Id] = m;
+            }
+            foreach (var kv in restored.messages)
+            {
+              var mid = Guid.Parse(kv.Key);
+              s.Messages[mid] = MessageList.Detached(mid, kv.Value);
+            }
+            foreach (var n in restored.notes) s.Notes[n.Id] = n;
+            foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
+            foreach (var x in restored.sources) s.Sources[x.Id] = x;
+            foreach (var kv in restored.blobs)
+            {
+              var bid2 = Guid.Parse(kv.Key);
+              if (s.Sources.TryGetValue(bid2, out var bdoc) && !string.IsNullOrEmpty(kv.Value))
+                bdoc.Original = Convert.FromBase64String(kv.Value);
+            }
+            s.Sources.Flush();
+            foreach (var img in restored.images)
+            {
+              s.Images[img.id] = new AdvisorImage
+              {
+                Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
+                Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
+                Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
+                ContentType = img.contentType ?? "image/png",
+                Data = string.IsNullOrEmpty(img.data) ? null : Convert.FromBase64String(img.data),
+                CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
+              };
+            }
+            foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
+            // ACL preserved: restored.grants / restored.invites are IGNORED by design.
+            if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
+            return restored.boards.Count;
+          });
+          s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restoredCount, aclPreserved = true }) });
         }
-        foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
-        foreach (var g in restored.grants) s.Grants[g.Id] = g;
-        foreach (var i in restored.invites) s.Invites[i.Id] = i;
-        if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
-        s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
+        catch (Exception __ex)
+        {
+          if (memMode)
+          {
+            // Real memory rollback: validation passed but a write failed; restore snapshots.
+            try
+            {
+              s.Boards.Clear(); foreach (var b in snapBoards) s.Boards[b.Id] = b;
+              s.Roster.Clear(); foreach (var r in snapRoster) s.Roster[r.Id] = r;
+              s.Advisors.Clear(); foreach (var a in snapAdvisors) s.Advisors[a.Id] = a;
+              s.Meetings.Clear(); foreach (var m in snapMeetings) s.Meetings[m.Id] = m;
+              s.Messages.Clear(); foreach (var kv in snapMessages) s.Messages[kv.Key] = MessageList.Detached(kv.Key, kv.Value);
+              s.Notes.Clear(); foreach (var n in snapNotes) s.Notes[n.Id] = n;
+              s.Drafts.Clear(); foreach (var d in snapDrafts) s.Drafts[d.Id] = d;
+              s.Sources.Clear(); foreach (var x in snapSources) s.Sources[x.Id] = x;
+              s.LeadProfiles.Clear(); foreach (var l in snapLeads) s.LeadProfiles[l.Id] = l;
+              s.Images.Clear(); foreach (var im in snapImages) s.Images[im.Id] = im;
+              s.WizardDrafts.Clear(); foreach (var w in snapWiz) s.WizardDrafts[w.Id] = w;
+            }
+            catch { }
+          }
+          return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
+        }
       }
-      return Results.Ok(new { restored = restored.boards.Count, at = restored.at });
+      return Results.Ok(new { restored = restoredCount, at = restored.at });
+
     });
 
     app.MapGet("/api/commands", () => Results.Ok(CommandMap.All));
 
-    app.MapGet("/api/spending", (InMemoryStore s) =>
+    app.MapGet("/api/spending", (InMemoryStore s, HttpRequest req) =>
     {
+      if (PeopleOps.IsSecure(s))
+      {
+        if (PeopleOps.BadToken(s, req) is { } badSp) return badSp;
+        if (!AuthOps.TrySession(s, req, out var sp)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admSp = PeopleOps.AdminEmail(s);
+        var isAdmSp = !string.IsNullOrWhiteSpace(admSp) && string.Equals(admSp, sp, StringComparison.OrdinalIgnoreCase);
+        if (!isAdmSp) return PeopleOps.Denied();
+      }
       var now = DateTime.UtcNow;
       var (known, unknown) = ModelGateway.MonthSpend(s);
       var cap = s.Spend.MonthlyCapUsd;
@@ -450,7 +562,15 @@ public static class OpsEndpoints
 
     app.MapPut("/api/spending", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
-      if (!PeopleOps.IsOwner(req))
+      if (PeopleOps.BadToken(s, req) is { } badSpP) return badSpP;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var spp)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        var admSpP = PeopleOps.AdminEmail(s);
+        if (string.IsNullOrWhiteSpace(admSpP) || !string.Equals(admSpP, spp, StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Only the installation admin can change spending controls." }, statusCode: 403);
+      }
+      else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can change spending controls." }, statusCode: 403);
       lock (s.SpendLock)
       {
@@ -464,7 +584,117 @@ public static class OpsEndpoints
         return Results.Ok(new { s.Spend.MonthlyCapUsd, s.Spend.Mode });
       }
     });
+  }
 
+  // Deep restore-graph validation: every collection entry present, IDs unique,
+  // all parent references resolve inside the snapshot, GUID keys parse, binaries
+  // are strict base64, messages are well-formed per meeting. Runs BEFORE mutation.
+  private static string? ValidateRestoreGraph(BackupSnapshot r)
+  {
+    string Err(string m) => m;
+    bool NullEntry<T>(System.Collections.Generic.IEnumerable<T>? xs, string name, out string? err)
+    {
+      err = null;
+      if (xs is null) { err = "Backup is missing required collection: " + name + "."; return true; }
+      foreach (var e in xs) if (e is null) { err = "Backup contains a null entry in " + name + "."; return true; }
+      return false;
+    }
+    string? e0;
+    if (NullEntry(r.boards, "boards", out e0)) return e0;
+    if (NullEntry(r.roster, "roster", out e0)) return e0;
+    if (NullEntry(r.advisors, "advisors", out e0)) return e0;
+    if (NullEntry(r.meetings, "meetings", out e0)) return e0;
+    if (NullEntry(r.notes, "notes", out e0)) return e0;
+    if (NullEntry(r.drafts, "drafts", out e0)) return e0;
+    if (NullEntry(r.sources, "sources", out e0)) return e0;
+    if (NullEntry(r.leads, "leads", out e0)) return e0;
+    if (NullEntry(r.images, "images", out e0)) return e0;
+    if (r.messages is null) return Err("Backup is missing required collection: messages.");
+    if (r.blobs is null) return Err("Backup is missing required collection: blobs.");
+    if (r.wizardDrafts is not null) foreach (var wz in r.wizardDrafts) if (wz is null) return Err("Backup contains a null entry in wizardDrafts.");
+    bool Dup(System.Collections.Generic.IEnumerable<Guid> ids, string name, out string? err)
+    {
+      err = null;
+      var seen = new System.Collections.Generic.HashSet<Guid>();
+      foreach (var i in ids) if (!seen.Add(i)) { err = "Backup contains a duplicate id in " + name + "."; return true; }
+      return false;
+    }
+    if (Dup(r.boards.Select(b => b.Id), "boards", out e0)) return e0;
+    if (Dup(r.roster.Select(x => x.Id), "roster", out e0)) return e0;
+    if (Dup(r.advisors.Select(x => x.Id), "advisors", out e0)) return e0;
+    if (Dup(r.meetings.Select(x => x.Id), "meetings", out e0)) return e0;
+    if (Dup(r.notes.Select(x => x.Id), "notes", out e0)) return e0;
+    if (Dup(r.drafts.Select(x => x.Id), "drafts", out e0)) return e0;
+    if (Dup(r.sources.Select(x => x.Id), "sources", out e0)) return e0;
+    if (Dup(r.leads.Select(x => x.Id), "leads", out e0)) return e0;
+    if (Dup(r.images.Select(x => x.id), "images", out e0)) return e0;
+    if (r.wizardDrafts is not null && Dup(r.wizardDrafts.Select(x => x.Id), "wizardDrafts", out e0)) return e0;
+    var bids = new System.Collections.Generic.HashSet<Guid>(r.boards.Select(b => b.Id));
+    var mids = new System.Collections.Generic.HashSet<Guid>(r.meetings.Select(m => m.Id));
+    var meetingBoard = r.meetings.ToDictionary(m => m.Id, m => m.BoardId);
+    var rosterIds = new System.Collections.Generic.HashSet<Guid>(r.roster.Select(x => x.Id));
+    var sourceIds = new System.Collections.Generic.HashSet<Guid>(r.sources.Select(x => x.Id));
+    foreach (var m in r.meetings) if (!bids.Contains(m.BoardId)) return Err("Backup graph: meeting references unknown board.");
+    foreach (var x in r.sources)
+    {
+      if (!bids.Contains(x.BoardId)) return Err("Backup graph: source references unknown board.");
+      if (x.MeetingId.HasValue && (!mids.Contains(x.MeetingId.Value) || meetingBoard[x.MeetingId.Value] != x.BoardId))
+        return Err("Backup graph: source references unknown or foreign meeting.");
+    }
+    foreach (var n in r.notes)
+    {
+      if (!bids.Contains(n.BoardId)) return Err("Backup graph: note references unknown board.");
+      if (!mids.Contains(n.MeetingId) || meetingBoard[n.MeetingId] != n.BoardId)
+        return Err("Backup graph: note references unknown or foreign meeting.");
+    }
+    foreach (var d in r.drafts)
+    {
+      if (!bids.Contains(d.BoardId)) return Err("Backup graph: record references unknown board.");
+      if (!mids.Contains(d.MeetingId) || meetingBoard[d.MeetingId] != d.BoardId)
+        return Err("Backup graph: record references unknown or foreign meeting.");
+    }
+    foreach (var l in r.leads) if (!bids.Contains(l.BoardId)) return Err("Backup graph: lead references unknown board.");
+    foreach (var a in r.advisors)
+    {
+      if (!bids.Contains(a.BoardId)) return Err("Backup graph: advisor references unknown board.");
+      if (!rosterIds.Contains(a.RosterEntryId)) return Err("Backup graph: advisor references missing roster entry.");
+    }
+    foreach (var im in r.images)
+    {
+      if (im.id == Guid.Empty) return Err("Backup graph: image has no id.");
+      if (im.rosterEntryId.HasValue && !rosterIds.Contains(im.rosterEntryId.Value))
+        return Err("Backup graph: image references missing roster entry.");
+    }
+    foreach (var kv in r.blobs)
+    {
+      if (!Guid.TryParse(kv.Key, out var bk)) return Err("Backup graph: blob key is not a GUID.");
+      if (!sourceIds.Contains(bk)) return Err("Backup graph: blob references unknown source.");
+      if (!string.IsNullOrEmpty(kv.Value))
+      {
+        try { Convert.FromBase64String(kv.Value); }
+        catch (FormatException) { return Err("Backup graph: blob is not valid base64."); }
+      }
+    }
+    foreach (var kv in r.messages)
+    {
+      if (!Guid.TryParse(kv.Key, out var mk)) return Err("Backup graph: message key is not a GUID.");
+      if (!mids.Contains(mk)) return Err("Backup graph: messages reference unknown meeting.");
+      if (kv.Value is null) return Err("Backup graph: message list is null.");
+      var seqs = new System.Collections.Generic.HashSet<long>();
+      foreach (var mm in kv.Value)
+      {
+        if (mm is null) return Err("Backup graph: message entry is null.");
+        if (mm.MeetingId != mk) return Err("Backup graph: message meeting mismatch.");
+        if (mm.BoardId != meetingBoard[mk]) return Err("Backup graph: message board mismatch.");
+        if (mm.Sequence <= 0) return Err("Backup graph: message sequence invalid.");
+        if (!seqs.Add(mm.Sequence)) return Err("Backup graph: duplicate message sequence.");
+      }
+    }
+    if (r.wizardDrafts is not null) foreach (var wz in r.wizardDrafts)
+    {
+      if (wz.Id == Guid.Empty) return Err("Backup graph: wizard draft has no id.");
+    }
+    return null;
   }
 }
 
