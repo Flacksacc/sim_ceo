@@ -135,9 +135,13 @@ public sealed record EvidenceRef(
 
 
   // Exact owner provenance: the approving record+version that last set this
-  // item, never the unapproved head that merely inherits its text.
+  // Exact owner provenance: the approving record+version that last set this
+  // item, never the unapproved head that merely inherits its text. Explicit
+  // item refs encode sourceRecordId:itemId so ownership resolves the
+  // REFERENCED item (not the destination item) at its historical version.
+  // Whole-record refs (bare recordId, no colon) remain readable for legacy.
   public static EvidenceRef ForRecordItem(string recordId, int version, string itemId, string? excerpt = null) =>
-    new("record", recordId, version, null, "record v" + version + " [" + itemId + "]", excerpt);
+    new("record", recordId + ":" + itemId, version, null, "record v" + version + " [" + itemId + "]", excerpt);
 
   public static EvidenceRef ForRecord(RecordDraft d, string? exactExport = null) =>
     new("record", d.Id.ToString(), d.Version, null, "record v" + d.Version, exactExport);

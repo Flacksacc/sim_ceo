@@ -997,18 +997,24 @@ public static class SourceGovernance
               h = new SourceFamilyHead { BoardId = d.BoardId, FamilyKey = d.FamilyKey, HeadVersion = d.Version, HeadSourceId = d.Id, HighWater = d.Version, UpdatedAt = DateTime.UtcNow };
               s.SourceHeads[h.Id] = h;
             }
-            else if (d.Version > h.HeadVersion)
+            // Promotion follows ORIGINAL-version ordering (server-owned alias), consistent with the pre-commit eligibility gate above: an actual newer original (e.g. orig v2, canonical v2) promotes above a parked old duplicate (orig v1, canonical v3). Canonical numbers alone never decide the head.
+            var dOrigProm = OriginalVersionOf(s, d);
+            int hOrigProm = h.HeadVersion;
+            if (h.HeadSourceId != Guid.Empty && s.Sources.TryGetValue(h.HeadSourceId, out var hDocProm) && hDocProm is not null && hDocProm.BoardId == d.BoardId && hDocProm.FamilyKey == d.FamilyKey)
+              hOrigProm = OriginalVersionOf(s, hDocProm);
+            if (dOrigProm > hOrigProm)
             {
               h.HeadVersion = d.Version; h.HeadSourceId = d.Id; if (d.Version > h.HighWater) h.HighWater = d.Version; h.UpdatedAt = DateTime.UtcNow;
             }
-            else if (d.Version == h.HeadVersion && h.HeadSourceId != Guid.Empty && h.HeadSourceId != d.Id)
+            else if (dOrigProm == hOrigProm)
             {
-              throw new InvalidOperationException("family/version collision at promotion");
+              if (h.HeadSourceId != Guid.Empty && h.HeadSourceId != d.Id)
+                throw new InvalidOperationException("family/version collision at promotion");
+              if (h.HeadSourceId == Guid.Empty)
+              { h.HeadSourceId = d.Id; h.UpdatedAt = DateTime.UtcNow; }
             }
-            else if (d.Version == h.HeadVersion && h.HeadSourceId == Guid.Empty)
-            {
-              h.HeadSourceId = d.Id; h.UpdatedAt = DateTime.UtcNow;
-            }
+            else
+              throw new InvalidOperationException("superseded by newer original version before commit");
             s.Sources.Flush(); s.SourceHeads.Flush();
             RecordEvent(s, d, "approve", "v" + d.Version);
             InvalidateLocked(s, d.BoardId);
@@ -1438,7 +1444,10 @@ public static class SourceGovernance
         // the actual backend transaction against freshly fetched rows: the
         // pre-gate captured source object never sources the mutation, so an
         // intervening tracker-clear cannot detach the write target.
-        string? failure = null;
+        // Partial-write faults escape the unit below (no failure swallowing):
+        // the store-bound unit rolls back ALL staged effects and the exception
+        // propagates to the caller for an honest post-commit/uncertain-rollback
+        // classification. Controlled stale/failed-extraction paths return normally.
         bool stale = false;
         string? staleErr = null;
         var eventName = isReindex ? "reindex" : "index";
@@ -1465,10 +1474,7 @@ public static class SourceGovernance
           if (!string.Equals(cur.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
             || cur.IndexGeneration != res.Generation)
           { stale = true; staleErr = "A newer index attempt superseded this one; stale completion discarded."; return; }
-          string? ferr = null;
-          try
-          {
-            // Fail closed on explicit extraction failure: raw Original bytes must
+          // Fail closed on explicit extraction failure (partial-write faults escape, no inner catch): raw Original bytes must
             // not stand in for extractor output. Textual uploads extract locally;
             // anything else requires a successful extractor result first.
             var md = Extraction.MarkdownOf(cur.ExtractionJson);
@@ -1524,15 +1530,8 @@ public static class SourceGovernance
             cur.IndexState = "completed"; cur.IndexError = ""; cur.IndexCompletedAt = DateTime.UtcNow;
             s.Sources.Flush(); s.SourceSections.Flush();
             RecordEvent(s, cur, eventName, "gen" + res.Generation + " sections" + built.Count);
-          }
-          catch (Exception ex)
-          {
-            ferr = ex.Message;
-          }
-          if (ferr is not null) { failure = ferr; return; }
+          // No catch inside the unit: a partial-write failure must escape Atomic.Run so ALL staged source/section/head/event effects roll back instead of committing partials.
         });
-        if (failure is not null)
-          return (false, false, false, failure, 500);
         if (stale)
           return (false, true, false, staleErr, 409);
         // Retire the completed reservation only if it is still current.
@@ -1576,6 +1575,13 @@ public static class SourceGovernance
               // Caller + authority revalidated inside the unit: a revocation or
               // logout between reservation and stamping must not mutate the row.
               if (PeopleOps.Check(s, req, stamped.BoardId, stamped.Scope == "meeting" ? stamped.MeetingId : null, need) is not null) return;
+              // Policy-drift gate BEFORE any derived write: a board policy change
+              // (mode/blocked-type revision or allowance) between reservation and
+              // stamping must not mutate the row. Reservation key + live allowance
+              // are both rechecked against the freshly fetched board/row.
+              if (!string.Equals(PolicyRevisionKey(s, stamped.BoardId), res.PolicyKey, StringComparison.Ordinal)) return;
+              if (!s.Boards.TryGetValue(stamped.BoardId, out var stampBoard) || stampBoard is null) return;
+              if (!PolicyAllows(stampBoard, stamped)) return;
               stamped.ExtractionJson = extractionJson;
               s.Sources.Flush();
             });
