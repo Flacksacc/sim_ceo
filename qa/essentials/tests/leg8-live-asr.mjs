@@ -2,11 +2,13 @@
 // + REAL spoken-WAV ASR through the ACTUAL app routes (needs API+PG; runner
 // managed leg; no fake needed for provider calls).
 // Arms ONLY when ESS_QA_LIVE=1 AND META_API_KEY is present in THIS child env
-// (the runner forwards the primary-supplied app key ONLY to the leg8 API +
-// leg env, captured-then-stripped so nothing else inherits it). The leg reads
-// the key from process env ONLY, never from files, never the inherited
-// coding-profile key; it never logs secrets, full env, or provider request
-// headers. No image calls, no new services. Windows TTS synthesizes the real
+// (the runner forwards the primary-supplied app key AND selected app base
+// ONLY to the leg8 API + leg env, captured-then-stripped so nothing else
+// inherits it). The leg reads key/base from process env ONLY, never files,
+// never the inherited coding-profile key/base (blank base => app default
+// https://api.meta.ai/v1; loopback/fake base is rejected while armed). Key
+// presence alone is NOT provider proof. No image calls, no new services.
+// Windows TTS synthesizes the real
 // spoken WAV (never claim a live hardware mic). Small bounded model text +
 // one short utterance; ledger checks + source identity; owned exclusive DB
 // and lifecycle (runner drops the DB in cleanup); no user 5080/data writes.
@@ -31,8 +33,25 @@ if (process.env.ESS_QA_LIVE !== "1") {
   process.exit(0);
 }
 const liveKeyPresent = !!process.env.META_API_KEY;
-ctx.ok("live-key-present", liveKeyPresent, "META_API_KEY present in child env (value never logged)");
+ctx.ok("live-key-present", liveKeyPresent, "META_API_KEY present in child env (value never logged; presence alone is NOT provider proof)");
 if (!liveKeyPresent) { ctx.ok("live-key-required", false, "armed but no key; primary supplies the app key via child env AFTER deterministic final builds"); process.exit(ctx.verdict()); }
+// Real-base gate (armed only): NEVER run the paid gate against the fake.
+// Blank base => app ModelGatewayBase default https://api.meta.ai/v1.
+const liveBaseRaw = String(process.env.META_API_BASE || "").trim();
+const liveBaseShown = liveBaseRaw || "https://api.meta.ai/v1 (app ModelGatewayBase default)";
+const liveBaseBad = !!liveBaseRaw && (/127\.0\.0\.1|localhost|::1|:5242|\/fake/i.test(liveBaseRaw) || !/^https?:\/\//i.test(liveBaseRaw));
+ctx.ok("live-base-real", !liveBaseBad, "META_API_BASE=" + liveBaseShown.slice(0, 120));
+if (liveBaseBad) { ctx.ok("live-base-required", false, "armed but base is loopback/fake/unsupported; refusing to claim real provider"); process.exit(ctx.verdict()); }
+if (!liveBaseRaw) ctx.ok("live-base-default", true, "blank base => app default https://api.meta.ai/v1 (never fake)");
+// Fake is health-only on this leg: prove zero fake chat/transcribe acquisition.
+try {
+  const fakeBase = process.env.QA_FAKE || "http://127.0.0.1:5242";
+  const fr = await fetch(fakeBase + "/__counts", { signal: AbortSignal.timeout(5000) });
+  if (fr.ok) {
+    const fc = await fr.json();
+    ctx.ok("live-fake-unused", Number(fc.chat || 0) === 0 && Number(fc.transcribe || 0) === 0, "fake chat=" + fc.chat + " transcribe=" + fc.transcribe + " (must stay 0; fake health-only, never provider)");
+  } else ctx.ok("live-fake-unused", true, "fake health-only, counts unavailable; no fake acquisition claimed");
+} catch { ctx.ok("live-fake-unused", true, "fake health-only, unreachable; no fake acquisition claimed"); }
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 async function uploadPortrait(token, rosterId) {
@@ -80,6 +99,7 @@ function resamplePcm16Mono(raw, outRate) {
     out.writeInt16LE(Math.max(-32768, Math.min(32767, v)), 44 + i * 2);
   }
   return out;
+}
 
 // QA-owned TTS synthesis (Windows Speech): real spoken words rendered with
 // the installed desktop voice to a WAV file, then honestly resampled to the
@@ -103,7 +123,8 @@ function synthSpeech(text, wavPath) {
   fs.writeFileSync(wavPath, strict);
   fs.rmSync(rawPath);
 }
-}
+// Module-scope guard (no TTS/provider/DB): both helpers must stay top-level.
+if (typeof resamplePcm16Mono !== "function" || typeof synthSpeech !== "function") { ctx.ok("scope-helpers-module", false, "helper scope regression: synthSpeech nested or missing"); process.exit(ctx.verdict()); }
 
 
 try {
