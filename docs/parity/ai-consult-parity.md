@@ -45,37 +45,37 @@ Checked off with verification evidence as each phase lands.
 - Honest unverified limits preserved: ASR codec path, image-live behavior, readiness/runtime beyond the logged runs, and phase 9 accounting depth are not claimed by this checkpoint.
 
 ## Phase 4 -- Secretary depth
-- [ ] Direct routing (Secretary, ...) bypassing bids; may interrupt unsent work. (FOURTH WIP by Muse in muse/secretary-depth; 13 findings from phase4-third-repair-independent-review.txt REJECT13; reuse accepted R1/R2/R3/R4/R8/R13/R14; not accepted, no self-acceptance. Interface: .tmp/secretary-fourth-interface.txt.)
-- [ ] Labeled provisional notes with update/reversal + history; never decisions. (FOURTH WIP same branch; linear unique chain + typed history/request validators + OmittedJson; not accepted.)
-- [ ] Briefings strictly from approved sources + directions + context, with excerpts. (FOURTH WIP same branch; whole essential board/lead/brief, selected spans, shared array hash, omission manifest; not accepted.)
-- [ ] Clarifying question on ambiguous requests. (FOURTH WIP same branch; attempt-bound uncertainty + shared SourceEpoch + Bearer precedence + callback isolation; not accepted.)
+- [ ] Direct routing (Secretary, ...) bypassing bids; may interrupt unsent work. (Delivered in the essentials checkpoint, with selected API/browser verification; full-phase acceptance remains open pending human feedback and the complete requirement audit.)
+- [ ] Labeled provisional notes with update/reversal + history; never decisions. (Delivered in the essentials checkpoint; earlier rejected lane checkpoints are historical, not the deployed source. Full-phase acceptance remains open.)
+- [ ] Briefings strictly from approved sources + directions + context, with excerpts. (Included in the selected Secretary implementation and evidence checks; full-phase acceptance remains open.)
+- [ ] Clarifying question on ambiguous requests. (Delivered and exercised in the selected API/browser checks, including reload/retry/answer recovery; full-phase acceptance remains open.)
 
 ## Phase 5 -- Records review UX
-- [ ] One-document review: working notes, items, excerpts, recent input; per-item approve/revise/discard + approve-all. (Not implemented; unchanged.)
-- [ ] Empty-draft guard: no approval control at all. (Not implemented; unchanged.)
-- [ ] Hash/version/watermark + supersession shown; 409 on drift. (Not implemented; unchanged.)
+- [ ] One-document review: working notes, items, excerpts, recent input; per-item approve/revise/discard + approve-all. (Basic review, selected/all approval, and whole-draft revision/discard are delivered. Granular item revision/discard controls remain pending: `itemRevise`/`itemDiscard` handlers exist, but the current rendered editor uses whole-draft JSON and draft discard. Do not count helper definitions as completed UI.)
+- [ ] Empty-draft guard: no approval control at all. (Delivered and covered by the final browser checks; full-phase acceptance remains open.)
+- [ ] Hash/version/watermark + supersession shown; 409 on drift. (Delivered in basic review; the selected browser checks exercise conflict display and an explicit refresh POST. Full-phase acceptance remains open.)
 
 ## Phase 6 -- Source governance depth
-- [ ] pending -> approved/rejected state machine with per-version states. (Review rejected; 13 defects in fresh Muse fixing; PRODUCT skill creation owned by phase 6, not Main.)
-- [ ] Type policies (wiki-only / allow-all-with-exclusions); changes invalidate pending replies + pause. (Same phase-6 rework; unchanged.)
-- [ ] Per-source indexing state + explicit reindex with completion status. (Same phase-6 rework; unchanged.)
-- [ ] Section-level persisted excerpts. (Same phase-6 rework; unchanged.)
+- [ ] pending -> approved/rejected state machine with per-version states. (Backend routes and validators are present in MAIN; selected source/restore checks passed. Full source-governance workflow acceptance is not established by the essentials checkpoint.)
+- [ ] Type policies (wiki-only / allow-all-with-exclusions); changes invalidate pending replies + pause. (Shared policy/publication protections are included in the delivered core; full policy workflow acceptance remains open.)
+- [ ] Per-source indexing state + explicit reindex with completion status. (Source index/reindex endpoints are present; complete phase-specific UI and lifecycle acceptance remains open.)
+- [ ] Section-level persisted excerpts. (Source section/version/history endpoints and selected preservation checks are present; full-phase acceptance remains open.)
 
 ## Phase 7 -- Read-only Wiki.js connector
-- [ ] Resource lifecycle (URL, server-side key, description, allowlist, exclusions-win, tags, locale, explicit enable). (Not implemented; unchanged.)
-- [ ] Board vs single-meeting scope; sync on enable/rule change/schedule + manual. (Not implemented; unchanged.)
-- [ ] Read-only, per-fetch rule recheck, failed sync blocks connector evidence. (Not implemented; unchanged.)
+- [ ] Resource lifecycle (URL, server-side key, description, allowlist, exclusions-win, tags, locale, explicit enable). (Deferred. Resource endpoint code is present, but the complete connector workflow is unaccepted.)
+- [ ] Board vs single-meeting scope; sync on enable/rule change/schedule + manual. (Deferred. Do not infer scheduled-sync or scope acceptance from endpoint presence.)
+- [ ] Read-only, per-fetch rule recheck, failed sync blocks connector evidence. (Deferred; requires its own full connector verification after the human-testing checkpoint.)
 
 ## Phase 8 -- Meeting-scoped guests
-- [ ] Discuss-only access to one meeting + read-only settings access, revocable. (Working in separate worktree; unaccepted in MAIN.)
-- [ ] Join tracking; leaving revokes. (Working in separate worktree; unaccepted in MAIN.)
+- [ ] Discuss-only access to one meeting + read-only settings access, revocable. (Basic access controls support the delivered milestone; expanded meeting-guest workflow acceptance is deferred.)
+- [ ] Join tracking; leaving revokes. (Deferred; full guest lifecycle acceptance remains open.)
 
 ## Phase 9 -- Usage accounting depth
-- [ ] Installation scope; hidden roles included; missing/unallocated labeled. (Working in separate worktree; unaccepted in MAIN; accounting limits not claimed.)
+- [ ] Installation scope; hidden roles included; missing/unallocated labeled. (Durable model-call/usage accounting supports the delivered features. Complete installation/hidden-role/unallocated reporting and dashboard acceptance is deferred.)
 
 ## Phase 10 -- Verify-first (prove, do not rebuild unless missing)
-- [ ] Jobs idempotent retry; backup/restore hash semantics; readiness/liveness; admin diagnostics. (Not implemented; unchanged.)
-- [ ] Auth stays session-based; voice stays sim_ceo-only. (Unchanged.)
+- [ ] Jobs idempotent retry; backup/restore hash semantics; readiness/liveness; admin diagnostics. (Hash-verified restore, persistent startup, readiness/liveness, and the human container restart are verified for the delivered milestone. Background-job retry/execution and the complete diagnostics audit remain open. See the timestamp precision limit above.)
+- [ ] Auth stays session-based; voice stays sim_ceo-only. (Session-based access and meeting dictation support the delivered milestone; physical microphone testing and the complete phase acceptance audit remain pending.)
 
 ## Explicit non-goals
 Telegram transport, group/topic mechanics, BotFather UI, verbatim command grammar, separate ai_consult web UI, new paid-service requirements.
