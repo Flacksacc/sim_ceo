@@ -862,7 +862,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
         return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", RecordsOps.SafeDraft(draft));
       });
     }
-    catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
+    catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Record creation") ?? (ex is InvalidOperationException iox ? CommitOutcome.StorageFault("Record creation", iox) : Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500)); }
     if (pendingCreateAudit is not null) Atomic.Audit(s, pendingCreateAudit);
     return created;
   }
@@ -934,7 +934,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemorySto
         return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", RecordsOps.SafeDraft(draft));
       });
     }
-    catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
+    catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Record creation from direction") ?? (ex is InvalidOperationException iox ? CommitOutcome.StorageFault("Record creation from direction", iox) : Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500)); }
     if (pendingDirAudit is not null) Atomic.Audit(s, pendingDirAudit);
     return createdDir;
   }

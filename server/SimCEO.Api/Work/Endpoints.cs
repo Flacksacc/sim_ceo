@@ -78,6 +78,70 @@ public static class SimCEOEndpoints
     return JsonSerializer.Deserialize<T>(json)!;
   }
 
+  // P1 finding 1: every live-store packet input is observed atomically under
+  // Root AFTER the original restore pin, the relevant captured fingerprints,
+  // and current authority are rechecked. Packet strings are fully constructed
+  // synchronously inside the Root gate; the provider await stays outside, so a
+  // packet never observes uncommitted/torn/rejected input and never acquires
+  // a new restore identity. Covers BidPacket + BuildPacket and every other
+  // live packet read inside BuildPacket (roster profile/dossier, recent
+  // messages, approved records, directions, sources/wiki). Post-await
+  // publication checks below are preserved unchanged.
+  private static void CheckPacketFreshnessLocked(InMemoryStore s, HttpRequest req, DiscussionCapture cap, Meeting m, BoardAdvisor adv)
+  {
+    PublicationGuard.Check(s, cap.PublishPin, req, m.BoardId, m.Id, "discuss");
+    if (s.SourceEpoch != cap.EpochBefore)
+      throw new InvalidOperationException("source-changed");
+    if (s.RestoreEpochId != cap.RestoreBefore)
+      throw new InvalidOperationException("restored");
+    if (s.Meetings.TryGetValue(m.Id, out var curM) && curM is not null)
+    {
+      if (curM.Generation != cap.Gen)
+        throw new InvalidOperationException("generation-changed");
+    }
+    LeadProfile? curLead = null;
+    if (s.Boards.TryGetValue(m.BoardId, out var curBoard) && curBoard is not null)
+      curLead = LeadSetup.ResolveLeadForBoard(s, curBoard);
+    else
+      curLead = LeadSetup.ResolveLeadFor(s, m.BoardId);
+    if ((curLead?.Version ?? 0) != cap.LeadVersion
+      || !string.Equals(LeadIdentityFingerprint(curLead), cap.LeadFingerprint, StringComparison.Ordinal))
+      throw new InvalidOperationException("lead-changed");
+    if (s.Boards.TryGetValue(m.BoardId, out var freshBoard) && freshBoard is not null)
+    {
+      var fv = LeadSetup.EffectiveView(s, freshBoard);
+      if (!string.Equals(fv.name ?? "", cap.BoardNameBefore, StringComparison.Ordinal)
+        || !string.Equals(fv.mission ?? "", cap.BoardMissionBefore, StringComparison.Ordinal)
+        || !string.Equals(fv.stage ?? "", cap.BoardStageBefore, StringComparison.Ordinal))
+        throw new InvalidOperationException("board-changed");
+    }
+    if (!string.Equals(DiscussionDirFingerprint(s, m.BoardId, m.Id), cap.DirBefore, StringComparison.Ordinal))
+      throw new InvalidOperationException("directions-changed");
+    if (!string.Equals(DiscussionEffFingerprint(s, m.BoardId, m.Id), cap.EffBefore, StringComparison.Ordinal))
+      throw new InvalidOperationException("records-changed");
+    if (!cap.LaneBPrints.TryGetValue(adv.Id, out var wanted)
+      || !string.Equals(RosterOps.ReviewedInputFingerprint(s, adv), wanted, StringComparison.Ordinal))
+      throw new InvalidOperationException("roster-changed");
+  }
+
+  private static string BuildBidPacketPinned(InMemoryStore s, HttpRequest req, DiscussionCapture cap, Meeting m, BoardAdvisor adv, string prompt, Board? board)
+  {
+    lock (s.RootGate)
+    {
+      CheckPacketFreshnessLocked(s, req, cap, m, adv);
+      return ContextCurator.BidPacket(s, m, adv, prompt, board);
+    }
+  }
+
+  private static (string packet, CuratorManifest manifest) BuildDiscussionPacketPinned(InMemoryStore s, HttpRequest req, DiscussionCapture cap, Meeting m, BoardAdvisor adv, string prompt, Board? board, LeadProfile? lead)
+  {
+    lock (s.RootGate)
+    {
+      CheckPacketFreshnessLocked(s, req, cap, m, adv);
+      return ContextCurator.BuildPacket(s, m, adv, prompt, board, lead);
+    }
+  }
+
   private sealed record DiscussionCapture(
     Meeting Meeting,
     Board? RunBoard,
@@ -1203,8 +1267,11 @@ public static class SimCEOEndpoints
           await bidSem.WaitAsync();
           try
           {
+            string bidPacket;
+            try { bidPacket = BuildBidPacketPinned(s, req, dx, m, adv, prompt, board); }
+            catch (Exception pktEx) { return (adv, score: 0.0, text: "", error: (string?)pktEx.Message); }
             var bidText = await gw.CompleteAsync(spark, "advisor-bid",
-              ContextCurator.BidPacket(s, m, adv, prompt, board) + "\nReply with exactly YES or NO, then one line why.",
+              bidPacket + "\nReply with exactly YES or NO, then one line why.",
               ContextBudget.BidTokens, 512, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id);
             var yes = bidText.TrimStart().StartsWith("YES", StringComparison.OrdinalIgnoreCase);
             return (adv, score: yes ? 10.0 + (adv.BoardRole.Length % 7) : 0.0, text: bidText, error: (string?)null);
@@ -1277,7 +1344,10 @@ public static class SimCEOEndpoints
           await draftSem.WaitAsync();
           try
           {
-            var (packet, manifest) = ContextCurator.BuildPacket(s, m, adv, prompt, board, lead);
+            string packet;
+            CuratorManifest? manifest;
+            try { var built = BuildDiscussionPacketPinned(s, req, dx, m, adv, prompt, board, lead); packet = built.packet; manifest = built.manifest; }
+            catch (Exception pktEx) { return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)pktEx.Message); }
             var text = await gw.CompleteAsync(spark, "advisor-reply",
               packet + "\nYOUR TURN. Cite [source:name] or [record:version] where used; if you add nothing, reply with exactly ABSTAIN. If your reply takes a clear position on the lead question or another advisor point, end with [stance: Agrees|Disagrees|Raises risk|Proposes alternative]; otherwise omit the tag.",
               ContextBudget.DraftTokens, 4096, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id);
