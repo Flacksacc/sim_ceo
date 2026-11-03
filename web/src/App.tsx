@@ -4292,6 +4292,11 @@ const testModel = useMutation({
   const adoptOmittedRow = (row: any, reqId: string, snap: { oB: string; oM: string; oU: string; oEp: number; oOrigin: { epoch: number; token: string; user: string } }) => {
     const om = parseOmittedRow(row);
     if (om !== null) { setSecOmitted(om); secOmittedReq.current = reqId || ""; return; }
+    // Display adoption from the validated same-identity/board/meeting/request envelope (known [] preserved, UNKNOWN never fabricated) BEFORE the fallback GET.
+    // Covers both row-reconciliation branches (arow + target) when the list row carries UNKNOWN metadata: the envelope rewrite above already preserved the
+    // manifest in storage, so restore it to display here instead of leaving the warning lost while the fallback GET hangs/fails.
+    try { const eIv = readEnvelope(secEnvelopeKey(snap.oU, snap.oB, snap.oM)); if (eIv && eIv.boardId === snap.oB && eIv.meetingId === snap.oM && eIv.identity === snap.oU && String(eIv.requestId) === String(reqId)) { const eIvOm = parseOmittedManifest((eIv as any)?.omitted); if (eIvOm !== null) { setSecOmitted(eIvOm); secOmittedReq.current = reqId || ""; return; } } } catch { /* preserve-only */ }
+    try { const eAv = readEnvelope(secAnsEnvelopeKey(snap.oU, snap.oB, snap.oM)); if (eAv && eAv.boardId === snap.oB && eAv.meetingId === snap.oM && eAv.identity === snap.oU && String(eAv.requestId) === String(reqId)) { const eAvOm = parseOmittedManifest((eAv as any)?.omitted); if (eAvOm !== null) { setSecOmitted(eAvOm); secOmittedReq.current = reqId || ""; return; } } } catch { /* preserve-only */ }
     if (!reqId || (secOmittedReq.current || "") === (reqId || "")) return;
     fetchPersistedOmitted(reqId, { ...snap, envRev: secEnvelopeRev.current, hydRev: secHydRef.current });
   };
