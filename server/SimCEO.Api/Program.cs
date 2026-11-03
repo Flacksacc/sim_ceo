@@ -328,6 +328,75 @@ if (args.Contains("--selftest"))
   var (isoA2, _, _) = LeadSetup.SaveLead(store, isoA.Id, new LeadProfile { Version = isoA1!.Version, Name = "LeadA v2" });
   if (isoA2 is null || isoA2.Version != 2) failures.Add("lead-iso-edit");
   if ((LeadSetup.ResolveLeadFor(store, isoB.Id)?.Version ?? 0) != 1) failures.Add("lead-iso-scope");
+  // Legacy roster visibility hotfix: blank-OwnerKey rows resolve to the
+  // unambiguous linked-board owner, live AND historically removed links, so
+  // removing the last live member link cannot delete account ownership.
+  // Explicit OwnerKey stays authoritative; distinct owners stay ambiguous.
+  {
+    HttpRequest DemoReq(string? user)
+    {
+      var ctx = new DefaultHttpContext();
+      if (!string.IsNullOrEmpty(user)) ctx.Request.Headers["X-User"] = user;
+      return ctx.Request;
+    }
+    var legBoard = new Board { Id = Guid.NewGuid(), Name = "LegBoard", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[legBoard.Id] = legBoard;
+    var legBoard2 = new Board { Id = Guid.NewGuid(), Name = "LegBoard2", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[legBoard2.Id] = legBoard2;
+    var ambBoard = new Board { Id = Guid.NewGuid(), Name = "AmbBoard", OwnerKey = "other", CreatedAt = DateTime.UtcNow };
+    store.Boards[ambBoard.Id] = ambBoard;
+    var histAcct = Guid.NewGuid();
+    var legEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = histAcct, OwnerKey = "", Name = "Leg Legacy", Description = "legacy entry", ProfileJson = "{leg-legacy-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[legEntry.Id] = legEntry;
+    var legAdv = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = legBoard.Id, RosterEntryId = legEntry.Id, RosterVersion = 1, BoardRole = "Leg Seat", CreatedAt = DateTime.UtcNow };
+    store.Advisors[legAdv.Id] = legAdv;
+    var legRemoved = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = legBoard2.Id, RosterEntryId = legEntry.Id, RosterVersion = 1, BoardRole = "Old Seat", Removed = true, CreatedAt = DateTime.UtcNow };
+    store.Advisors[legRemoved.Id] = legRemoved;
+    var rndAcct = Guid.NewGuid();
+    var demoReq = DemoReq(null);
+    if (legEntry.AccountId == rndAcct) failures.Add("leg-acct-distinct");
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, legEntry) != "owner") failures.Add("leg-effective-owner");
+    if (!RosterLegacyAccess.CallerMatchesEffectiveOwner(store, demoReq, legEntry)) failures.Add("leg-caller-owner");
+    if (!RosterOps.CanWriteRoster(store, demoReq, legEntry)) failures.Add("leg-demo-owner-write");
+    if (!RosterEndpoints.CanReadRoster(store, demoReq, legEntry)) failures.Add("leg-demo-owner-read");
+    legAdv.Removed = true;
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, legEntry) != "owner") failures.Add("leg-historical-owner");
+    if (!RosterOps.CanWriteRoster(store, demoReq, legEntry)) failures.Add("leg-historical-write");
+    if (!RosterEndpoints.CanReadRoster(store, demoReq, legEntry)) failures.Add("leg-historical-read");
+    legAdv.Removed = false;
+    var expEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = histAcct, OwnerKey = "explicit", Name = "Exp", Description = "explicit entry", ProfileJson = "{exp-explicit-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[expEntry.Id] = expEntry;
+    store.Advisors[Guid.NewGuid()] = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = ambBoard.Id, RosterEntryId = expEntry.Id, RosterVersion = 1, BoardRole = "Exp Seat", CreatedAt = DateTime.UtcNow };
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, expEntry) != "explicit") failures.Add("leg-explicit-priority");
+    if (RosterOps.CanWriteRoster(store, DemoReq("stranger-x"), expEntry)) failures.Add("leg-explicit-stranger-denied");
+    var ambEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = histAcct, OwnerKey = "", Name = "Amb", Description = "ambiguous entry", ProfileJson = "{amb-ambiguous-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[ambEntry.Id] = ambEntry;
+    store.Advisors[Guid.NewGuid()] = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = legBoard.Id, RosterEntryId = ambEntry.Id, RosterVersion = 1, BoardRole = "Amb A", CreatedAt = DateTime.UtcNow };
+    store.Advisors[Guid.NewGuid()] = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = ambBoard.Id, RosterEntryId = ambEntry.Id, RosterVersion = 1, BoardRole = "Amb B", CreatedAt = DateTime.UtcNow };
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, ambEntry) is not null) failures.Add("leg-ambiguous-null");
+    store.Security[Guid.NewGuid()] = new SecurityState { AuthRequired = true };
+    var ownerAcct = new global::SimCEO.Api.Account { Id = Guid.NewGuid(), Email = "se-owner@x.test", Salt = "s", Hash = "h", CreatedAt = DateTime.UtcNow };
+    store.Accounts[ownerAcct.Id] = ownerAcct;
+    store.Sessions["leg-sec-owner"] = new global::SimCEO.Api.Session { Token = "leg-sec-owner", AccountId = ownerAcct.Id, Email = "se-owner@x.test", ExpiresAt = DateTime.UtcNow.AddHours(1) };
+    store.Sessions["leg-sec-bob"] = new global::SimCEO.Api.Session { Token = "leg-sec-bob", AccountId = Guid.NewGuid(), Email = "se-bob@x.test", ExpiresAt = DateTime.UtcNow.AddHours(1) };
+    var secBoard = new Board { Id = Guid.NewGuid(), Name = "SecBoard", OwnerKey = "se-owner@x.test", CreatedAt = DateTime.UtcNow };
+    store.Boards[secBoard.Id] = secBoard;
+    var secEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "", Name = "Sec Legacy", Description = "secure legacy entry", ProfileJson = "{sec-legacy-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[secEntry.Id] = secEntry;
+    store.Advisors[Guid.NewGuid()] = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = secBoard.Id, RosterEntryId = secEntry.Id, RosterVersion = 1, BoardRole = "Sec Seat", CreatedAt = DateTime.UtcNow };
+    HttpRequest SecReq(string tok)
+    {
+      var sctx = new DefaultHttpContext();
+      sctx.Request.Headers["Authorization"] = "Bearer " + tok;
+      return sctx.Request;
+    }
+    if (!PeopleOps.IsSecure(store)) failures.Add("leg-sec-mode-on");
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, secEntry) != "se-owner@x.test") failures.Add("leg-sec-effective-owner");
+    if (!RosterOps.CanWriteRoster(store, SecReq("leg-sec-owner"), secEntry)) failures.Add("leg-sec-owner-write");
+    if (RosterOps.CanWriteRoster(store, SecReq("leg-sec-bob"), secEntry)) failures.Add("leg-sec-stranger-write-denied");
+    if (!RosterEndpoints.CanReadRoster(store, SecReq("leg-sec-owner"), secEntry)) failures.Add("leg-sec-owner-read");
+    if (RosterEndpoints.CanReadRoster(store, SecReq("leg-sec-bob"), secEntry)) failures.Add("leg-sec-stranger-read-denied");
+  }
     Console.WriteLine(failures.Count == 0 ? "SELFTEST PASS: advisor-cap, sequence, record-hash, policy, budgets, challenge, lead-version, setup-activate, roster-copy, same-role, approval-gate, record-export, record-export-refs, evidence-ref, grants, spend-cap, model-policy, provider-guard" : "SELFTEST FAIL: " + string.Join(";", failures));
   Environment.Exit(failures.Count == 0 ? 0 : 1);
 }
@@ -540,7 +609,12 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
     list0 = list0.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
       || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read")));
   else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty)
-    list0 = list0.Where(r => r.AccountId == accountId);
+    list0 = list0.Where(r => r.AccountId == accountId
+      // Canonical visibility (demo mode): a random browser-local account filter must not
+      // hide existing attached entries. Attached-to-a-readable-board and unambiguous
+      // legacy-owner entries stay visible; unattached foreign entries stay hidden.
+      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+      || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
   var list = list0;
   if (!string.IsNullOrWhiteSpace(q))
     list = list.Where(r => r.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
@@ -557,6 +631,7 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
       try { __readBoards = s.Advisors.Values.Where(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
         .Select(a => new { boardId = a.BoardId, board = s.Boards.TryGetValue(a.BoardId, out var __bb) ? __bb.Name : "?", role = a.BoardRole, approved = a.Approved }).ToList<object>(); } catch {}
       var __isFull = isAdmin || string.Equals(r.OwnerKey ?? "", me, System.StringComparison.OrdinalIgnoreCase)
+        || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, System.StringComparison.OrdinalIgnoreCase)
         || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
       object __entry = __isFull ? r : new { r.Id, r.Name, r.Description, r.Version, r.UpdatedAt };
       var __imgs = __isFull ? s.Images.Values.Count(i => i.RosterEntryId == r.Id) : s.Images.Values.Count(i => i.RosterEntryId == r.Id && i.Review == "accepted");
@@ -571,8 +646,12 @@ app.MapGet("/api/roster/count", (InMemoryStore s, HttpRequest req, Guid accountI
   var admin = PeopleOps.AdminEmail(s);
   var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, me, StringComparison.OrdinalIgnoreCase);
   var q = s.Roster.Values.Where(r => !r.Archived);
-  if (PeopleOps.IsSecure(s) && !isAdmin) q = q.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase));
-  else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty) q = q.Where(r => r.AccountId == accountId);
+  if (PeopleOps.IsSecure(s) && !isAdmin) q = q.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
+    || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+    || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
+  else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty) q = q.Where(r => r.AccountId == accountId
+    || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+    || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
   return Results.Ok(new { total = q.Count() });
 });
 
@@ -630,6 +709,7 @@ app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest
   if (!s.Roster.TryGetValue(rosterId, out var __src) || __src.Archived) return Results.NotFound("Roster entry not found.");
   { var __me2 = PeopleOps.UserOf(s, req); var __adm2 = PeopleOps.AdminEmail(s); var __isAdm2 = !string.IsNullOrWhiteSpace(__adm2) && string.Equals(__adm2, __me2, StringComparison.OrdinalIgnoreCase);
     var __canSrc = __isAdm2 || string.Equals(__src.OwnerKey ?? "", __me2, StringComparison.OrdinalIgnoreCase)
+      || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, __src) ?? "", __me2, StringComparison.OrdinalIgnoreCase)
       || s.Advisors.Values.Any(a => a.RosterEntryId == rosterId && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
     if (!__canSrc) return PeopleOps.Denied(); }
   var role = body.TryGetProperty("boardRole", out var br) ? (br.GetString() ?? "") : "";

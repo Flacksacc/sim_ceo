@@ -222,6 +222,10 @@ public static class RosterOps
     var user = PeopleOps.UserOf(s, req);
     if (!string.IsNullOrWhiteSpace(entry.OwnerKey))
       return string.Equals(entry.OwnerKey, user, StringComparison.OrdinalIgnoreCase);
+    // BACKEND-PROFILE HOOK (cherry-pick note): legacy blank-OwnerKey rows resolve to the
+    // unambiguous linked-board owner for writes. No invented ownership, no cross-account
+    // merge; ambiguous/ownerless rows still fall through to the linked-board grant rule.
+    if (RosterLegacyAccess.CallerMatchesEffectiveOwner(s, req, entry)) return true;
     var linked = s.Advisors.Values
       .Where(a => a.RosterEntryId == entry.Id && !a.Removed)
       .Select(a => a.BoardId).Distinct().ToList();
@@ -295,6 +299,7 @@ public static class RosterEndpoints
     var me = PeopleOps.UserOf(s, req);
     if (PeopleOps.IsInstallationAdmin(s, me)) return true;
     if (string.Equals(entry.OwnerKey ?? "", me, StringComparison.OrdinalIgnoreCase)) return true;
+    if (RosterLegacyAccess.CallerMatchesEffectiveOwner(s, req, entry)) return true;
     try
     {
       return s.Advisors.Values.Any(a => a.RosterEntryId == entry.Id && !a.Removed
@@ -336,6 +341,7 @@ public static class RosterEndpoints
         var __meCp = PeopleOps.UserOf(s, req);
         var __canSrc = PeopleOps.IsInstallationAdmin(s, __meCp)
           || string.Equals(__srcCp.OwnerKey ?? "", __meCp, StringComparison.OrdinalIgnoreCase)
+          || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, __srcCp) ?? "", __meCp, StringComparison.OrdinalIgnoreCase)
           || s.Advisors.Values.Any(a => a.RosterEntryId == id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
         if (!__canSrc) return PeopleOps.Denied();
       }
