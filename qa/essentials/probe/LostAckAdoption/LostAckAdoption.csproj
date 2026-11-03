@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SkipStagePostgres>true</SkipStagePostgres>
+    <AssemblyName>LostAckAdoption</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Frozen ae review Approot: read-only references to the ACTUAL server
+       assemblies. This harness authors NO server code and edits NO production
+       file; it hosts the real endpoint mappings in-process around the real
+       PostgresBackend with a QA-owned post-commit interceptor. -->
+  <ItemGroup>
+    <ProjectReference Include="C:/Users/War/scrach/sim_ceo/.tmp/essentials-backend-ae-review-worktree/server/SimCEO.Api/SimCEO.Api.csproj" />
+    <ProjectReference Include="C:/Users/War/scrach/sim_ceo/.tmp/essentials-backend-ae-review-worktree/server/SimCEO.Postgres/SimCEO.Postgres.csproj" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>
