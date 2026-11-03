@@ -244,8 +244,9 @@ try {
       if (hasMeetingParam) {
         ctx.ok("nav-tab-meet-action", st.body.indexOf("Discussion") >= 0 && st.body.indexOf("Run discussion") >= 0, "detail hash=" + st.hash);
       } else {
-        ctx.ok("nav-tab-meet-action", st.body.indexOf("Start meeting") >= 0 && st.body.indexOf("Search meetings") >= 0, "list hash=" + st.hash);
-        ctx.ok("nav-tab-meet-list-title", st.body.indexOf(run + " meeting") >= 0, "agenda title hash=" + st.hash);
+        const listDom = await page.evaluate((args) => { const sec = document.querySelector('section[aria-label="Meetings and conversation"]'); const startBtn = sec ? Array.from(sec.querySelectorAll("button")).find((x) => (x.textContent || "").trim() === "Start meeting") : null; const searchInput = sec ? sec.querySelector('input[aria-label="Search meetings"]') : null; const agenda = sec ? sec.querySelector('ol[aria-label="Meetings"]') : null; const rowBtn = agenda ? Array.from(agenda.querySelectorAll("button")).find((x) => (x.textContent || "").includes(args.run + " meeting")) : null; const vis = (el) => !!el && !!(el.offsetParent || (el.getClientRects && el.getClientRects().length)); return { startVisible: vis(startBtn), searchPresent: !!searchInput, agendaPresent: !!agenda, rowVisible: vis(rowBtn), rowText: rowBtn ? (rowBtn.textContent || "").slice(0, 120) : "" }; }, { run });
+                ctx.ok("nav-tab-meet-action", listDom.startVisible && listDom.searchPresent && listDom.agendaPresent, "visible list Start meeting + Search meetings input + Meetings agenda list hash=" + st.hash);
+                ctx.ok("nav-tab-meet-list-title", listDom.rowVisible && listDom.rowText.indexOf(run + " meeting") >= 0, "existing meeting row visible title=" + listDom.rowText.slice(0, 80));
       }
     } else {
       ctx.ok("nav-tab-" + exp.key + "-action", st.body.indexOf(exp.action) >= 0, "action/content=" + exp.action);
@@ -887,8 +888,12 @@ try {
       const errDomO2 = await page.evaluate(() => document.body.innerText);
       ctx.ok("secC-retry-still-offline", errDomO2.includes("Secretary error") && /502/.test(errDomO2), errDomO2.slice(0, 300));
       ctx.ok("secC-paused-no-post", finC.length === finBeforePaused && failC.length === failBeforePaused, "finished=" + finC.length + " failed=" + failC.length + " before=" + finBeforePaused + "/" + failBeforePaused);
+      const msgsOFail = mustArray(ctx, "secC-msgs-after-initial-502", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
+      const idsOMsg0 = new Set(msgsO0.map((m) => String(camel(m, "sequence") ?? camel(m, "id"))));
+      const newFailO = msgsOFail.filter((m) => !idsOMsg0.has(String(camel(m, "sequence") ?? camel(m, "id"))));
+      ctx.ok("secC-initial-echo-only", msgsOFail.length === msgsO0.length + 1 && newFailO.length === 1 && String(camel(newFailO[0], "sender") || "") === "lead" && String(camel(newFailO[0], "content") || "") === askO.slice(10), "new=" + newFailO.length + " echo=" + (newFailO[0] ? String(camel(newFailO[0], "content")).slice(0, 80) : "?"));
       const msgsO1 = mustArray(ctx, "secC-msgs-offline", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
-      ctx.ok("secC-offline-no-publish", msgsO1.length === msgsO0.length, "msgs " + msgsO0.length + "->" + msgsO1.length);
+      ctx.ok("secC-offline-no-publish", msgsO1.length === msgsOFail.length, "paused window zero NEW after initial echo baseline msgs " + msgsOFail.length + "->" + msgsO1.length);
       const fcPaused = await fakeJson("/__counts");
       ctx.ok("secC-paused-no-provider", (fcPaused.json.chat | 0) === (fcBeforePaused.json.chat | 0), "chat " + fcBeforePaused.json.chat + "->" + fcPaused.json.chat);
       await page.getByRole("button", { name: "Clear saved retry" }).click();
@@ -995,6 +1000,31 @@ try {
         return null;
       }, { b: bid, m: mid });
       ctx.ok("secD-Bold-present", !!envHB && !!envHB.requestId && !!envHB.nonce, "req=" + (envHB ? String(envHB.requestId).slice(0, 8) : "?"));
+      const askHC = "secretary: HELD-C SECRETARY-AMBIGUOUS scope " + run + " QA-SLEEP:6000?";
+      const draftKeyD = "simceo-draft:" + bid + ":" + mid + ":" + emailA;
+      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(1200);
+      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askHC);
+      const wDraftC = await waitFor("secD-draft-saved", async () => {
+        const v = await page.evaluate((k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }, draftKeyD);
+        if (v === askHC) return { done: true, value: v };
+        return { done: false, note: "key=" + draftKeyD + " val=" + String(v).slice(0, 80) };
+      }, { timeoutMs: 15000 });
+      ctx.ok("secD-draft-saved-exact", wDraftC.ok, String(wDraftC.last || draftKeyD).slice(0, 160));
+      const envHB2 = await page.evaluate((args) => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || "";
+            if (k.indexOf("sec-envelope:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) {
+              const q = JSON.parse(localStorage.getItem(k) || "null");
+              if (q && q.requestId) return q;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }, { b: bid, m: mid });
+      ctx.ok("secD-Bold-settled", !!envHB2 && !!envHB2.requestId && envHB2.requestId === (envHB ? envHB.requestId : "__missing__"), "old B response/save effects settled before reload");
       const heldRoutes = [];
       const heldPred = (url) => String((url && url.pathname) || "").endsWith("/secretary/requests");
       const heldHandler = async (route) => { heldRoutes.push(route); };
@@ -1003,23 +1033,9 @@ try {
       await page.waitForTimeout(1500);
       const wH = await waitFor("secD-hold", async () => (heldRoutes.length >= 1 ? { done: true, value: heldRoutes.length } : { done: false, note: "held=0" }), { timeoutMs: 15000 });
       ctx.ok("secD-hydration-held", wH.ok, String(wH.last || ("held=" + heldRoutes.length)).slice(0, 120));
-      await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(1200);
-      await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
-      const askHC = "secretary: HELD-C SECRETARY-AMBIGUOUS scope " + run + " QA-SLEEP:6000?";
-      await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askHC);
-      await page.waitForTimeout(800);
       const boxD = await askScopeD.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").inputValue().catch(() => "<no-composer>");
-      const draftSavedD = await page.evaluate((args) => {
-        try {
-          for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i) || "";
-            if (k.indexOf("simceo-draft:") === 0 && k.endsWith(":" + args.b + ":" + args.m)) return localStorage.getItem(k) || "";
-          }
-        } catch (e) {}
-        return "";
-      }, { b: bid, m: mid });
-      ctx.ok("secD-draft-untouched", boxD === askHC && draftSavedD === askHC, "held hydration never clobbered the saved composer draft");
+      const draftSavedD = await page.evaluate((k) => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }, draftKeyD);
+      ctx.ok("secD-draft-untouched", boxD === askHC && draftSavedD === askHC, "held hydration never clobbered the saved composer draft key=" + draftKeyD);
       await askScopeD.locator('select[aria-label="Message audience"]').selectOption("secretary");
       await askScopeD.getByRole("button", { name: "Send" }).click();
       await page.waitForTimeout(1500);
@@ -1118,7 +1134,7 @@ try {
     const denyAlert = await vp.evaluate(() => { const a = document.querySelector('[aria-label="Dictation failed"]'); return a ? a.textContent.slice(0, 400) : ""; });
     ctx.ok("voice-denial-this-attempt", /Microphone unavailable or permission denied/i.test(denyAlert), "alert=" + denyAlert.slice(0, 240));
     ctx.ok("voice-denial-record-again", await vMeet.getByRole("button", { name: "Record again" }).count() >= 1, "supported recovery control present on denial");
-    ctx.ok("voice-denied-no-recording", await vMeet.getByRole("button", { name: "Stop dictation" }).count() === 0, "recorder never started while denied");
+    ctx.ok("voice-denied-no-recording", await vMeet.getByRole("button", { name: "Stop and transcribe into draft" }).count() === 0, "recorder never started while denied");
     const msgsDenied = mustArray(ctx, "voice-msgs-denied", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
     ctx.ok("voice-denied-no-publish", msgsDenied.length === msgsV0.length, "msgs " + msgsV0.length + "->" + msgsDenied.length);
     // Supported recovery on a SEPARATE browser with a fake mic device: grant
@@ -1146,9 +1162,9 @@ try {
     const fcV0 = await fakeJson("/__counts");
     await vMeet3.getByRole("button", { name: "Dictate with microphone" }).click();
     await vp3.waitForTimeout(2500);
-    ctx.ok("voice-regrant-records", await vMeet3.getByRole("button", { name: "Stop dictation" }).count() >= 1, "recording after regrant");
+    ctx.ok("voice-regrant-records", await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).count() >= 1, "recording after regrant");
     await vp3.waitForTimeout(3000);
-    if (await vMeet3.getByRole("button", { name: "Stop dictation" }).count()) { await vMeet3.getByRole("button", { name: "Stop dictation" }).click(); }
+    if (await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).count()) { await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).click(); }
     else { ctx.ok("voice-stop-present", false, "Stop control never appeared; recording did not start"); }
     try {
       await vp3.waitForFunction(() => { const t = document.querySelector('section[aria-label="Meetings and conversation"] textarea'); return !!t && (t.value || "").includes("qa transcript"); }, null, { timeout: 30000 });
@@ -1180,7 +1196,7 @@ try {
     ctx.ok("voice-body-held-reload", restoredV === draftV, "restored=" + restoredV.slice(0, 120));
     const vDraftKeys = await vp3.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("simceo-draft:")));
     ctx.ok("voice-draft-localstorage", vDraftKeys.length >= 1, vDraftKeys.slice(0, 3).join(","));
-    await vMeet3locator('select[aria-label="Message audience"]').selectOption("everyone");
+    await vMeet3.locator('select[aria-label="Message audience"]').selectOption("everyone");
     await vMeet3.getByRole("button", { name: "Send" }).click();
     await vp3.waitForTimeout(2500);
     const sentV = mustArray(ctx, "voice-msgs-sent", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
@@ -1196,7 +1212,7 @@ try {
       const fcH0 = await fakeJson("/__counts");
       await vMeet3.getByRole("button", { name: "Dictate with microphone" }).click();
       await vp3.waitForTimeout(2000);
-      if (await vMeet3.getByRole("button", { name: "Stop dictation" }).count()) await vMeet3.getByRole("button", { name: "Stop dictation" }).click();
+      if (await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).count()) await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).click();
       await vp3.waitForTimeout(5000);
       const errDom = await vp3.evaluate(() => document.body.innerText);
       ctx.ok("voice-502-error-visible", /Dictation failed/i.test(errDom) && /502/.test(errDom), errDom.slice(0, 300));
@@ -1218,7 +1234,7 @@ try {
       // Fresh retry after the fault clears: Record again, Stop, completed.
       await vMeet3.getByRole("button", { name: "Dictate with microphone" }).click();
       await vp3.waitForTimeout(2000);
-      if (await vMeet3.getByRole("button", { name: "Stop dictation" }).count()) await vMeet3.getByRole("button", { name: "Stop dictation" }).click();
+      if (await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).count()) await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).click();
       try {
         await vp3.waitForFunction((want) => { const t = document.querySelector('section[aria-label="Meetings and conversation"] textarea'); return !!t && (t.value || "").includes(want); }, "qa transcript", { timeout: 30000 });
       } catch (e) { ctx.ok("voice-retry-lands", false, "retry transcription never reached the draft"); }
@@ -1250,7 +1266,7 @@ try {
       ctx.ok("voice-cancel-present", cancelVisible >= 1, "Cancel control rendered while recording");
       if (cancelVisible) await vMeet3.getByRole("button", { name: "Cancel dictation" }).click();
       await vp3.waitForTimeout(1500);
-      ctx.ok("voice-cancel-stopped", await vMeet3.getByRole("button", { name: "Stop dictation" }).count() === 0, "recorder stopped after Cancel");
+      ctx.ok("voice-cancel-stopped", await vMeet3.getByRole("button", { name: "Stop and transcribe into draft" }).count() === 0, "recorder stopped after Cancel");
       const draftAfterC = await vMeet3.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").inputValue().catch(() => "<no-composer>");
       ctx.ok("voice-cancel-no-draft-change", draftAfterC === draftBefore, "draft untouched by Cancel");
       const cancelDom = await vp3.evaluate(() => document.body.innerText);
