@@ -4,3 +4,43 @@
 **/dist/
 .vs/
 *.user
+
+# --- essentials delivery hardening (source-only; keep server/web/solution/props/locks) ---
+# Git metadata must never enter the build context.
+.git
+.git/
+# Local scratch/worktree outputs (root + nested). Covers MAIN .tmp worktrees.
+.tmp
+.tmp/
+.tmp_*/
+**/.tmp/
+**/.tmp_*/
+# Private dotenv files, root + nested. .env.example stays included via ! below
+# so required web/server sources and package locks are unaffected.
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example
+# Private key/certificate material, root + nested (never ship in layers).
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.pfx
+**/*.pfx
+*.p12
+**/*.p12
+# QA run artifacts/logs and published outputs (sources under qa/ stay shippable;
+# Dockerfile only COPYs web/ + server/, so these exclusions cannot break the build).
+qa/**/art-*/
+qa/**/art-manual-*/
+qa/**/pub/
+qa/**/*.log
+qa/**/*.pid
+# Generic run logs/pids and local output dirs (no server/web source matches these).
+*.log
+**/*.pid
+output/
+logs/
