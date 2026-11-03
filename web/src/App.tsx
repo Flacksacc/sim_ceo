@@ -3121,6 +3121,11 @@ const tabCount = (k: Tab): number | null => {
   const [revText, setRevText] = useState("");
   const revTextRev = useRef(0);
   const revTextOwner = useRef("");
+  // Whole-draft ownership retires with its context: board and meeting switches
+  // and record deselect clear the owner so a deliberate same-ID reselect
+  // rehydrates. Same-draft refetches keep the owner and preserve newer typing.
+  useEffect(() => { try { revTextOwner.current = ""; } catch { /* noop */ } }, [boardId, meetingId]);
+  useEffect(() => { if (!recId) { try { revTextOwner.current = ""; } catch { /* noop */ } } }, [recId]);
   useEffect(() => {
     if (recDetail.data) {
       const nid = (recDetail.data as RecordDraft).id;
@@ -4340,7 +4345,7 @@ const testModel = useMutation({
         if (aenv0 && aenv0.boardId === boardId && aenv0.meetingId === meetingId && aenv0.identity === u && aenv0.requestId && aenv0.answer) {
           setSecQuestion(aenv0.question || ""); setSecRequestId(aenv0.requestId); setSecAnswer(aenv0.answer); preHydAns = aenv0.answer;
           secAnsOwnerReq.current = aenv0.requestId; secAnsOwnerHyd.current = true;
-          try { const __om0 = parseOmittedManifest((aenv0 as any)?.omitted); if (__om0 !== null) { setSecOmitted(__om0); secOmittedReq.current = aenv0.requestId; } } catch { /* noop */ }
+          try { const __om0 = parseOmittedManifest((aenv0 as any)?.omitted); if (__om0 !== null) { setSecOmitted(__om0); secOmittedReq.current = aenv0.requestId; } else { try { const __ienv0 = readEnvelope(secEnvelopeKey(u, boardId, meetingId)); if (__ienv0 && __ienv0.boardId === boardId && __ienv0.meetingId === meetingId && __ienv0.identity === u && String(__ienv0.requestId) === String(aenv0.requestId)) { const __omI0 = parseOmittedManifest((__ienv0 as any)?.omitted); if (__omI0 !== null) { setSecOmitted(__omI0); secOmittedReq.current = aenv0.requestId; } } } catch { /* preserve-only */ } } } catch { /* noop */ }
         }
       }
     } catch { }
@@ -4409,7 +4414,7 @@ const testModel = useMutation({
             try {
               const __rowOm = parseOmittedManifest((arow as any)?.omitted) ?? parseOmittedRow(arow);
               if (__rowOm !== null) env.omitted = __rowOm;
-              else if (aenv && String(aenv.requestId) === String(arid)) { const __prevOm = parseOmittedManifest((aenv as any)?.omitted); if (__prevOm !== null) env.omitted = __prevOm; }
+              else { try { const __prevInitOm = (ienv && ienv.boardId === boardId && ienv.meetingId === meetingId && ienv.identity === u && String(ienv.requestId) === String(arid)) ? parseOmittedManifest((ienv as any)?.omitted) : null; if (__prevInitOm !== null) env.omitted = __prevInitOm; else if (aenv && aenv.boardId === boardId && aenv.meetingId === meetingId && aenv.identity === u && String(aenv.requestId) === String(arid)) { const __prevOm = parseOmittedManifest((aenv as any)?.omitted); if (__prevOm !== null) env.omitted = __prevOm; } } catch { /* preserve-only */ } }
             } catch { /* preserve-only */ }
             localStorage.setItem(secAnsEnvelopeKey(u, boardId, meetingId), JSON.stringify(env));
             secEnvelopeRev.current++;
@@ -4464,7 +4469,7 @@ const testModel = useMutation({
           try {
             const __tRowOm = parseOmittedManifest((target as any)?.omitted) ?? parseOmittedRow(target);
             if (__tRowOm !== null) env.omitted = __tRowOm;
-            else if (aenv && String(aenv.requestId) === String(rid)) { const __tPrevOm = parseOmittedManifest((aenv as any)?.omitted); if (__tPrevOm !== null) env.omitted = __tPrevOm; }
+            else { try { const __tPrevInitOm = (ienv && ienv.boardId === boardId && ienv.meetingId === meetingId && ienv.identity === u && String(ienv.requestId) === String(rid)) ? parseOmittedManifest((ienv as any)?.omitted) : null; if (__tPrevInitOm !== null) env.omitted = __tPrevInitOm; else if (aenv && aenv.boardId === boardId && aenv.meetingId === meetingId && aenv.identity === u && String(aenv.requestId) === String(rid)) { const __tPrevOm = parseOmittedManifest((aenv as any)?.omitted); if (__tPrevOm !== null) env.omitted = __tPrevOm; } } catch { /* preserve-only */ } }
           } catch { /* preserve-only */ }
           localStorage.setItem(secEnvelopeKey(u, boardId, meetingId), JSON.stringify(env));
           secEnvelopeRev.current++;
@@ -4772,7 +4777,7 @@ const testModel = useMutation({
       if (!v.usedSaved) {
         try {
           const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: v.req, nonce: v.savedNonce ?? "", input: "", evidence: [], phase: "continuation", question: v.question, answer: v.answer, epoch: originEpoch, submittedRev: secDraftVer.current };
-          try { const __prevAns = readEnvelope(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId)); if (__prevAns && String(__prevAns.requestId) === String(v.req)) { const __prevAnsOm = parseOmittedManifest((__prevAns as any)?.omitted); if (__prevAnsOm !== null) env.omitted = __prevAnsOm; } } catch { /* preserve-only */ }
+          try { const __prevAns = readEnvelope(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId)); if (__prevAns && __prevAns.boardId === originBoardId && __prevAns.meetingId === originMeetingId && __prevAns.identity === originUser && String(__prevAns.requestId) === String(v.req)) { const __prevAnsOm = parseOmittedManifest((__prevAns as any)?.omitted); if (__prevAnsOm !== null) env.omitted = __prevAnsOm; } if ((env as any).omitted === undefined) { try { const __prevInit = readEnvelope(secEnvelopeKey(originUser, originBoardId, originMeetingId)); if (__prevInit && __prevInit.boardId === originBoardId && __prevInit.meetingId === originMeetingId && __prevInit.identity === originUser && String(__prevInit.requestId) === String(v.req)) { const __prevInitOm = parseOmittedManifest((__prevInit as any)?.omitted); if (__prevInitOm !== null) env.omitted = __prevInitOm; } } catch { /* preserve-only */ } } } catch { /* preserve-only */ }
           localStorage.setItem(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env));
           // The per-attempt revision was frozen once at click (variables); the
           // success gate compares that immutable revision, so a first answer is
