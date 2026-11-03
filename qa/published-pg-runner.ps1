@@ -119,7 +119,11 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "record probe failed" }
   if ($rpOut -match "SKIP") { throw "record probe skipped PG; non-skip result required" }
   Ok "record-pg-nonskip"
-  Step "admin-diag"
+  Step "admin-diag-gate-on-shared-db"
+  $anonCode = 0
+  try { $ar = Invoke-WebRequest -Uri "http://127.0.0.1:5121/api/admin/diag" -TimeoutSec 10 -UseBasicParsing; $anonCode = $ar.StatusCode } catch { $rpc = $_.Exception.Response; if ($rpc -ne $null) { $anonCode = [int]$rpc.StatusCode } }
+  if ($anonCode -ne 401) { throw "shared-db anon diag must be 401, got=" + $anonCode }
+  Ok "shared-db-anon-401"
   $regCode = 0
   $reg = $null
   try {
@@ -134,9 +138,73 @@ try {
     $lin = Invoke-WebRequest -Uri "http://127.0.0.1:5121/api/auth/login" -Method POST -ContentType "application/json" -Body '{"email":"runner-admin@qa.local","password":"qa-runner-admin-1"}' -TimeoutSec 10 -UseBasicParsing
     $tok = ($lin.Content | ConvertFrom-Json).token
   } else { $tok = ($reg.Content | ConvertFrom-Json).token }
-  $dg = Invoke-WebRequest -Uri "http://127.0.0.1:5121/api/admin/diag" -Headers @{ Authorization = "Bearer $tok" } -TimeoutSec 10 -UseBasicParsing
-  if ($dg.StatusCode -ne 200) { throw "admin diag status=" + $dg.StatusCode }
-  Ok "admin-diag-200"
+  $denCode = 0
+  try { $dd = Invoke-WebRequest -Uri "http://127.0.0.1:5121/api/admin/diag" -Headers @{ Authorization = "Bearer $tok" } -TimeoutSec 10 -UseBasicParsing; $denCode = $dd.StatusCode } catch { $rp2 = $_.Exception.Response; if ($rp2 -ne $null) { $denCode = [int]$rp2.StatusCode } }
+  if ($denCode -ne 403) { throw "shared-db non-admin diag must be 403, got=" + $denCode }
+  Ok "shared-db-nonadmin-403"
+  Step "admin-diag-positive-on-fresh-tmpdb"
+  try {
+    $tc0 = New-Object System.Net.Sockets.TcpClient
+    $iar0 = $tc0.BeginConnect("127.0.0.1", 5122, $null, $null)
+    $null = $iar0.AsyncWaitHandle.WaitOne(800)
+    if ($tc0.Connected) { throw "ephemeral tmp api port 5122 already in use; refusing to reuse unverified server" }
+    $tc0.Close()
+  } catch { if ($_.Exception.Message -match "already in use") { throw } }
+  $tmpDb = "simceo_runner_tmp"
+  & docker exec simceo-integration-qa-pg psql -U simceo -d postgres -c "DROP DATABASE IF EXISTS `"$tmpDb`";" | Out-Null
+  & docker exec simceo-integration-qa-pg psql -U simceo -d postgres -c "CREATE DATABASE `"$tmpDb`";" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "tmp db create failed" }
+  $tmpApiLog = Join-Path $pubDir "tmpapi.log"
+  $tmpApiErr = Join-Path $pubDir "tmpapi.err.log"
+  $tmpEnv = @{ "ASPNETCORE_URLS" = "http://127.0.0.1:5122" }
+  $tmpEnv["META_API_BASE"] = "http://127.0.0.1:5221"
+  $tmpEnv["META_API_KEY"] = "qa-dummy"
+  $tmpEnv["USE_POSTGRES"] = "1"
+  $tmpEnv["CONNECTIONSTRINGS__APP"] = "Host=127.0.0.1;Port=15441;Database=$tmpDb;Username=simceo;Password=qa-only"
+  $tmpApi = New-OwnedProcess "dotnet" $dll $root $tmpEnv $tmpApiLog $tmpApiErr
+  Write-Host ("  tmp-api-pid=" + $tmpApi.Id)
+  try {
+    $tmpReady = $false
+    for ($i = 0; $i -lt 40 -and -not $tmpReady; $i++) {
+      Start-Sleep -Milliseconds 500
+      try { $rr = Invoke-WebRequest -Uri "http://127.0.0.1:5122/ready" -TimeoutSec 3 -UseBasicParsing; if ($rr.StatusCode -eq 200) { $tmpReady = $true } } catch { }
+    }
+    if (-not $tmpReady) { throw "tmp API /ready never 200" }
+    Ok "tmpapi-ready-200"
+    $treg = Invoke-WebRequest -Uri "http://127.0.0.1:5122/api/auth/register" -Method POST -ContentType "application/json" -Body '{"email":"tmp-admin@qa.local","password":"qa-tmp-admin-1"}' -TimeoutSec 10 -UseBasicParsing
+    if ($treg.StatusCode -ne 201) { throw "tmp first register must be 201, got=" + $treg.StatusCode }
+    $ttok = ($treg.Content | ConvertFrom-Json).token
+    $tdg = Invoke-WebRequest -Uri "http://127.0.0.1:5122/api/admin/diag" -Headers @{ Authorization = "Bearer $ttok" } -TimeoutSec 10 -UseBasicParsing
+    if ($tdg.StatusCode -ne 200) { throw "tmp admin diag must be 200, got=" + $tdg.StatusCode }
+    $dj = $tdg.Content | ConvertFrom-Json
+    if ($null -eq $dj.counts -or $null -eq $dj.security) { throw "tmp diag missing counts/security" }
+    $raw = $tdg.Content
+    foreach ($bad in @("token", "session", "connectionstring", "password", "secret", "apikey", "api_key", "bearer")) {
+      if ($raw -match ("(?i)`"" + $bad + "`"\s*:")) { throw "tmp diag leaks field resembling " + $bad }
+    }
+    Ok "tmp-admin-diag-200-redacted"
+    $treg2 = Invoke-WebRequest -Uri "http://127.0.0.1:5122/api/auth/register" -Method POST -ContentType "application/json" -Body '{"email":"tmp-other@qa.local","password":"qa-tmp-other-1"}' -TimeoutSec 10 -UseBasicParsing
+    $ttok2 = ($treg2.Content | ConvertFrom-Json).token
+    $den2 = 0
+    try { $dd2 = Invoke-WebRequest -Uri "http://127.0.0.1:5122/api/admin/diag" -Headers @{ Authorization = "Bearer $ttok2" } -TimeoutSec 10 -UseBasicParsing; $den2 = $dd2.StatusCode } catch { $rp3 = $_.Exception.Response; if ($rp3 -ne $null) { $den2 = [int]$rp3.StatusCode } }
+    if ($den2 -ne 403) { throw "tmp non-admin diag must be 403, got=" + $den2 }
+    Ok "tmp-nonadmin-403"
+  } finally {
+    try { if (-not $tmpApi.HasExited) { $tmpApi.Kill() }; $tmpApi.WaitForExit(8000) | Out-Null } catch { }
+    try { $tmpApi.Dispose() } catch { }
+    Start-Sleep -Seconds 2
+    $stillOpen = $false
+    try {
+      $tc = New-Object System.Net.Sockets.TcpClient
+      $iar = $tc.BeginConnect("127.0.0.1", 5122, $null, $null)
+      $null = $iar.AsyncWaitHandle.WaitOne(800)
+      if ($tc.Connected) { $stillOpen = $true }
+      $tc.Close()
+    } catch { }
+    if ($stillOpen) { throw "tmp api port 5122 still open after kill" }
+    & docker exec simceo-integration-qa-pg psql -U simceo -d postgres -c "DROP DATABASE IF EXISTS `"$tmpDb`";" | Out-Null
+    Write-Host "  tmpdb dropped, tmp api stopped"
+  }
   Write-Host ""
   Write-Host ("PUBLISHED-RUNNER PASS head=" + $head + " dll=" + $hash)
 } catch {

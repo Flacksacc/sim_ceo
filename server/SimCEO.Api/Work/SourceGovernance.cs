@@ -452,7 +452,7 @@ public static class SourceGovernance
     if (restored.boards is null || restored.roster is null || restored.advisors is null
       || restored.meetings is null || restored.messages is null || restored.notes is null
       || restored.drafts is null || restored.sources is null || restored.blobs is null
-      || restored.leads is null || restored.grants is null || restored.invites is null
+      || restored.leads is null
       || restored.images is null)
     { error = "snapshot is missing required collections."; return false; }
     foreach (var b in restored.boards)

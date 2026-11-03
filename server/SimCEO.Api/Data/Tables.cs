@@ -19,6 +19,17 @@ public static class PgFaults
   public static Func<bool>? FailBeforeCommit;
 }
 
+/// <summary>
+/// Code-only memory-capture fault seam for rollback tests. In-process QA may set
+/// <see cref="FailCapture"/> to force the next memory capture to fail, proving the
+/// unit unwinds cleanly (depth reset, no snapshot, store reusable) instead of
+/// poisoning ownership. Never exposed via HTTP routes or environment.
+/// </summary>
+public static class MemFaults
+{
+  public static Func<bool>? FailCapture;
+}
+
 public interface IPgBackend
 {
   T? Find<T>(Guid id) where T : class;

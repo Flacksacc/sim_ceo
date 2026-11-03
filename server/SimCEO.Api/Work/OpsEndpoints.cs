@@ -484,7 +484,7 @@ public static class OpsEndpoints
       // round-trip byte-identically (modulo the fresh export timestamp).
       var snapshot = new
       {
-        version = 3,
+        version = 4,
         at = DateTime.UtcNow,
         boards = s.Boards.Values.OrderBy(x => x.Id).ToList(),
         roster = s.Roster.Values.OrderBy(x => x.Id).ToList(),
@@ -500,8 +500,8 @@ public static class OpsEndpoints
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
         leads = s.LeadProfiles.Values.OrderBy(x => x.Id).ToList(),
           wizardDrafts = s.WizardDrafts.Values.OrderBy(x => x.Id).ToList(),
-        grants = s.Grants.Values.OrderBy(x => x.Id).ToList(),
-        invites = s.Invites.Values.OrderBy(x => x.Id).ToList(),
+        jobs = s.Jobs.Values.OrderBy(x => x.Id).ToList(),
+        voiceTurns = s.VoiceTurns.Values.OrderBy(x => x.Id).ToList(),
         images = s.Images.Values.OrderBy(i => i.Id).Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
         secretaryRequests = s.SecretaryRequests.Values.OrderBy(x => x.Id).ToList(),
         noteHistories = s.NoteHistories.Values.OrderBy(x => x.Id).ToList(),
@@ -528,11 +528,30 @@ public static class OpsEndpoints
       JsonDocument doc;
       try { doc = JsonDocument.Parse(snapshot); }
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
-      if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2 or 3))
+      if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2 or 3 or 4))
         return Results.BadRequest("Unsupported backup version.");
       var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
         new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
       if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
+      if (restored.jobs is not null)
+      {
+        var seenJ = new HashSet<Guid>();
+        foreach (var j in restored.jobs)
+        {
+          if (j is null || j.Id == Guid.Empty) return Results.BadRequest("Backup job is null or missing id.");
+          if (!seenJ.Add(j.Id)) return Results.BadRequest("Backup job ids are not unique.");
+          if (!string.IsNullOrWhiteSpace(j.Payload)) { try { using var _ = JsonDocument.Parse(j.Payload); } catch { return Results.BadRequest("Backup job payload is not valid JSON."); } }
+        }
+      }
+      if (restored.voiceTurns is not null)
+      {
+        var seenV = new HashSet<Guid>();
+        foreach (var vt in restored.voiceTurns)
+        {
+          if (vt is null || vt.Id == Guid.Empty) return Results.BadRequest("Backup voice turn is null or missing id.");
+          if (!seenV.Add(vt.Id)) return Results.BadRequest("Backup voice turn ids are not unique.");
+        }
+      }
       // Restore boundary (explicit, documented): domain backup restores ONLY domain entities.
       // Installation security authority (Accounts/Sessions/SecurityStates), current ACL
       // (Grants/Invites/Memberships) and revocation decisions are NEVER cleared or replaced
@@ -585,6 +604,8 @@ public static class OpsEndpoints
               s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
               s.WikiResources.Clear(); s.WikiSecrets.Clear();
               s.SecretaryRequests.Clear(); s.NoteHistories.Clear();
+              if (restored.jobs is not null) s.Jobs.Clear();
+              if (restored.voiceTurns is not null) s.VoiceTurns.Clear();
               foreach (var b in restored.boards) s.Boards[b.Id] = b;
               foreach (var r in restored.roster) s.Roster[r.Id] = r;
               foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
@@ -605,6 +626,8 @@ public static class OpsEndpoints
               if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
               if (restored.secretaryRequests is not null) foreach (var sr in restored.secretaryRequests) s.SecretaryRequests[sr.Id] = sr;
               if (restored.noteHistories is not null) foreach (var hh in restored.noteHistories) s.NoteHistories[hh.Id] = hh;
+              if (restored.jobs is not null) foreach (var j in restored.jobs) { if (string.Equals(j.State, "running", System.StringComparison.OrdinalIgnoreCase)) { j.State = "interrupted"; j.Error = "Restored from backup; retry explicitly to resume."; j.UpdatedAt = DateTime.UtcNow; } s.Jobs[j.Id] = j; }
+              if (restored.voiceTurns is not null) foreach (var vt in restored.voiceTurns) s.VoiceTurns[vt.Id] = vt;
             // Typed Wiki restore: exact validated export round-trips resource IDs,
             // history, URLs, rules, scope, and schedule; credentials are absent
             // and every resource is DISABLED with blocked cached sources.
@@ -1074,7 +1097,7 @@ public static class BackupGraphValidator
   public static string? Validate(BackupSnapshot r)
   {
     if (r.boards is null || r.meetings is null || r.messages is null || r.notes is null || r.drafts is null
-      || r.sources is null || r.blobs is null || r.leads is null || r.grants is null || r.invites is null || r.images is null)
+      || r.sources is null || r.blobs is null || r.leads is null || r.images is null)
       return "Backup snapshot is missing required collections.";
     foreach (var b in r.boards) if (b is null || Empty(b.Id)) return "Backup board missing id.";
     if (r.boards.Select(b => b!.Id).Distinct().Count() != r.boards.Count) return "Backup board ids are not unique.";
@@ -1091,6 +1114,10 @@ public static class BackupGraphValidator
     foreach (var l in r.leads) if (l is null || Empty(l.Id)) return "Backup lead is null or missing id.";
     foreach (var x in r.roster) if (x is null || Empty(x.Id)) return "Backup roster entry is null or missing id.";
     foreach (var a in r.advisors) if (a is null || Empty(a.Id) || Empty(a.BoardId) || Empty(a.RosterEntryId)) return "Backup advisor missing lineage.";
+    foreach (var g in r.grants ?? Enumerable.Empty<Grant>()) if (g is null || Empty(g.Id)) return "Backup grant missing id.";
+    foreach (var iv in r.invites ?? Enumerable.Empty<Invite>()) if (iv is null || Empty(iv.Id)) return "Backup invite missing id.";
+    if (r.jobs is not null) { var sj = new HashSet<Guid>(); foreach (var j in r.jobs) { if (j is null || Empty(j.Id)) return "Backup job missing id."; if (!sj.Add(j.Id)) return "Backup job ids are not unique."; } }
+    if (r.voiceTurns is not null) { var sv = new HashSet<Guid>(); foreach (var vt in r.voiceTurns) { if (vt is null || Empty(vt.Id)) return "Backup voice turn missing id."; if (!sv.Add(vt.Id)) return "Backup voice turn ids are not unique."; } }
     foreach (var g in r.grants) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
     foreach (var i in r.invites) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
     foreach (var w in r.wizardDrafts ?? new List<Domain.WizardDraft>()) if (w is null || Empty(w.Id)) return "Backup wizard draft is null or missing id.";
@@ -1188,7 +1215,7 @@ public sealed record BackupSnapshot(int version, DateTime at,
   List<Meeting> meetings, Dictionary<string, List<Message>> messages,
   List<Note> notes, List<RecordDraft> drafts, List<SourceDoc> sources,
   Dictionary<string, string> blobs, List<LeadProfile> leads,
-  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null, List<Domain.SecretaryRequest>? secretaryRequests = null, List<Domain.NoteHistory>? noteHistories = null);
+  List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null, List<Domain.SecretaryRequest>? secretaryRequests = null, List<Domain.NoteHistory>? noteHistories = null, List<JobRow>? jobs = null, List<VoiceTurn>? voiceTurns = null, List<Grant>? grants = null, List<Invite>? invites = null);
 
 public static class CommandMap
 {

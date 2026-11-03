@@ -50,7 +50,7 @@ function Start-Hidden($file, $argline, $out, $err, $envmap, $workdir = $null) {
   $psi.FileName = $file; $psi.Arguments = $argline
   $psi.WorkingDirectory = ($workdir ? $workdir : $root)
   $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
   foreach ($k in $envmap.Keys) { $psi.Environment[$k] = $envmap[$k] }
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
@@ -70,13 +70,7 @@ function Stop-Hidden($entry) {
   try { $entry.p.WaitForExit(10000) } catch {}
   try { $entry.outW.Close(); $entry.errW.Close() } catch {}
 }
-function Stop-Tree($taskPid) {
-  try {
-    $kids = Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $taskPid) -ErrorAction SilentlyContinue
-    foreach ($k in $kids) { Stop-Tree $k.ProcessId }
-    try { Stop-Process -Id $taskPid -Force -ErrorAction SilentlyContinue } catch {}
-  } catch {}
-}
+# Stop-Tree removed: CIM child discovery violates hidden-window/owned-handle policy; owned procs stop via retained Stop-Hidden handles + port-closed gates.
 try {
   if ($BrowserOnly -and $Pg) { throw "-BrowserOnly cannot be combined with -Pg; fail closed" }
   if ($BrowserOnly) { $Browser = $true }
@@ -148,6 +142,17 @@ try {
     Check "public-evidence-build" ($LASTEXITCODE -eq 0)
     if ($LASTEXITCODE -eq 0) {
       dotnet (Join-Path $pubOut "PublicEvidenceProbe.dll"); Check "public-evidence-probe" ($LASTEXITCODE -eq 0)
+    }
+  }
+  Step "root-unit focused probe (memory, non-skip)"
+  $atomicProj = Need-File "qa/AtomicUnitProbe/AtomicUnitProbe.csproj"
+  $atomicProg = Need-File "qa/AtomicUnitProbe/Program.cs"
+  if ($atomicProj -and $atomicProg) {
+    $atomicOut = Join-Path $root ".tmp/qa/probe-atomic/"
+    dotnet build qa/AtomicUnitProbe/AtomicUnitProbe.csproj --nologo -v q -p:SkipStagePostgres=true "-p:OutputPath=$atomicOut"
+    Check "atomic-probe-build" ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -eq 0) {
+      dotnet (Join-Path $atomicOut "AtomicUnitProbe.dll"); Check "atomic-probe-mem" ($LASTEXITCODE -eq 0)
     }
   }
   Step "selftest"
@@ -251,6 +256,10 @@ try {
         dotnet (Join-Path $probeOut "RecordAtomicProbe.dll") "Host=127.0.0.1;Port=15433;Database=simceo;Username=simceo;Password=qa-only"; Check "records-probe" ($LASTEXITCODE -eq 0)
       }
     }
+    Step "root-unit focused probe (PG, non-skip)"
+    if ($atomicProj) {
+      dotnet (Join-Path $atomicOut "AtomicUnitProbe.dll") --pg "Host=127.0.0.1;Port=15433;Database=simceo;Username=simceo;Password=qa-only"; Check "atomic-probe-pg" ($LASTEXITCODE -eq 0)
+    } else { Check "atomic-probe-present" $false "AtomicUnitProbe missing; refusing PG claim" }
     Step "records legacy + commit-gate seed (before owned :5100 restart)"
     if ($recPresent) {
       $env:QA_API = "http://127.0.0.1:5100"
@@ -366,7 +375,7 @@ try {
   $fail++
 } finally {
   Step "cleanup"
-  if ($vite) { try { Stop-Tree $vite.Id } catch {} }
+  if ($vite) { try { $ventry = $procs | Where-Object { $_.p -eq $vite } | Select-Object -First 1; if ($ventry) { Stop-Hidden $ventry } else { try { if (-not $vite.HasExited) { $vite.Kill() } } catch {} } } catch {} Check "vite5174-port-closed" (Wait-PortClosed 5174 30) "owned port still open after kill" }
   foreach ($e in $procs) { Stop-Hidden $e }
   if ($Pg -and $ownPgContainer) { docker rm -f simceo-qa-pg 2>$null | Out-Null; Write-Host "  removed simceo-qa-pg" }
 }

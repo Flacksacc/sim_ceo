@@ -129,6 +129,7 @@ public sealed class InMemoryStore
 
   public MemoryCapture CaptureMemory()
   {
+    if (MemFaults.FailCapture?.Invoke() == true) throw new InvalidOperationException("injected memory capture fault");
     var c = new MemoryCapture
     {
       Boards = Boards.CaptureLive(),

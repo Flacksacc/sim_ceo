@@ -320,6 +320,20 @@ InMemoryStore NewMem() => new InMemoryStore();
   Check(isAgg, "mem-compensation-failure-surfaced", "type=" + (caught is null ? "none" : caught.GetType().Name));
 }
 
+{
+  var s = NewMem();
+  var b = new Board { Name = "keep" };
+  Atomic.Run(s, () => { s.Boards[b.Id] = b; });
+  SimCEO.Api.Data.MemFaults.FailCapture = () => true;
+  bool threw = false;
+  try { Atomic.Run(s, () => { s.Boards[b.Id].Name = "changed"; }); }
+  catch (InvalidOperationException) { threw = true; }
+  finally { SimCEO.Api.Data.MemFaults.FailCapture = null; }
+  bool ok = false;
+  Atomic.Run(s, () => { s.Boards[b.Id].Name = "after"; ok = true; });
+  Check(threw && ok && s.Boards[b.Id].Name == "after", "mem-capture-fault-clean-retry", "threw=" + threw);
+}
+
 int memFails = failures.Count;
 
 // 8b. parallel ledger finalization vs failing domain unit (threads).
