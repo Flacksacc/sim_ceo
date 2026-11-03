@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr"; import SourcesGovernance from "./sources-governance";
+import { convertRecordedBlobToWav } from "./voiceCodec";
 type Board = { id: string; name: string; mission: string };
 type Meeting = { id: string; title: string; state: number };
 type Msg = {
@@ -3242,88 +3243,326 @@ const testModel = useMutation({
     queryFn: () =>
       get<{ user: string; authenticated: boolean }>("/api/auth/me"),
   });
+  type VoiceOp = {
+    id: number;
+    boardId: string;
+    meetingId: string;
+    navGen: number;
+    // Originating identity: late callbacks after an account switch or token
+    // refresh never touch UI, storage, or newer ops (Auth8 boundary).
+    epoch: number;
+    token: string;
+    user: string;
+    stream: MediaStream | null;
+    recorder: MediaRecorder | null;
+    chunks: Blob[];
+    timer: number | null;
+    abort: AbortController;
+    cancelled: boolean;
+  };
   const recRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micMetaRef = useRef<{ epoch: number; token: string; user: string; meeting: string } | null>(null);
+  const voiceOpIdRef = useRef(0);
+  const voiceOpRef = useRef<VoiceOp | null>(null);
+  const voiceStartingRef = useRef(false);
+  const voiceNavGenRef = useRef(0);
+  const voiceMountedRef = useRef(true);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
-  // Mic lifecycle: stop recorder + release tracks on unmount/identity change.
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const isOwnerOp = (op: VoiceOp): boolean => voiceOpRef.current?.id === op.id;
+  const isVoiceAbort = (op: VoiceOp, e: unknown): boolean =>
+    op.abort.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+  const endVoiceOp = (op: VoiceOp, error?: string | null): boolean => {
+    if (voiceOpRef.current?.id !== op.id) return false;
+    voiceOpRef.current = null;
+    voiceStartingRef.current = false;
+    if (recRef.current === op.recorder) recRef.current = null;
+    setRecording(false);
+    setTranscribing(false);
+    if (error !== undefined) setVoiceError(error);
+    return true;
+  };
+  const cancelActiveVoiceOp = (resetUi: boolean) => {
+    const op = voiceOpRef.current;
+    voiceOpRef.current = null;
+    voiceStartingRef.current = false;
+    if (op) {
+      op.cancelled = true;
+      try { op.abort.abort(); } catch { /* ignore */ }
+      if (op.timer !== null) {
+        try { window.clearTimeout(op.timer); } catch { /* ignore */ }
+        op.timer = null;
+      }
+      try {
+        if (op.recorder && op.recorder.state !== "inactive") op.recorder.stop();
+      } catch { /* ignore */ }
+      try {
+        op.stream?.getTracks().forEach((tr) => tr.stop());
+      } catch { /* ignore */ }
+      if (recRef.current === op.recorder) recRef.current = null;
+    }
+    if (resetUi) {
+      setRecording(false);
+      setTranscribing(false);
+    }
+  };
+  const isOpAlive = (op: VoiceOp): boolean => {
+    if (op.cancelled) return false;
+    if (!voiceMountedRef.current) return false;
+    if (voiceOpRef.current?.id !== op.id) return false;
+    if (voiceNavGenRef.current !== op.navGen) return false;
+    if (epochNow() !== op.epoch || currentToken() !== op.token || currentUser() !== op.user) return false;
+    const live = liveSelRef.current;
+    if (live.boardId !== op.boardId || live.meetingId !== op.meetingId) return false;
+    return true;
+  };
   useEffect(() => {
+    voiceMountedRef.current = true;
     return () => {
-      try { recRef.current?.stop(); } catch {}
-      try { recRef.current = null; } catch {}
-      try { micStreamRef.current?.getTracks().forEach((tr) => { try { tr.stop(); } catch {} }); } catch {}
-      try { micStreamRef.current = null; } catch {}
-      try { setRecording(false); } catch {}
+      voiceMountedRef.current = false;
+      cancelActiveVoiceOp(false);
     };
   }, []);
+  useEffect(() => {
+    voiceNavGenRef.current += 1;
+    if (voiceOpRef.current) cancelActiveVoiceOp(true);
+  }, [boardId, meetingId, tab]);
   const toggleRec = async () => {
-    if (recording) {
-      recRef.current?.stop();
+    const cur = voiceOpRef.current;
+    if (voiceStartingRef.current || (cur && !cur.cancelled)) {
+      const liveStop = cur;
+      if (liveStop && !liveStop.cancelled && liveStop.recorder) {
+        try {
+          if (liveStop.recorder.state !== "inactive") liveStop.recorder.stop();
+        } catch { /* ignore */ }
+      }
       return;
     }
-    // Capture originating identity; late permission/callbacks recheck it.
-    const micEpoch = epochNow(); const micToken = currentToken(); const micUser = currentUser();
-    const micMeeting = meetingId;
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    if (!originMeetingId) {
+      alert("Pick a meeting first.");
+      return;
+    }
+    setVoiceError(null);
+    const myId = voiceOpIdRef.current + 1;
+    voiceOpIdRef.current = myId;
+    const abort = new AbortController();
+    // Capture originating identity; every late callback rechecks it.
+    const opEpoch = epochNow(); const opToken = currentToken(); const opUser = currentUser();
+    const op: VoiceOp = {
+      id: myId,
+      boardId: originBoardId,
+      meetingId: originMeetingId,
+      navGen: voiceNavGenRef.current,
+      epoch: opEpoch,
+      token: opToken,
+      user: opUser,
+      stream: null,
+      recorder: null,
+      chunks: [],
+      timer: null,
+      abort,
+      cancelled: false,
+    };
+    voiceOpRef.current = op;
+    voiceStartingRef.current = true;
+    let stream: MediaStream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (epochNow() !== micEpoch || currentToken() !== micToken || currentUser() !== micUser || meetingId !== micMeeting) {
-        try { stream.getTracks().forEach((tr) => { try { tr.stop(); } catch {} }); } catch {}
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      if (isOwnerOp(op) && voiceMountedRef.current && voiceNavGenRef.current === op.navGen
+        && epochNow() === op.epoch && currentToken() === op.token && currentUser() === op.user) {
+        const live = liveSelRef.current;
+        if (live.boardId === op.boardId && live.meetingId === op.meetingId) {
+          endVoiceOp(op);
+          alert("Microphone unavailable.");
+          return;
+        }
+        endVoiceOp(op);
         return;
       }
-      micStreamRef.current = stream;
-      micMetaRef.current = { epoch: micEpoch, token: micToken, user: micUser, meeting: micMeeting };
-      const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(
-        (t) => {
+      if (isOwnerOp(op)) endVoiceOp(op);
+      return;
+    }
+    if (!voiceMountedRef.current || op.cancelled || voiceOpRef.current?.id !== op.id || voiceNavGenRef.current !== op.navGen) {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+      if (isOwnerOp(op)) endVoiceOp(op);
+      return;
+    }
+    {
+      const live = liveSelRef.current;
+      if (live.boardId !== op.boardId || live.meetingId !== op.meetingId) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+        endVoiceOp(op);
+        return;
+      }
+    }
+    op.stream = stream;
+    let mime: string | undefined;
+    try {
+      mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(
+        (cand) => {
           try {
-            return MediaRecorder.isTypeSupported(t);
+            return MediaRecorder.isTypeSupported(cand);
           } catch {
             return false;
           }
         },
       );
-      const mr = mime
-        ? new MediaRecorder(stream, { mimeType: mime })
-        : new MediaRecorder(stream);
-      chunksRef.current = [];
-      mr.ondataavailable = (e) => {
-        if (e.data.size) chunksRef.current.push(e.data);
-      };
-      mr.onstop = async () => {
-        const meta = micMetaRef.current;
-        setRecording(false);
-        stream.getTracks().forEach((t) => t.stop());
-        try { if (micStreamRef.current === stream) micStreamRef.current = null; } catch {}
-        // Late callback guard: identity or meeting changed while recording.
-        if (!meta || epochNow() !== meta.epoch || currentToken() !== meta.token || currentUser() !== meta.user || meetingId !== meta.meeting) return;
-        const fd = new FormData();
-        fd.append(
-          "audio",
-          new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" }),
-          "mic.webm",
-        );
-        setTranscribing(true);
-        try {
-          const r = await upload<{ transcript: string }>(
-            `/api/meetings/${meetingId}/transcribe`,
-            fd,
-          );
-          setDraft(draft ? `${draft} ${r.transcript}` : r.transcript);
-          notify("Dictation transcribed into the draft.");
-          setTranscribing(false);
-        } catch (e) {
-          setTranscribing(false);
-          alert(String(e));
-        }
-      };
-      recRef.current = mr;
-      mr.start();
-      setRecording(true);
     } catch {
-      alert("Microphone unavailable.");
+      mime = undefined;
     }
+    let mr: MediaRecorder;
+    try {
+      mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    } catch {
+      try { stream.getTracks().forEach((tr) => tr.stop()); } catch { /* ignore */ }
+      op.stream = null;
+      if (isOwnerOp(op)) endVoiceOp(op);
+      voiceStartingRef.current = false;
+      alert("Microphone unavailable.");
+      return;
+    }
+    op.recorder = mr;
+    recRef.current = mr;
+    op.chunks = [];
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size) op.chunks.push(e.data);
+    };
+    mr.onstop = async () => {
+      if (op.timer !== null) {
+        try { window.clearTimeout(op.timer); } catch { /* ignore */ }
+        op.timer = null;
+      }
+      const stillCurrent = voiceOpRef.current?.id === op.id && !op.cancelled;
+      try {
+        op.stream?.getTracks().forEach((tr) => tr.stop());
+      } catch { /* ignore */ }
+      if (!stillCurrent || !voiceMountedRef.current || voiceNavGenRef.current !== op.navGen) {
+        if (isOwnerOp(op)) endVoiceOp(op);
+        if (recRef.current === mr) recRef.current = null;
+        return;
+      }
+      if (recRef.current === mr) recRef.current = null;
+      setRecording(false);
+      const live = liveSelRef.current;
+      if (live.boardId !== op.boardId || live.meetingId !== op.meetingId) {
+        endVoiceOp(op);
+        return;
+      }
+      const recorded = new Blob(op.chunks, { type: mr.mimeType || "audio/webm" });
+      op.chunks = [];
+      if (recorded.size === 0) {
+        endVoiceOp(op, "No audio captured; try again.");
+        return;
+      }
+      setTranscribing(true);
+      let wavBlob: Blob;
+      try {
+        const conv = await convertRecordedBlobToWav(recorded, 16000, { signal: op.abort.signal });
+        if (!isOpAlive(op)) { if (isOwnerOp(op)) endVoiceOp(op); return; }
+        wavBlob = conv.wavBlob;
+      } catch (e) {
+        if (isVoiceAbort(op, e)) {
+          if (isOwnerOp(op)) endVoiceOp(op);
+          return;
+        }
+        if (!isOwnerOp(op) || !voiceMountedRef.current || op.cancelled || voiceNavGenRef.current !== op.navGen) return;
+        const live2 = liveSelRef.current;
+        if (live2.boardId !== op.boardId || live2.meetingId !== op.meetingId) {
+          endVoiceOp(op);
+          return;
+        }
+        endVoiceOp(op, e instanceof Error ? e.message : String(e));
+        return;
+      }
+      if (!isOpAlive(op)) { if (isOwnerOp(op)) endVoiceOp(op); return; }
+      const fd = new FormData();
+      fd.append("audio", wavBlob, "mic.wav");
+      try {
+        const resp = await fetch(`/api/meetings/${op.meetingId}/transcribe`, {
+          method: "POST",
+          headers: withUser(),
+          body: fd,
+          signal: op.abort.signal,
+        });
+        if (!isOpAlive(op)) { if (isOwnerOp(op)) endVoiceOp(op); return; }
+        const live3 = liveSelRef.current;
+        if (live3.boardId !== op.boardId || live3.meetingId !== op.meetingId) {
+          endVoiceOp(op);
+          return;
+        }
+        if (!resp.ok) {
+          const t = await resp.text().catch(() => "");
+          throw new Error(`${resp.status} ${t}`);
+        }
+        const r = (await resp.json()) as { transcript: string };
+        if (!isOpAlive(op)) { if (isOwnerOp(op)) endVoiceOp(op); return; }
+        const live4 = liveSelRef.current;
+        if (live4.boardId !== op.boardId || live4.meetingId !== op.meetingId) {
+          endVoiceOp(op);
+          return;
+        }
+        const text = (r.transcript || "").trim();
+        if (!text) {
+          endVoiceOp(op, "No speech recognized; nothing posted.");
+          return;
+        }
+        setDraft((prev) => (prev ? `${prev} ${text}` : text));
+        notify("Dictation transcribed into the draft.");
+        endVoiceOp(op);
+      } catch (e) {
+        if (isVoiceAbort(op, e)) {
+          if (isOwnerOp(op)) endVoiceOp(op);
+          return;
+        }
+        if (!isOwnerOp(op) || !voiceMountedRef.current || op.cancelled || voiceNavGenRef.current !== op.navGen) return;
+        const live5 = liveSelRef.current;
+        if (live5.boardId !== op.boardId || live5.meetingId !== op.meetingId) {
+          endVoiceOp(op);
+          return;
+        }
+        endVoiceOp(op, e instanceof Error ? e.message : String(e));
+      }
+    };
+    try {
+      mr.start();
+    } catch {
+      try { stream.getTracks().forEach((tr) => tr.stop()); } catch { /* ignore */ }
+      op.stream = null;
+      if (isOwnerOp(op)) {
+        if (voiceMountedRef.current && voiceNavGenRef.current === op.navGen) {
+          endVoiceOp(op);
+          alert("Microphone unavailable.");
+        } else {
+          endVoiceOp(op);
+        }
+      }
+      voiceStartingRef.current = false;
+      return;
+    }
+    voiceStartingRef.current = false;
+    if (voiceOpRef.current?.id !== op.id || op.cancelled || !voiceMountedRef.current || voiceNavGenRef.current !== op.navGen) {
+      try { if (mr.state !== "inactive") mr.stop(); } catch { /* ignore */ }
+      try { stream.getTracks().forEach((tr) => tr.stop()); } catch { /* ignore */ }
+      return;
+    }
+    setRecording(true);
+    if (op.timer !== null) {
+      try { window.clearTimeout(op.timer); } catch { /* ignore */ }
+      op.timer = null;
+    }
+    const myTimer = window.setTimeout(() => {
+      if (voiceOpRef.current?.id !== op.id || op.cancelled) return;
+      try {
+        if (op.recorder && op.recorder.state !== "inactive") op.recorder.stop();
+      } catch { /* ignore */ }
+    }, 300000);
+    op.timer = myTimer;
   };
+
+
   const [dossier, setDossier] = useState("");
   const research = (id: string) =>
     post<unknown>(`/api/roster/${id}/research`, {})
@@ -6153,7 +6392,8 @@ const testModel = useMutation({
                               >
                                 {" "}
                                 Enter to send · Shift+Enter for a new line{" "}
-                                {transcribing ? " · Transcribing…" : ""}{" "}
+                                {transcribing ? " · Transcribing…" : ""}
+                                {voiceError ? " · Dictation failed: " + voiceError + " (retry)" : ""}{" "}
                               </div>{" "}
                             </div>{" "}
                             <details className="setup">

@@ -455,6 +455,11 @@ public sealed class ModelGateway
     CancellationToken ct = default, bool ownerOverride = false,
     Guid? boardId = null, Guid? meetingId = null)
   {
+    if (!VoiceAudio.TryValidate(audio, contentType, fileName,
+        out var wavError, out _, out var wavType, out var wavName))
+      throw new VoiceAudioException(wavError);
+    contentType = wavType;
+    fileName = wavName;
     ThrowIfCapped(ownerOverride);
     EnsureAvailable();
     var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -462,7 +467,7 @@ public sealed class ModelGateway
     var requestJson = JsonSerializer.Serialize(new
     {
       model = ModelPolicy.Voice,
-      audioEncoding = contentType.Contains("wav", StringComparison.OrdinalIgnoreCase) ? "WAV" : "AUTO",
+      audioEncoding = "WAV",
     });
     form.Add(new StringContent(requestJson, Encoding.UTF8, "application/json"), "request");
     var bytes = new ByteArrayContent(audio);
