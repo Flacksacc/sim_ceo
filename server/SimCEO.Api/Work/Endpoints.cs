@@ -216,7 +216,7 @@ public static class SimCEOEndpoints
     });
 
     // ---- Sources: governed via SourceEndpoints (single predicate); these are compatibility shims ----
-    app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
+    app.MapPost("/api/boards/{bid:guid}/sources", async (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badSrc) return badSrc;
       if (!s.Boards.TryGetValue(bid, out var bboard)) return Results.NotFound("Board not found.");
@@ -238,18 +238,16 @@ public static class SimCEOEndpoints
           return Results.Json(new { error = "Meeting does not belong to this board." }, statusCode: 409);
       }
       var familyKey = SourceGovernance.FamilyKeyFor(bid, effScope, effMeeting, "upload", fname);
-      var version = s.Sources.Values.Where(x => x.BoardId == bid && x.FamilyKey == familyKey).Select(x => (int?)x.Version).Max() ?? 0;
-      // Server-computed content hash over the stored bytes (P2 #11): caller
-      // ContentHash is never trusted and is never copied into index sections.
+      // The caller-supplied extraction JSON is untrusted: the server derives
+      // content bytes first, then runs actual extraction itself (textual
+      // formats decode locally, binary goes to the extractor) under the
+      // index reservation. Nothing caller-supplied becomes indexed text.
       var inlineText = Extraction.MarkdownOf(d.ExtractionJson) ?? "";
-      if (d.Original is null && !string.IsNullOrEmpty(inlineText))
-      {
-        var inlineRaw = Encoding.UTF8.GetBytes(inlineText);
-        if (inlineRaw.Length > 10 * 1024 * 1024) return Results.BadRequest("Inline content exceeds 10 MB.");
-        d.Original = inlineRaw;
-      }
-      var hashBytes = d.Original ?? Encoding.UTF8.GetBytes(d.ExtractionJson ?? "");
-      var serverHash = Convert.ToHexString(SHA256.HashData(hashBytes)).ToLowerInvariant();
+      var inlineRaw = d.Original ?? (string.IsNullOrEmpty(inlineText) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(inlineText));
+      if (inlineRaw.Length > 10 * 1024 * 1024) return Results.BadRequest("Inline content exceeds 10 MB.");
+      // Server-computed content hash over the stored bytes: caller
+      // ContentHash is never trusted and is never copied into index sections.
+      var serverHash = Convert.ToHexString(SHA256.HashData(inlineRaw)).ToLowerInvariant();
       d.Id = Guid.NewGuid();
       d.BoardId = bid;
       d.FileName = fname;
@@ -257,24 +255,47 @@ public static class SimCEOEndpoints
       d.Origin = "upload";
       d.ResourceId = null;
       d.FamilyKey = familyKey;
-      d.Version = version + 1;
       d.Approved = false; d.Excluded = false; d.ReviewState = "pending";
       d.Scope = effScope; d.MeetingId = effMeeting;
       d.IndexState = "queued"; d.IndexGeneration = 0; d.IndexError = ""; d.IndexCompletedAt = null;
-      if (string.IsNullOrWhiteSpace(d.ExtractionJson)) d.ExtractionJson = "{}";
-      s.Sources[d.Id] = d;
-      s.Sources.Flush();
-      SourceGovernance.IndexSource(s, d, false);
-      SourceGovernance.RecordEvent(s, d, "create", "inline scope=" + effScope);
-      return Results.Created($"/api/sources/{d.Id}", d);
+      d.ExtractionJson = "{}";
+      d.Original = inlineRaw;
+      // Allocation AND insertion happen in one serialized transaction so two
+      // concurrent creations can never reserve and store the same version.
+      SourceDoc? inlineDoc = null;
+      string? inlineDup = null;
+      lock (s.SetupLock)
+      {
+        lock (s.MessageLock)
+        {
+          Atomic.Run(() =>
+          {
+            var dupe = s.Sources.Values.FirstOrDefault(x => x.BoardId == bid && x.FamilyKey == familyKey && x.ContentHash == d.ContentHash);
+            if (dupe is not null) { inlineDup = $"Identical content already stored as {dupe.Id} (v{dupe.Version})."; return; }
+            d.Version = SourceGovernance.ReserveVersion(s, bid, familyKey);
+            s.Sources[d.Id] = d;
+            s.Sources.Flush();
+            SourceGovernance.RecordEvent(s, d, "create", "inline scope=" + effScope);
+            inlineDoc = d;
+          });
+        }
+      }
+      if (inlineDoc is null) return Results.Conflict(inlineDup ?? "Identical content already stored.");
+      if (!SourceGovernance.TryBeginIndex(s, inlineDoc.Id, out var inlineRes, out var inlineBeginErr) || inlineRes is null)
+        return Results.Json(new { error = inlineBeginErr }, statusCode: 500);
+      var inlineExt = await Extraction.ExtractAsync(inlineRaw, fname);
+      SourceGovernance.StampExtraction(s, inlineRes, Extraction.ToJson(inlineExt));
+      var (inlineOk, inlineStale, _, inlineErr, inlineStatus) = SourceGovernance.FinishIndex(s, inlineRes, false);
+      if (!inlineOk)
+        return Results.Json(new { error = inlineErr, stale = inlineStale }, statusCode: inlineStatus);
+      if (!s.Sources.TryGetValue(inlineDoc.Id, out var created) || created is null) return Results.NotFound();
+      return Results.Created($"/api/sources/{created.Id}", created);
     });
     app.MapPost("/api/sources/{id:guid}/exclude", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badEx) return badEx;
-      if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
-      SourceGovernance.SetExcluded(s, d, true);
-      return Results.Ok(d);
+      var (exOk, exErr, exStatus) = SourceGovernance.SetExcludedById(s, req, id, true); if (!exOk) return Results.Json(new { error = exErr }, statusCode: exStatus); if (!s.Sources.TryGetValue(id, out var exd) || exd is null) return Results.NotFound(); return Results.Ok(exd);
+      // (exclude shim returns the fresh row above; auth runs inside the helper)
     });
     // ---- Jobs with idempotency + safe retry ----
     app.MapGet("/api/activity/jobs", (InMemoryStore s) => Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100)));
@@ -379,6 +400,10 @@ public static class SimCEOEndpoints
       var spark = ModelPolicy.SparkFor(s, m.BoardId);
       Board? board = runBoard;
       var gen = m.Generation;
+      // Source-epoch pin: a restore replaces all state and bumps the epoch,
+      // so any in-flight publication generated before it must be discarded
+      // even if meeting generation numbers happen to coincide.
+      var epochBefore = s.SourceEpoch;
       var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
       // Lane B: capture which candidates were explicitly invited; non-invited must stay Approved at commit.
       var invitedIds = new HashSet<Guid>();
@@ -585,6 +610,8 @@ public static class SimCEOEndpoints
               return LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining());
             if (cur.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
               return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining());
+            if (s.SourceEpoch != epochBefore)
+              return LaneBFail("source evidence changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining());
             var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
             var curLeadVersion = curLead?.Version ?? 0;
             if (curLeadVersion != leadVersion

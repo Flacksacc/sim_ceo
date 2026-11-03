@@ -175,12 +175,15 @@ public static class MeetingEndpoints
       if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
         return Results.Conflict("Meeting is not active; resume to request a briefing.");
       // Capture generation + eligible-input fingerprint BEFORE the provider
-      // await: a policy change, exclusion, or revocation during generation must
-      // discard the stale draft instead of publishing it (P1 #4).
+      // await: a policy change, exclusion, revocation, or index-generation
+      // change during generation must discard the stale draft instead of
+      // publishing it (P1 #3/#4). The fingerprint pins the exact eligible
+      // set with per-source version, index generation, content hash, and
+      // section-graph shape, so a same-bytes/version reindex that swaps
+      // text still discards the in-flight draft.
       var genBefore = m.Generation;
-      List<string> EligibleFingerprint() => s.Sources.Values
-        .Where(x => x.BoardId == m.BoardId && SourceGovernance.IsEligible(s, x, id))
-        .OrderBy(x => x.Id.ToString("N")).Select(x => x.Id.ToString("N") + ":v" + x.Version + ":" + (x.ContentHash ?? "")).ToList();
+      var epochBefore = s.SourceEpoch;
+      List<string> EligibleFingerprint() => SourceGovernance.EligibleFingerprint(s, m.BoardId, id);
       var fpBefore = EligibleFingerprint();
       var evidenceBefore = SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
       string text;
@@ -199,11 +202,11 @@ public static class MeetingEndpoints
         {
           if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
             return Results.Conflict("Meeting state changed during briefing; draft discarded.");
-          if (cur.Generation != genBefore)
+          if (cur.Generation != genBefore || s.SourceEpoch != epochBefore)
             return Results.Conflict("Source evidence changed during briefing; draft discarded.");
           if (!EligibleFingerprint().SequenceEqual(fpBefore))
             return Results.Conflict("Source evidence changed during briefing; draft discarded.");
-          var resolved = SourceGovernance.ResolveEvidence(s, evidenceBefore, m.BoardId, id);
+            var resolved = SourceGovernance.ResolveEvidence(s, evidenceBefore, m.BoardId, id);
           var note = new Note
           {
             BoardId = m.BoardId, MeetingId = id, Kind = "briefing",

@@ -828,6 +828,10 @@ export default function App() {
     return a;
   });
   const [actAsState, setActAsState] = useState("");
+  // Applied demo identity: the value actually sent as X-User by every app
+  // request, updated ONLY through "Apply identity". The draft input above
+  // stays editable without affecting traffic until applied.
+  const [appliedActAs, setAppliedActAs] = useState("");
   const [mq, setMq] = useState("");
   const [mstate, setMstate] = useState("");
   const [uday, setUday] = useState("");
@@ -5897,7 +5901,7 @@ const testModel = useMutation({
             <section aria-label="Resources and Inbox">
               {" "}
               <h2>Resources and Inbox</h2>{" "}
-              <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} />
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} />
             </section>
           )}{" "}
           {tab === "records" && (
@@ -6126,6 +6130,7 @@ const testModel = useMutation({
                     <button
                       onClick={() => {
                         actAs = actAsState.trim();
+                        setAppliedActAs(actAsState.trim());
                         qc.invalidateQueries();
                       }}
                     >

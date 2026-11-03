@@ -41,10 +41,11 @@ if (app.Environment.IsDevelopment()) { }
 
 
 var pgStore = app.Services.GetRequiredService<InMemoryStore>();
+string? pgCs = null;
 if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
 {
-  var cs = builder.Configuration.GetConnectionString("App");
-  if (string.IsNullOrWhiteSpace(cs))
+  pgCs = builder.Configuration.GetConnectionString("App");
+  if (string.IsNullOrWhiteSpace(pgCs))
   {
     Console.Error.WriteLine("POSTGRES FATAL: USE_POSTGRES=1 but no connection string configured (ConnectionStrings:App). Refusing in-memory fallback.");
     Environment.Exit(1);
@@ -56,7 +57,7 @@ if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
       var asm = System.Reflection.Assembly.LoadFrom(
         Path.Combine(AppContext.BaseDirectory, "SimCEO.Postgres.dll"));
       var boot = asm.GetType("SimCEO.Postgres.PgBoot");
-      var argv = new object?[] { cs, "" };
+      var argv = new object?[] { pgCs, "" };
       var ok = boot is not null && (bool)boot.GetMethod("TryWire")!.Invoke(null, argv)!;
       if (!ok)
       {
@@ -537,5 +538,45 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
     }
   }
 });
+
+// Phase 6 deterministic migration: runs after the backend is wired and
+// before the API serves, so strict head-gated eligibility never depends on
+// a list/review/context GET happening first. The migration is idempotent
+// and convergent; any failure is fatal — the API refuses to serve rather
+// than serve a half-migrated graph.
+try
+{
+  SourceGovernance.Bootstrap(pgStore);
+}
+catch (Exception mex)
+{
+  Console.Error.WriteLine($"MIGRATION FATAL: source-governance migration failed ({mex.GetType().Name}: {mex.Message}). Refusing to serve.");
+  Environment.Exit(1);
+}
+// Unique identity constraints are enforced ONLY after the migration above
+// has canonicalized families and resolved legacy collisions. Creating them
+// earlier would fail on reachable legacy shapes.
+if (pgCs is not null)
+{
+  try
+  {
+    var asm2 = System.Reflection.Assembly.LoadFrom(
+      Path.Combine(AppContext.BaseDirectory, "SimCEO.Postgres.dll"));
+    var boot2 = asm2.GetType("SimCEO.Postgres.PgBoot");
+    var argv2 = new object?[] { pgCs, "" };
+    var ok2 = boot2 is not null && (bool)boot2.GetMethod("EnsureUniqueIndexes")!.Invoke(null, argv2)!;
+    if (!ok2)
+    {
+      Console.Error.WriteLine($"POSTGRES FATAL: {argv2[1]}");
+      Environment.Exit(1);
+    }
+    Console.WriteLine("POSTGRES: unique source indexes enforced.");
+  }
+  catch (Exception ex2)
+  {
+    Console.Error.WriteLine($"POSTGRES FATAL: unique-index enforcement unavailable ({ex2.GetType().Name}). Refusing to serve without constraints.");
+    Environment.Exit(1);
+  }
+}
 
 app.Run();

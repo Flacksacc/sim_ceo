@@ -43,6 +43,15 @@ public sealed class InMemoryStore
   public Bag<Work.ModelCall> ModelCalls { get; } = new();
   public object MessageLock { get; } = new();
   public object SetupLock { get; } = new();
+  // Process/runtime index epoch: bumped on every successful restore so
+  // outstanding index reservations and in-flight publications fail closed
+  // instead of committing against replaced state. Runtime-only by design:
+  // reservations do not survive restart, so the epoch need not persist.
+  public long SourceEpoch { get; set; } = 0;
+  // Outstanding index reservations by source id. Set at reservation time
+  // (inside the governance locks+transaction) and verified at completion.
+  // Cleared + epoch-bumped on restore; never serialized into backups.
+  public ConcurrentDictionary<Guid, Work.ActiveIndexJob> ActiveIndexJobs { get; } = new();
   public HashSet<Guid> RunningRuns { get; } = new();
   public ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim> DraftLocks { get; } = new();
   public string PgError { get; set; } = "";

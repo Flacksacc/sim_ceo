@@ -85,7 +85,7 @@ public static class ContextCurator
       foreach (var (doc, text) in ranked)
       {
         sb.AppendLine($"[SOURCE:{doc.FileName} v{doc.Version}]: {Truncate(text, share)}");
-        sourceIds.Add($"{doc.Id}:v{doc.Version}");
+        sourceIds.Add($"{doc.Id}:v{doc.Version}:g{doc.IndexGeneration}:{doc.ContentHash}:s{SourceGovernance.SectionRevision(s, doc.Id)}");
         evidence.Add(EvidenceRef.ForSource(doc, Truncate(text, 200)));
       }
     }

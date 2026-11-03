@@ -32,6 +32,13 @@ public sealed class PostgresDb : DbContext
   {
     b.Entity<Message>().HasKey(m => new { m.MeetingId, m.Sequence });
     b.Entity<SourceDoc>().HasIndex(x => x.BoardId);
+    // Phase 6 uniqueness: one version identity per family, one head per family.
+    // Legacy collisions are resolved by the controlled startup migration BEFORE
+    // these constraints are enforced (see PgBoot.EnsureUniqueIndexes), and all
+    // writes allocate+insert in one serialized transaction, so these constraints
+    // only ever guard against out-of-band writes.
+    b.Entity<SourceDoc>().HasIndex(x => new { x.BoardId, x.FamilyKey, x.Version }).IsUnique();
+    b.Entity<SourceFamilyHead>().HasIndex(x => new { x.BoardId, x.FamilyKey }).IsUnique();
     b.Entity<BoardAdvisor>().HasIndex(x => x.BoardId);
     b.Entity<Meeting>().HasIndex(x => x.BoardId);
     b.Entity<SimCEO.Api.Account>().HasIndex(a => a.Email).IsUnique();
@@ -264,15 +271,40 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");
-      // One-time idempotent legacy migration: pending for new, approved stays, then heads backfill runs at request time.
+      // Unique identity constraints are NOT created here: they are enforced by
+      // EnsureUniqueIndexes AFTER the controlled startup migration has
+      // canonicalized families and resolved legacy collisions in app code.
       db.Database.ExecuteSqlRaw("UPDATE \"Sources\" SET \"ReviewState\" = CASE WHEN \"Approved\" THEN 'approved' ELSE 'pending' END WHERE (\"ReviewState\" = 'pending' OR \"ReviewState\" = '') AND \"Approved\" = TRUE");
-      // FamilyKey backfill runs in app code (EnsureMigratedAll) to compute board/scope/origin-aware keys; SQL leaves new rows empty.
+      // Canonical family keys and legacy collision resolution run in app code (SourceGovernance.MigrateStore); SQL leaves new rows empty.
       Pg.Backend = new PostgresBackend(db);
       return true;
     }
     catch (Exception ex)
     {
       error = $"Postgres wire-up failed ({ex.GetType().Name}); refusing in-memory fallback for requested PG mode.";
+      return false;
+    }
+  }
+
+  // Unique identity constraints, enforced ONLY after the controlled
+  // startup migration has canonicalized families and deterministically
+  // resolved legacy collisions. Creating them earlier would fail on
+  // reachable legacy shapes (e.g. two pre-family v1 rows that canonicalize
+  // to one family). Called by Program after SourceGovernance.MigrateStore.
+  public static bool EnsureUniqueIndexes(string cs, out string error)
+  {
+    error = "";
+    try
+    {
+      var options = new DbContextOptionsBuilder<PostgresDb>().UseNpgsql(cs).Options;
+      using var db = new PostgresDb(options);
+      db.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX IF NOT EXISTS \"UX_Sources_FamilyVersion\" ON \"Sources\" (\"BoardId\",\"FamilyKey\",\"Version\")");
+      db.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX IF NOT EXISTS \"UX_SourceHeads_Family\" ON \"SourceHeads\" (\"BoardId\",\"FamilyKey\")");
+      return true;
+    }
+    catch (Exception ex)
+    {
+      error = $"Postgres unique-index enforcement failed ({ex.GetType().Name}: {ex.Message}).";
       return false;
     }
   }

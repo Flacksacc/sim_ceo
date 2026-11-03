@@ -402,50 +402,83 @@ public static class OpsEndpoints
       var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
         new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
       if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
-      lock (s.SetupLock)
+      // Phase 6 graph validation BEFORE any mutation: canonical identities,
+      // uniqueness, parent relationships, heads, section metadata, and legal
+      // states. A malformed or forged graph is rejected with zero partial
+      // state. Deserialization never validates list elements, so this gate —
+      // not the type system — is the trust boundary for the graph fields.
+      if (!SourceGovernance.ValidateRestoreGraph(restored, out var graphErr))
+        return Results.Json(new { error = "Backup graph rejected: " + graphErr }, statusCode: 422);
+      try
       {
-        s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
-        s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
-        s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
-        foreach (var b in restored.boards) s.Boards[b.Id] = b;
-        foreach (var r in restored.roster) s.Roster[r.Id] = r;
-        foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
-        foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
-        foreach (var kv in restored.messages)
-          if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
-        foreach (var n in restored.notes) s.Notes[n.Id] = n;
-        foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
-        foreach (var x in restored.sources) s.Sources[x.Id] = x; if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss; if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh; if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
-        // Deliberate legacy migration (P2 #9): pre-phase-6 snapshots carry
-        // Approved=true with no ReviewState field. The "" sentinel promotes
-        // those to "approved" without touching explicit decisions (rejected
-        // rows stay rejected), and completed-without-sections metadata is
-        // failed-closed until reindex.
-        SourceGovernance.MigrateRestoredSources(s);
-        foreach (var kv in restored.blobs)
-          if (Guid.TryParse(kv.Key, out var bid2))
-            if (s.Sources.TryGetValue(bid2, out var bdoc))
-              try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
-        s.Sources.Flush();
-        foreach (var img in restored.images)
+        lock (s.SetupLock)
         {
-          byte[]? data = null;
-          if (img.data is not null) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
-          s.Images[img.id] = new AdvisorImage
+          lock (s.MessageLock)
           {
-            Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
-            Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
-            Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
-            ContentType = img.contentType ?? "image/png", Data = data,
-            CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
-          };
+            // One transactional unit: a storage failure anywhere (state,
+            // sections, heads, blobs) rolls everything back together.
+            Atomic.Run(() =>
+            {
+              s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
+              s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
+              s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
+              foreach (var b in restored.boards) s.Boards[b.Id] = b;
+              foreach (var r in restored.roster) s.Roster[r.Id] = r;
+              foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
+              foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
+              foreach (var kv in restored.messages)
+                if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
+              foreach (var n in restored.notes) s.Notes[n.Id] = n;
+              foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
+              foreach (var x in restored.sources) s.Sources[x.Id] = x;
+              if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss;
+              if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh;
+              if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
+              // Deliberate legacy migration (P2 #9): pre-phase-6 snapshots carry
+              // Approved=true with no ReviewState field. The "" sentinel promotes
+              // those to "approved" without touching explicit decisions (rejected
+              // rows stay rejected); empty legacy family keys are canonicalized;
+              // completed-without-sections metadata is failed-closed until
+              // reindex; established heads cover families the snapshot left
+              // headless. All inside this same transaction.
+              SourceGovernance.MigrateRestoredSources(s);
+              foreach (var kv in restored.blobs)
+                if (Guid.TryParse(kv.Key, out var bid2))
+                  if (s.Sources.TryGetValue(bid2, out var bdoc))
+                    try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
+              s.Sources.Flush();
+              foreach (var img in restored.images)
+              {
+                byte[]? data = null;
+                if (img.data is not null) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
+                s.Images[img.id] = new AdvisorImage
+                {
+                  Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
+                  Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
+                  Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
+                  ContentType = img.contentType ?? "image/png", Data = data,
+                  CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
+                };
+              }
+              foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
+              foreach (var g in restored.grants) s.Grants[g.Id] = g;
+              foreach (var i in restored.invites) s.Invites[i.Id] = i;
+              if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
+            });
+            // Replacement succeeded: advance the runtime epoch and retire all
+            // outstanding index reservations so in-flight extraction and
+            // publication work fails closed instead of committing against the
+            // replaced state. No generation reuse is observable afterwards.
+            s.ActiveIndexJobs.Clear();
+            s.SourceEpoch++;
+          }
         }
-        foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
-        foreach (var g in restored.grants) s.Grants[g.Id] = g;
-        foreach (var i in restored.invites) s.Invites[i.Id] = i;
-        if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
-        s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
       }
+      catch (Exception rex)
+      {
+        return Results.Json(new { error = "Backup restore failed; no state changed (" + rex.Message + ")." }, statusCode: 500);
+      }
+      s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
       return Results.Ok(new { restored = restored.boards.Count, at = restored.at });
     });
 

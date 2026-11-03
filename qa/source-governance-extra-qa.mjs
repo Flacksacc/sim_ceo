@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import http from "node:http";
 import fs from "fs";
 const API = "http://127.0.0.1:5095";
@@ -7,6 +7,7 @@ const FAKE_PORT = 5195;
 const HIND_PORT = 5198;
 const INSTANCE = "source-gov-qa";
 const OUT = ".tmp/source-governance-extra-result.txt";
+const pgcs = (db) => "Host=127.0.0.1;Port=15435;Database=" + db + ";Username=simceo;Password=simceo-dev-only";
 fs.mkdirSync(".tmp", { recursive: true });
 fs.writeFileSync(OUT, "START extra " + new Date().toISOString() + "\n");
 let pass = 0, fail = 0;
@@ -70,12 +71,28 @@ const hind = http.createServer((rq, rs) => { rs.writeHead(200, { "content-type":
 await new Promise((res, rej) => { hind.once("error", rej); hind.listen(HIND_PORT, "127.0.0.1", res); }).catch((e) => { ok("hind-port", false, String(e)); throw e; });
 let fake = startProc("node", ["qa/fake-provider.mjs", "--port", String(FAKE_PORT)], { QA_DRAFT_SLEEP_ONLY: "1" }, ".tmp/sg-extra-fake.log");
 await sleep(1500);
-let api = startProc("dotnet", ["server/SimCEO.Api/bin/Debug/net10.0/SimCEO.Api.dll"], { META_API_KEY: "dummy-qa-key", META_API_BASE: "http://127.0.0.1:" + FAKE_PORT, HINDSIGHT_URL: "http://127.0.0.1:" + HIND_PORT, SIMCEO_INSTANCE: INSTANCE, ASPNETCORE_URLS: API }, ".tmp/sg-extra-api.log");
-ok("extra-api-up", await waitHealth(30000), "no api");
-{
-  const h = await (await fetch(API + "/health")).json();
-  ok("extra-identity", (h.instance || h.Instance) === INSTANCE, JSON.stringify(h));
+async function startApi(pgDb, log) {
+  const env = { META_API_KEY: "dummy-qa-key", META_API_BASE: "http://127.0.0.1:" + FAKE_PORT, HINDSIGHT_URL: "http://127.0.0.1:" + HIND_PORT, SIMCEO_INSTANCE: INSTANCE, ASPNETCORE_URLS: API };
+  if (pgDb) { env.USE_POSTGRES = "1"; env.CONNECTIONSTRINGS__APP = pgcs(pgDb); }
+  const p = startProc("dotnet", ["server/SimCEO.Api/bin/Debug/net10.0/SimCEO.Api.dll"], env, log);
+  const up = await waitHealth(30000);
+  return { proc: p, up };
 }
+async function assertIdentity(expectMode, tag) {
+  let inst = null, mode = null;
+  try {
+    const h = await (await fetch(API + "/health")).json();
+    inst = h.instance || h.Instance || null;
+    const b = await (await fetch(API + "/api/backend")).json();
+    mode = b.mode || b.Mode || null;
+  } catch (e) { ok(tag + "-identity-probe", false, String(e)); return false; }
+  ok(tag + "-identity-instance", inst === INSTANCE, "instance=" + inst);
+  ok(tag + "-identity-mode-" + expectMode, mode === expectMode, "mode=" + mode);
+  return inst === INSTANCE && mode === expectMode;
+}
+let api = await startApi(null, ".tmp/sg-extra-api.log");
+ok("mem-extra-api-up", api.up, "no api");
+if (!api.up) { fs.appendFileSync(OUT, "ABORT no api\nDONE pass=" + pass + " fail=" + fail + "\n"); try { fake.kill(); } catch { } hind.close(); process.exit(1); }
 async function setupBoard(tag) {
   const b = await post("/api/boards", { name: "sg-extra-" + tag + "-" + Date.now() });
   const bid = b.json.id;
@@ -104,6 +121,10 @@ async function messages(bid, mid) {
   const r = await get("/api/meetings/" + mid + "/messages?take=100");
   return r.json || [];
 }
+async function suite(tag) {
+  if (!await assertIdentity(tag === "pg" ? "postgres" : "memory", tag)) { ok(tag + "-abort-identity", false, "backend identity"); return; }
+  try { await fetch("http://127.0.0.1:" + HIND_PORT + "/__inject", { method: "POST", headers: { "content-type": "application/json" }, body: "{\"hits\":null}" }); } catch { }
+  await fakeLogReset();
 // --- CASE 1: exclusion during an observed evidence-bearing draft ---
 {
   const { bid } = await setupBoard("excl");
@@ -116,34 +137,39 @@ async function messages(bid, mid) {
   await post("/api/sources/" + sid + "/approve", {});
   await post("/api/meetings/" + mid + "/resume", {});
   let st0 = await meetingState(bid, mid);
-  ok("case1-resumed", stateIs(st0.state, "active"), st0.state);
+  ok(tag + "-case1-resumed", stateIs(st0.state, "active"), st0.state);
   // Control run first: no invalidation -> publishes.
   const ctl = await post("/api/meetings/" + mid + "/run", { policy: "balanced", prompt: "control question, no sleep" }, { timeout: 60000 });
   const ctlMsgs = await messages(bid, mid);
-  ok("case1-control-publishes", ctl.status === 200 && (Array.isArray(ctl.json.published ?? ctl.json.Published) ? (ctl.json.published ?? ctl.json.Published).length : 0) >= 1 && ctlMsgs.length >= 1, ctl.status + " " + (ctl.text || "").slice(0, 300));
+  ok(tag + "-case1-control-publishes", ctl.status === 200 && (Array.isArray(ctl.json.published ?? ctl.json.Published) ? (ctl.json.published ?? ctl.json.Published).length : 0) >= 1 && ctlMsgs.length >= 1, ctl.status + " " + (ctl.text || "").slice(0, 300));
   // New owner turn: the control run consumed this turn's advisor reply, so open
   // a fresh turn before the slow run or no draft request would be issued.
   const lead2 = await post("/api/meetings/" + mid + "/messages", { content: "follow-up question about alpha" });
-  ok("case1-new-turn", lead2.status === 201, lead2.status + " " + lead2.text.slice(0, 200));
+  ok(tag + "-case1-new-turn", lead2.status === 201, lead2.status + " " + lead2.text.slice(0, 200));
   const msgsBase = await messages(bid, mid);
   const seqBefore = msgsBase.map((x) => x.sequence ?? x.Sequence);
+  const bodyBefore = JSON.stringify(msgsBase.map((x) => ({ s: x.sequence ?? x.Sequence, c: x.content ?? x.Content ?? "" })));
   await fakeLogReset();
   const runP = post("/api/meetings/" + mid + "/run", { policy: "balanced", prompt: "slow question about alpha" }, { timeout: 60000 });
-  ok("case1-draft-observed", await waitDraftLatch(25000), "no evidence-bearing draft request reached the provider");
+  ok(tag + "-case1-draft-observed", await waitDraftLatch(25000), "no evidence-bearing draft request reached the provider");
   const genBefore = (await meetingState(bid, mid)).gen;
   const ex = await post("/api/sources/" + sid + "/exclude", {});
-  ok("case1-exclude-200", ex.status === 200, ex.status + " " + ex.text.slice(0, 200));
+  ok(tag + "-case1-exclude-200", ex.status === 200, ex.status + " " + ex.text.slice(0, 200));
   let runR;
   try { runR = await runP; } catch (e) { runR = { status: 0, text: String(e), json: null }; }
   const msgsAfter = await messages(bid, mid);
   const seqAfter = msgsAfter.map((x) => x.sequence ?? x.Sequence);
-  ok("case1-slow-discarded", (runR.status === 200 && (Array.isArray(runR.json.published ?? runR.json.Published) ? (runR.json.published ?? runR.json.Published).length : -1) === 0) || (runR.status === 409 && /paused|discard|interrupt/i.test(runR.text || "")), runR.status + " " + (runR.text || JSON.stringify(runR.json)).slice(0, 500));
-  ok("case1-history-unchanged", JSON.stringify(seqAfter) === JSON.stringify(seqBefore), JSON.stringify(seqBefore) + " vs " + JSON.stringify(seqAfter));
+  // A discarded draft must 409 (interrupted run outcome); an ordinary 200 with
+  // empty publication would also pass here without any revocation, so 200-empty
+  // is explicitly rejected as a false PASS.
+  ok(tag + "-case1-slow-discarded-409", runR.status === 409 && /paused|discard|interrupt/i.test(runR.text || ""), runR.status + " " + (runR.text || JSON.stringify(runR.json)).slice(0, 500));
+  ok(tag + "-case1-history-unchanged", JSON.stringify(seqAfter) === JSON.stringify(seqBefore), JSON.stringify(seqBefore) + " vs " + JSON.stringify(seqAfter));
+  ok(tag + "-case1-committed-history-intact", JSON.stringify(msgsAfter.map((x) => ({ s: x.sequence ?? x.Sequence, c: x.content ?? x.Content ?? "" }))) === bodyBefore, "committed message identities/content changed");
   const st1 = await meetingState(bid, mid);
-  ok("case1-paused", stateIs(st1.state, "paused"), st1.state);
-  ok("case1-gen-inc", st1.gen > genBefore, genBefore + "->" + st1.gen);
+  ok(tag + "-case1-paused", stateIs(st1.state, "paused"), st1.state);
+  ok(tag + "-case1-gen-inc", st1.gen > genBefore, genBefore + "->" + st1.gen);
   const cx = await get("/api/boards/" + bid + "/context");
-  ok("case1-context-empty", (cx.json.approved ?? cx.json.Approved) === 0, JSON.stringify(cx.json).slice(0, 300));
+  ok(tag + "-case1-context-empty", (cx.json.approved ?? cx.json.Approved) === 0, JSON.stringify(cx.json).slice(0, 300));
 }
 // --- CASE 2: policy change during an observed draft (separate run) ---
 {
@@ -157,19 +183,24 @@ async function messages(bid, mid) {
   await post("/api/meetings/" + mid + "/resume", {});
   await fakeLogReset();
   const runP = post("/api/meetings/" + mid + "/run", { policy: "balanced", prompt: "policy slow question" }, { timeout: 60000 });
-  ok("case2-draft-observed", await waitDraftLatch(25000), "no draft latch");
+  ok(tag + "-case2-draft-observed", await waitDraftLatch(25000), "no draft latch");
   const genBefore = (await meetingState(bid, mid)).gen;
   const msgsBefore = await messages(bid, mid);
+  const bodyBefore = JSON.stringify(msgsBefore.map((x) => ({ s: x.sequence ?? x.Sequence, c: x.content ?? x.Content ?? "" })));
   const pol = await put("/api/boards/" + bid + "/source-policy", { blockedTypes: "", mode: "wikiOnly" });
-  ok("case2-policy-200", pol.status === 200, pol.status + " " + pol.text.slice(0, 200));
+  ok(tag + "-case2-policy-200", pol.status === 200, pol.status + " " + pol.text.slice(0, 200));
   let runR;
   try { runR = await runP; } catch (e) { runR = { status: 0, text: String(e), json: null }; }
   const msgsAfter = await messages(bid, mid);
-  ok("case2-slow-discarded", (runR.status === 200 && (Array.isArray(runR.json.published ?? runR.json.Published) ? (runR.json.published ?? runR.json.Published).length : -1) === 0) || (runR.status === 409 && /paused|discard|interrupt/i.test(runR.text || "")), runR.status + " " + (runR.text || JSON.stringify(runR.json)).slice(0, 500));
-  ok("case2-no-new-messages", msgsAfter.length === msgsBefore.length, msgsBefore.length + " vs " + msgsAfter.length);
+  // A discarded policy run must 409 (interrupted run outcome); an ordinary 200
+  // with empty publication would also pass here without any revocation, so
+  // 200-empty is explicitly rejected as a false PASS.
+  ok(tag + "-case2-slow-discarded-409", runR.status === 409 && /paused|discard|interrupt/i.test(runR.text || ""), runR.status + " " + (runR.text || JSON.stringify(runR.json)).slice(0, 500));
+  ok(tag + "-case2-no-new-messages", msgsAfter.length === msgsBefore.length, msgsBefore.length + " vs " + msgsAfter.length);
+  ok(tag + "-case2-committed-history-intact", JSON.stringify(msgsAfter.map((x) => ({ s: x.sequence ?? x.Sequence, c: x.content ?? x.Content ?? "" }))) === bodyBefore, "committed message identities/content changed");
   const st1 = await meetingState(bid, mid);
-  ok("case2-paused", stateIs(st1.state, "paused"), st1.state);
-  ok("case2-gen-inc", st1.gen > genBefore, genBefore + "->" + st1.gen);
+  ok(tag + "-case2-paused", stateIs(st1.state, "paused"), st1.state);
+  ok(tag + "-case2-gen-inc", st1.gen > genBefore, genBefore + "->" + st1.gen);
 }
 // --- CASE 3: briefing invalidated during generation is discarded (409, no note) ---
 {
@@ -185,19 +216,73 @@ async function messages(bid, mid) {
   const n0 = (notes0.json || []).length;
   await fakeLogReset();
   const briefP = post("/api/meetings/" + mid + "/briefings", { topic: "QA-SLEEP:4000 slow briefing topic" }, { timeout: 60000 });
-  ok("case3-brief-observed", await waitBriefLatch(25000), "no briefing provider request observed");
+  ok(tag + "-case3-brief-observed", await waitBriefLatch(25000), "no briefing provider request observed");
   const ex = await post("/api/sources/" + sid + "/exclude", {});
-  ok("case3-exclude-200", ex.status === 200, ex.status + " " + ex.text.slice(0, 200));
+  ok(tag + "-case3-exclude-200", ex.status === 200, ex.status + " " + ex.text.slice(0, 200));
   let briefR;
   try { briefR = await briefP; } catch (e) { briefR = { status: 0, text: String(e), json: null }; }
-  ok("case3-brief-discarded-409", briefR.status === 409 && /discard/i.test(briefR.text || ""), briefR.status + " " + (briefR.text || "").slice(0, 300));
+  ok(tag + "-case3-brief-discarded-409", briefR.status === 409 && /discard/i.test(briefR.text || ""), briefR.status + " " + (briefR.text || "").slice(0, 300));
   const notes1 = await get("/api/meetings/" + mid + "/notes?kind=briefing");
-  ok("case3-no-note-stored", (notes1.json || []).length === n0, n0 + " vs " + (notes1.json || []).length);
+  ok(tag + "-case3-no-note-stored", (notes1.json || []).length === n0, n0 + " vs " + (notes1.json || []).length);
   const st1 = await meetingState(bid, mid);
-  ok("case3-paused", stateIs(st1.state, "paused"), st1.state);
+  ok(tag + "-case3-paused", stateIs(st1.state, "paused"), st1.state);
 }
+// --- CASE 4: restore during an observed briefing discards the stale draft ---
+// A valid OLDER snapshot (same source id, different section text) restored
+// mid-briefing bumps the epoch: the in-flight draft pinned the NEW text and
+// must discard 409 with no note stored; the restored OLD text wins.
+{
+  const { bid } = await setupBoard(tag + "-restore-race");
+  const m = await post("/api/boards/" + bid + "/meetings", { title: "m-restore-race" });
+  const mid = m.json.id;
+  await patch("/api/meetings/" + mid, { brief: "restore race brief" });
+  const markOld = "restore race evidence OLD " + crypto.randomUUID();
+  const markNew = "restore race evidence NEW " + crypto.randomUUID();
+  const u1 = await upload(bid, "racer.txt", markOld, "board");
+  const s1 = u1.json.id;
+  ok(tag + "-case4-v1-201", u1.status === 201, u1.status + " " + (u1.text || "").slice(0, 200));
+  await post("/api/sources/" + s1 + "/approve", {});
+  await post("/api/sources/" + s1 + "/reindex", {});
+  const bkOld = await get("/api/backup");
+  ok(tag + "-case4-snap-200", bkOld.status === 200 && bkOld.json.snapshot, bkOld.status + "");
+  const snapOld = JSON.parse(bkOld.json.snapshot);
+  const hashOld = crypto.createHash("sha256").update(JSON.stringify(snapOld), "utf8").digest("hex");
+  const u2 = await upload(bid, "racer.txt", markNew, "board");
+  const s2 = u2.json.id;
+  await post("/api/sources/" + s2 + "/approve", {});
+  await post("/api/sources/" + s2 + "/reindex", {});
+  const secNew = await get("/api/sources/" + s2 + "/sections");
+  ok(tag + "-case4-new-sections", secNew.status === 200 && JSON.stringify(secNew.json).includes(markNew), JSON.stringify(secNew.json).slice(0, 200));
+  await post("/api/meetings/" + mid + "/resume", {});
+  const notes0 = await get("/api/meetings/" + mid + "/notes?kind=briefing");
+  const n0 = (notes0.json || []).length;
+  await fakeLogReset();
+  const briefP = post("/api/meetings/" + mid + "/briefings", { topic: "QA-SLEEP:4000 restore race" }, { timeout: 60000 });
+  ok(tag + "-case4-brief-observed", await waitBriefLatch(25000), "no briefing provider request observed");
+  const rs = await post("/api/backup/restore", { snapshot: JSON.stringify(snapOld), hash: hashOld });
+  ok(tag + "-case4-restore-200", rs.status === 200, rs.status + " " + (rs.text || "").slice(0, 300));
+  let briefR;
+  try { briefR = await briefP; } catch (e) { briefR = { status: 0, text: String(e), json: null }; }
+  ok(tag + "-case4-brief-discarded-409", briefR.status === 409 && /discard/i.test(briefR.text || ""), briefR.status + " " + (briefR.text || "").slice(0, 300));
+  const notes1 = await get("/api/meetings/" + mid + "/notes?kind=briefing");
+  ok(tag + "-case4-no-note-stored", (notes1.json || []).length === n0, n0 + " vs " + (notes1.json || []).length);
+  const secOld = await get("/api/sources/" + s1 + "/sections");
+  ok(tag + "-case4-old-wins", secOld.status === 200 && JSON.stringify(secOld.json).includes(markOld) && !JSON.stringify(secOld.json).includes(markNew), JSON.stringify(secOld.json).slice(0, 300));
+}
+}
+
+await suite("mem");
+await stopProc(api.proc, "extra-mem-api");
+await sleep(2000);
+try { execSync('docker exec simceo-source-qa-pg psql -U simceo -d postgres -c "DROP DATABASE IF EXISTS sgqa_extra;"'); } catch (e) { ok("pg-drop", false, String(e).slice(0, 200)); }
+try { execSync('docker exec simceo-source-qa-pg psql -U simceo -d postgres -c "CREATE DATABASE sgqa_extra;"'); ok("pg-create", true); } catch (e) { ok("pg-create", false, String(e).slice(0, 200)); }
+api = await startApi("sgqa_extra", ".tmp/sg-extra-api-pg.log");
+ok("pg-extra-api-up", api.up, "no pg api");
+if (!api.up) { fs.appendFileSync(OUT, "ABORT no pg api\\nDONE pass=" + pass + " fail=" + fail + "\\n"); try { fake.kill(); } catch { } hind.close(); process.exit(1); }
+await suite("pg");
+
 fs.appendFileSync(OUT, "DONE pass=" + pass + " fail=" + fail + " failures=" + JSON.stringify(failures) + "\n");
-await stopProc(api, "extra-api");
+await stopProc(api.proc, "extra-api");
 try { fake.kill(); } catch { }
 hind.close();
 setTimeout(() => process.exit(fail === 0 ? 0 : 1), 500);
