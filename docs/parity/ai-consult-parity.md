@@ -120,6 +120,8 @@ Broader recovery candidate `c3c5dee` passed primary build, 89 HTTP/selftest chec
 
 Character editor candidate `794ec72` also remains **rejected**. Dedicated `.tmp/character-ui-final-review.txt` found saved-paragraph overwrite on research, stale entry/auth continuations, disabled cancellation, polling that cannot adopt completion, unreliable proof reconciliation, and inability to remove every source URL. Muse is repairing the source and meaningful browser coverage. Shared Profile editor fixes build successfully but still require corrected conflict/reload/offline tests and independent closure. These results do not establish complete advisor readiness.
 
+Activity backend candidate `3df0ffb` is also rejected pending `.tmp/meeting-activity-independent-review.txt`: some Secretary failure paths never terminate the activity mirror, requester identity can be resolved too late, individual completions wait for an entire batch, and restore/meeting changes can leave stale busy states. The continuation event and several claimed QA guarantees also need correction. All seven findings were returned to Muse. The original 52 passing fixture checks are not accepted as evidence for these missing cases.
+
 ## Navigation + secure UI completion (Muse lane, unaccepted)
 
 Scope: entire-app navigation (hash routes, normalization, board/meeting/record scope, wrong-parent, unknown/missing/archived/deleted/denied, public invite join, recovery, back/forward) and secure UI (fail-closed private queries/rendering, canonical Bearer-first applied identity + auth epoch, server-derived role caps for every tab/action, server stateValid-gated record approval, identity-aware transport/downloads/refresh/exports, held-response and A-B-A invalidation).
