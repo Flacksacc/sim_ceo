@@ -325,33 +325,39 @@ public static class SimCEOEndpoints
     // ---- Board lead profile ("Your Profile"): explicit versioned save ----
     app.MapGet("/api/boards/{bid:guid}/lead", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badLG) return badLG;
       if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
         return Results.Json(new { error = "Authentication required." }, statusCode: 401);
       var user = PeopleOps.UserOf(s, req);
       if (!PeopleOps.Can(s, req, bid, null, "read") && PeopleOps.GuestMeetingIds(s, user, bid).Count == 0) return PeopleOps.Denied();
+      Board? effBoard = null;
+      try { s.Boards.TryGetValue(bid, out effBoard); } catch { effBoard = null; }
       var owned = LeadSetup.ResolveLeadForStrict(s, bid);
-      var fb = owned is null ? LeadSetup.ResolveLead(s) : null;
-      var cur = owned ?? LeadSetup.ResolveLeadFor(s, bid);
+      LeadProfile? cur = owned;
+      if (cur is null && effBoard is not null) cur = LeadSetup.ResolveLeadForBoard(s, effBoard);
+      if (cur is null) cur = LeadSetup.ResolveLeadFor(s, bid);
       if (cur is null) return Results.NotFound();
       var fallback = LeadSetup.IsFallback(cur, bid);
+      var source = LeadSetup.LeadSource(cur, bid);
       var caller = PeopleOps.UserOf(s, req);
       bool isInstAdmin = false;
       try { isInstAdmin = PeopleOps.IsInstallationAdmin(s, caller); }
       catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       if (!PeopleOps.Can(s, req, bid, null, "read"))
       {
-        // Meeting guests: minimal board-owned identity only; never global fallback content.
+        // Meeting guests: minimal board-owned identity only; never fallback content.
         if (fallback) return Results.NotFound();
-        return Results.Ok(new { cur.Id, cur.BoardId, cur.Version, cur.Name, cur.RoleLabel });
+        return Results.Ok(new { cur.Id, cur.BoardId, cur.Version, cur.Name, cur.RoleLabel, source });
       }
-      // Board readers+: full board-owned profile; global fallback is installation data.
-      if (fallback && !isInstAdmin)
+      // Board readers+: full board-owned or owner-default profile; legacy global stays installation data.
+      if (source == "global" && !isInstAdmin)
         return Results.Json(new { error = "No board lead profile saved; save the board lead profile to continue." }, statusCode: 404);
-      return Results.Ok(cur);
+      return Results.Ok(new { cur.Id, cur.BoardId, cur.Version, cur.Name, cur.RoleLabel, cur.Background, cur.FamiliarTopics, cur.SimplerTopics, cur.CommPrefs, cur.ProvenanceJson, cur.UpdatedAt, source, isFallback = fallback });
     });
     app.MapPost("/api/boards/{bid:guid}/lead", (InMemoryStore s, HttpRequest req, Guid bid, LeadProfile input) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badLead) return badLead;
       if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedLead) return deniedLead;
       LeadProfile saved = null; string error = null; int status = 200;
@@ -389,6 +395,34 @@ public static class SimCEOEndpoints
       catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Lead save") ?? Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return gsaved is not null ? Results.Ok(gsaved) : Results.Json(new { error = gerror }, statusCode: gstatus);
+    });
+    // ---- Per-account default profile ("Default profile"): one per person ----
+    // Boards inherit this default unless they carry an explicit board override.
+    // Saving here NEVER writes board rows and NEVER touches another account:
+    // identity is always the caller (session email or demo X-User), with 401
+    // when unauthenticated in secure mode and per-owner version guards (409).
+    app.MapGet("/api/profile", (InMemoryStore s, HttpRequest req) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } badProf) return badProf;
+      try {
+        if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+          return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      } catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      var cur = LeadSetup.ResolveDefaultForCaller(s, req);
+      if (cur is null) return Results.NotFound();
+      return Results.Ok(new { cur.Id, cur.BoardId, cur.Version, cur.Name, cur.RoleLabel, cur.Background, cur.FamiliarTopics, cur.SimplerTopics, cur.CommPrefs, cur.ProvenanceJson, cur.UpdatedAt, source = "default" });
+    });
+    app.MapPost("/api/profile", (InMemoryStore s, HttpRequest req, LeadProfile input) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } badProfPost) return badProfPost;
+      LeadProfile? saved = null; string? error = null; int status = 200;
+      try { var r = LeadSetup.SaveDefault(s, input, req); saved = r.saved; error = r.error; status = r.status; }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Default save") ?? Results.Json(new { error = "Default save failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (saved is not null) return Results.Ok(new { saved.Id, saved.BoardId, saved.Version, saved.Name, saved.RoleLabel, saved.Background, saved.FamiliarTopics, saved.SimplerTopics, saved.CommPrefs, saved.ProvenanceJson, saved.UpdatedAt, source = "default" });
+      return Results.Json(new { error }, statusCode: status);
     });
 
     // ---- Board fields edit (stays a draft until setup activation) ----
@@ -436,30 +470,43 @@ public static class SimCEOEndpoints
     // ---- Setup review + activation (exact reviewed draft only) ----
     app.MapGet("/api/boards/{bid:guid}/setup", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (PeopleOps.Check(s, req, bid, null, "read") is { } deniedSetup) return deniedSetup;
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
-      // Board-owned lead only; global fallback content is installation data (admin-only).
-      var leadOwned = LeadSetup.ResolveLeadForStrict(s, bid);
-      object? lead = leadOwned;
-      if (lead is null)
+      // Effective board lead: strict override, else owner default, else legacy global (admin-only).
+      var effLead = LeadSetup.ResolveLeadForBoard(s, b);
+      object? lead = effLead;
+      bool hideGlobal = false;
+      try
       {
-        try { if (PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) lead = LeadSetup.ResolveLead(s); } catch { lead = null; }
+        if (effLead is not null && LeadSetup.LeadSource(effLead, bid) == "global" && !PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) { lead = null; hideGlobal = true; }
       }
+      catch { lead = null; hideGlobal = true; }
       var total = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed);
       var approved = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed && a.Approved);
       var canonical = LeadSetup.CanonicalDraftJson(s, b);
+      var shownActive = b.ActiveJson ?? "";
+      if (hideGlobal)
+      {
+        // A hidden top-level lead is not enough: canonical/active JSON embed the
+        // full legacy-global profile. Serve redacted views (lead null) so the
+        // installation content never leaks to non-admin readers.
+        canonical = LeadSetup.CanonicalDraftJsonWithLead(s, b, null);
+        shownActive = LeadSetup.RedactLeadJson(shownActive);
+      }
       return Results.Ok(new
       {
         board = new { b.Id, b.Name, b.Mission, b.Stage, b.ActiveConfig, b.LeadProfileVersion, b.RetainAudio, b.DiscussionPolicy, b.DataUse },
-        draftJson = b.DraftJson, activeJson = b.ActiveJson,
+        draftJson = b.DraftJson, activeJson = shownActive,
         canonicalJson = canonical,
         draftHash = Hashing.HashOf(canonical),
-        dirty = !string.Equals(canonical, b.ActiveJson, StringComparison.Ordinal),
+        dirty = !string.Equals(canonical, shownActive, StringComparison.Ordinal),
         lead, advisors = new { total, approved },
       });
     });
     app.MapPost("/api/boards/{bid:guid}/setup/activate", (InMemoryStore s, HttpRequest req, Guid bid, JsonElement body) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badAct) return badAct;
       if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedAct) return deniedAct;
       string? hash = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("hash", out var h)

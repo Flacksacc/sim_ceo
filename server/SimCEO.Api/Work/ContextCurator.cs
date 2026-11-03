@@ -109,9 +109,11 @@ public static class ContextCurator
       }
     }
     var packet = sb.ToString();
+    // Manifest must describe the ACTUAL effective profile in the packet, not the
+    // stale board counter: inherited defaults advance while board counters stay put.
     var manifest = new CuratorManifest(sourceIds,
       recent.Select(x => x.Sequence).ToList(),
-      board?.LeadProfileVersion ?? 0,
+      lead?.Version ?? 0,
       eff.policy,
       packet.Length / 4, m.DeliveredRevision, evidence);
     return (packet, manifest);

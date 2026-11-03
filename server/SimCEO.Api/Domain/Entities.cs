@@ -40,6 +40,7 @@ public sealed class LeadProfile
   public string FamiliarTopics { get; set; } = "";
   public string SimplerTopics { get; set; } = "";
   public string CommPrefs { get; set; } = "";
+  public string OwnerKey { get; set; } = "";
   public string ProvenanceJson { get; set; } = "{}";
   public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }

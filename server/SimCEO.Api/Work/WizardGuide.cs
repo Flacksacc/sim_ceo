@@ -48,7 +48,9 @@ public static class WizardGuide
       if (!s.WizardDrafts.TryGetValue(id, out var __wd0)) return Results.NotFound();
       if (!TryWizardUser(s, req, __wd0, out _, out var deniedRw)) return deniedRw;
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
-      var blockers = Blockers(d);
+      bool hasDefaultRev = false;
+      try { if (TryWizardUser(s, req, d, out var revUser, out _)) hasDefaultRev = LeadSetup.ResolveDefaultForOwner(s, revUser) is not null; } catch { hasDefaultRev = false; }
+      var blockers = BlockersForOwner(d, hasDefaultRev);
       return Results.Ok(new
       {
         step = d.Step,
@@ -305,12 +307,18 @@ public static class WizardGuide
           portraitReview = "pending: accept a portrait for each advisor before approval",
         });
       }
-      // Validate everything BEFORE any write: no partial boards on failure.
-      var blockers = Blockers(d);
+      // Owner-aware validation: inheriting boards need no lead fields when the
+      // owner already has a default. Explicit overrides (or first-run drafts with
+      // lead content and no default) still require a lead name.
+      bool hasDefaultCreate;
+      try { hasDefaultCreate = LeadSetup.ResolveDefaultForOwner(s, ownerKey) is not null; } catch { hasDefaultCreate = false; }
+      var blockers = BlockersForOwner(d, hasDefaultCreate);
       if (blockers.Count > 0) return Results.Json(new { blockers }, statusCode: 409);
       var f = ReadFields(d);
       var seats = f.Advisors.Where(seat => !string.IsNullOrWhiteSpace(seat.Role)).Take(11).ToList();
-      if (string.IsNullOrWhiteSpace(f.LeadName))
+      bool wantsOverrideCreate = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
+      bool saveBoardLead = wantsOverrideCreate || !hasDefaultCreate;
+      if (saveBoardLead && string.IsNullOrWhiteSpace(f.LeadName))
         return Results.Json(new { error = "Lead name is required." }, statusCode: 409);
       var board = new Board { Id = Guid.NewGuid(), Name = f.Name, Mission = f.Mission, Stage = f.Stage, OwnerKey = ownerKey, CreatedAt = DateTime.UtcNow };
       var created = new List<object>();
@@ -323,13 +331,20 @@ public static class WizardGuide
         return Atomic.Run(s, () =>
         {
           s.Boards[board.Id] = board;
-          var (saved, leadError, _) = LeadSetup.SaveLead(s, board.Id, new LeadProfile
+          // Inheritance is the default: no board-specific row is written, so the
+          // new board follows future default changes. Explicit overrides (or the
+          // legacy first-run path with no default) still freeze a board copy.
+          // Existing board rows are never reclassified by content matching.
+          if (saveBoardLead)
           {
-            Name = f.LeadName, RoleLabel = f.LeadRole, Background = f.LeadBackground,
-            FamiliarTopics = f.LeadFamiliar, SimplerTopics = f.LeadSimpler, CommPrefs = f.LeadComm,
-          });
-          if (saved is null) throw new InvalidOperationException(leadError ?? "Lead save failed.");
-          savedLeadId = saved.Id;
+            var (saved, leadError, _) = LeadSetup.SaveLead(s, board.Id, new LeadProfile
+            {
+              Name = f.LeadName, RoleLabel = string.IsNullOrWhiteSpace(f.LeadRole) ? "Board Lead" : f.LeadRole, Background = f.LeadBackground,
+              FamiliarTopics = f.LeadFamiliar, SimplerTopics = f.LeadSimpler, CommPrefs = f.LeadComm,
+            });
+            if (saved is null) throw new InvalidOperationException(leadError ?? "Lead save failed.");
+            savedLeadId = saved.Id;
+          }
       // Fictional wizard advisors enter the explicit portrait review lifecycle
       // with a clearly-marked pending placeholder: copy succeeds, but approval
       // still requires an accepted portrait (same trust gate as every advisor).
@@ -396,7 +411,7 @@ public static class WizardGuide
   private static readonly byte[] WizardPlaceholderPng = Convert.FromBase64String(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
 
-  private sealed record WizardFields(string Name, string Mission, string Stage, string Preset, string LeadName, string LeadRole, string LeadBackground, string LeadFamiliar, string LeadSimpler, string LeadComm, List<Seat> Advisors);
+  private sealed record WizardFields(string Name, string Mission, string Stage, string Preset, string LeadName, string LeadRole, string LeadBackground, string LeadFamiliar, string LeadSimpler, string LeadComm, List<Seat> Advisors, bool LeadOverride);
   private sealed record Seat(string Role, string Name);
   private sealed record Blocker(string field, int step, string message);
 
@@ -413,6 +428,19 @@ public static class WizardGuide
       using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.FieldsJson) ? "{}" : d.FieldsJson);
       var root = doc.RootElement;
       var hasLead = root.TryGetProperty("lead", out var l) && l.ValueKind == JsonValueKind.Object;
+      bool leadOverride = false;
+      try
+      {
+        if (hasLead && l.TryGetProperty("override", out var ov) && (ov.ValueKind == JsonValueKind.True || ov.ValueKind == JsonValueKind.False))
+          leadOverride = ov.ValueKind == JsonValueKind.True;
+        else if (hasLead && l.TryGetProperty("explicit", out var ex) && (ex.ValueKind == JsonValueKind.True || ex.ValueKind == JsonValueKind.False))
+          leadOverride = ex.ValueKind == JsonValueKind.True;
+        else if (root.TryGetProperty("leadOverride", out var lo) && (lo.ValueKind == JsonValueKind.True || lo.ValueKind == JsonValueKind.False))
+          leadOverride = lo.ValueKind == JsonValueKind.True;
+        else if (root.TryGetProperty("leadExplicit", out var le) && (le.ValueKind == JsonValueKind.True || le.ValueKind == JsonValueKind.False))
+          leadOverride = le.ValueKind == JsonValueKind.True;
+      }
+      catch { leadOverride = false; }
       var advisors = new List<Seat>();
       if (root.TryGetProperty("advisors", out var arr) && arr.ValueKind == JsonValueKind.Array)
         foreach (var a in arr.EnumerateArray())
@@ -424,12 +452,18 @@ public static class WizardGuide
       return new WizardFields(Str(root, "name"), Str(root, "mission"), Str(root, "stage"), d.PresetKey,
         hasLead ? Str(l, "name") : "", hasLead ? Str(l, "roleLabel") : "", hasLead ? Str(l, "background") : "",
         hasLead ? Str(l, "familiarTopics") : "", hasLead ? Str(l, "simplerTopics") : "", hasLead ? Str(l, "commPrefs") : "",
-        advisors);
+        advisors, leadOverride);
     }
-    catch (JsonException) { return new WizardFields("", "", "", d.PresetKey, "", "", "", "", "", "", new()); }
+    catch (JsonException) { return new WizardFields("", "", "", d.PresetKey, "", "", "", "", "", "", new(), false); }
   }
 
-  private static List<Blocker> Blockers(WizardDraft d)
+  private static List<Blocker> Blockers(WizardDraft d) => BlockersForOwner(d, hasDefault: false);
+
+  // Owner-aware blockers: an inheriting board (no explicit override) is ready
+  // when the owner already has a default profile, even with no lead fields in
+  // the draft. Explicit overrides still require a lead name. Existing drafts
+  // with lead content but no override flag keep legacy behavior (required).
+  private static List<Blocker> BlockersForOwner(WizardDraft d, bool hasDefault)
   {
     var f = ReadFields(d);
     var list = new List<Blocker>();
@@ -437,7 +471,15 @@ public static class WizardGuide
     if (string.IsNullOrWhiteSpace(f.Mission)) list.Add(new Blocker("mission", 1, "Describe what the board is for."));
     if (f.Advisors.Count == 0) list.Add(new Blocker("advisors", 2, "Add at least one advisor."));
     if (f.Advisors.Count > 10) list.Add(new Blocker("advisors", 2, "A board holds at most ten advisors."));
-    if (string.IsNullOrWhiteSpace(f.LeadName)) list.Add(new Blocker("lead", 3, "Tell us who leads the board."));
+    bool wantsOverride = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
+    if (wantsOverride)
+    {
+      if (string.IsNullOrWhiteSpace(f.LeadName)) list.Add(new Blocker("lead", 3, "Tell us who leads the board."));
+    }
+    else if (!hasDefault)
+    {
+      if (string.IsNullOrWhiteSpace(f.LeadName)) list.Add(new Blocker("lead", 3, "Tell us who leads the board."));
+    }
     return list;
   }
 
@@ -578,15 +620,26 @@ public static class WizardGuide
     return new();
   }
   private static string StepLabel(int step) => step switch { 1 => "About the board", 2 => "Advisor seats", 3 => "Board lead", _ => "Review" };
-  private static string NextQuestion(WizardDraft d)
+  private static string NextQuestion(WizardDraft d) => NextQuestionForOwner(d, hasDefault: false);
+
+  private static string NextQuestionForOwner(WizardDraft d, bool hasDefault)
   {
     var f = ReadFields(d);
     if (string.IsNullOrWhiteSpace(f.Name)) return "What should we call this board?";
     if (string.IsNullOrWhiteSpace(f.Mission)) return "What decision should this board help you make?";
     if (string.IsNullOrWhiteSpace(f.Stage)) return "Where do things stand right now?";
     if (f.Advisors.Count == 0) return "Which seats do you want on this board, and what expertise is missing?";
-    if (string.IsNullOrWhiteSpace(f.LeadName)) return "Who leads this board? Tell me your name.";
-    if (string.IsNullOrWhiteSpace(f.LeadComm)) return "How should advisors talk to you: blunt, careful, or detailed?";
+    bool wantsOverride = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
+    if (wantsOverride)
+    {
+      if (string.IsNullOrWhiteSpace(f.LeadName)) return "Who leads this board? Tell me your name.";
+      if (string.IsNullOrWhiteSpace(f.LeadComm)) return "How should advisors talk to you: blunt, careful, or detailed?";
+    }
+    else if (!hasDefault)
+    {
+      if (string.IsNullOrWhiteSpace(f.LeadName)) return "Who leads this board? Tell me your name.";
+      if (string.IsNullOrWhiteSpace(f.LeadComm)) return "How should advisors talk to you: blunt, careful, or detailed?";
+    }
     return "The setup looks complete. Review the draft and create the board when ready.";
   }
   private static List<object> FieldStates(WizardDraft d)

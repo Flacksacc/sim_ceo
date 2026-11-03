@@ -58,6 +58,7 @@ public static class OpsEndpoints
 
     app.MapGet("/api/boards/{bid:guid}/status", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badSt) return badSt;
       if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
@@ -68,14 +69,17 @@ public static class OpsEndpoints
       var stCanContrib = PeopleOps.Can(s, req, bid, null, "contribute") || PeopleOps.Can(s, req, bid, null, "manage");
       var advisors = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList();
       var meetings = s.Meetings.Values.Where(m => m.BoardId == bid).ToList();
+      var stEff = LeadSetup.ResolveLeadForBoard(s, b);
+      bool stHideGlobal = stEff is not null && LeadSetup.LeadSource(stEff, bid) == "global" && !stIsAdmin;
+      if (stHideGlobal) stEff = null;
       return Results.Ok(new
       {
         board = b.Name,
         active = b.ActiveConfig,
         dirty = !string.Equals(b.DraftJson, b.ActiveJson, StringComparison.Ordinal),
         name = !string.IsNullOrWhiteSpace(b.Name),
-        lead = (LeadSetup.ResolveLeadForStrict(s, bid) ?? (LeadSetup.InheritsGlobalLead(s, b) ? LeadSetup.ResolveLead(s) : null)) is not null,
-        leadVersion = (LeadSetup.ResolveLeadForStrict(s, bid) ?? (LeadSetup.InheritsGlobalLead(s, b) ? LeadSetup.ResolveLead(s) : null))?.Version ?? 0,
+        lead = stEff is not null,
+        leadVersion = stEff?.Version ?? 0,
         advisors = new { total = advisors.Count, approved = advisors.Count(a => a.Approved) },
         meetings = new
         {
@@ -113,15 +117,24 @@ public static class OpsEndpoints
 
     app.MapGet("/api/boards/{bid:guid}/export", (InMemoryStore s, HttpRequest req, Guid bid) =>
     {
+      if (bid == Guid.Empty) return Results.NotFound();
       if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound();
       if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedExp) return deniedExp;
       var copies = s.Advisors.Values.Where(a => a.BoardId == bid && !a.Removed).ToList();
       var rosterIds = copies.Select(a => a.RosterEntryId).ToHashSet();
-      var ownLead = s.LeadProfiles.Values.Where(l => l.BoardId == bid).OrderByDescending(l => l.Version).FirstOrDefault();
+      // Export resolves by BOARD ownership, never caller admin status: an admin
+      // exporting another owner's board must not receive unrelated global content.
+      // Inherited boards export an inheritance marker WITHOUT content so a fresh
+      // import uses the importer's own default instead of freezing a copy.
+      var ownLead = LeadSetup.ResolveLeadForStrict(s, bid);
       object? effLead = ownLead;
-      if (effLead is null)
+      string leadSource = "none";
+      if (ownLead is not null) leadSource = "board";
+      else
       {
-        try { if (PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) effLead = LeadSetup.ResolveLead(s); } catch { effLead = null; }
+        var ownerDefault = LeadSetup.ResolveDefaultForOwner(s, b.OwnerKey);
+        if (ownerDefault is not null) leadSource = "inherit";
+        else if (LeadSetup.InheritsGlobalLead(s, b) && LeadSetup.ResolveLead(s) is not null) leadSource = "inherit-global";
       }
       var rosterRows = s.Roster.Values.Where(r => rosterIds.Contains(r.Id)).ToList();
       var topAccount = rosterRows.Where(r => r.AccountId != Guid.Empty).Select(r => r.AccountId).FirstOrDefault();
@@ -131,7 +144,7 @@ public static class OpsEndpoints
         accountId = topAccount == Guid.Empty ? "" : topAccount.ToString(),
         board = b,
         lead = effLead,
-        leadSource = ownLead is not null ? "board" : effLead is not null ? "global" : "none",
+        leadSource,
         advisors = copies,
         roster = rosterRows,
         exportedAt = DateTime.UtcNow,
@@ -321,13 +334,28 @@ public static class OpsEndpoints
           if (!string.IsNullOrWhiteSpace(oldId)) rosterMap[oldId] = entry.Id;
           plannedRoster.Add(entry);
         }
+      // Inherited exports (leadSource inherit/inherit-global/none, or null lead)
+      // create NO board override: the new board inherits the IMPORTER's own
+      // default instead of freezing the exporter's private copy. Legacy explicit
+      // exports (leadSource board, or legacy global WITH content) keep compat by
+      // materializing a board override.
+      string leadSourceSnap = "";
+      if (root.TryGetProperty("leadSource", out var lsEl) && lsEl.ValueKind == JsonValueKind.String)
+        leadSourceSnap = (lsEl.GetString() ?? "").Trim().ToLowerInvariant();
+      bool wantOverride = false;
+      if (root.TryGetProperty("lead", out var leadPreTmp) && leadPreTmp.ValueKind == JsonValueKind.Object)
+      {
+        if (leadSourceSnap == "board") wantOverride = true;
+        else if (leadSourceSnap == "global") wantOverride = true;
+        else if (string.IsNullOrEmpty(leadSourceSnap)) wantOverride = true;
+      }
       LeadProfile? plannedLead = null;
-      if (root.TryGetProperty("lead", out var leadPre) && leadPre.ValueKind == JsonValueKind.Object)
+      if (wantOverride && root.TryGetProperty("lead", out var leadPre) && leadPre.ValueKind == JsonValueKind.Object)
       {
         plannedLead = new LeadProfile
         {
           Id = Guid.NewGuid(),
-          BoardId = board.Id, Version = 1,
+          BoardId = board.Id, OwnerKey = board.OwnerKey ?? "", Version = 1,
           Name = leadPre.TryGetProperty("name", out var ln0) && ln0.ValueKind == JsonValueKind.String ? ln0.GetString() ?? "" : "",
           RoleLabel = leadPre.TryGetProperty("roleLabel", out var rl0) && rl0.ValueKind == JsonValueKind.String ? rl0.GetString() ?? "Board Lead" : "Board Lead",
           Background = leadPre.TryGetProperty("background", out var bg0) && bg0.ValueKind == JsonValueKind.String ? bg0.GetString() ?? "" : "",
@@ -775,6 +803,10 @@ public static class OpsEndpoints
                   CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
                 };
               }
+              // Lead rows restore verbatim (OwnerKey preserved). Cross-install restores
+              // keep foreign per-account defaults as orphans: boards rewritten to the
+              // restoring admin resolve to the admin's own default, never to a
+              // randomly-mapped foreign default. Importers use their own default.
               foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
               // ACL preserved: restored.grants / restored.invites are IGNORED by design.
               if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
