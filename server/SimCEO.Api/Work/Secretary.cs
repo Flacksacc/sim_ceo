@@ -46,18 +46,48 @@ public static class SecretaryDirect
     var sorted = (refs ?? new List<EvidenceRef>()).OrderBy(r => r.Kind).ThenBy(r => r.Ref).ThenBy(r => r.SectionId ?? "").ThenBy(r => r.Version ?? -1).ToList();
     return JsonSerializer.Serialize(sorted.Select(r => new { kind = r.Kind, @ref = r.Ref, version = r.Version, sectionId = r.SectionId, location = r.Location, indexGeneration = r.IndexGeneration, contentHash = r.ContentHash, excerpt = r.Excerpt }));
   }
-  // Immutable submission identity: normalized input + caller-supplied ref
-  // identity (kind/ref/version/sectionId only). Never includes canonicalized
+  // Immutable submission identity: normalized input + EVERY caller-supplied
+  // evidence selector (kind/ref/version/sectionId/excerpt/indexGeneration/
+  // contentHash/location) exactly as received. Never includes canonicalized
   // text or current eligibility, so completed replay is stable across
-  // exclude/reindex/record-change/provider-down/setup-change/read-downgrade.
+  // exclude/reindex/record-change/provider-down/setup-change/read-downgrade,
+  // while genuinely changed selectors conflict.
   public static string RawCallerIdentityJson(List<EvidenceRef> refs)
   {
     var sorted = (refs ?? new List<EvidenceRef>()).OrderBy(r => (r.Kind ?? "").ToLowerInvariant()).ThenBy(r => r.Ref ?? "").ThenBy(r => r.SectionId ?? "").ToList();
-    return JsonSerializer.Serialize(sorted.Select(r => new { kind = (r.Kind ?? "").Trim().ToLowerInvariant(), @ref = (r.Ref ?? "").Trim(), version = r.Version, sectionId = (r.SectionId ?? "").Trim() }));
+    return JsonSerializer.Serialize(sorted.Select(r => new { kind = (r.Kind ?? "").Trim().ToLowerInvariant(), @ref = (r.Ref ?? "").Trim(), version = r.Version, sectionId = (r.SectionId ?? "").Trim(), excerpt = r.Excerpt ?? "", indexGeneration = r.IndexGeneration, contentHash = r.ContentHash ?? "", location = r.Location ?? "" }));
   }
   public static string SubmissionHash(string normalizedInput, List<EvidenceRef> rawCaller)
   {
     return Hashing.HashOf((normalizedInput ?? "") + "\n||SUBMIT||\n" + RawCallerIdentityJson(rawCaller));
+  }
+  public static string RawCallerIdentityJsonLegacy(List<EvidenceRef> refs)
+  {
+    var sorted = (refs ?? new List<EvidenceRef>()).OrderBy(r => (r.Kind ?? "").ToLowerInvariant()).ThenBy(r => r.Ref ?? "").ThenBy(r => r.SectionId ?? "").ToList();
+    return JsonSerializer.Serialize(sorted.Select(r => new { kind = (r.Kind ?? "").Trim().ToLowerInvariant(), @ref = (r.Ref ?? "").Trim(), version = r.Version, sectionId = (r.SectionId ?? "").Trim() }));
+  }
+  public static string SubmissionHashLegacy(string normalizedInput, List<EvidenceRef> rawCaller)
+  {
+    return Hashing.HashOf((normalizedInput ?? "") + "\n||SUBMIT||\n" + RawCallerIdentityJsonLegacy(rawCaller));
+  }
+  public static bool IsLegacyCallerIdentityJson(string? json)
+  {
+    try
+    {
+      if (string.IsNullOrWhiteSpace(json)) return false;
+      using var d = JsonDocument.Parse(json);
+      if (d.RootElement.ValueKind != JsonValueKind.Array) return false;
+      var any = false;
+      foreach (var el in d.RootElement.EnumerateArray())
+      {
+        any = true;
+        if (el.ValueKind != JsonValueKind.Object) continue;
+        if (el.TryGetProperty("excerpt", out _) || el.TryGetProperty("indexGeneration", out _) || el.TryGetProperty("contentHash", out _) || el.TryGetProperty("location", out _))
+          return false;
+      }
+      return any;
+    }
+    catch { return false; }
   }
   public static List<EvidenceRef> RehydrateRawCallerRefs(string? json)
   {
@@ -74,7 +104,14 @@ public static class SecretaryDirect
         if (!EvidenceRef.ValidKind(kind) || string.IsNullOrWhiteSpace(rf)) continue;
         int? ver = el.TryGetProperty("version", out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? n : (int?)null;
         string? sec = el.TryGetProperty("sectionId", out var s2) && s2.ValueKind == JsonValueKind.String ? s2.GetString() : null;
-        list.Add(new EvidenceRef(kind.Trim().ToLowerInvariant(), rf.Trim(), ver, null, null, null, string.IsNullOrWhiteSpace(sec) ? null : sec!.Trim(), null, null, null));
+        string? exc = el.TryGetProperty("excerpt", out var e2) && e2.ValueKind == JsonValueKind.String ? e2.GetString() : null;
+        int? ig = el.TryGetProperty("indexGeneration", out var g2) && g2.ValueKind == JsonValueKind.Number && g2.TryGetInt32(out var gn) ? gn : (int?)null;
+        string? ch = el.TryGetProperty("contentHash", out var c2) && c2.ValueKind == JsonValueKind.String ? c2.GetString() : null;
+        string? loc = el.TryGetProperty("location", out var l2) && l2.ValueKind == JsonValueKind.String ? l2.GetString() : null;
+        list.Add(new EvidenceRef(kind.Trim().ToLowerInvariant(), rf.Trim(), ver, null, null, exc,
+          string.IsNullOrWhiteSpace(sec) ? null : sec!.Trim(),
+          string.IsNullOrWhiteSpace(loc) ? null : loc, ig,
+          string.IsNullOrWhiteSpace(ch) ? null : ch));
       }
     }
     catch { }
@@ -82,11 +119,20 @@ public static class SecretaryDirect
   }
 }
 
+public static class SecretaryEpoch
+{
+  // Shared restore-epoch contract: Secretary workers (including legacy briefings) consume the
+  // Core-owned SourceEpoch, NOT a process-lifetime static. Restore bumps SourceEpoch, so a held
+  // identical restore invalidates old workers (epoch mismatch discards). No parallel helper.
+  public static string CurrentFor(SimCEO.Api.Data.InMemoryStore s) => "src-" + s.SourceEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture);
+  [System.Obsolete("Use CurrentFor(store): process-lifetime epoch does not invalidate on restore.")]
+  public static string Current => "src-0";
+}
 public sealed record SecretarySnapshot(
   string Brief, long Generation, long DeliveredRevision, string BoardConfig,
   string LeadFp, string EvFp, List<string> DirectionIds, string DirectionHash,
   List<string> RecordIds, string RecordHash, List<string> SectionIds, string SectionHash,
-  string RecentHash, string EvidenceTextHash, string DossierHash);
+  string RecentHash, string EvidenceTextHash, string DossierHash, string EpochId, List<string> CitedMessages);
 
 public static class SecretaryContext
 {
@@ -125,7 +171,7 @@ public static class SecretaryContext
     if (s.Length <= max) return s;
     return s.Substring(0, max) + "...";
   }
-  public static SecretarySnapshot CaptureSnapshot(InMemoryStore s, Meeting m)
+  public static SecretarySnapshot CaptureSnapshot(InMemoryStore s, Meeting m, List<EvidenceRef>? citedCallerRefs = null)
   {
     var brief = m.Brief ?? "";
     var gen = m.Generation;
@@ -150,8 +196,20 @@ public static class SecretaryContext
     secs.Sort(StringComparer.Ordinal);
     var secHash = Hashing.HashOf(string.Join(",", secs));
     var recentList = new List<Message>();
-    lock (s.MessageLock) { if (s.Messages.TryGetValue(m.Id, out var rl)) recentList = rl.OrderByDescending(x => x.Sequence).Take(8).OrderBy(x => x.Sequence).ToList(); }
-    var recentHash = Hashing.HashOf(m.DeliveredRevision + "|" + JsonSerializer.Serialize(recentList.Select(x => new { s = x.Sequence, sender = x.Sender, content = x.Content })));
+    lock (s.MessageLock) { if (s.Messages.TryGetValue(m.Id, out var rl)) recentList = rl.Where(x => !string.Equals(x.Sender, "lead", StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.Sequence).Take(8).OrderBy(x => x.Sequence).ToList(); }
+    var citedBits = new List<string>();
+    foreach (var cr in citedCallerRefs ?? new List<EvidenceRef>())
+    {
+      if (!string.Equals(cr.Kind, "message", StringComparison.OrdinalIgnoreCase)) continue;
+      var parts = (cr.Ref ?? "").Split(":");
+      if (parts.Length != 2 || !Guid.TryParse(parts[0], out var cmid) || cmid != m.Id || !long.TryParse(parts[1], out var cseq)) continue;
+      Message? cm = null;
+      lock (s.MessageLock) { if (s.Messages.TryGetValue(m.Id, out var cl)) cm = cl.FirstOrDefault(x => x.Sequence == cseq); }
+      if (cm is null) citedBits.Add(cmid + ":" + cseq + ":missing");
+      else citedBits.Add(cmid + ":" + cseq + ":" + Hashing.HashOf(cm.Sender + "|" + (cm.Content ?? "")));
+    }
+    citedBits.Sort(StringComparer.Ordinal);
+    var recentHash = Hashing.HashOf(m.DeliveredRevision + "|" + JsonSerializer.Serialize(recentList.Select(x => new { s = x.Sequence, sender = x.Sender, content = x.Content })) + "|" + string.Join(",", citedBits));
     var secTexts = new List<string>();
     foreach (var doc in s.Sources.Values.Where(x => x.BoardId == m.BoardId && SourceGovernance.IsEligible(s, x, m.Id)))
     {
@@ -160,15 +218,22 @@ public static class SecretaryContext
     }
     secTexts.Sort(StringComparer.Ordinal);
     var evTextHash = Hashing.HashOf(string.Join("\n", secTexts));
-    var dossierIds = s.Advisors.Values.Where(a => a.BoardId == m.BoardId && !a.Removed && a.Approved).OrderBy(a => a.Id.ToString()).Select(a => a.Id + ":" + a.RosterEntryId + ":" + a.RosterVersion).ToList();
-    var dossierHash = Hashing.HashOf(JsonSerializer.Serialize(dossierIds));
-    return new SecretarySnapshot(brief, gen, rev, boardCfg, leadFp, evFp, dirIds, dirHash, recIds, recHash, secs, secHash, recentHash, evTextHash, dossierHash);
+    var dossierBits = new List<string>();
+    foreach (var a in s.Advisors.Values.Where(x => x.BoardId == m.BoardId && !x.Removed && x.Approved).OrderBy(x => x.Id.ToString()))
+    {
+      s.Roster.TryGetValue(a.RosterEntryId, out var rent);
+      dossierBits.Add(a.Id + ":" + a.RosterEntryId + ":rv" + a.RosterVersion + ":" + (a.BoardRole ?? "") + ":" + (rent is null ? "missing" : (rent.Name ?? "") + "|v" + rent.Version + "|" + Hashing.HashOf(rent.ProfileJson ?? "")));
+    }
+    var dossierHash = Hashing.HashOf(JsonSerializer.Serialize(dossierBits));
+    return new SecretarySnapshot(brief, gen, rev, boardCfg, leadFp, evFp, dirIds, dirHash, recIds, recHash, secs, secHash, recentHash, evTextHash, dossierHash, SecretaryEpoch.CurrentFor(s), citedBits);
   }
   public static string SnapshotToJson(SecretarySnapshot snap) => JsonSerializer.Serialize(snap);
   public static bool SnapshotEquals(SecretarySnapshot a, SecretarySnapshot b)
   {
     if (a is null || b is null) return false;
     if (string.IsNullOrWhiteSpace(a.Brief) != string.IsNullOrWhiteSpace(b.Brief)) return false;
+    if (!string.Equals(a.EpochId ?? "", b.EpochId ?? "", StringComparison.Ordinal)) return false;
+    if (!((a.CitedMessages ?? new List<string>()).SequenceEqual(b.CitedMessages ?? new List<string>()))) return false;
     return a.Brief == b.Brief && a.Generation == b.Generation && a.DeliveredRevision == b.DeliveredRevision && a.BoardConfig == b.BoardConfig
       && a.LeadFp == b.LeadFp && a.EvFp == b.EvFp && a.DirectionHash == b.DirectionHash
       && a.RecordHash == b.RecordHash && a.SectionHash == b.SectionHash
@@ -190,6 +255,8 @@ public static class SecretaryContext
   }
   public static string SnapshotMismatchReason(SecretarySnapshot before, SecretarySnapshot now)
   {
+    if (!string.Equals(before.EpochId ?? "", now.EpochId ?? "", StringComparison.Ordinal)) return "Service generation changed during secretary work; retry with the same nonce.";
+    if (!(before.CitedMessages ?? new List<string>()).SequenceEqual(now.CitedMessages ?? new List<string>())) return "Cited conversation history changed during secretary work; draft discarded.";
     if (before.DeliveredRevision != now.DeliveredRevision || before.RecentHash != now.RecentHash) return "Conversation history changed during secretary work; draft discarded.";
     if (before.EvidenceTextHash != now.EvidenceTextHash) return "Source section text changed during secretary work; draft discarded.";
     if (before.DossierHash != now.DossierHash) return "Advisor roster changed during secretary work; draft discarded.";
@@ -277,8 +344,13 @@ public static class SecretaryContext
         if (note.BoardId != boardId || note.Kind != "direction" || note.Provisional) continue;
         if (note.Scope == "meeting" && note.MeetingId != meetingId) continue;
         if (note.Scope != "board" && note.Scope != "meeting") continue;
-        if (!string.IsNullOrWhiteSpace(r.Excerpt) && !string.Equals((note.Body ?? "").Trim(), r.Excerpt!.Trim(), StringComparison.Ordinal)) continue;
-        outRefs.Add(EvidenceRef.ForNote(note));
+        // Preserve validated SELECTED late quote: exact caller substring, not leading excerpt.
+        if (!string.IsNullOrWhiteSpace(r.Excerpt))
+        {
+          if (!(note.Body ?? "").Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+          outRefs.Add(new EvidenceRef("direction", note.Id.ToString(), null, null, note.Title, r.Excerpt!));
+        }
+        else outRefs.Add(EvidenceRef.ForNoteFull(note));
       }
       else if (kind == "record")
       {
@@ -288,8 +360,12 @@ public static class SecretaryContext
         if (r.Version.HasValue && r.Version.Value != draft.Version) continue;
         var exp = RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false);
         if (string.IsNullOrWhiteSpace(exp)) continue;
-        if (!string.IsNullOrWhiteSpace(r.Excerpt) && !exp.Contains(r.Excerpt!.Trim(), StringComparison.Ordinal)) continue;
-        outRefs.Add(EvidenceRef.ForRecord(draft, EvidenceRef.ExactExcerpt(exp.Trim(), 240)));
+        if (!string.IsNullOrWhiteSpace(r.Excerpt))
+        {
+          if (!exp.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+          outRefs.Add(EvidenceRef.ForRecord(draft, r.Excerpt!));
+        }
+        else outRefs.Add(EvidenceRef.ForRecord(draft, exp.Trim()));
       }
       else if (kind == "message")
       {
@@ -301,7 +377,13 @@ public static class SecretaryContext
         lock (s.MessageLock) { list = s.Messages.TryGetValue(meetingId, out var l) ? l.ToList() : new List<Message>(); }
         var msg = list.FirstOrDefault(x => x.Sequence == seq && x.MeetingId == meetingId && x.BoardId == boardId);
         if (msg is null || string.IsNullOrWhiteSpace(msg.Content)) continue;
-        outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, EvidenceRef.ExactExcerpt(msg.Content.Trim(), 240)));
+        // Preserve validated SELECTED late quote for messages (char-500 span must survive, not become leading 240).
+        if (!string.IsNullOrWhiteSpace(r.Excerpt))
+        {
+          if (!(msg.Content ?? "").Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+          outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, r.Excerpt!));
+        }
+        else outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, EvidenceRef.ExactExcerpt(msg.Content.Trim(), 240)));
       }
       else if (kind == "dossier")
       {
@@ -312,9 +394,17 @@ public static class SecretaryContext
         if (link is null) continue;
         string dossierText = (link.BoardRole ?? "") + " " + (ent.Name ?? "") + " " + (ent.ProfileJson ?? "");
         if (string.IsNullOrWhiteSpace(dossierText)) continue;
-        var dex = EvidenceRef.ExactExcerpt(dossierText.Trim(), 240);
-        if (!string.IsNullOrWhiteSpace(r.Excerpt) && !dossierText.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
-        outRefs.Add(new EvidenceRef("dossier", ent.Id.ToString(), ent.Version, null, ent.Name, dex));
+        // Preserve validated SELECTED late quote for dossiers.
+        if (!string.IsNullOrWhiteSpace(r.Excerpt))
+        {
+          if (!dossierText.Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
+          outRefs.Add(new EvidenceRef("dossier", ent.Id.ToString(), ent.Version, null, ent.Name, r.Excerpt!));
+        }
+        else
+        {
+          var dex = EvidenceRef.ExactExcerpt(dossierText.Trim(), 240);
+          outRefs.Add(new EvidenceRef("dossier", ent.Id.ToString(), ent.Version, null, ent.Name, dex));
+        }
       }
       else if (kind == "note") continue;
     }
@@ -323,7 +413,14 @@ public static class SecretaryContext
   // Budgeted packet: caller refs are delivered first, then directions,
   // records, then per-section sources. Only actually included refs are
   // returned. Throws 502 if required caller evidence cannot fit.
-  public static string BuildPacket(InMemoryStore s, Meeting m, string ownerInput, List<EvidenceRef> callerCanon, List<EvidenceRef> evidenceOut, int budgetChars, List<string>? omittedOut = null)
+  // Budgeted packet: caller refs are delivered first IN FULL, then automatic
+  // directions/records/sources in full or not at all. Every persisted ref is
+  // an exact substring of the returned packet. Automatic omissions are
+  // reported via omittedOut and must be surfaced to the user, never saved
+  // as citations. Throws 502 when required caller evidence cannot fit.
+  // The owner input appears ONLY in the caller wrapper, never as an
+  // OWNER REQUEST line and never via lead history (history is advisor-only).
+  public static string BuildPacket(InMemoryStore s, Meeting m, string ownerInputForRanking, List<EvidenceRef> callerCanon, List<EvidenceRef> evidenceOut, int budgetChars, List<string>? omittedOut = null)
   {
     var sb = new StringBuilder();
     Board? board = null;
@@ -339,14 +436,15 @@ public static class SecretaryContext
       sb.AppendLine(line);
       return true;
     }
-    AppendLineBudgeted("BOARD: " + Trunc(eff, 600), true);
+    // Essential mandatory context MUST be delivered whole or fail locally before any reservation.
+    // Truncation of board/lead/brief tails is forbidden: a mandatory restriction after char 800 must not be silently dropped.
+    AppendLineBudgeted("BOARD: " + eff, true);
     var __pb = s.Boards.TryGetValue(m.BoardId, out var __pbb) ? __pbb : null;
     var lead = __pb is null ? LeadSetup.ResolveLeadFor(s, m.BoardId) : LeadSetup.ResolveLeadForBoard(s, __pb);
-    if (lead is not null) AppendLineBudgeted("LEAD: " + Trunc(lead.Name + " (" + lead.RoleLabel + "). " + lead.Background, 600), true);
-    AppendLineBudgeted("MEETING BRIEF: " + Trunc(m.Brief ?? "", 800), true);
-    AppendLineBudgeted("OWNER REQUEST: " + (ownerInput ?? ""), true);
+    if (lead is not null) AppendLineBudgeted("LEAD: " + lead.Name + " (" + lead.RoleLabel + "). " + lead.Background, true);
+    AppendLineBudgeted("MEETING BRIEF: " + (m.Brief ?? ""), true);
     List<Message> recent = new List<Message>();
-    lock (s.MessageLock) { if (s.Messages.TryGetValue(m.Id, out var list)) recent = list.OrderByDescending(x => x.Sequence).Take(8).OrderBy(x => x.Sequence).ToList(); }
+    lock (s.MessageLock) { if (s.Messages.TryGetValue(m.Id, out var list)) recent = list.Where(x => !string.Equals(x.Sender, "lead", StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.Sequence).Take(8).OrderBy(x => x.Sequence).ToList(); }
     foreach (var msg in recent) AppendLineBudgeted("HISTORY [" + msg.Sequence + "] " + msg.Sender + ": " + Trunc(msg.Content ?? "", 400), false);
     foreach (var c in callerCanon ?? new List<EvidenceRef>())
     {
@@ -358,7 +456,8 @@ public static class SecretaryContext
         if (!string.IsNullOrWhiteSpace(c.SectionId) && Guid.TryParse(c.SectionId, out var scid))
           sec = s.SourceSections.Values.FirstOrDefault(x => x.Id == scid && x.SourceId == doc.Id);
         if (sec is null) continue;
-        var line = "CALLER SOURCE " + doc.FileName + " v" + doc.Version + " sec:" + sec.Ordinal + " [" + sec.Id + "] loc:" + (sec.Location ?? "") + ": " + Trunc(c.Excerpt ?? sec.Text ?? "", 500);
+        var span = string.IsNullOrWhiteSpace(c.Excerpt) ? (sec.Text ?? "") : c.Excerpt!;
+        var line = "CALLER SOURCE " + doc.FileName + " v" + doc.Version + " sec:" + sec.Ordinal + " [" + sec.Id + "] loc:" + (sec.Location ?? "") + ": " + span;
         var before = sb.Length;
         AppendLineBudgeted(line, true);
         if (sb.Length > before) evidenceOut.Add(c);
@@ -366,7 +465,8 @@ public static class SecretaryContext
       else if (c.Kind == "direction")
       {
         if (!Guid.TryParse(c.Ref, out var nid) || !s.Notes.TryGetValue(nid, out var note) || note is null) continue;
-        var line = "CALLER DIRECTION (" + note.Scope + "): " + Trunc(note.Body ?? "", 500);
+        var span = string.IsNullOrWhiteSpace(c.Excerpt) ? (note.Body ?? "") : c.Excerpt!;
+        var line = "CALLER DIRECTION (" + note.Scope + "): " + span;
         var before = sb.Length;
         AppendLineBudgeted(line, true);
         if (sb.Length > before) evidenceOut.Add(c);
@@ -374,15 +474,15 @@ public static class SecretaryContext
       else if (c.Kind == "record")
       {
         if (!Guid.TryParse(c.Ref, out var did) || !s.Drafts.TryGetValue(did, out var draft) || draft is null) continue;
-        var exp = RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false);
-        var line = "CALLER RECORD v" + draft.Version + ": " + Trunc(exp, 800);
+        var span = string.IsNullOrWhiteSpace(c.Excerpt) ? RecordsOps.BuildExport(draft.ItemsJson ?? "[]", draft.ApprovedJson ?? "[]", false).Trim() : c.Excerpt!;
+        var line = "CALLER RECORD v" + draft.Version + ": " + span;
         var before = sb.Length;
         AppendLineBudgeted(line, true);
         if (sb.Length > before) evidenceOut.Add(c);
       }
       else
       {
-        var line = "CALLER " + c.Kind.ToUpperInvariant() + " " + c.Ref + ": " + Trunc(c.Excerpt ?? "", 400);
+        var line = "CALLER " + c.Kind.ToUpperInvariant() + " " + c.Ref + ": " + (c.Excerpt ?? "");
         var before = sb.Length;
         AppendLineBudgeted(line, true);
         if (sb.Length > before) evidenceOut.Add(c);
@@ -394,23 +494,25 @@ public static class SecretaryContext
     {
       var key = "direction:" + d.Id;
       if (callerKeys.Any(k => k.StartsWith(key))) continue;
-      var line = "ADOPTED DIRECTION (" + d.Scope + "): " + Trunc(d.Body ?? "", 500);
+      var body = d.Body ?? "";
+      var line = "ADOPTED DIRECTION (" + d.Scope + "): " + body;
       var before = sb.Length;
       if (AppendLineBudgeted(line, false)) evidenceOut.Add(EvidenceRef.ForNote(d));
-      else { omittedOut?.Add("direction:" + d.Id); break; }
+      else { omittedOut?.Add("direction:" + d.Id); continue; }
     }
     var approved = s.Drafts.Values.Where(d => d.MeetingId == m.Id && d.Status == "approved").OrderByDescending(d => d.Version).ToList();
     foreach (var d in approved)
     {
       var key = "record:" + d.Id;
       if (callerKeys.Any(k => k.StartsWith(key))) continue;
-      var exp = RecordsOps.BuildExport(d.ItemsJson ?? "[]", d.ApprovedJson ?? "[]", false);
-      var line = "APPROVED RECORD v" + d.Version + ": " + Trunc(exp, 800);
+      var exp = RecordsOps.BuildExport(d.ItemsJson ?? "[]", d.ApprovedJson ?? "[]", false).Trim();
+      if (string.IsNullOrWhiteSpace(exp)) continue;
+      var line = "APPROVED RECORD v" + d.Version + ": " + exp;
       var before = sb.Length;
-      if (AppendLineBudgeted(line, false)) evidenceOut.Add(EvidenceRef.ForRecord(d, EvidenceRef.ExactExcerpt(exp.Trim(), 240)));
-      else { omittedOut?.Add("record:" + d.Id + ":v" + d.Version); break; }
+      if (AppendLineBudgeted(line, false)) evidenceOut.Add(EvidenceRef.ForRecord(d, EvidenceRef.ExactExcerpt(exp, 240)));
+      else { omittedOut?.Add("record:" + d.Id + ":v" + d.Version); continue; }
     }
-    var words = (ownerInput ?? "").ToLowerInvariant().Split(new[] { " ", ",", ".", ";", ":", "?", "!", "\n", "\r", "\t", "-", "(", ")" }, StringSplitOptions.RemoveEmptyEntries).Where(w => w.Length > 3).Distinct().Take(30).ToHashSet();
+    var words = (ownerInputForRanking ?? "").ToLowerInvariant().Split(new[] { " ", ",", ".", ";", ":", "?", "!", "\n", "\r", "\t", "-", "(", ")" }, StringSplitOptions.RemoveEmptyEntries).Where(w => w.Length > 3).Distinct().Take(30).ToHashSet();
     var ranked = s.Sources.Values.Where(x => x.BoardId == m.BoardId && SourceGovernance.VisibleForRecall(s, x, m.BoardId, m.Id)).Select(x => new { doc = x, secs = s.SourceSections.Values.Where(z => z.SourceId == x.Id).OrderBy(z => z.Ordinal).ToList() }).Where(e => e.secs.Count > 0).ToList();
     int Score(SourceDoc doc, List<SourceSection> secs)
     {
@@ -429,12 +531,13 @@ public static class SecretaryContext
         if (sec.SourceVersion != e.doc.Version || sec.IndexGeneration != e.doc.IndexGeneration) continue;
         if (!string.Equals(sec.ContentHash ?? "", e.doc.ContentHash ?? "", StringComparison.Ordinal)) continue;
         if (string.IsNullOrWhiteSpace(sec.Text)) continue;
-        var line = "SOURCE " + e.doc.FileName + " v" + e.doc.Version + " sec:" + sec.Ordinal + " [" + sec.Id + "] loc:" + (sec.Location ?? "") + ": " + Trunc(sec.Text ?? "", 500);
+        var line = "SOURCE " + e.doc.FileName + " v" + e.doc.Version + " sec:" + sec.Ordinal + " [" + sec.Id + "] loc:" + (sec.Location ?? "") + ": " + (sec.Text ?? "");
         var before = sb.Length;
         if (AppendLineBudgeted(line, false)) evidenceOut.Add(EvidenceRef.ForSection(e.doc, sec));
-        else { omittedOut?.Add("source:" + e.doc.Id + ":" + sec.Id); break; }
+        else { omittedOut?.Add("source:" + e.doc.Id + ":" + sec.Id); continue; }
       }
-      if (sb.Length > budgetChars - 800) { omittedOut?.Add("source-budget-stop"); break; }
+      // No early budget-stop break: every remaining automatic input must be enumerated in omittedOut.
+      // If budget is exhausted, subsequent AppendLineBudgeted calls will fail and record each omission individually.
     }
     if (evidenceOut.Count == 0)
       AppendLineBudgeted("EVIDENCE LIMITATION: No eligible approved sources, adopted directions, or approved records are available for this meeting. State this limitation clearly and do not invent support.", false);
@@ -482,9 +585,9 @@ public static class SecretaryOutcomeParser
     if (string.IsNullOrWhiteSpace(text)) throw new ProviderException(502, "malformed provider envelope: secretary content empty");
     if (text.StartsWith("```")) throw new ProviderException(502, "malformed secretary response: fenced code block");
     if (!text.StartsWith("{")) throw new ProviderException(502, "malformed secretary response: expected JSON object");
-    ValidateShape(text);
     try
     {
+      ValidateShape(text);
       using var doc = JsonDocument.Parse(text);
       var root = doc.RootElement;
       if (root.ValueKind != JsonValueKind.Object) throw new ProviderException(502, "malformed secretary response: expected JSON object");
@@ -632,6 +735,12 @@ public static class EvidenceAvailability
         if (sec is null) return new Status(false, "section removed");
         if (sec.SourceVersion != doc.Version || sec.IndexGeneration != doc.IndexGeneration)
           return new Status(false, "section reindexed");
+        if (r.IndexGeneration.HasValue && r.IndexGeneration.Value != sec.IndexGeneration)
+          return new Status(false, "section reindexed to g" + sec.IndexGeneration);
+        if (!string.IsNullOrWhiteSpace(r.ContentHash) && !string.Equals(r.ContentHash, sec.ContentHash ?? doc.ContentHash ?? "", StringComparison.Ordinal))
+          return new Status(false, "section content changed");
+        if (r.Version.HasValue && r.Version.Value != sec.SourceVersion)
+          return new Status(false, "section superseded");
       }
       return new Status(true, "current");
     }
@@ -640,12 +749,18 @@ public static class EvidenceAvailability
       if (!Guid.TryParse(r.Ref, out var nid) || !s.Notes.TryGetValue(nid, out var note) || note is null)
         return new Status(false, "direction removed");
       if (note.BoardId != boardId) return new Status(false, "direction moved");
+      if (note.Kind != "direction" || note.Provisional) return new Status(false, "direction no longer adopted");
+      if (note.Scope == "meeting" && (!meetingId.HasValue || note.MeetingId != meetingId.Value))
+        return new Status(false, "direction not in this meeting");
+      if (note.Scope != "board" && note.Scope != "meeting") return new Status(false, "direction scope changed");
       return new Status(true, "current");
     }
     if (kind == "record")
     {
       if (!Guid.TryParse(r.Ref, out var did) || !s.Drafts.TryGetValue(did, out var d) || d is null)
         return new Status(false, "record removed");
+      if (d.BoardId != boardId) return new Status(false, "record moved");
+      if (d.MeetingId != meetingId) return new Status(false, "record not in this meeting");
       if (r.Version.HasValue && r.Version.Value != d.Version)
         return new Status(false, "superseded by v" + d.Version);
       if (!string.Equals(d.Status, "approved", StringComparison.OrdinalIgnoreCase))
@@ -665,6 +780,8 @@ public static class EvidenceAvailability
     {
       if (!Guid.TryParse(r.Ref, out var eid) || !s.Roster.TryGetValue(eid, out var ent) || ent is null)
         return new Status(false, "dossier removed");
+      if (r.Version.HasValue && r.Version.Value != ent.Version)
+        return new Status(false, "dossier superseded by v" + ent.Version);
       var link = s.Advisors.Values.FirstOrDefault(a => a.BoardId == boardId && a.RosterEntryId == eid && !a.Removed && a.Approved);
       if (link is null) return new Status(false, "advisor not currently assigned");
       return new Status(true, "current");
@@ -675,13 +792,41 @@ public static class EvidenceAvailability
 public static class SecretaryEndpoints
 {
   static bool IsRetryableStatus(string st) => st == "failed" || st == "discarded" || st == "interrupted";
+  static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> LiveAttempts = new();
+  // Uncertain terminal marker bound to the exact failed attempt. Value is the attempt id whose terminal write failed.
+  // A marker for an old attempt MUST NOT supersede a newer live attempt; it retires only after authoritative reconcile + successful new reservation.
+  static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Guid> UncertainTerminal = new();
+  static int LeaseSeconds = 120;
   // Best-effort error-path transition; the mutation itself runs inside the
-  // atomic gate via MarkTerminal. The outer guard only protects the error
-  // path from masking the original provider/model failure.
-  static void FailBound(InMemoryStore s, Guid reqId, Guid attempt, string err)
+  // atomic gate via MarkTerminal. Returns false when even the recovery write
+  // failed; callers must then surface an honest 503 (never a blind retry).
+  // Storage-layer faults (Postgres/EF/Npgsql/transport) get controlled
+  // recoverable outcomes; code bugs still surface. Transport breaks during
+  // publication are genuinely uncertain (commit may have succeeded), so
+  // they reconcile against ground truth instead of assuming failure.
+  internal static bool IsStorageFault(Exception? ex)
   {
-    try { SecretaryTransitions.MarkTerminal(s, reqId, attempt, false, "failed", err); }
-    catch { }
+    if (ex is null) return false;
+    if (ex is TimeoutException or System.IO.IOException or TaskCanceledException or OperationCanceledException) return true;
+    var tn = ex.GetType().FullName ?? "";
+    if (tn.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) || tn.Contains("Postgres", StringComparison.OrdinalIgnoreCase) || tn.Contains("EntityFramework", StringComparison.OrdinalIgnoreCase) || tn.Contains("DbUpdate", StringComparison.Ordinal)) return true;
+    return IsStorageFault(ex.InnerException);
+  }
+  internal static bool IsTransportBreak(Exception? ex)
+  {
+    if (ex is null) return false;
+    if (ex is TimeoutException or System.IO.IOException or TaskCanceledException or OperationCanceledException || ex is System.Net.Sockets.SocketException) return true;
+    return IsTransportBreak(ex.InnerException);
+  }
+  static bool FailBound(InMemoryStore s, Guid reqId, Guid attempt, string err)
+  {
+    try { SecretaryTransitions.MarkTerminal(s, reqId, attempt, false, "failed", err); return true; }
+    catch { try { UncertainTerminal[reqId] = attempt; } catch { } return false; }
+  }
+  static bool FailBoundAnswer(InMemoryStore s, Guid reqId, Guid attempt, string err)
+  {
+    try { SecretaryTransitions.MarkTerminal(s, reqId, attempt, true, "needs-clarification", err); return true; }
+    catch { try { UncertainTerminal[reqId] = attempt; } catch { } return false; }
   }
   public static void MapSecretary(this WebApplication app)
   {
@@ -709,6 +854,7 @@ public static class SecretaryEndpoints
       SecretaryRequest? reserved = null;
       string reservedPrompt = "";
       List<EvidenceRef> reservedDelivered = new();
+      bool staleSupersede = false;
       SecretaryRequest? replay = null;
       string replayKind = "";
       IResult? early = null;
@@ -722,7 +868,11 @@ public static class SecretaryEndpoints
           {
             bool samePayload;
             if (!string.IsNullOrWhiteSpace(existing.SubmissionHash))
+            {
               samePayload = string.Equals(existing.SubmissionHash, sub0, StringComparison.Ordinal);
+              if (!samePayload && SecretaryDirect.IsLegacyCallerIdentityJson(existing.CallerRefsJson))
+                samePayload = string.Equals(existing.SubmissionHash, SecretaryDirect.SubmissionHashLegacy(normalized, rawCaller), StringComparison.Ordinal);
+            }
             else
             {
               var canonLegacy = SecretaryContext.CanonicalizeCaller(s, cur0.BoardId, id, rawCaller);
@@ -743,13 +893,54 @@ public static class SecretaryEndpoints
               if (!PeopleOps.Can(s, req, doneNote.BoardId, doneNote.MeetingId, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
               replay = existing; replayKind = "completed"; return null;
             }
-            if (existing.Status == "needs-clarification")
+            if (existing is not null && existing.Status == "needs-clarification")
             {
               if (!PeopleOps.Can(s, req, existing.BoardId, id, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
               replay = existing; replayKind = "clarify"; return null;
             }
-            if (existing.Status == "pending" || existing.Status == "inflight" || existing.Status == "answering")
-              return Results.Json(new { error = "Secretary request is already in flight for this nonce." }, statusCode: 409);
+            if (existing is not null && (string.Equals(existing.Phase, "continuation", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(existing.Question)))
+              return Results.Json(new { error = "This request is awaiting a clarification answer; retry the continuation via /secretary/answer with the same requestId." }, statusCode: 409);
+            if (existing is not null && (existing.Status == "pending" || existing.Status == "inflight" || existing.Status == "answering"))
+            {
+              var rel0 = existing.Status == "answering" ? existing.AnswerAttemptId : existing.AttemptId;
+              bool live0 = rel0 != Guid.Empty && LiveAttempts.ContainsKey(rel0);
+              if (live0)
+                return Results.Json(new { error = "Secretary request is already in flight for this nonce." }, statusCode: 409);
+              Guid failedAtt0 = Guid.Empty;
+              bool hasUncertain0 = false;
+              try { hasUncertain0 = UncertainTerminal.TryGetValue(existing.Id, out failedAtt0); } catch { }
+              bool uncertainForCurrent0 = hasUncertain0 && (failedAtt0 == Guid.Empty || failedAtt0 == rel0);
+              bool stale = false;
+              if (!uncertainForCurrent0)
+              {
+                if ((DateTime.UtcNow - existing.UpdatedAt).TotalSeconds > LeaseSeconds) stale = true;
+                if (!stale)
+                  return Results.Json(new { error = "Secretary request is already in flight for this nonce." }, statusCode: 409);
+              }
+              if (uncertainForCurrent0)
+              {
+                Guid unRoot = Guid.Empty;
+                if (existing.NoteId.HasValue && s.Notes.TryGetValue(existing.NoteId.Value, out var un0) && un0 is not null)
+                  unRoot = un0.RootId == Guid.Empty ? un0.Id : un0.RootId;
+                SecretaryTransitions.ReconcileAfterUncertainCommit(s, existing.Id, existing.NoteId, unRoot);
+                if (s.SecretaryRequests.TryGetValue(existing.Id, out var reconciled) && reconciled is not null) existing = reconciled;
+                if (existing.Status == "completed")
+                {
+                  if (!PeopleOps.Can(s, req, existing.BoardId, id, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+                  if (!existing.NoteId.HasValue || !s.Notes.TryGetValue(existing.NoteId.Value, out var doneNote2) || doneNote2 is null)
+                  {
+                    existing.Status = "failed"; existing.Error = "Reconciled result is no longer available; safe to retry with the same nonce."; existing.UpdatedAt = DateTime.UtcNow;
+                    s.SecretaryRequests[existing.Id] = existing; s.SecretaryRequests.Flush();
+                    return Results.Json(new { error = "Reconciled result is no longer available; retry with the same nonce." }, statusCode: 409);
+                  }
+                  if (doneNote2.BoardId != existing.BoardId || doneNote2.MeetingId != id) return Results.NotFound("secretary request not found.");
+                  if (!PeopleOps.Can(s, req, doneNote2.BoardId, doneNote2.MeetingId, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+                  try { UncertainTerminal.TryRemove(existing.Id, out _); } catch { }
+                  replay = existing; replayKind = "completed"; return null;
+                }
+              }
+              staleSupersede = true;
+            }
           }
           bool canContrib = PeopleOps.Can(s, req, cur0.BoardId, id, "contribute");
           if (!canContrib) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
@@ -759,7 +950,8 @@ public static class SecretaryEndpoints
           if (setupFixes.Count > 0) return Results.Json(new { error = "Board setup is incomplete.", fixes = setupFixes }, statusCode: 409);
           if (PeopleOps.Guard(gw, req) is { } capped) return capped;
           if (cur0.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) return Results.Json(new { error = "Meeting is not active." }, statusCode: 409);
-          bool isRetry = existing is not null && IsRetryableStatus(existing.Status);
+                    bool isRetryBase = existing is not null && IsRetryableStatus(existing.Status);
+          bool doReserve = isRetryBase || staleSupersede;
           SecretaryRequest reqRow;
           var attempt = Guid.NewGuid();
           var canonNew = SecretaryContext.CanonicalizeCaller(s, cur0.BoardId, id, rawCaller);
@@ -769,97 +961,91 @@ public static class SecretaryEndpoints
           int packetBudget = 32000 - head.Length - tail.Length - 1000;
           if (packetBudget < 4000)
             return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
-          if (isRetry && existing is not null)
+          var prepRefs = new List<EvidenceRef>(); var prepOmit = new List<string>();
+          string prepPacket;
+          try { prepPacket = SecretaryContext.BuildPacket(s, cur0, normalized, canonNew, prepRefs, packetBudget, prepOmit); }
+          catch (ProviderException pexPrep) { return PeopleOps.ProviderError(pexPrep); }
+          string prepFooter = prepOmit.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", prepOmit) + "\n" : "";
+          if (head.Length + prepPacket.Length + prepFooter.Length + tail.Length > 32000)
+            return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
+          string prepPrompt = head + prepPacket + prepFooter + tail;
+          foreach (var d in prepRefs.ToList())
+          {
+            if (string.IsNullOrWhiteSpace(d.Excerpt) || !prepPrompt.Contains(d.Excerpt!, StringComparison.Ordinal))
+            {
+              bool isCaller = canonNew.Any(c => c.Kind == d.Kind && c.Ref == d.Ref && (c.SectionId ?? "") == (d.SectionId ?? ""));
+              if (isCaller)
+                return Results.Json(new { error = "Secretary caller evidence exceeds prompt budget." }, statusCode: 502);
+              prepRefs.Remove(d);
+              prepOmit.Add(d.Kind + ":" + d.Ref + ":undelivered");
+            }
+          }
+          if (prepOmit.Count > 0 && string.IsNullOrWhiteSpace(prepFooter))
+          {
+            prepFooter = "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", prepOmit) + "\n";
+            prepPrompt = head + prepPacket + prepFooter + tail;
+            if (prepPrompt.Length > 32000)
+              return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
+          }
+          string prepHash;
+          try
+          {
+            var (prepDev, prepUser) = ModelGateway.BuildSecretaryPayload("secretary", prepPrompt, SecretaryDirect.InputTokens, false);
+            prepHash = ModelGateway.HashDeliveredPrompt(prepDev, prepUser);
+          }
+          catch (ProviderException pexGw) { return PeopleOps.ProviderError(pexGw); }
+          if (doReserve && existing is not null)
           {
             reqRow = existing;
             string keepQuestion = reqRow.Question ?? "";
             string keepAnswer = reqRow.Answer ?? "";
-            string keepPhase = !string.IsNullOrWhiteSpace(reqRow.Phase) ? reqRow.Phase : (!string.IsNullOrWhiteSpace(keepQuestion) ? "continuation" : "initial");
+            string keepPhase = !string.IsNullOrWhiteSpace(reqRow.Phase) ? reqRow.Phase : "initial";
             reqRow.AttemptId = attempt; reqRow.AnswerAttemptId = Guid.Empty;
             reqRow.InputText = normalized; reqRow.InputHash = curHash;
             reqRow.SubmissionHash = sub0; reqRow.CallerRefsJson = SecretaryDirect.RawCallerIdentityJson(rawCaller);
             reqRow.Phase = keepPhase; reqRow.Question = keepQuestion; reqRow.Answer = keepAnswer;
             reqRow.Status = "inflight"; reqRow.NoteId = null; reqRow.Error = ""; reqRow.UpdatedAt = DateTime.UtcNow;
             cur0.Generation++; reqRow.Generation = cur0.Generation;
-            var snap2 = SecretaryContext.CaptureSnapshot(s, cur0);
-            reqRow.LeadFingerprint = snap2.LeadFp; reqRow.EvidenceFingerprintJson = snap2.EvFp;
-            reqRow.RecentHash = snap2.RecentHash; reqRow.EvidenceTextHash = snap2.EvidenceTextHash; reqRow.DossierHash = snap2.DossierHash;
-            reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snap2);
-            var tmp = new List<EvidenceRef>(); var omitted = new List<string>();
-            string packet = SecretaryContext.BuildPacket(s, cur0, normalized, canonNew, tmp, packetBudget, omitted);
-            string footer = omitted.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitted.Take(20)) + "\n" : "";
-            if (head.Length + packet.Length + footer.Length + tail.Length > 32000)
-              return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
-            string fullPrompt = head + packet + footer + tail;
-            foreach (var d in tmp.ToList())
-            {
-              if (string.IsNullOrWhiteSpace(d.Excerpt) || !fullPrompt.Contains(d.Excerpt!, StringComparison.Ordinal))
-              {
-                bool isCaller = canonNew.Any(c => c.Kind == d.Kind && c.Ref == d.Ref && (c.SectionId ?? "") == (d.SectionId ?? ""));
-                if (isCaller)
-                  return Results.Json(new { error = "Secretary caller evidence exceeds prompt budget." }, statusCode: 502);
-                tmp.Remove(d);
-                omitted.Add(d.Kind + ":" + d.Ref + ":undelivered");
-              }
-            }
-            if (omitted.Count > 0 && string.IsNullOrWhiteSpace(footer))
-            {
-              footer = "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitted.Take(20)) + "\n";
-              fullPrompt = head + packet + footer + tail;
-              if (fullPrompt.Length > 32000)
-                return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
-            }
-            reqRow.DeliveredRefsJson = EvidenceRef.ToJsonList(tmp);
-            reqRow.DeliveredPromptHash = Hashing.HashOf(fullPrompt);
+            // Fresh capture AFTER the reservation mutations: RecentHash binds
+            // DeliveredRevision, so a pre-mutation snapshot patched with new
+            // counters would never equal the publication-time snapshot.
+            var snapStored = SecretaryContext.CaptureSnapshot(s, cur0, rawCaller);
+            reqRow.LeadFingerprint = snapStored.LeadFp; reqRow.EvidenceFingerprintJson = snapStored.EvFp;
+            reqRow.RecentHash = snapStored.RecentHash; reqRow.EvidenceTextHash = snapStored.EvidenceTextHash; reqRow.DossierHash = snapStored.DossierHash;
+            reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snapStored);
+            reqRow.DeliveredRefsJson = EvidenceRef.ToJsonList(prepRefs);
+            reqRow.DeliveredPromptHash = prepHash;
+            try { reqRow.OmittedJson = System.Text.Json.JsonSerializer.Serialize(prepOmit); } catch { reqRow.OmittedJson = "[]"; }
             s.SecretaryRequests[reqRow.Id] = reqRow; s.Meetings.Flush(); s.SecretaryRequests.Flush();
-            reserved = reqRow; reservedPrompt = fullPrompt; reservedDelivered = tmp;
+            try { UncertainTerminal.TryRemove(existing.Id, out _); } catch { }
+            reserved = reqRow; reservedPrompt = prepPrompt; reservedDelivered = prepRefs;
           }
           else
           {
             reqRow = new SecretaryRequest { BoardId = cur0.BoardId, MeetingId = id, ClientNonce = nonce, InputHash = curHash, InputText = normalized, Status = "inflight", Generation = cur0.Generation, LeadFingerprint = "", EvidenceFingerprintJson = "[]", SnapshotJson = "{}", Phase = "initial", SubmissionHash = sub0, CallerRefsJson = SecretaryDirect.RawCallerIdentityJson(rawCaller), AttemptId = attempt, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow };
             var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
-            var msg = new Message { MeetingId = id, BoardId = cur0.BoardId, Sender = "lead", Content = normalized, Status = "committed" };
+            long newSeq = (list.Count == 0 ? 0 : list.Max(x => x.Sequence)) + 1;
+            var msg = new Message { MeetingId = id, BoardId = cur0.BoardId, Sender = "lead", Content = normalized, Status = "committed", Sequence = newSeq, CreatedAt = DateTime.UtcNow };
             list.Add(msg);
-            cur0.DeliveredRevision = (list.Count == 0 ? 0 : list.Max(x => x.Sequence)) + 1;
-            msg.Sequence = cur0.DeliveredRevision; msg.CreatedAt = DateTime.UtcNow;
+            cur0.DeliveredRevision = newSeq;
             cur0.Generation++;
             reqRow.Generation = cur0.Generation;
-            var snap3 = SecretaryContext.CaptureSnapshot(s, cur0);
-            reqRow.LeadFingerprint = snap3.LeadFp; reqRow.EvidenceFingerprintJson = snap3.EvFp;
-            reqRow.RecentHash = snap3.RecentHash; reqRow.EvidenceTextHash = snap3.EvidenceTextHash; reqRow.DossierHash = snap3.DossierHash;
-            reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snap3);
-            var tmp = new List<EvidenceRef>(); var omitted = new List<string>();
-            string packet = SecretaryContext.BuildPacket(s, cur0, normalized, canonNew, tmp, packetBudget, omitted);
-            string footer = omitted.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitted.Take(20)) + "\n" : "";
-            if (head.Length + packet.Length + footer.Length + tail.Length > 32000)
-              return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
-            string fullPrompt = head + packet + footer + tail;
-            foreach (var d in tmp.ToList())
-            {
-              if (string.IsNullOrWhiteSpace(d.Excerpt) || !fullPrompt.Contains(d.Excerpt!, StringComparison.Ordinal))
-              {
-                bool isCaller = canonNew.Any(c => c.Kind == d.Kind && c.Ref == d.Ref && (c.SectionId ?? "") == (d.SectionId ?? ""));
-                if (isCaller)
-                  return Results.Json(new { error = "Secretary caller evidence exceeds prompt budget." }, statusCode: 502);
-                tmp.Remove(d);
-                omitted.Add(d.Kind + ":" + d.Ref + ":undelivered");
-              }
-            }
-            if (omitted.Count > 0 && string.IsNullOrWhiteSpace(footer))
-            {
-              footer = "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitted.Take(20)) + "\n";
-              fullPrompt = head + packet + footer + tail;
-              if (fullPrompt.Length > 32000)
-                return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
-            }
-            reqRow.DeliveredRefsJson = EvidenceRef.ToJsonList(tmp);
-            reqRow.DeliveredPromptHash = Hashing.HashOf(fullPrompt);
+            // Fresh capture AFTER the reservation mutations: RecentHash binds
+            // DeliveredRevision, so a pre-mutation snapshot patched with new
+            // counters would never equal the publication-time snapshot.
+            var snapStored = SecretaryContext.CaptureSnapshot(s, cur0, rawCaller);
+            reqRow.LeadFingerprint = snapStored.LeadFp; reqRow.EvidenceFingerprintJson = snapStored.EvFp;
+            reqRow.RecentHash = snapStored.RecentHash; reqRow.EvidenceTextHash = snapStored.EvidenceTextHash; reqRow.DossierHash = snapStored.DossierHash;
+            reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snapStored);
+            reqRow.DeliveredRefsJson = EvidenceRef.ToJsonList(prepRefs);
+            reqRow.DeliveredPromptHash = prepHash;
+            try { reqRow.OmittedJson = System.Text.Json.JsonSerializer.Serialize(prepOmit); } catch { reqRow.OmittedJson = "[]"; }
             s.SecretaryRequests[reqRow.Id] = reqRow;
             s.Meetings.Flush();
             s.SecretaryRequests.Flush();
-            reserved = reqRow; reservedPrompt = fullPrompt; reservedDelivered = tmp;
+            reserved = reqRow; reservedPrompt = prepPrompt; reservedDelivered = prepRefs;
           }
-          return null;
+return null;
         }); } catch (Exception ex) {
           if (ex is ProviderException) throw;
           var msg = ex.Message ?? "";
@@ -876,6 +1062,16 @@ public static class SecretaryEndpoints
               if (existing2.Status == "completed") return Results.Ok(new { requestId = existing2.Id, clientNonce = existing2.ClientNonce, status = existing2.Status, note = existing2.NoteId.HasValue && s.Notes.TryGetValue(existing2.NoteId.Value, out var dn) ? dn : null, replay = true });
               return Results.Json(new { error = "Secretary request is already in flight for this nonce." }, statusCode: 409);
             }
+          }
+          if (IsStorageFault(ex))
+          {
+            var gateRow = s.SecretaryRequests.Values.Where(r => r.MeetingId == id && r.ClientNonce == nonce).OrderByDescending(r => r.CreatedAt).FirstOrDefault();
+            if (gateRow is not null && (gateRow.Status == "inflight" || gateRow.Status == "answering" || gateRow.Status == "pending"))
+            {
+              try { var __ga = gateRow.AttemptId != Guid.Empty ? gateRow.AttemptId : gateRow.AnswerAttemptId; UncertainTerminal[gateRow.Id] = __ga; } catch { }
+              return Results.Json(new { error = "Reservation storage fault; recovery state marked uncertain. Re-read the request before retrying with the same nonce." }, statusCode: 503);
+            }
+            return Results.Json(new { error = "Reservation storage fault before any live reservation; safe to retry with the same nonce." }, statusCode: 502);
           }
           throw;
         }
@@ -897,13 +1093,24 @@ public static class SecretaryEndpoints
       var restoreBeforeS = s.RestoreEpochId;
       var delivered = reservedDelivered;
       string prompt = reservedPrompt;
+      LiveAttempts[myAttempt] = 1;
       string modelText;
       try { modelText = await gw.CompleteAsync(ModelPolicy.SparkFor(s, myReq.BoardId), "secretary", prompt, SecretaryDirect.InputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), boardId: myReq.BoardId, meetingId: id, truncatePrompt: false); }
       catch (Exception ex) when (ex is ProviderException or CapExceededException)
-      { FailBound(s, myReq.Id, myAttempt, ex.Message); return PeopleOps.ModelError(ex); }
+      {
+        if (!FailBound(s, myReq.Id, myAttempt, ex.Message))
+          return Results.Json(new { error = "Provider failed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying with the same nonce." }, statusCode: 503);
+        return PeopleOps.ModelError(ex);
+      }
+      finally { try { LiveAttempts.TryRemove(myAttempt, out _); } catch { } }
       SecretaryOutcome outcome;
       try { outcome = SecretaryOutcomeParser.Parse(modelText); }
-      catch (ProviderException pex) { FailBound(s, myReq.Id, myAttempt, pex.Message); return PeopleOps.ProviderError(pex); }
+      catch (ProviderException pex)
+      {
+        if (!FailBound(s, myReq.Id, myAttempt, pex.Message))
+          return Results.Json(new { error = "Response was malformed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying with the same nonce." }, statusCode: 503);
+        return PeopleOps.ProviderError(pex);
+      }
       var pubNoteId = Guid.NewGuid();
       lock (s.SetupLock) { lock (s.MessageLock) {
         IResult pubResult;
@@ -917,7 +1124,7 @@ public static class SecretaryEndpoints
           if (!s.Meetings.TryGetValue(id, out var cur)) return Results.Conflict("Meeting moved on; draft discarded.");
           if (!PeopleOps.Can(s, req, cur.BoardId, id, "contribute")) { fresh.Status = "failed"; fresh.Error = "Access revoked during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
           if (cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) { fresh.Status = "discarded"; fresh.Error = "Meeting state changed during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Meeting state changed during secretary work; draft discarded." }, statusCode: 409); }
-          var nowSnap = SecretaryContext.CaptureSnapshot(s, cur);
+          var nowSnap = SecretaryContext.CaptureSnapshot(s, cur, SecretaryDirect.RehydrateRawCallerRefs(fresh.CallerRefsJson));
           if (!SecretaryContext.TryParseSnapshot(fresh.SnapshotJson, out var beforeSnap) || beforeSnap is null)
           {
             fresh.Status = "discarded"; fresh.Error = "Stored request snapshot is invalid; retry with the same nonce."; s.SecretaryRequests.Flush();
@@ -935,11 +1142,16 @@ public static class SecretaryEndpoints
           }
           if (outcome.Kind == "question")
           {
-            fresh.Status = "needs-clarification"; fresh.Phase = "continuation"; fresh.Question = outcome.Question; fresh.DeliveredRefsJson = EvidenceRef.ToJsonList(delivered); fresh.DeliveredPromptHash = Hashing.HashOf(prompt); fresh.UpdatedAt = DateTime.UtcNow; s.SecretaryRequests.Flush();
-            return Results.Ok(new { requestId = fresh.Id, clientNonce = fresh.ClientNonce, status = fresh.Status, question = fresh.Question });
+            fresh.Status = "needs-clarification"; fresh.Phase = "continuation"; fresh.Question = outcome.Question; fresh.DeliveredRefsJson = EvidenceRef.ToJsonList(delivered); fresh.DeliveredPromptHash = myReq.DeliveredPromptHash; fresh.UpdatedAt = DateTime.UtcNow; s.SecretaryRequests.Flush();
+            List<string> __omQ = new();
+            try { __omQ = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh.OmittedJson ?? "[]") ?? new(); } catch { }
+            return Results.Ok(new { requestId = fresh.Id, clientNonce = fresh.ClientNonce, status = fresh.Status, question = fresh.Question, omitted = __omQ });
           }
           var noteBody = outcome.Body;
           if (delivered.Count == 0) noteBody = noteBody + " [Limitation: No eligible approved sources, adopted directions, or approved records were available for this meeting.]";
+          List<string> __omNoteEarly = new();
+          try { __omNoteEarly = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh.OmittedJson ?? "[]") ?? new(); } catch { }
+          if (__omNoteEarly.Count > 0) noteBody = noteBody + " [Omitted from packet (not cited as evidence): " + string.Join("; ", __omNoteEarly) + "]";
           Note? created = null;
           {
             var note = new Note { BoardId = cur.BoardId, MeetingId = id, Kind = outcome.Kind, Title = outcome.Title, Body = noteBody, Scope = "meeting", Provisional = true, EvidenceJson = EvidenceRef.ToJsonList(delivered), Revision = 1, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
@@ -948,22 +1160,25 @@ public static class SecretaryEndpoints
             var h = new NoteHistory { BoardId = cur.BoardId, MeetingId = id, NoteId = note.Id, RootId = note.RootId, Revision = 1, Title = note.Title, Body = note.Body, EvidenceJson = note.EvidenceJson, Action = "created", CreatedAt = DateTime.UtcNow };
             s.NoteHistories[h.Id] = h;
             fresh.Status = "completed"; fresh.NoteId = note.Id; fresh.CompletedAt = DateTime.UtcNow; fresh.UpdatedAt = DateTime.UtcNow;
-            fresh.DeliveredRefsJson = EvidenceRef.ToJsonList(delivered); fresh.DeliveredPromptHash = Hashing.HashOf(prompt);
+            fresh.DeliveredRefsJson = EvidenceRef.ToJsonList(delivered); fresh.DeliveredPromptHash = myReq.DeliveredPromptHash;
             s.SecretaryRequests[myReq.Id] = fresh;
             s.Notes.Flush(); s.NoteHistories.Flush(); s.SecretaryRequests.Flush();
             created = note;
           }
-          return Results.Ok(new { requestId = fresh.Id, clientNonce = fresh.ClientNonce, status = fresh.Status, note = created });
+          List<string> __omPub = new();
+          try { __omPub = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh.OmittedJson ?? "[]") ?? new(); } catch { }
+          return Results.Ok(new { requestId = fresh.Id, clientNonce = fresh.ClientNonce, status = fresh.Status, note = created, omitted = __omPub });
         });
         }
-        catch (Exception pubEx) when (pubEx is TimeoutException || pubEx is System.IO.IOException || pubEx is TaskCanceledException)
+        catch (Exception pubEx) when (IsTransportBreak(pubEx))
         {
           SecretaryTransitions.ReconcileAfterUncertainCommit(s, myReq.Id, pubNoteId, pubNoteId);
           return Results.Json(new { error = "Storage outcome uncertain during publication; reconciled. Retry with the same nonce." }, statusCode: 502);
         }
-        catch (Exception pubEx)
+        catch (Exception pubEx) when (IsStorageFault(pubEx))
         {
-          try { SecretaryTransitions.MarkTerminal(s, myReq.Id, myAttempt, false, "failed", "Storage fault during publication: " + pubEx.GetType().Name + ". Safe to retry with the same nonce."); } catch { }
+          try { SecretaryTransitions.MarkTerminal(s, myReq.Id, myAttempt, false, "failed", "Storage fault during publication: " + pubEx.GetType().Name + ". Safe to retry with the same nonce."); }
+          catch { try { UncertainTerminal[myReq.Id] = myAttempt; } catch { } return Results.Json(new { error = "Storage fault during publication and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying with the same nonce." }, statusCode: 503); }
           return Results.Json(new { error = "Storage fault during publication; safe to retry with the same nonce." }, statusCode: 502);
         }
         return pubResult;
@@ -984,16 +1199,21 @@ public static class SecretaryEndpoints
       List<EvidenceRef> reservedAnsDelivered = new();
       SecretaryRequest? replayAns = null;
       IResult? earlyAns = null;
+      bool ansSupersede = false;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        earlyAns = Atomic.Run<IResult?>(s, () =>
+        try { earlyAns = Atomic.Run<IResult?>(s, () =>
         {
           if (!s.SecretaryRequests.TryGetValue(reqId, out var reqRow) || reqRow is null || reqRow.MeetingId != id) return Results.NotFound("secretary request not found.");
           if (!s.Meetings.TryGetValue(id, out var cur0)) return Results.NotFound("meeting");
           if (reqRow.Status == "completed")
           {
             if (!PeopleOps.Can(s, req, reqRow.BoardId, id, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+            if (!string.Equals(reqRow.Phase, "continuation", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(reqRow.Question))
+              return Results.Json(new { error = "This request never asked a clarification question." }, statusCode: 409);
             if (!string.IsNullOrWhiteSpace(reqRow.Answer) && reqRow.Answer.Trim() != cleanAnswer)
               return Results.Json(new { error = "Conflicting answer for the same request." }, statusCode: 409);
+            if (string.IsNullOrWhiteSpace(reqRow.Answer) || reqRow.AnswerAttemptId == Guid.Empty)
+              return Results.Json(new { error = "Completed clarification result is unavailable; retry the continuation." }, statusCode: 409);
             if (!reqRow.NoteId.HasValue || !s.Notes.TryGetValue(reqRow.NoteId.Value, out var dn) || dn is null)
             {
               reqRow.Status = "failed"; reqRow.Error = "Completed result is no longer available; safe to retry the continuation."; reqRow.UpdatedAt = DateTime.UtcNow;
@@ -1012,53 +1232,69 @@ public static class SecretaryEndpoints
             return Results.Json(new { error = "Conflicting answer for the same request." }, statusCode: 409);
           if (reqRow.Status == "answering")
           {
-            if (!string.IsNullOrWhiteSpace(reqRow.Answer) && reqRow.Answer.Trim() == cleanAnswer)
+            if (!string.IsNullOrWhiteSpace(reqRow.Answer) && reqRow.Answer.Trim() != cleanAnswer)
+              return Results.Json(new { error = "Conflicting answer for the same request." }, statusCode: 409);
+            var relAns0 = reqRow.AnswerAttemptId;
+            bool liveAns0 = relAns0 != Guid.Empty && LiveAttempts.ContainsKey(relAns0);
+            if (liveAns0)
               return Results.Json(new { error = "Secretary continuation is already in flight for this answer." }, statusCode: 409);
-            return Results.Json(new { error = "Conflicting answer for the same request." }, statusCode: 409);
+            Guid failedAns0 = Guid.Empty;
+            bool hasUncertainAns0 = false;
+            try { hasUncertainAns0 = UncertainTerminal.TryGetValue(reqRow.Id, out failedAns0); } catch { }
+            bool uncertainForAns0 = hasUncertainAns0 && (failedAns0 == Guid.Empty || failedAns0 == relAns0);
+            bool ansStale = false;
+            if (!uncertainForAns0)
+            {
+              if ((DateTime.UtcNow - reqRow.UpdatedAt).TotalSeconds > LeaseSeconds) ansStale = true;
+              if (!ansStale)
+                return Results.Json(new { error = "Secretary continuation is already in flight for this answer." }, statusCode: 409);
+            }
+            if (uncertainForAns0)
+            {
+              Guid unRootA = Guid.Empty;
+              if (reqRow.NoteId.HasValue && s.Notes.TryGetValue(reqRow.NoteId.Value, out var unA) && unA is not null)
+                unRootA = unA.RootId == Guid.Empty ? unA.Id : unA.RootId;
+              SecretaryTransitions.ReconcileAfterUncertainCommit(s, reqRow.Id, reqRow.NoteId, unRootA);
+              if (s.SecretaryRequests.TryGetValue(reqRow.Id, out var reconciledA) && reconciledA is not null) reqRow = reconciledA;
+              if (reqRow.Status == "completed")
+              {
+                if (!PeopleOps.Can(s, req, reqRow.BoardId, id, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+                if (!reqRow.NoteId.HasValue || !s.Notes.TryGetValue(reqRow.NoteId.Value, out var dnA) || dnA is null)
+                {
+                  reqRow.Status = "failed"; reqRow.Error = "Reconciled result is no longer available; safe to retry the continuation."; reqRow.UpdatedAt = DateTime.UtcNow;
+                  s.SecretaryRequests[reqRow.Id] = reqRow; s.SecretaryRequests.Flush();
+                  return Results.Json(new { error = "Reconciled result is no longer available; safe to retry the continuation." }, statusCode: 409);
+                }
+                if (dnA.BoardId != reqRow.BoardId || dnA.MeetingId != id) return Results.NotFound("secretary request not found.");
+                if (!PeopleOps.Can(s, req, dnA.BoardId, dnA.MeetingId, "read")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+                try { UncertainTerminal.TryRemove(reqRow.Id, out _); } catch { }
+                replayAns = reqRow; return null;
+              }
+            }
+            ansSupersede = true;
           }
           if (reqRow.Status == "pending" || reqRow.Status == "inflight")
             return Results.Json(new { error = "Request is not awaiting clarification." }, statusCode: 409);
-          if (reqRow.Status != "needs-clarification" && !IsRetryableStatus(reqRow.Status))
+          if (!ansSupersede && reqRow.Status != "needs-clarification" && !IsRetryableStatus(reqRow.Status))
             return Results.Json(new { error = "Request is not awaiting clarification." }, statusCode: 409);
           if (!PeopleOps.Can(s, req, cur0.BoardId, id, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
           if (PeopleOps.Guard(gw, req) is { } capped) return capped;
           if (cur0.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) return Results.Json(new { error = "Meeting is not active." }, statusCode: 409);
           var attempt = Guid.NewGuid();
           bool firstAnswer = string.IsNullOrWhiteSpace(reqRow.Answer);
-          if (firstAnswer)
-          {
-            var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
-            var msg = new Message { MeetingId = id, BoardId = cur0.BoardId, Sender = "lead", Content = cleanAnswer, Status = "committed" };
-            list.Add(msg);
-            cur0.DeliveredRevision = (list.Count == 0 ? 0 : list.Max(x => x.Sequence)) + 1;
-            msg.Sequence = cur0.DeliveredRevision; msg.CreatedAt = DateTime.UtcNow;
-            cur0.Generation++;
-            reqRow.Answer = cleanAnswer;
-          }
-          else
-          {
-            cur0.Generation++;
-          }
-          reqRow.AnswerAttemptId = attempt;
-          reqRow.AttemptId = reqRow.AttemptId == Guid.Empty ? Guid.NewGuid() : reqRow.AttemptId;
-          reqRow.Status = "answering";
-          reqRow.Phase = "continuation";
-          reqRow.Generation = cur0.Generation;
-          var snap = SecretaryContext.CaptureSnapshot(s, cur0);
-          reqRow.LeadFingerprint = snap.LeadFp; reqRow.EvidenceFingerprintJson = snap.EvFp;
-          reqRow.RecentHash = snap.RecentHash; reqRow.EvidenceTextHash = snap.EvidenceTextHash; reqRow.DossierHash = snap.DossierHash;
-          reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snap);
-          reqRow.UpdatedAt = DateTime.UtcNow;
-          var storedCaller = SecretaryDirect.RehydrateRawCallerRefs(reqRow.CallerRefsJson);
-          var canonAns = SecretaryContext.CanonicalizeCaller(s, cur0.BoardId, id, storedCaller);
+          string answerText = firstAnswer ? cleanAnswer : (reqRow.Answer ?? "").Trim();
+          var storedCallerA = SecretaryDirect.RehydrateRawCallerRefs(reqRow.CallerRefsJson);
+          var canonAns = SecretaryContext.CanonicalizeCaller(s, cur0.BoardId, id, storedCallerA);
           const string ahead = "You are the board secretary. Return JSON only.\n";
-          string amid = "OWNER QUESTION: " + reqRow.Question + "\nOWNER ANSWER: " + reqRow.Answer + "\nORIGINAL: " + reqRow.InputText + "\nCONTEXT:\n";
+          string amid = "OWNER QUESTION: " + reqRow.Question + "\nOWNER ANSWER: " + answerText + "\nORIGINAL: " + reqRow.InputText + "\nCONTEXT:\n";
           int abudget = 32000 - ahead.Length - amid.Length - 500;
           if (abudget < 4000)
             return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
           var tmpa = new List<EvidenceRef>(); var omitteda = new List<string>();
-          string packeta = SecretaryContext.BuildPacket(s, cur0, reqRow.InputText + " CLARIFIED: " + reqRow.Answer, canonAns, tmpa, abudget, omitteda);
-          string afooter = omitteda.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitteda.Take(20)) + "\n" : "";
+          string packeta;
+          try { packeta = SecretaryContext.BuildPacket(s, cur0, reqRow.InputText + " CLARIFIED: " + answerText, canonAns, tmpa, abudget, omitteda); }
+          catch (ProviderException pexA) { return PeopleOps.ProviderError(pexA); }
+          string afooter = omitteda.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitteda) + "\n" : "";
           string fullAns = ahead + amid + packeta + afooter;
           if (fullAns.Length > 32000)
             return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
@@ -1070,14 +1306,68 @@ public static class SecretaryEndpoints
               if (isCallerA)
                 return Results.Json(new { error = "Secretary caller evidence exceeds prompt budget." }, statusCode: 502);
               tmpa.Remove(d);
+              omitteda.Add(d.Kind + ":" + d.Ref + ":undelivered");
             }
           }
+          if (omitteda.Count > 0 && string.IsNullOrWhiteSpace(afooter))
+          {
+            afooter = "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omitteda) + "\n";
+            fullAns = ahead + amid + packeta + afooter;
+            if (fullAns.Length > 32000)
+              return Results.Json(new { error = "Secretary prompt exceeds budget; essential context cannot fit." }, statusCode: 502);
+          }
+          string ansHash;
+          try
+          {
+            var (ansDev, ansUser) = ModelGateway.BuildSecretaryPayload("secretary", fullAns, SecretaryDirect.InputTokens, false);
+            ansHash = ModelGateway.HashDeliveredPrompt(ansDev, ansUser);
+          }
+          catch (ProviderException pexGwA) { return PeopleOps.ProviderError(pexGwA); }
+          if (firstAnswer)
+          {
+            var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
+            long ansSeq = (list.Count == 0 ? 0 : list.Max(x => x.Sequence)) + 1;
+            var msg = new Message { MeetingId = id, BoardId = cur0.BoardId, Sender = "lead", Content = cleanAnswer, Status = "committed", Sequence = ansSeq, CreatedAt = DateTime.UtcNow };
+            list.Add(msg);
+            cur0.DeliveredRevision = ansSeq;
+            reqRow.Answer = cleanAnswer;
+          }
+          cur0.Generation++;
+          reqRow.AnswerAttemptId = attempt;
+          reqRow.AttemptId = reqRow.AttemptId == Guid.Empty ? Guid.NewGuid() : reqRow.AttemptId;
+          reqRow.Status = "answering";
+          reqRow.Phase = "continuation";
+          reqRow.Generation = cur0.Generation;
+          // Fresh capture AFTER the answer-reservation mutations: RecentHash binds
+            // DeliveredRevision, so a pre-mutation snapshot patched with new
+            // counters would never equal the publication-time snapshot.
+          var snapStoredA = SecretaryContext.CaptureSnapshot(s, cur0, storedCallerA);
+          reqRow.LeadFingerprint = snapStoredA.LeadFp; reqRow.EvidenceFingerprintJson = snapStoredA.EvFp;
+          reqRow.RecentHash = snapStoredA.RecentHash; reqRow.EvidenceTextHash = snapStoredA.EvidenceTextHash; reqRow.DossierHash = snapStoredA.DossierHash;
+          reqRow.SnapshotJson = SecretaryContext.SnapshotToJson(snapStoredA);
+          reqRow.UpdatedAt = DateTime.UtcNow;
           reqRow.DeliveredRefsJson = EvidenceRef.ToJsonList(tmpa);
-          reqRow.DeliveredPromptHash = Hashing.HashOf(fullAns);
+          reqRow.DeliveredPromptHash = ansHash;
+          try { reqRow.OmittedJson = System.Text.Json.JsonSerializer.Serialize(omitteda); } catch { reqRow.OmittedJson = "[]"; }
           s.SecretaryRequests[reqRow.Id] = reqRow; s.Meetings.Flush(); s.SecretaryRequests.Flush();
+          try { UncertainTerminal.TryRemove(reqRow.Id, out _); } catch { }
           reservedAns = reqRow; myAnsAttempt = attempt; reservedAnsPrompt = fullAns; reservedAnsDelivered = tmpa;
           return null;
-        });
+        }); } catch (Exception gateEx)
+        {
+          if (IsStorageFault(gateEx))
+          {
+            s.SecretaryRequests.TryGetValue(reqId, out var gateAnsRow);
+            if (gateAnsRow is not null && (gateAnsRow.Status == "answering" || gateAnsRow.Status == "needs-clarification"))
+            {
+              try { var __ga2 = gateAnsRow.AnswerAttemptId != Guid.Empty ? gateAnsRow.AnswerAttemptId : gateAnsRow.AttemptId; UncertainTerminal[gateAnsRow.Id] = __ga2; } catch { }
+              earlyAns = Results.Json(new { error = "Continuation reservation storage fault; recovery state marked uncertain. Re-read the request before retrying." }, statusCode: 503);
+            }
+            else earlyAns = Results.Json(new { error = "Continuation reservation storage fault before any live reservation; safe to retry." }, statusCode: 502);
+          }
+          else throw;
+        }
+
       } }
       if (earlyAns is not null) return earlyAns;
       if (replayAns is not null)
@@ -1090,23 +1380,28 @@ public static class SecretaryEndpoints
       var restoreBeforeA = s.RestoreEpochId;
       var autoEvidence = reservedAnsDelivered;
       string prompt2 = reservedAnsPrompt;
+      LiveAttempts[myAnsAttempt] = 1;
       string modelText2;
       try { modelText2 = await gw.CompleteAsync(ModelPolicy.SparkFor(s, myReq2.BoardId), "secretary", prompt2, SecretaryDirect.InputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), boardId: myReq2.BoardId, meetingId: id, truncatePrompt: false); }
       catch (Exception ex) when (ex is ProviderException or CapExceededException)
       {
-        try { SecretaryTransitions.MarkTerminal(s, myReq2.Id, myAnsAttempt, true, "needs-clarification", ex.Message); } catch { }
+        if (!FailBoundAnswer(s, myReq2.Id, myAnsAttempt, ex.Message))
+          return Results.Json(new { error = "Provider failed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying." }, statusCode: 503);
         return PeopleOps.ModelError(ex);
       }
+      finally { try { LiveAttempts.TryRemove(myAnsAttempt, out _); } catch { } }
       SecretaryOutcome outcome2;
       try { outcome2 = SecretaryOutcomeParser.Parse(modelText2); }
       catch (ProviderException pex2)
       {
-        try { SecretaryTransitions.MarkTerminal(s, myReq2.Id, myAnsAttempt, true, "needs-clarification", pex2.Message); } catch { }
+        if (!FailBoundAnswer(s, myReq2.Id, myAnsAttempt, pex2.Message))
+          return Results.Json(new { error = "Response was malformed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying." }, statusCode: 503);
         return PeopleOps.ProviderError(pex2);
       }
       if (outcome2.Kind == "question")
       {
-        try { SecretaryTransitions.MarkTerminal(s, myReq2.Id, myAnsAttempt, true, "needs-clarification", "Secretary asked a second clarification; answer the first question only."); } catch { }
+        if (!FailBoundAnswer(s, myReq2.Id, myAnsAttempt, "Secretary asked a second clarification; answer the first question only."))
+          return Results.Json(new { error = "Second clarification received and recovery state could not be persisted; do not retry blindly." }, statusCode: 503);
         return Results.Json(new { error = "Secretary asked a second clarification; answer the first question only." }, statusCode: 502);
       }
       var pubNoteId2 = Guid.NewGuid();
@@ -1122,7 +1417,7 @@ public static class SecretaryEndpoints
           if (!s.Meetings.TryGetValue(id, out var cur2)) return Results.Conflict("Meeting moved on; draft discarded.");
           if (!PeopleOps.Can(s, req, cur2.BoardId, id, "contribute")) { fresh2.Status = "needs-clarification"; fresh2.Error = "Access revoked during secretary work."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
           if (cur2.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) { fresh2.Status = "discarded"; fresh2.Error = "Meeting state changed; draft discarded."; s.SecretaryRequests.Flush(); return Results.Json(new { error = "Meeting state changed; draft discarded." }, statusCode: 409); }
-          var nowSnap2 = SecretaryContext.CaptureSnapshot(s, cur2);
+          var nowSnap2 = SecretaryContext.CaptureSnapshot(s, cur2, SecretaryDirect.RehydrateRawCallerRefs(fresh2.CallerRefsJson));
           if (!SecretaryContext.TryParseSnapshot(fresh2.SnapshotJson, out var before2) || before2 is null)
           {
             fresh2.Status = "discarded"; fresh2.Error = "Stored request snapshot is invalid; retry with the same nonce."; s.SecretaryRequests.Flush();
@@ -1140,6 +1435,9 @@ public static class SecretaryEndpoints
           }
           var noteBody2 = outcome2.Body;
           if (autoEvidence.Count == 0) noteBody2 = noteBody2 + " [Limitation: No eligible approved sources were available.]";
+          List<string> __omNoteEarly2 = new();
+          try { __omNoteEarly2 = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh2.OmittedJson ?? "[]") ?? new(); } catch { }
+          if (__omNoteEarly2.Count > 0) noteBody2 = noteBody2 + " [Omitted from packet (not cited as evidence): " + string.Join("; ", __omNoteEarly2) + "]";
           Note? created2 = null;
           {
             var note = new Note { BoardId = cur2.BoardId, MeetingId = id, Kind = outcome2.Kind, Title = outcome2.Title, Body = noteBody2, Scope = "meeting", Provisional = true, EvidenceJson = EvidenceRef.ToJsonList(autoEvidence), Revision = 1, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
@@ -1148,22 +1446,25 @@ public static class SecretaryEndpoints
             var hh = new NoteHistory { BoardId = cur2.BoardId, MeetingId = id, NoteId = note.Id, RootId = note.RootId, Revision = 1, Title = note.Title, Body = note.Body, EvidenceJson = note.EvidenceJson, Action = "created", CreatedAt = DateTime.UtcNow };
             s.NoteHistories[hh.Id] = hh;
             fresh2.Status = "completed"; fresh2.NoteId = note.Id; fresh2.CompletedAt = DateTime.UtcNow; fresh2.UpdatedAt = DateTime.UtcNow;
-            fresh2.DeliveredRefsJson = EvidenceRef.ToJsonList(autoEvidence); fresh2.DeliveredPromptHash = Hashing.HashOf(prompt2);
+            fresh2.DeliveredRefsJson = EvidenceRef.ToJsonList(autoEvidence); fresh2.DeliveredPromptHash = myReq2.DeliveredPromptHash;
             s.SecretaryRequests[fresh2.Id] = fresh2;
             s.Notes.Flush(); s.NoteHistories.Flush(); s.SecretaryRequests.Flush();
             created2 = note;
           }
-          return Results.Ok(new { requestId = fresh2.Id, clientNonce = fresh2.ClientNonce, status = fresh2.Status, note = created2 });
+          List<string> __omPub2 = new();
+          try { __omPub2 = System.Text.Json.JsonSerializer.Deserialize<List<string>>(fresh2.OmittedJson ?? "[]") ?? new(); } catch { }
+          return Results.Ok(new { requestId = fresh2.Id, clientNonce = fresh2.ClientNonce, status = fresh2.Status, note = created2, omitted = __omPub2 });
         });
         }
-        catch (Exception pubEx2) when (pubEx2 is TimeoutException || pubEx2 is System.IO.IOException || pubEx2 is TaskCanceledException)
+        catch (Exception pubEx2) when (IsTransportBreak(pubEx2))
         {
           SecretaryTransitions.ReconcileAfterUncertainCommit(s, myReq2.Id, pubNoteId2, pubNoteId2);
           return Results.Json(new { error = "Storage outcome uncertain during publication; reconciled. Retry with the same nonce." }, statusCode: 502);
         }
-        catch (Exception pubEx2)
+        catch (Exception pubEx2) when (IsStorageFault(pubEx2))
         {
-          try { SecretaryTransitions.MarkTerminal(s, myReq2.Id, myAnsAttempt, true, "failed", "Storage fault during publication: " + pubEx2.GetType().Name + ". Safe to retry the continuation."); } catch { }
+          try { SecretaryTransitions.MarkTerminal(s, myReq2.Id, myAnsAttempt, true, "failed", "Storage fault during publication: " + pubEx2.GetType().Name + ". Safe to retry the continuation."); }
+          catch { try { UncertainTerminal[myReq2.Id] = myAnsAttempt; } catch { } return Results.Json(new { error = "Storage fault during publication and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying." }, statusCode: 503); }
           return Results.Json(new { error = "Storage fault during publication; safe to retry the continuation." }, statusCode: 502);
         }
         return pubResult2;
@@ -1218,7 +1519,7 @@ public static class SecretaryEndpoints
       if (string.IsNullOrWhiteSpace(nbody)) return Results.BadRequest("body is required.");
       Note? created = null;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        return Atomic.Run<IResult>(s, () =>
+        try { return Atomic.Run<IResult>(s, () =>
         {
           if (!s.Notes.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
           if (!PeopleOps.Can(s, req, fresh.BoardId, fresh.MeetingId, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
@@ -1238,7 +1539,8 @@ public static class SecretaryEndpoints
             created = next;
           }
           return Results.Ok(created);
-        });
+        }); } catch (Exception editEx) when (SecretaryEndpoints.IsStorageFault(editEx))
+        { return Results.Json(new { error = "Storage fault during note edit; safe to retry." }, statusCode: 502); }
       } }
     });
     app.MapPost("/api/notes/{id:guid}/reverse", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -1251,10 +1553,11 @@ public static class SecretaryEndpoints
       if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("expectedRevision", out var ev) && ev.ValueKind == JsonValueKind.Number) ev.TryGetInt32(out want);
       if (want != cur.Revision) return Results.Json(new { error = "Stale revision; refresh history and retry.", currentRevision = cur.Revision }, statusCode: 409);
       lock (s.SetupLock) { lock (s.MessageLock) {
-        return Atomic.Run<IResult>(s, () =>
+        try { return Atomic.Run<IResult>(s, () =>
         {
           if (!s.Notes.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
           if (!PeopleOps.Can(s, req, fresh.BoardId, fresh.MeetingId, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+          if (!SecretaryContext.IsBusinessNote(fresh)) return Results.Json(new { error = "Only provisional business working notes may be reversed." }, statusCode: 422);
           if (fresh.Revision != want || fresh.NoteStatus != "current") return Results.Json(new { error = "Stale revision.", currentRevision = fresh.Revision }, statusCode: 409);
           {
             fresh.NoteStatus = "reversed";
@@ -1264,7 +1567,8 @@ public static class SecretaryEndpoints
             s.Notes.Flush(); s.NoteHistories.Flush();
           }
           return Results.Ok(fresh);
-        });
+        }); } catch (Exception revEx) when (SecretaryEndpoints.IsStorageFault(revEx))
+        { return Results.Json(new { error = "Storage fault during note reversal; safe to retry." }, statusCode: 502); }
       } }
     });
     app.MapGet("/api/notes/{id:guid}/history", (InMemoryStore s, HttpRequest req, Guid id) =>

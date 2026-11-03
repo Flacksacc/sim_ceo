@@ -31,9 +31,11 @@ const promptLog = [];
 const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
 function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
 function gateWait(text) { const w = sleepMsOf(text); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
-function logPrompt(path, text) {
+function logPrompt(path, text, messages) {
   try {
-    promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length, prompt: (text || "").slice(0, 40000) });
+    // Exact canonical ORDERED role/content message ARRAY as received from the ACTUAL sender (preserves roles/boundaries, never flattened).
+    const msgs = Array.isArray(messages) ? messages.map((m) => ({ role: m.role, content: m.content })) : null;
+    promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length, prompt: (text || "").slice(0, 40000), messages: msgs });
     if (promptLog.length > 500) promptLog.splice(0, promptLog.length - 500);
   } catch { }
 }
@@ -71,6 +73,8 @@ function chatContent(prompt) {
     if (rawSeg.includes("SECRETARY-NONSTRING-Q")) return { content: "{\"kind\":\"note\",\"title\":\"t\",\"body\":\"b\",\"question\":42}" };
     if (rawSeg.includes("SECRETARY-DUP-BODY")) return { content: "{\"kind\":\"question\",\"question\":\"q?\",\"question\":\"q2?\"}" };
     if (rawSeg.includes("SECRETARY-NONSTRING-KIND")) return { content: "{\"kind\":42,\"title\":\"t\",\"body\":\"b\"}" };
+    if (rawSeg.includes("SECRETARY-TRUNCATED")) return { content: "{\"kind\":\"note\",\"title\":\"truncated" };
+    if (rawSeg.includes("SECRETARY-DEEP")) return { content: "[".repeat(400) };
     if (rawSeg.includes("SECRETARY-SECOND-QUESTION")) return { content: JSON.stringify({ kind: "question", question: "QA second clarification?" }) };
     if (prompt.includes("CLARIFIED:") || prompt.includes("OWNER ANSWER")) {
       if (rawSeg.includes("SECRETARY-SECOND-QUESTION") || prompt.includes("SECRETARY-SECOND-QUESTION")) return { content: JSON.stringify({ kind: "question", question: "QA second clarification?" }) };
@@ -141,7 +145,7 @@ const server = http.createServer(async (req, res) => {
     counts.chat++;
     const msgs = Array.isArray(body?.messages) ? body.messages : [];
     const prompt = msgs.map((m) => m.content).join("\n") || "";
-    logPrompt("chat", prompt);
+    logPrompt("chat", prompt, msgs);
     const wait = gateWait(prompt);
     if (wait) await sleep(wait);
     const out = chatContent(prompt);

@@ -150,6 +150,10 @@ public sealed record EvidenceRef(
       null, null, n.Title, ex);
   }
 
+  public static EvidenceRef ForNoteFull(Note n) =>
+    new(n.Kind == "direction" ? "direction" : "note", n.Id.ToString(),
+      null, null, n.Title, n.Body ?? "");
+
   public static EvidenceRef ForDossier(RosterEntry e) =>
     new("dossier", e.Id.ToString(), e.Version, null, e.Name, null);
 }

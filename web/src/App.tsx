@@ -238,6 +238,8 @@ type RecordReviewMsg = { sequence: number; sender: string; advisorName?: string 
 type RecordEvidence = { itemId: string; kind: string; ref: string; version?: number | null; title: string; excerpt: string; currentEligible: boolean; historical: boolean; missing: boolean };
 type LineageEffect = { id: string; text: string; status: string; fromVersion: number; toVersion: number };
 type RecordReview = {
+  stateValid: boolean;
+  stateError: string;
   draft: RecordDraft;
   approved: string[];
   discarded: string[];
@@ -378,6 +380,19 @@ async function j<T>(r: Response): Promise<T> {
   return r.json() as Promise<T>;
 }
 let actAs = "";
+function canonicalUser(): string {
+  try {
+    const tok = currentToken();
+    if (tok) return currentUser() || "owner";
+  } catch { /* fall through to demo label */ }
+  try { return (actAs || "").trim() || "owner"; } catch { return "owner"; }
+}
+function tokenPrefixOf(tok: string): string {
+  try { return (tok || "").slice(0, 12); } catch { return ""; }
+}
+function canonicalTokenPrefix(): string {
+  try { return (currentToken() || "").slice(0, 12); } catch { return ""; }
+}
 function epochNow(): number {
   try { return (window as unknown as { __simceoEpoch?: number }).__simceoEpoch ?? 0; } catch { return 0; }
 }
@@ -422,7 +437,9 @@ async function fetchAuth<T>(u: string, init: RequestInit, wantJson = true): Prom
   if (r.status === 401) {
     const latest = currentToken();
     if (latest && latest !== myToken) { const e = Object.assign(new Error("stale 401 discarded (signed in as another identity)"), { stale: true }); throw e; }
-    if (latest === myToken) {
+    // Anonymous (never-signed-in) 401s never raise the expired-session
+    // banner; only a previously held session token expires the identity.
+    if (latest === myToken && myToken) {
       // Current-session failure: let the app expire this identity (stop hub, purge
       // private state, gate rendering, navigate safe). Never auto-clear the token here.
       try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
@@ -494,11 +511,10 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
   const url = URL.createObjectURL(b);
   // Track for late revocation even if unmounted.
   try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = [...(((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs) ?? []), url]; setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 60000); } catch {}
-  return { url, epoch: myEpoch, token: myToken, user: myUser };
+  return { url, epoch: myEpoch, token: myToken, user: myToken ? (myUser || "owner") : canonicalUser() };
 };
 const blobStale = (b: { epoch: number; token: string; user: string }) =>
-  epochNow() !== b.epoch || currentToken() !== b.token
-  || (currentToken() ? currentUser() : (actAs || "owner")) !== (b.token ? b.user : (actAs || "owner"));
+  epochNow() !== b.epoch || currentToken() !== b.token || canonicalUser() !== b.user;
 const authedDownload = async (u: string, filename: string): Promise<void> => {
   const b = await authedBlobUrl(u);
   // Re-verify the originating identity AT click time: an account switch
@@ -633,6 +649,9 @@ function parseHash(): NavRoute {
 }
 function isNotFound(e: unknown): boolean {
   return e instanceof Error && e.message.startsWith("404");
+}
+function isDenied(e: unknown): boolean {
+  return e instanceof Error && e.message.startsWith("403");
 }
 function buildHash(r: {
   tab: Tab;
@@ -1218,6 +1237,10 @@ export default function App() {
   // is verified: a stored token with no /auth/me answer yet gates everything.
   const sessPending = (() => { try { return !!currentToken() && sessQ.data === undefined; } catch { return false; } })();
   const sessGate = sessExpired || sessPending;
+  // Fail-closed private rendering: while the session is expired or still
+  // unverified, no private names, missions, or cached content render — only
+  // the re-authentication surface and public invite lookup stay visible.
+  const privateHidden = sessGate;
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
@@ -1239,6 +1262,13 @@ export default function App() {
       qc.invalidateQueries({ queryKey: ["my-memberships"] });
       qc.invalidateQueries({ queryKey: ["sess"] });
     } catch {}
+    // Secretary continuations join the central transition: bump the epoch so
+    // in-flight submissions resolve stale, and drop the pending marker whose
+    // origin identity no longer holds. Per-user drafts in localStorage are
+    // preserved for re-authentication under the same identity key.
+    try { secEpoch.current++; } catch {}
+    try { secPendingRef.current = null; } catch {}
+    try { secHydSeq.current++; } catch {}
     try { resetMeetingOwnedState(); } catch {}
     try { resetBoardOwnedState(); } catch {}
     try { setMeetingId(""); } catch {}
@@ -1281,6 +1311,11 @@ export default function App() {
   // gate downstream queries without clearing.
   const boardMissing =
     !!boardId && boardDetail.isError && isNotFound(boardDetail.error);
+  // A 403 on the singular lookup proves the current identity may not read
+  // this board. The route is kept (unlike a 404) so the user can recover to
+  // an allowed board; detail rendering goes fail-closed instead.
+  const boardDenied =
+    !!boardId && !!boardDetail.error && isDenied(boardDetail.error);
   const boardValid =
     boardId === "" ||
     (boardDetail.isSuccess && (boardDetail.data as Board | undefined)?.id === boardId);
@@ -1305,6 +1340,16 @@ export default function App() {
   // board writers always qualify; otherwise the selected meeting grant must
   // confer contribute or manage. Discuss/read-only never mutates.
   const canActMeeting = canWriteBoard || capMeeting === "contribute" || capMeeting === "manage";
+  // Discuss-only meeting guests may use the designated meeting composer
+  // (discuss/send/rebid) plus read-only effective settings. Every other
+  // mutation stays behind canActMeeting (contribute+) or manage gates.
+  const canDiscussMeeting = canActMeeting || capMeeting === "discuss";
+  // Effective usage scope: installation billing is privileged (installation
+  // admin only). Board collaborators transparently fall back to board scope;
+  // without a board the installation query stays disabled (never 403 noise).
+
+  const capsAdmin = (caps.data as { admin?: boolean } | undefined)?.admin === true;
+  const effUsageScope = capsAdmin ? usageScope : (usageScope === "installation" ? "board" : usageScope);
   const isGuest = (caps.data as { guest?: boolean } | undefined)?.guest === true;
   const presets = useQuery({
     queryKey: ["presets"],
@@ -1322,12 +1367,12 @@ export default function App() {
       get<MeetingFull[]>(
         `/api/boards/${boardId}/meetings?${new URLSearchParams({ ...(mq ? { q: mq } : {}), ...(mstate ? { state: mstate } : {}) })}`,
       ),
-    enabled: !!boardId && boardOk && !sessGate,
+    enabled: !!boardId && boardOk && !sessGate && caps.isSuccess && !isGuest,
   });
   const allMeetings = useQuery({
     queryKey: ["meetings", boardId, "all"],
     queryFn: () => get<MeetingFull[]>(`/api/boards/${boardId}/meetings`),
-    enabled: !!boardId && boardOk && !sessGate && !sessGate,
+    enabled: !!boardId && boardOk && !sessGate && caps.isSuccess && !isGuest,
   });
   // Selected-meeting authority is the scoped singular lookup, which also
   // verifies the parent board. Absence from capped lists never clears.
@@ -1353,6 +1398,16 @@ export default function App() {
       meetingDetail.isError &&
       isNotFound(meetingDetail.error)) ||
     (!!meetingId && !!meetingParentMismatch);
+  // A 403 on the scoped singular lookup proves the current identity may not
+  // read this meeting. Keep the board route and recover to an allowed
+  // meeting instead of rendering a broken empty view.
+  const meetingDenied =
+    !!meetingId &&
+    !!boardId &&
+    boardValid &&
+    !meetingParentMismatch &&
+    !!meetingDetail.error &&
+    isDenied(meetingDetail.error);
   const meetingValid =
     meetingId === "" ||
     (meetingDetail.isSuccess &&
@@ -1788,38 +1843,38 @@ export default function App() {
   const jobs = useQuery({
     queryKey: ["jobs"],
     queryFn: () => get<Job[]>("/api/activity/jobs"),
-    enabled: tab === "activity" && !sessGate,
+    enabled: tab === "activity" && capsAdmin && !sessGate,
   });
   const usage = useQuery({
-    queryKey: ["usage", uday, ufrom, uto, boardId, usageScope, usageMeeting, usagePurpose],
+    queryKey: ["usage", uday, ufrom, uto, boardId, effUsageScope, usageMeeting, usagePurpose],
     queryFn: () => {
       const params: Record<string, string> = { summary: "true" };
-      if (usageScope !== "installation" && boardId) params.boardId = boardId;
-      if (usageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
+      if (effUsageScope !== "installation" && boardId) params.boardId = boardId;
+      if (effUsageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
       if (uday) params.day = uday;
       if (ufrom) params.from = ufrom;
       if (uto) params.to = uto;
       if (usagePurpose) params.purpose = usagePurpose;
       return get<UsageSummaryEnvelope>(`/api/usage?${new URLSearchParams(params)}`);
     },
-    enabled: tab === "activity" && (usageScope === "installation" || (!!boardId && boardOk)) && (usageScope !== "meeting" || !!usageMeeting) && !sessGate,
+    enabled: tab === "activity" && (effUsageScope === "installation" ? capsAdmin : (!!boardId && boardOk)) && (effUsageScope !== "meeting" || !!usageMeeting) && !sessGate,
   });
   const lead = useQuery({
     queryKey: ["lead", boardId],
     queryFn: () => get<Lead>(`/api/boards/${boardId}/lead`),
     enabled:
-      !!boardId && (tab === "profile" || tab === "meet") && !sessGate,
+      !!boardId && boardOk && (tab === "profile" || tab === "meet") && !sessGate,
     retry: false,
   });
   const setup = useQuery({
     queryKey: ["setup", boardId],
     queryFn: () => get<Setup>(`/api/boards/${boardId}/setup`),
-    enabled: !!boardId && boardOk && !sessGate && tab === "boards" && !sessGate,
+    enabled: !!boardId && boardOk && boardDetail.isSuccess && !sessGate && tab === "boards",
   });
   const guestSettings = useQuery({
     queryKey: ["guest-settings", boardId],
     queryFn: () => get<{ id: string; name: string; mission: string; stage: string; discussionPolicy: string; dataUse: string; lead: { name: string; roleLabel: string } | null; meetingIds: string[] }>(`/api/boards/${boardId}/guest-settings`),
-    enabled: !!boardId && boardOk && !sessGate && (tab === "boards" || tab === "meet") && !sessGate,
+    enabled: !!boardId && boardOk && !sessGate && (tab === "boards" || tab === "meet" || tab === "settings"),
     retry: false,
   });
   const [leadForm, setLeadForm] = useState({
@@ -2603,6 +2658,9 @@ const tabCount = (k: Tab): number | null => {
   const briefText = curMeeting?.brief ?? "";
   useEffect(() => {
     if (tab !== "meet" || !meetingId || !boardId || !briefText.trim()) return;
+    // Board-scoped recall requires board read access: guests without a board
+    // grant must not issue a request the server will deny.
+    if (!caps.isSuccess || isGuest) return;
     let dead = false;
     get<Excerpt[]>(
       `/api/boards/${boardId}/recall?q=${encodeURIComponent(briefText)}&take=5`,
@@ -2736,7 +2794,7 @@ const tabCount = (k: Tab): number | null => {
   const directions = useQuery({
     queryKey: ["directions", boardId],
     queryFn: () => get<Note[]>(`/api/boards/${boardId}/directions`),
-    enabled: !!boardId && boardOk && !sessGate && tab === "meet" && !sessGate,
+    enabled: !!boardId && boardOk && !sessGate && tab === "meet" && caps.isSuccess && !isGuest,
   });
   const [dtext, setDtext] = useState("");
   const [dscope, setDscope] = useState("meeting");
@@ -2872,6 +2930,10 @@ const tabCount = (k: Tab): number | null => {
     .slice()
     .sort((a, b) => b.version - a.version)[0];
   const [recId, setRecId] = useState(route0.rec);
+  // Record-visit generation: incremented on every record selection so a
+  // same-record A-B-A return cannot validate a stale first-visit callback.
+  const recVisitRef = useRef(0);
+  useEffect(() => { recVisitRef.current++; }, [recId]);
   const liveSelRef = useRef({ boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") });
   liveSelRef.current = { boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") };
   // Immutable origin identity for async callbacks: the effective session
@@ -2881,11 +2943,10 @@ const tabCount = (k: Tab): number | null => {
   const originIdentity = () => ({
     epoch: epochNow(),
     token: currentToken(),
-    user: currentToken() ? currentUser() : (actAs || "owner"),
+    user: canonicalUser(),
   });
   const originStale = (o: { epoch: number; token: string; user: string }) =>
-    epochNow() !== o.epoch || currentToken() !== o.token
-    || (currentToken() ? currentUser() : (actAs || "owner")) !== o.user;
+    epochNow() !== o.epoch || currentToken() !== o.token || canonicalUser() !== o.user;
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -2949,7 +3010,10 @@ const tabCount = (k: Tab): number | null => {
   const [revText, setRevText] = useState("");
   useEffect(() => {
     if (recDetail.data) {
-      setRevText(recDetail.data.itemsJson);
+      // Draft item text is redacted server-side for read-only roles: coerce
+      // to empty string so the editor stays controlled and the list below
+      // renders the restricted notice instead of crashing on undefined.
+      setRevText(recDetail.data.itemsJson ?? "");
       try {
         const ids = (JSON.parse(recDetail.data.itemsJson) as { id?: string }[])
           .map((i) => i.id ?? "")
@@ -2967,11 +3031,20 @@ const tabCount = (k: Tab): number | null => {
     retry: false,
   });
   const [reviewError, setReviewError] = useState<{ key: string; message: string } | null>(null);
-  const errKey = `${boardId}:${meetingId}:${recId}:${actAs || "owner"}`;
+  const errKey = `${boardId}:${meetingId}:${recId}:${canonicalUser()}:${canonicalTokenPrefix()}`;
   useEffect(() => {
     setReviewError(null);
   }, [boardId, meetingId, recId]);
   const showReviewError = reviewError !== null && reviewError.key === errKey;
+  try { if (reviewError !== null) console.error("DBG-REV-KEY " + reviewError.key + " ||| " + errKey); } catch {}
+  // Authoritative persisted-state validity: the SERVER-computed stateValid
+  // flag (StrictStateCheck) is required === true. A missing flag, a false
+  // flag, a failed/empty review, or a non-manage grant hides EVERY approval
+  // control, including the selection checkboxes. An empty draft (no pending
+  // items) likewise shows no approval controls.
+  const reviewPendingCount = (recReview.data?.pending ?? []).length;
+  const stateValid = recOk && !!recReview.data && !recReview.isError && !showReviewError && reviewPendingCount > 0 && recReview.data.stateValid === true;
+  const canApproveRecord = canManageMeeting && stateValid === true;
   const [itemTexts, setItemTexts] = useState<Record<string, string>>({});
   const editKey = (draftId: string, itemId: string) => `${draftId}:${itemId}`;
   useEffect(() => {
@@ -2979,11 +3052,13 @@ const tabCount = (k: Tab): number | null => {
   }, [boardId, meetingId, recId]);
   const refreshReview = async () => {
     if (!recOk) return;
-    const origin = { boardId, meetingId, recId, user: actAs || "owner" };
-    const stillLive = () => {
-      const live = liveSelRef.current;
-      return live.boardId === origin.boardId && live.meetingId === origin.meetingId && live.recId === origin.recId && live.user === origin.user;
-    };
+    // Full origin + record-visit capture BEFORE the initial GET: a held GET
+    // plus same-user new token, an account switch, or a record A-B-A return
+    // must not POST or mutate the new context. Every state/error write below
+    // revalidates; the POST uses the staged GET payload guards, never stale
+    // captured detail.
+    const origin = captureRecOrigin();
+    const stillLive = () => recOriginLive(origin);
     try {
       setReviewError(null);
       const fresh = await get<RecordReview>(`/api/records/${origin.recId}/review`);
@@ -3015,6 +3090,27 @@ const tabCount = (k: Tab): number | null => {
     reviewToken: d.reviewToken,
     watermark: d.watermark,
   });
+  // Record export travels the identity-aware transport (never a plain anchor):
+  // the originating identity is pinned before fetch and rechecked at click,
+  // and late completion after an account switch is discarded silently.
+  const exportRecord = (format: string) => {
+    if (!recOk || !recDetail.data || !canActMeeting) return;
+    const d = recDetail.data;
+    const oB = boardId; const oM = meetingId; const oR = recId;
+    const o = originIdentity();
+    authedDownload(`/api/records/${d.id}/export?format=${format}`, `record-${d.id}-${format}.json`)
+      .then(() => {
+        const live = liveSelRef.current;
+        if (live.boardId !== oB || live.meetingId !== oM || live.recId !== oR || originStale(o) || live.user !== o.user) return;
+        notify(`Exported ${format} record v${d.version}.`);
+      })
+      .catch((e) => {
+        if ((e as Error & { stale?: boolean })?.stale) return;
+        const live = liveSelRef.current;
+        if (live.boardId !== oB || live.meetingId !== oM || live.recId !== oR || originStale(o) || live.user !== o.user) return;
+        notify(String(e));
+      });
+  };
   const applyDraft = (r: unknown) => {
     const upd = r as unknown as RecordDraft | undefined;
     if (upd && (upd as RecordDraft).id) {
@@ -3035,15 +3131,26 @@ const tabCount = (k: Tab): number | null => {
       void recReview.refetch();
     }
   };
-  const noteReviewError = (e: unknown, origin: { boardId: string; meetingId: string; recId: string; user: string }) => {
+  // Full record-origin capture: selection + record-visit generation + the
+  // canonical authority (epoch, token, user). Late callbacks must revalidate
+  // ALL of it; a same-user new token or a record A-B-A return invalidates.
+  const captureRecOrigin = () => ({ boardId, meetingId, recId, visit: recVisitRef.current, ...originIdentity() });
+  const recOriginLive = (o: { boardId: string; meetingId: string; recId: string; visit: number; epoch: number; token: string; user: string }) => {
+    const live = liveSelRef.current;
+    if (live.boardId !== o.boardId || live.meetingId !== o.meetingId || live.recId !== o.recId || live.user !== o.user) return false;
+    if (o.visit !== recVisitRef.current) return false;
+    return !originStale({ epoch: o.epoch, token: o.token, user: o.user });
+  };
+  const noteReviewError = (e: unknown, origin: { boardId: string; meetingId: string; recId: string; user: string; token?: string }) => {
+    try { console.error("DBG-NOTE-ERR " + origin.boardId + ":" + origin.meetingId + ":" + origin.recId + ":" + origin.user + ":" + (origin.token !== undefined ? tokenPrefixOf(origin.token) : canonicalTokenPrefix())); } catch {}
     const msg = String(e);
     const message = msg.includes("409")
       ? `${msg} — the review changed or the meeting moved on. Use Refresh review below, then choose again deliberately. No automatic retry was made.`
       : msg;
-    setReviewError({ key: `${origin.boardId}:${origin.meetingId}:${origin.recId}:${origin.user}`, message });
+    setReviewError({ key: `${origin.boardId}:${origin.meetingId}:${origin.recId}:${origin.user}:${origin.token !== undefined ? tokenPrefixOf(origin.token) : canonicalTokenPrefix()}`, message });
   };
   const itemApprove = (itemId: string) => {
-    if (!recOk) return;
+    if (!recOk || !canManageMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3062,11 +3169,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const itemRevise = (itemId: string) => {
-    if (!recOk) return;
+    if (!recOk || !canManageMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3095,11 +3202,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const itemDiscard = (itemId: string) => {
-    if (!recOk) return;
+    if (!recOk || !canManageMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3117,11 +3224,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const approveAllFresh = () => {
-    if (!recOk) return;
+    if (!recOk || !canManageMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3139,11 +3246,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const approveRec = (all: boolean) => {
-    if (!recOk) return;
+    if (!recOk || !canManageMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3184,11 +3291,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const reviseRec = (amend: boolean) => {
-    if (!recOk) return;
+    if (!recOk || !canActMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3224,11 +3331,11 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };
   const discardRec = () => {
-    if (!recOk || !recDetail.data) return Promise.resolve();
+    if (!recOk || !canActMeeting || !recDetail.data) return Promise.resolve();
     const d = recReview.data?.draft ?? recDetail.data;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
     const originBoardId = boardId;
@@ -3244,13 +3351,13 @@ const tabCount = (k: Tab): number | null => {
       .catch((e) => {
         const live = liveSelRef.current;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user, token: origin.token });
       });
   };  const [draftItems, setDraftItems] = useState(
     '[{"id":"1","text":"","detail":"","status":"proposed","scope":"meeting"}]',
   );
   const prepareDraft = () => {
-    if (!boardId || !meetingId || !boardOk || !meetingOk) return;
+    if (!boardId || !meetingId || !boardOk || !meetingOk || !canActMeeting) return;
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
@@ -3280,18 +3387,18 @@ const tabCount = (k: Tab): number | null => {
         if (originStale(origin)) return;
         if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== origin.user) return;
         const msg = String(e);
-        setReviewError({ key: `${originBoardId}:${originMeetingId}:${originRecId}:${origin.user}`, message: msg });
+        setReviewError({ key: `${originBoardId}:${originMeetingId}:${originRecId}:${origin.user}:${tokenPrefixOf(origin.token)}`, message: msg });
       });
   };
   const invites = useQuery({
     queryKey: ["invites", boardId],
     queryFn: () => get<Invite[]>(`/api/boards/${boardId}/invites`),
-    enabled: !!boardId && boardOk && !sessGate && tab === "people" && !sessGate,
+    enabled: !!boardId && boardOk && canManageBoard && !sessGate && tab === "people",
   });
   const grants = useQuery({
     queryKey: ["grants", boardId],
     queryFn: () => get<Grant[]>(`/api/boards/${boardId}/grants`),
-    enabled: !!boardId && boardOk && !sessGate && tab === "people" && !sessGate,
+    enabled: !!boardId && boardOk && canManageBoard && !sessGate && tab === "people",
   });
   const [iemail, setIemail] = useState("");
   const [irole, setIrole] = useState("contributor");
@@ -3329,21 +3436,21 @@ const tabCount = (k: Tab): number | null => {
       get<{ action: string; detail: string; createdAt: string }[]>(
         "/api/activity/audit",
       ),
-    enabled: tab === "activity" && !sessGate,
+    enabled: tab === "activity" && capsAdmin && !sessGate,
   });
   const modelCalls = useQuery({
-    queryKey: ["modelcalls", boardId, usageScope, usageMeeting, usagePurpose, uday, ufrom, uto],
+    queryKey: ["modelcalls", boardId, effUsageScope, usageMeeting, usagePurpose, uday, ufrom, uto],
     queryFn: () => {
       const params: Record<string, string> = { summary: "true", limit: "200" };
-      if (usageScope !== "installation" && boardId) params.boardId = boardId;
-      if (usageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
+      if (effUsageScope !== "installation" && boardId) params.boardId = boardId;
+      if (effUsageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
       if (usagePurpose) params.purpose = usagePurpose;
       if (uday) params.day = uday;
       if (ufrom) params.from = ufrom;
       if (uto) params.to = uto;
       return get<ModelCallsEnvelope>(`/api/models/calls?${new URLSearchParams(params)}`);
     },
-    enabled: tab === "activity" && (usageScope === "installation" || (!!boardId && boardOk)) && (usageScope !== "meeting" || !!usageMeeting) && !sessGate,
+    enabled: tab === "activity" && (effUsageScope === "installation" ? capsAdmin : (!!boardId && boardOk)) && (effUsageScope !== "meeting" || !!usageMeeting) && !sessGate,
   });
   const retryJob = (j: Job) =>
     post<Job>(`/api/jobs/${j.id}/retry`, {})
@@ -3352,7 +3459,7 @@ const tabCount = (k: Tab): number | null => {
   const spending = useQuery({
     queryKey: ["spending"],
     queryFn: () => get<Spending>("/api/spending"),
-    enabled: tab === "activity" && !sessGate,
+    enabled: tab === "activity" && capsAdmin && !sessGate,
   });
   const [capInput, setCapInput] = useState("");
   const [capMode, setCapMode] = useState("warn");
@@ -3379,7 +3486,9 @@ const tabCount = (k: Tab): number | null => {
 const modelStatus = useQuery({
   queryKey: ["model-status"],
   queryFn: () => get<ModelStatus>("/api/model/status"),
-  enabled: !sessGate,
+  // Installation-admin only: verified via board-scope caps. Never probe for
+  // readers, guests, or anonymous identities.
+  enabled: !!boardId && boardOk && capsAdmin && !sessGate,
 });
 const [modelKey, setModelKey] = useState("");
 const [modelChat, setModelChat] = useState("");
@@ -3859,7 +3968,9 @@ const testModel = useMutation({
   const [secEditId, setSecEditId] = useState("");
   const [secEditBody, setSecEditBody] = useState("");
   const secHasPrefix = (v: string) => { const t = (v ?? "").replace(/^\s+/, ""); return /^secretary,/i.test(t.slice(0, 10)) || /^secretary:/i.test(t.slice(0, 10)); };
-  const secIdentity = () => { try { const a = (typeof actAsState !== "undefined" ? actAsState : "").trim(); if (a) return a; const m: any = (typeof me !== "undefined" && (me as any)?.data) ? (me as any).data : null; const u = (m && (m.user || m.email)) || "owner"; return String(u); } catch { return "owner"; } };
+  // Global canonical authority: Bearer session user precedes; otherwise the
+  // explicitly APPLIED demo label. Unapplied draft text is never identity.
+  const secIdentity = () => canonicalUser();
   type SecEnvelope = { identity: string; boardId: string; meetingId: string; requestId: string; nonce: string; input: string; evidence: any[]; phase: string; question: string; answer: string; epoch: number; submittedRev: number };
   const secEnvelopeKey = (u: string, b: string, m: string) => "sec-envelope:" + u + ":" + b + ":" + m;
   const secAnsEnvelopeKey = (u: string, b: string, m: string) => "sec-answer-envelope:" + u + ":" + b + ":" + m;
@@ -3869,15 +3980,23 @@ const testModel = useMutation({
   const secPendingKey = (u: string, b: string, m: string) => "sec-pending:" + u + ":" + b + ":" + m;
   const secEpoch = useRef(0);
   const secDraftVer = useRef(0);
-  useEffect(() => { secEpoch.current++; setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); setSecError(""); setSecHistory(null); setSecEditId(""); setSecEditBody(""); }, [boardId, meetingId, actAsState]);
+  // Hydration-generation token: starting (or completing) any new submission
+  // invalidates a pending late hydration for the same selection.
+  const secHydSeq = useRef(0);
+  // History-fetch ordering token: overlapping History loads resolve in order.
+  const secHistSeq = useRef(0);
+  // Editor-session token: every keystroke invalidates an older pending save.
+  const secEditTok = useRef(0);
+  useEffect(() => { secEpoch.current++; setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); setSecError(""); setSecHistory(null); setSecEditId(""); setSecEditBody(""); }, [boardId, meetingId, appliedActAs]);
   useEffect(() => {
     if (!meetingId || !boardId) return;
     const u = secIdentity();
     const oEp = secEpoch.current;
+    const oHyd = secHydSeq.current;
     get<any>(`/api/meetings/${meetingId}/secretary/requests`).then((rs: any) => {
       const live = liveSelRef.current;
       let liveUser = secIdentity();
-      if (live.boardId !== boardId || live.meetingId !== meetingId || liveUser !== u || oEp !== secEpoch.current) return;
+      if (live.boardId !== boardId || live.meetingId !== meetingId || liveUser !== u || oEp !== secEpoch.current || oHyd !== secHydSeq.current) return;
       const list = Array.isArray(rs) ? rs : [];
       const mine = list.filter((r: any) => (r.boardId ?? r.BoardId) === boardId && (r.meetingId ?? r.MeetingId) === meetingId);
       const byTime = mine.slice().sort((a: any, b: any) => String(b.createdAt ?? b.CreatedAt ?? "").localeCompare(String(a.createdAt ?? a.CreatedAt ?? "")));
@@ -3888,6 +4007,10 @@ const testModel = useMutation({
         const q = target.question || target.Question || "";
         const rid = target.id || target.Id || "";
         setSecQuestion(q); setSecRequestId(rid); setSecError("");
+        // Durable-only recovery: a persisted answer without a local editor
+        // value must still enable retry for the exact active request. Never
+        // clobber text the user already typed after hydration started.
+        try { setSecAnswer((prev) => prev || (target.answer || target.Answer || "")); } catch {}
         try {
           const env: SecEnvelope = { identity: u, boardId, meetingId, requestId: rid, nonce: target.clientNonce || target.ClientNonce || "", input: target.inputText || target.InputText || "", evidence: [], phase: "continuation", question: q, answer: target.answer || target.Answer || "", epoch: oEp, submittedRev: secDraftVer.current };
           localStorage.setItem(secEnvelopeKey(u, boardId, meetingId), JSON.stringify(env));
@@ -3908,7 +4031,7 @@ const testModel = useMutation({
         if (raw) { const pend = JSON.parse(raw); if (pend && pend.requestId) { setSecQuestion(pend.question || ""); setSecRequestId(pend.requestId || ""); } }
       } catch { }
     }).catch(() => {});
-  }, [boardId, meetingId, actAsState]);
+  }, [boardId, meetingId, appliedActAs]);
   const submitDraft = () => {
     if (!draft.trim()) return;
     if (secPendingRef.current || askSecretary.isPending || send.isPending) return;
@@ -3948,7 +4071,7 @@ const testModel = useMutation({
       try { localStorage.setItem(secSubmitKey(originUser, originBoardId, originMeetingId), JSON.stringify({ nonce, input: raw })); } catch { }
       return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: raw, clientNonce: nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce, submittedDraft: raw, submitVer }));
     },
-    onMutate: () => { secPendingRef.current = { kind: "secretary-initial" }; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current }; },
+    onMutate: () => { secPendingRef.current = { kind: "secretary-initial" }; secHydSeq.current++; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current }; },
     onSuccess: (pack: any) => {
       const r = (pack as any)?.r ?? pack;
       const originMeetingId = (pack as any)?.originMeetingId ?? meetingId;
@@ -3973,6 +4096,8 @@ const testModel = useMutation({
         try {
           const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: (r as any).requestId ?? "", nonce: (pack as any)?.nonce ?? "", input: submittedDraft, evidence: [], phase: "continuation", question: (r as any).question ?? "", answer: "", epoch: originEpoch, submittedRev: submittedVer };
           localStorage.setItem(secEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env));
+          const prevAns = readEnvelope(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId));
+          if (prevAns && prevAns.requestId && prevAns.requestId !== env.requestId) localStorage.removeItem(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId));
         } catch { }
       }
       else if (r && r.note) { setSecQuestion(""); setSecRequestId(""); setSecError(""); try { localStorage.removeItem(secSubmitKey(originUser, originBoardId, originMeetingId)); } catch { } try { localStorage.removeItem(secPendingKey(originUser, originBoardId, originMeetingId)); } catch { } try { localStorage.removeItem(secEnvelopeKey(originUser, originBoardId, originMeetingId)); } catch { } try { localStorage.removeItem(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId)); } catch { } notify("Secretary note saved as provisional."); }
@@ -3996,7 +4121,7 @@ const testModel = useMutation({
       const originBoardId = env.boardId; const originMeetingId = env.meetingId; const originUser = env.identity; const originEpoch = secEpoch.current;
       return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: env.input, clientNonce: env.nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce: env.nonce, submittedDraft: env.input, submitVer: env.submittedRev, retried: true }));
     },
-    onMutate: () => { secPendingRef.current = { kind: "secretary-retry" }; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current }; },
+    onMutate: () => { secPendingRef.current = { kind: "secretary-retry" }; secHydSeq.current++; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current }; },
     onSuccess: (pack: any) => {
       const r = (pack as any)?.r ?? pack;
       const originBoardId = (pack as any)?.originBoardId ?? boardId;
@@ -4045,7 +4170,7 @@ const testModel = useMutation({
       } catch { }
       return post<any>(`/api/meetings/${originMeetingId}/secretary/answer`, { requestId: originReq, answer: submittedAnswer }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, originReq, submittedAnswer }));
     },
-    onMutate: () => { secPendingRef.current = { kind: "secretary-answer" }; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current, originReq: secRequestId }; },
+    onMutate: () => { secPendingRef.current = { kind: "secretary-answer" }; secHydSeq.current++; return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current, originReq: secRequestId }; },
     onSuccess: (pack: any) => {
       const r = (pack as any)?.r ?? pack;
       const originBoardId = (pack as any)?.originBoardId ?? boardId;
@@ -4071,12 +4196,16 @@ const testModel = useMutation({
   });
   const editNote = useMutation({
     mutationFn: (v: { id: string; revision: number; body: string }) => post<Note>(`/api/notes/${v.id}/edit`, { expectedRevision: v.revision, body: v.body }),
-    onMutate: (v: { id: string; revision: number; body: string }) => { secPendingRef.current = { kind: "note-edit" }; return { oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, id: v.id, rev: v.revision }; },
+    onMutate: (v: { id: string; revision: number; body: string }) => { secPendingRef.current = { kind: "note-edit" }; const tok = secEditTok.current; return { oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, id: v.id, rev: v.revision, tok }; },
     onSuccess: (_r, _v, ctx) => {
       const o = ctx as any;
       const live = liveSelRef.current;
       let liveUser = secIdentity();
       if (o && (live.boardId !== o.oB || live.meetingId !== o.oM || liveUser !== o.oU || o.oEp !== secEpoch.current || secEditId !== o.id)) { refresh("notes"); return; }
+      // Editor-session ownership: a newer editing session (reopened editor or
+      // continued typing) must survive this older save. Clear only the exact
+      // session that submitted.
+      if (o && typeof o.tok === "number" && o.tok !== secEditTok.current) { refresh("notes"); return; }
       setSecEditId(""); setSecEditBody(""); setSecHistory(null); refresh("notes", "notes-history"); notify("Note revision saved.");
     },
     onError: (e, _v, ctx) => {
@@ -4109,9 +4238,10 @@ const testModel = useMutation({
   });
   const loadHistory = (id: string) => {
     const oB = boardId; const oM = meetingId; const oEp = secEpoch.current;
+    const oSeq = ++secHistSeq.current;
     get<any>(`/api/notes/${id}/history`).then((h: any) => {
       const live = liveSelRef.current;
-      if (live.boardId !== oB || live.meetingId !== oM || oEp !== secEpoch.current) return;
+      if (live.boardId !== oB || live.meetingId !== oM || oEp !== secEpoch.current || oSeq !== secHistSeq.current) return;
       setSecHistory(h);
     }).catch((e) => alert(String(e)));
   };
@@ -4244,6 +4374,9 @@ const testModel = useMutation({
       setRecId("");
     }
   }, [boardMissing]);
+  // A 403 on the singular board lookup proves the current identity may not
+  // read this board. Each board-scoped tab renders an inline denied card with
+  // recovery; the route keeps the board id and only a 404 clears it.
   useEffect(() => {
     if (meetingMissing) {
       navReplace.current = true;
@@ -4588,7 +4721,7 @@ const testModel = useMutation({
           {boardId ? (
             <span className="boardname">
               {" "}
-              Open board: {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? boardId.slice(0, 8)}{" "}
+              {boardDenied ? "Not authorized for this board." : (<>Open board: {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? boardId.slice(0, 8)}</>)}{" "}
               <button
                 type="button"
                 className="btn ghost"
@@ -4611,6 +4744,13 @@ const testModel = useMutation({
         <main className="main" id="main" tabIndex={-1}>
           {" "}
           {sessExpired && (<p role="alert">Session expired. Sign in again to continue; private data is hidden until re-authentication.</p>)}
+          {privateHidden ? (
+            <section aria-label="Session verification">
+              <AuthPanel />
+              <InviteClaim />
+              <p role="status">Session verification pending — private content is hidden until the current session is verified. Unsent per-account drafts are preserved for re-authentication.</p>
+            </section>
+          ) : (<>
           {tab === "boards" && (
             <section aria-label="Boards">
               <AuthPanel />
@@ -4620,6 +4760,27 @@ const testModel = useMutation({
               {boardId && (
                 <div className="card" aria-label="Current board">
                   {" "}
+                  {boardDenied ? (
+                    <>
+                      {" "}
+                      <h3>Not authorized for this board.</h3>{" "}
+                      <p role="status">The current identity may not read this board. Pick an allowed board below, or close this one.</p>{" "}
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        onClick={() => {
+                          setBoardId("");
+                          setMeetingId("");
+                          setMeetPicks([]);
+                        }}
+                      >
+                        {" "}
+                        Close board{" "}
+                      </button>{" "}
+                    </>
+                  ) : (
+                    <>
+                      {" "}
                   <h3>
                     {" "}
                     Open board:{" "}
@@ -4668,6 +4829,8 @@ const testModel = useMutation({
                       Close board{" "}
                     </button>{" "}
                   </div>{" "}
+                    </>
+                  )}{" "}
                 </div>
               )}{" "}
               {boardId && (
@@ -4690,6 +4853,7 @@ const testModel = useMutation({
                         {" "}
                         Board name{" "}
                         <input
+                          disabled={!canManageBoard}
                           value={boardForm.name}
                           onChange={(e) =>
                             setBoardForm({ ...boardForm, name: e.target.value })
@@ -4700,6 +4864,7 @@ const testModel = useMutation({
                         {" "}
                         Mission{" "}
                         <input
+                          disabled={!canManageBoard}
                           value={boardForm.mission}
                           onChange={(e) =>
                             setBoardForm({ ...boardForm, mission: e.target.value })
@@ -4710,13 +4875,14 @@ const testModel = useMutation({
                         {" "}
                         Stage{" "}
                         <input
+                          disabled={!canManageBoard}
                           value={boardForm.stage}
                           onChange={(e) =>
                             setBoardForm({ ...boardForm, stage: e.target.value })
                           }
                         />{" "}
                       </label>{" "}
-                      <button onClick={() => saveBoard.mutate()}>Save draft</button>{" "}
+                      {canManageBoard && (<button onClick={() => saveBoard.mutate()}>Save draft</button>)}{" "}
                       <h3>Activation checklist</h3>{" "}
                       <ul>
                         {" "}
@@ -4745,15 +4911,15 @@ const testModel = useMutation({
                         Reviewed draft hash:{" "}
                         <code>{setup.data.draftHash}</code>{" "}
                       </p>{" "}
-                      <button onClick={() => activate.mutate(setup.data.draftHash)}>
+                      {canManageBoard && (<button onClick={() => activate.mutate(setup.data.draftHash)}>
                         {" "}
                         Activate configuration{" "}
-                      </button>{" "}
+                      </button>)}{" "}
                       <h3>Export / import</h3>{" "}
-                      <button onClick={doExport}>
+                      {canManageBoard && (<button onClick={doExport}>
                         {" "}
                         Export reviewed configuration{" "}
-                      </button>{" "}
+                      </button>)}{" "}
                       {expText && (
                         <p role="status">
                           {" "}
@@ -4778,10 +4944,11 @@ const testModel = useMutation({
                           onChange={(e) => setExpHash(e.target.value)}
                         />{" "}
                       </label>{" "}
-                      <button onClick={doImport}>
+                      {canManageBoard && (<button onClick={doImport}>
                         {" "}
                         Import as new board (advisors unapproved){" "}
-                      </button>{" "}
+                      </button>)}{" "}
+                      {canManageBoard && (<>
                       <h3>Common settings</h3>{" "}
                       <label>
                         {" "}
@@ -4840,9 +5007,10 @@ const testModel = useMutation({
                           </option>{" "}
                         </select>{" "}
                       </label>{" "}
+                      </>)}{" "}
                     </>
                   )}{" "}
-                  {!setup.data && guestSettings.data && (
+                  {!setup.data && isGuest && guestSettings.data && (
                     <>
                       <p role="status">Read-only guest settings for your assigned meeting.</p>
                       <dl>
@@ -4907,7 +5075,7 @@ const testModel = useMutation({
                     {b.name}{" "}
                   </button>{" "}
                   {b.mission && <div>{b.mission}</div>}{" "}
-                  <div className="meetctl">
+                  {canManageBoard && boardId === b.id && (<div className="meetctl">
                     {" "}
                     <button
                       type="button"
@@ -4921,7 +5089,7 @@ const testModel = useMutation({
                       {" "}
                       Archive{" "}
                     </button>{" "}
-                  </div>{" "}
+                  </div>)}{" "}
                 </div>
               ))}{" "}
               {boardId && status.data && (
@@ -5758,7 +5926,7 @@ const testModel = useMutation({
                 ) : (
                   <button
                     onClick={() => saveLead.mutate()}
-                    disabled={!leadForm.name.trim() || saveLead.isPending}
+                    disabled={!canManageBoard || !leadForm.name.trim() || saveLead.isPending}
                   >
                     {" "}
                     Save profile{" "}
@@ -5774,7 +5942,11 @@ const testModel = useMutation({
 
               <div className="card">
                 {" "}
-                <h3>Model connection (owner only)</h3>{" "}
+                <h3>Model connection (installation admin only)</h3>{" "}
+                {!boardId && (<p role="status">Select a board to verify installation-admin controls.</p>)}{" "}
+                {!!boardId && !capsAdmin && (<p role="status">Restricted to installation admins.</p>)}{" "}
+                {capsAdmin && (<>
+                {" "}
                 {modelStatus.data && (
                   <p role="status">
                     {" "}
@@ -5835,7 +6007,21 @@ const testModel = useMutation({
                     {modelMsg}{" "}
                   </p>
                 )}{" "}
+                </>)}{" "}
               </div>{" "}
+              {boardId && isGuest && guestSettings.data && (
+                <div className="card">
+                  {" "}
+                  <p role="status">Read-only guest settings for your assigned meeting.</p>{" "}
+                  <dl>
+                    <dt>Board</dt><dd>{guestSettings.data.name}</dd>
+                    <dt>Mission</dt><dd>{guestSettings.data.mission}</dd>
+                    <dt>Stage</dt><dd>{guestSettings.data.stage}</dd>
+                    <dt>Discussion rhythm</dt><dd>{guestSettings.data.discussionPolicy}</dd>
+                    <dt>Lead</dt><dd>{guestSettings.data.lead ? `${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : "\u2014"}</dd>
+                  </dl>{" "}
+                </div>
+              )}{" "}
             </section>
           )}{" "}
           {tab === "roster" && (
@@ -5888,14 +6074,14 @@ const testModel = useMutation({
                       )}{" "}
                       <div className="meetctl">
                         {" "}
-                        <button disabled={!boardId || !selRow.complete} title={!boardId ? "Pick a board first" : selRow.complete ? "Attach to current board" : "Complete this entry first: " + selRow.missing.join(", ")} onClick={() => copyAdv.mutate(selRow)}>{" "}Add to current board{" "}</button>{" "}
+                        <button disabled={!boardId || !canManageBoard || !selRow.complete} title={!boardId ? "Pick a board first" : selRow.complete ? "Attach to current board" : "Complete this entry first: " + selRow.missing.join(", ")} onClick={() => copyAdv.mutate(selRow)}>{" "}Add to current board{" "}</button>{" "}
                         <button onClick={() => { archiveRoster.mutate(selRow); setSelRoster(""); }}>{" "}Archive{" "}</button>{" "}
                         <button onClick={() => { setCnewId(selRow.entry.id); setCportraitMsg(""); setCreateOpen(true); }}>{" "}Add portrait{" "}</button>{" "}
                       </div>{" "}
                       <h4>{" "}Audition (never a meeting message){" "}</h4>{" "}
                       <label>{" "}Sample question{" "}
                         <input value={aq} onChange={(e) => setAq(e.target.value)} placeholder="Ask the starter question" />{" "}</label>{" "}
-                      <button disabled={!aq.trim() || runAud.isPending} onClick={() => runAud.mutate()}>{" "}Run audition{" "}</button>{" "}
+                      <button disabled={!canActMeeting || !aq.trim() || runAud.isPending} onClick={() => runAud.mutate()}>{" "}Run audition{" "}</button>{" "}
                       {audResult && <div className="btext">{audResult}</div>}{" "}
                       <h4>{" "}Research dossier{" "}</h4>{" "}
                       <button onClick={() => research(selRow.entry.id)}>{" "}Research dossier{" "}</button>{" "}
@@ -5979,14 +6165,14 @@ const testModel = useMutation({
                   const full = (advisors.data ?? []).length >= 10;
                   return (
                     <label key={row.entry.id}>{" "}
-                      <input type="checkbox" disabled={!boardId || (!attached && (full || !row.complete))} checked={!!attached} onChange={() => toggleBoardAdvisor(row)} />{" "}
+                      <input type="checkbox" disabled={!boardId || !canManageBoard || (!attached && (full || !row.complete))} checked={!!attached} onChange={() => toggleBoardAdvisor(row)} />{" "}
                       {row.entry.name}{" "}{attached ? (attached.approved ? "(approved)" : "(pending approval)") : row.complete ? "" : "(incomplete: " + row.missing.join(", ") + ")"}{" "}
                     </label>
                   );
                 })}{" "}
                   </>
                 )}{" "}
-                <button type="button" onClick={() => setTab("roster")}>{" "}Create new Advisor{" "}</button>{" "}
+                {canManageBoard && (<button type="button" onClick={() => setTab("roster")}>{" "}Create new Advisor{" "}</button>)}{" "}
               </div>{" "}
               {(advisors.data ?? []).length >= 10 && (
                 <p>Remove an advisor to add another.</p>
@@ -6056,7 +6242,7 @@ const testModel = useMutation({
                 )}{" "}
                 <label>{" "}Message{" "}
                   <input disabled={chatBlocked} value={chatMsg} onChange={(e) => setChatMsg(e.target.value)} placeholder="Ask this advisor directly" onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }} />{" "}</label>{" "}
-                <button disabled={!boardId || !chatAdv || !chatMsg.trim() || chatBusy || chatBlocked} onClick={sendChat}>{" "}{chatBusy ? "Sending…" : "Send"}{" "}</button>{" "}
+                <button disabled={!boardId || !canActMeeting || !chatAdv || !chatMsg.trim() || chatBusy || chatBlocked} onClick={sendChat}>{" "}{chatBusy ? "Sending…" : "Send"}{" "}</button>{" "}
                 {chatErr && <p role="alert">{chatErr}</p>}{" "}
               </div>{" "}
 <div className="card">
@@ -6142,11 +6328,31 @@ const testModel = useMutation({
               {boardId && (
                 <>
                   {" "}
+                  {boardDenied ? (
+                    <div className="card" role="alert">
+                      {" "}
+                      <p>Not authorized for this board. Pick an allowed board below, or close this one.</p>{" "}
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        onClick={() => {
+                          setBoardId("");
+                          setMeetingId("");
+                          setMeetPicks([]);
+                        }}
+                      >
+                        {" "}
+                        Close board{" "}
+                      </button>{" "}
+                    </div>
+                  ) : (
+                    <>
+                  {" "}
                   <div className="meet-left">
                     {" "}
                     <div className="meetctl">
                       {" "}
-                      {canActMeeting && (<button
+                      {canManageBoard && (<button
                         type="button"
                         className="primary"
                         onClick={() => createMeeting.mutate()}
@@ -6154,7 +6360,7 @@ const testModel = useMutation({
                         {" "}
                         Start meeting{" "}
                       </button>)}{" "}
-                    {canActMeeting && (<div className="card">{" "}
+                    {canManageBoard && (<div className="card">{" "}
                       Advisors for the next meeting (all when untouched){" "}
                       {(advisors.data ?? []).map((a) => (
                         <label key={a.id}>{" "}
@@ -6218,7 +6424,7 @@ const testModel = useMutation({
                     </ol>{" "}
                     {(meetings.data ?? []).length === 0 &&
                       (allMeetings.data ?? []).length === 0 && (
-                        <p>No meetings yet — start one above.</p>
+                        <p>{isGuest ? "Your assigned meeting is open in the discussion panel." : "No meetings yet"}</p>
                       )}{" "}
                     {(meetings.data ?? []).length === 0 &&
                       (allMeetings.data ?? []).length > 0 && (
@@ -6228,10 +6434,26 @@ const testModel = useMutation({
                         </p>
                       )}{" "}
                   </div>{" "}
-                  {meetingId && (
-                    <>
+                  {meetingDenied ? (
+                    <div className="card" role="alert">
                       {" "}
-                      <div className="meet-center">
+                      <p>Not authorized for this meeting. The board route is kept; pick an allowed meeting from the list, or return to the board.</p>{" "}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMeetingId("");
+                          setRecId("");
+                        }}
+                      >
+                        {" "}
+                        Back to board meetings{" "}
+                      </button>{" "}
+                    </div>
+                  ) : (
+                    meetingId && (
+                      <>
+                        {" "}
+                        <div className="meet-center">
                         {" "}
                         <div className="meet-head">
                           {" "}
@@ -6289,6 +6511,7 @@ const testModel = useMutation({
                               onClick={() => runDiscussion.mutate()}
                               disabled={
                                 runDiscussion.isPending ||
+                                !canDiscussMeeting ||
                                 !briefText.trim() ||
                                 (curMeeting != null &&
                                   !meetingIsOpen(curMeeting.state))
@@ -6323,7 +6546,7 @@ const testModel = useMutation({
                             )}{" "}
                           </p>
                         )}{" "}
-                        {canActMeeting && (<details className="setup">
+                        {canManageMeeting && (<details className="setup">
                           {" "}
                           <summary>Meeting setup</summary>{" "}
                           <label>
@@ -6793,7 +7016,7 @@ const testModel = useMutation({
                                   type="button"
                                   className="primary"
                                   onClick={() => submitDraft()}
-                                  disabled={!draft.trim() || askSecretary.isPending || send.isPending}
+                                  disabled={!canDiscussMeeting || !draft.trim() || askSecretary.isPending || send.isPending}
                                 >
                                   {" "}
                                   {askSecretary.isPending ? "Sending secretary..." : "Send"}{" "}
@@ -6867,7 +7090,7 @@ const testModel = useMutation({
                                 );
                               })}{" "}
                             {(notes.data ?? []).filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing").length === 0 && <p>No briefings yet.</p>}{" "}
-                            <div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => setBtopic(e.target.value)} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate(); }} disabled={!btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>{" "}
+                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => setBtopic(e.target.value)} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate(); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
                             {secQuestion && (
                               <div className="card" role="status">
                                 <b>Secretary clarification</b>
@@ -6894,8 +7117,8 @@ const testModel = useMutation({
                                   {exs2.length > 0 && (<div className="excerpts">{exs2.map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? e.ref}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind}:{e.ref}{e.version ? " v" + e.version : ""}{e.sectionId ? " sec:" + String(e.sectionId).slice(0,8) : ""}{e.location ? " " + e.location : ""}{e.indexGeneration != null ? " g" + e.indexGeneration : ""}</div><div className="muted">Historical quote; current availability is resolved in History view per reference.</div></div>))}</div>)}{" "}
                                   {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
                                   <button type="button" onClick={() => loadHistory(n.id)}>History</button>{" "}
-                                  {isCur ? (<><button type="button" onClick={() => { setSecEditId(n.id); setSecEditBody(n.body); }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted"> Superseded/reversed: read-only; open History for full text.</span>)}{" "}
-                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => setSecEditBody(e.target.value)} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody })}>Save revision</button></div>)}{" "}
+                                  {isCur && canActMeeting ? (<><button type="button" onClick={() => { secEditTok.current++; setSecEditId(n.id); setSecEditBody(n.body); }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted">{isCur ? " Requires contribute access to edit." : " Superseded/reversed: read-only; open History for full text."}</span>)}{" "}
+                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => { secEditTok.current++; setSecEditBody(e.target.value); }} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody })}>Save revision</button></div>)}{" "}
                                 </div>
                                 );
                               })}{" "}
@@ -6926,13 +7149,13 @@ const testModel = useMutation({
                                 onChange={(e) => setNbody(e.target.value)}
                               />{" "}
                             </label>{" "}
-                            <button
+                            {canActMeeting && (<button
                               type="button"
                               onClick={() => addNote.mutate()}
                             >
                               {" "}
                               Save note{" "}
-                            </button>{" "}
+                            </button>)}{" "}
                           </div>
                         )}{" "}
                         {meetTab === "options" && (
@@ -6960,7 +7183,7 @@ const testModel = useMutation({
                                 ) : (
                                   <span> {n.body}</span>
                                 )}{" "}
-                                <button
+                                {canActMeeting && (<button
                                   type="button"
                                   className="btn ghost"
                                   disabled={!meetingId || fromDirection.isPending}
@@ -6969,12 +7192,13 @@ const testModel = useMutation({
                                 >
                                   {" "}
                                   Record this direction{" "}
-                                </button>{" "}
+                                </button>)}{" "}
                               </div>
                             ))}{" "}
                             {(directions.data ?? []).length === 0 && (
                               <p>No directions adopted yet.</p>
                             )}{" "}
+                            {canActMeeting && (<>
                             <label>
                               {" "}
                               Exact text{" "}
@@ -7005,12 +7229,13 @@ const testModel = useMutation({
                             <button
                               type="button"
                               className="primary"
-                              disabled={!dtext.trim()}
+                              disabled={!canActMeeting || !dtext.trim()}
                               onClick={() => adopt.mutate()}
                             >
                               {" "}
                               Adopt exact text{" "}
-                            </button>{" "}
+                            </button>
+                            </>)}{" "}
                           </div>
                         )}{" "}
                         {meetTab === "decision" && (
@@ -7263,7 +7488,9 @@ const testModel = useMutation({
                         </button>
                       )}{" "}
                     </>
+                    )
                   )}{" "}
+                    </>)}
                 </>
               )}{" "}
             </section>
@@ -7272,8 +7499,29 @@ const testModel = useMutation({
             <section aria-label="Resources and Inbox">
               {" "}
               <h2>Resources and Inbox</h2>{" "}
+              {boardDenied ? (
+                <div className="card" role="alert">
+                  {" "}
+                  <p>Not authorized for this board. Pick an allowed board below, or close this one.</p>{" "}
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    onClick={() => {
+                      setBoardId("");
+                      setMeetingId("");
+                      setMeetPicks([]);
+                    }}
+                  >
+                    {" "}
+                    Close board{" "}
+                  </button>{" "}
+                </div>
+              ) : (
+                <>
+              {" "}
               <WikiResources boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} api={wikiApi} onChanged={() => { try { qc.invalidateQueries(); } catch {} }} />
-                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} />
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} transport={{ get, post, put, del, upload, download: (u: string, f: string) => authedDownload(u, f), origin: () => originIdentity(), stale: (o: { epoch: number; token: string; user: string }) => originStale(o) }} />
+                </>)}
             </section>
           )}{" "}
           {tab === "records" && (
@@ -7287,7 +7535,24 @@ const testModel = useMutation({
                 approves.{" "}
               </p>{" "}
               {!meetingId && <p>Pick a meeting first.</p>}{" "}
-              {meetingId && (
+              {boardDenied ? (
+                <div className="card" role="alert">
+                  {" "}
+                  <p>Not authorized for this board. Pick an allowed board below, or close this one.</p>{" "}
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    onClick={() => {
+                      setBoardId("");
+                      setMeetingId("");
+                      setMeetPicks([]);
+                    }}
+                  >
+                    {" "}
+                    Close board{" "}
+                  </button>{" "}
+                </div>
+              ) : meetingId && (
                 <>
                   {" "}
                   <div className="card">
@@ -7301,10 +7566,10 @@ const testModel = useMutation({
                         onChange={(e) => setDraftItems(e.target.value)}
                       />{" "}
                     </label>{" "}
-                    <button onClick={prepareDraft}>
+                    {canActMeeting && (<button onClick={prepareDraft}>
                       {" "}
                       Prepare draft from items{" "}
-                    </button>{" "}
+                    </button>)}{" "}
                   </div>{" "}
                   {(recs.data ?? []).map((r) => (
                     <div className="card" key={r.id}>
@@ -7332,6 +7597,12 @@ const testModel = useMutation({
                         Hash <code>{recDetail.data.hash}</code> · watermark{" "}
                         {recDetail.data.watermark}{" "}
                       </p>{" "}
+                      {showReviewError && reviewError && (<p role="alert">Review error: {reviewError.message}</p>)}{" "}
+                      {recOk && recDetail.data && !!recReview.data && !recReview.isError && !showReviewError && canManageMeeting && stateValid !== true && (<p role="alert">{recReview.data.stateValid !== true && recReview.data.stateError ? "Review state invalid: " + recReview.data.stateError : (reviewPendingCount === 0 ? "No pending items; nothing to approve." : "Review state invalid: explicit repair required; approval disabled")}</p>)}{" "}
+                      {canActMeeting && (<button type="button" onClick={() => { void refreshReview(); }}>
+                        {" "}
+                        Refresh review{" "}
+                      </button>)}{" "}
                       {(() => {
                         try {
                           return (
@@ -7344,6 +7615,8 @@ const testModel = useMutation({
                               {" "}
                               <input
                                 type="checkbox"
+                                disabled={!canApproveRecord}
+                                title={!canApproveRecord ? "Approval selection requires a manage grant and a current valid review." : undefined}
                                 checked={selItems.includes(it.id ?? "")}
                                 onChange={(e) =>
                                   setSelItems(
@@ -7359,7 +7632,8 @@ const testModel = useMutation({
                             </label>
                           ));
                         } catch {
-                          return <p>Unparseable items.</p>;
+                          const restricted = !recDetail.data.itemsJson;
+                          return <p>{restricted && !canManageMeeting ? "Draft item text is restricted." : "Unparseable items."}</p>;
                         }
                       })()}{" "}
                       <div className="card">
@@ -7417,27 +7691,24 @@ const testModel = useMutation({
                       </div>{" "}
                       <div>
                         {" "}
-                        <button onClick={() => approveRec(false)}>
+                        {canApproveRecord && (<button onClick={() => approveRec(false)}>
                           {" "}
                           Approve selected{" "}
-                        </button>{" "}
-                        <button onClick={() => approveRec(true)}>
+                        </button>)}{" "}
+                        {canApproveRecord && (<button onClick={() => approveRec(true)}>
                           {" "}
                           Approve all{" "}
-                        </button>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=concise`}
-                        >
+                        </button>)}{" "}
+                        {!canApproveRecord && (<span className="muted">Approval requires a manage grant and a current valid review.</span>)}{" "}
+                        {canActMeeting && (<button type="button" onClick={() => exportRecord("concise")}>
                           {" "}
                           Export concise{" "}
-                        </a>{" "}
+                        </button>)}{" "}
                         <span> </span>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=detailed`}
-                        >
+                        {canActMeeting && (<button type="button" onClick={() => exportRecord("detailed")}>
                           {" "}
                           Export detailed{" "}
-                        </a>{" "}
+                        </button>)}{" "}
                       </div>{" "}
                       <label>
                         {" "}
@@ -7447,15 +7718,15 @@ const testModel = useMutation({
                           onChange={(e) => setRevText(e.target.value)}
                         />{" "}
                       </label>{" "}
-                      <button onClick={() => reviseRec(false)}>
+                      {canActMeeting && (<button onClick={() => reviseRec(false)}>
                         {" "}
                         Request revision (new version){" "}
-                      </button>{" "}
-                      <button onClick={() => reviseRec(true)}>
+                      </button>)}{" "}
+                      {canApproveRecord && (<button onClick={() => reviseRec(true)}>
                         {" "}
                         Amend (name superseded IDs){" "}
-                      </button>{" "}
-                      <button onClick={discardRec}>Discard draft</button>{" "}
+                      </button>)}{" "}
+                      {canActMeeting && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
                   )}{" "}
                 </>
@@ -7502,6 +7773,10 @@ const testModel = useMutation({
                     <button
                       onClick={() => {
                         actAs = actAsState.trim();
+                        setAppliedActAs(actAs);
+                        try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
+                        try { secEpoch.current++; } catch {}
+                        try { qc.clear(); } catch {}
                         qc.invalidateQueries();
                       }}
                     >
@@ -7509,6 +7784,7 @@ const testModel = useMutation({
                       Apply identity{" "}
                     </button>{" "}
                   </div>{" "}
+                  {canManageBoard && (<>
                   <div className="card">
                     {" "}
                     <h3>Invitations</h3>{" "}
@@ -7536,13 +7812,13 @@ const testModel = useMutation({
                         <option value="manager">Manager (manage)</option>{" "}
                       </select>{" "}
                     </label>{" "}
-                    <button onClick={() => invite.mutate()}>Invite</button>{" "}
+                    {canManageBoard && (<button onClick={() => invite.mutate()}>Invite</button>)}{" "}
                     {(invites.data ?? []).map((i) => (
                       <div key={i.id}>
                         {" "}
                         {i.email} · {i.role} ·{" "}
                         <span className="badge">{i.state}</span>{" "}
-                        {i.state === "pending" && (
+                        {i.state === "pending" && canManageBoard && (
                           <button
                             onClick={() =>
                               post<unknown>(
@@ -7595,7 +7871,7 @@ const testModel = useMutation({
                         : "whole board"}{" "}
                       . Pick a meeting in Meetings to scope a grant to it.{" "}
                     </p>{" "}
-                    <button onClick={() => grant.mutate()}>Set grant</button>{" "}
+                    {canManageBoard && (<button onClick={() => grant.mutate()}>Set grant</button>)}{" "}
                     {(grants.data ?? []).map((g) => (
                       <div key={g.id}>
                         {" "}
@@ -7603,20 +7879,18 @@ const testModel = useMutation({
                         {g.meetingId
                           ? ` · meeting ${g.meetingId.slice(0, 8)}`
                           : " · board"}{" "}
-                        <button
+                        {canManageBoard && (<button
                           onClick={() =>
-                            fetch(`/api/grants/${g.id}`, {
-                              method: "DELETE",
-                              headers: withUser(),
-                            }).then(() => refresh("grants"))
+                            del<unknown>(`/api/grants/${g.id}`).then(() => refresh("grants"))
                           }
                         >
                           {" "}
                           Revoke{" "}
-                        </button>{" "}
+                        </button>)}{" "}
                       </div>
                     ))}{" "}
-                  </div>{" "}
+                  </div>
+                  </>)}{" "}
                 </>
               )}{" "}
             </section>
@@ -7625,6 +7899,23 @@ const testModel = useMutation({
             <section aria-label="Activity and Usage">
               {" "}
               <h2>Activity and Usage</h2>{" "}
+              <div className="meetctl">
+                {" "}
+                <label>
+                  {" "}
+                  Scope{" "}
+                  <select
+                    aria-label="Usage scope"
+                    value={effUsageScope}
+                    onChange={(e) => setUsageScope(e.target.value)}
+                  >
+                    {" "}
+                    {capsAdmin && (<option value="installation">Installation (privileged)</option>)}{" "}
+                    <option value="board">Board</option>{" "}
+                  </select>
+                </label>{" "}
+                {!capsAdmin && (<span className="muted">Installation jobs, spending, and audit require installation admin. Usage below is board-scoped.</span>)}{" "}
+              </div>{" "}
               <div className="meetctl">
                 {" "}
                 <label>
@@ -7655,6 +7946,7 @@ const testModel = useMutation({
                   />{" "}
                 </label>{" "}
               </div>{" "}
+              {capsAdmin && (<>
               <h3>Jobs</h3>{" "}
               {(jobs.data ?? []).map((j) => (
                 <div key={j.id}>
@@ -7669,9 +7961,10 @@ const testModel = useMutation({
                 </div>
               ))}{" "}
               {(jobs.data ?? []).length === 0 && <p>No jobs.</p>}{" "}
-              <div className="card">
+              </>)}
+              {capsAdmin && (<div className="card">
                 {" "}
-                <h3>Spending cap (owner only)</h3>{" "}
+                <h3>Spending cap (installation admin only)</h3>{" "}
                 {spending.data && (
                   <p role="status">
                     {" "}
@@ -7719,7 +8012,7 @@ const testModel = useMutation({
                   {" "}
                   Save spending controls{" "}
                 </button>{" "}
-              </div>{" "}
+              </div>)}{" "}
 
               <h3>Usage (live ledger)</h3>{" "}
               <div className="table-scroll">
@@ -7841,11 +8134,12 @@ const testModel = useMutation({
                     onChange={(e) => setBakHash(e.target.value)}
                   />{" "}
                 </label>{" "}
-                <button onClick={doRestore}>
+                {canManageBoard && (<button onClick={doRestore}>
                   {" "}
                   Restore (replaces current data){" "}
-                </button>{" "}
+                </button>)}{" "}
               </div>{" "}
+              {capsAdmin && (<>
               <h3>Audit</h3>{" "}
               <div className="table-scroll">
                 {" "}
@@ -7864,7 +8158,8 @@ const testModel = useMutation({
                     ))}
                   </tbody>
                 </table>{" "}
-              </div>{" "}
+              </div>
+              </>)}{" "}
             </section>
           )}{" "}
           {tab === "help" && (
@@ -7908,6 +8203,7 @@ const testModel = useMutation({
                 ))}{" "}
             </section>
           )}{" "}
+          </>)}
         </main>{" "}
       </div>{" "}
       <div className="toasts" aria-live="polite">

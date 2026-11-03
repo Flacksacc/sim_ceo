@@ -39,10 +39,10 @@ Checked off with verification evidence as each phase lands.
 - Honest unverified limits preserved: ASR codec path, image-live behavior, readiness/runtime beyond the logged runs, and phase 9 accounting depth are not claimed by this checkpoint.
 
 ## Phase 4 -- Secretary depth
-- [ ] Direct routing (Secretary, ...) bypassing bids; may interrupt unsent work. (Not implemented; unchanged.)
-- [ ] Labeled provisional notes with update/reversal + history; never decisions. (Not implemented; unchanged.)
-- [ ] Briefings strictly from approved sources + directions + context, with excerpts. (Not implemented; unchanged.)
-- [ ] Clarifying question on ambiguous requests. (Not implemented; unchanged.)
+- [ ] Direct routing (Secretary, ...) bypassing bids; may interrupt unsent work. (FOURTH WIP by Muse in muse/secretary-depth; 13 findings from phase4-third-repair-independent-review.txt REJECT13; reuse accepted R1/R2/R3/R4/R8/R13/R14; not accepted, no self-acceptance. Interface: .tmp/secretary-fourth-interface.txt.)
+- [ ] Labeled provisional notes with update/reversal + history; never decisions. (FOURTH WIP same branch; linear unique chain + typed history/request validators + OmittedJson; not accepted.)
+- [ ] Briefings strictly from approved sources + directions + context, with excerpts. (FOURTH WIP same branch; whole essential board/lead/brief, selected spans, shared array hash, omission manifest; not accepted.)
+- [ ] Clarifying question on ambiguous requests. (FOURTH WIP same branch; attempt-bound uncertainty + shared SourceEpoch + Bearer precedence + callback isolation; not accepted.)
 
 ## Phase 5 -- Records review UX
 - [ ] One-document review: working notes, items, excerpts, recent input; per-item approve/revise/discard + approve-all. (Not implemented; unchanged.)
@@ -73,3 +73,13 @@ Checked off with verification evidence as each phase lands.
 
 ## Explicit non-goals
 Telegram transport, group/topic mechanics, BotFather UI, verbatim command grammar, separate ai_consult web UI, new paid-service requirements.
+
+## Navigation + secure UI completion (Muse lane, unaccepted)
+
+Scope: entire-app navigation (hash routes, normalization, board/meeting/record scope, wrong-parent, unknown/missing/archived/deleted/denied, public invite join, recovery, back/forward) and secure UI (fail-closed private queries/rendering, canonical Bearer-first applied identity + auth epoch, server-derived role caps for every tab/action, server stateValid-gated record approval, identity-aware transport/downloads/refresh/exports, held-response and A-B-A invalidation).
+
+Contracts for Wiki/Secretary lanes: docs/nav-completion-interface.md and .tmp/nav-completion-interface.txt (host GovTransport adapter, origin/epoch/selection rules, capability matrix).
+
+Evidence: qa/nav-secure-qa.cjs (real-memory API :5129 + web :5197 + owned Edge CDP :9336; registered admin/owner/contribute/readonly/discuss/unrelated/anonymous/expired/revoked identities; actual interactions, request authority, deny AND positive DOM, held-response/revocation/A-B-A, all-tab back/forward + direct links, desktop/mobile light/dark, no console errors/fetch failures). Run log: .tmp/nav-secure-*.log (git-ignored).
+
+Status: implementation + browser QA authored by Muse; acceptance requires primary + dedicated-AI review (no self-acceptance).

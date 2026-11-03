@@ -9,6 +9,8 @@
 
   <ItemGroup>
     <PackageReference Include="AngleSharp" Version="1.8.5" />
+    <PackageReference Include="SkiaSharp" Version="4.154.0" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="4.154.0" />
   </ItemGroup>
 
   <!-- The Postgres backend ships alongside the API without a static reference
@@ -41,7 +43,7 @@
     </PropertyGroup>
     <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\..\SimCEO.Postgres\SimCEO.Postgres.csproj&quot; -c $(Configuration) -p:SkipStagePostgres=true -o &quot;$(_PgPubStageDir)&quot; --nologo -v q" />
     <ItemGroup>
-      <PgPubDlls Include="$(_PgPubStageDir)\*.dll" Exclude="$(_PgPubStageDir)\SimCEO.Api.*" />
+      <PgPubDlls Include="$(_PgPubStageDir)\*.dll" Exclude="$(_PgPubStageDir)\SimCEO.Api.*;$(_PgPubStageDir)\*.deps.json;$(_PgPubStageDir)\*.runtimeconfig.json" />
     </ItemGroup>
     <Copy SourceFiles="@(PgPubDlls)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
     <RemoveDir Directories="$(_PgPubStageDir)" />

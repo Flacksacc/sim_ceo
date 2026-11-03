@@ -255,7 +255,7 @@ public sealed class SecretaryRequest
     public Guid? NoteId { get; set; }
     public long Generation { get; set; }
     public string LeadFingerprint { get; set; } = "";
-    public string EvidenceFingerprintJson { get; set; } = "[]"; public string SnapshotJson { get; set; } = "{}"; public string Phase { get; set; } = "initial"; public string SubmissionHash { get; set; } = ""; public string CallerRefsJson { get; set; } = "[]"; public string RecentHash { get; set; } = ""; public string EvidenceTextHash { get; set; } = ""; public string DossierHash { get; set; } = "";public string DeliveredRefsJson { get; set; } = "[]"; public string DeliveredPromptHash { get; set; } = ""; public Guid AttemptId { get; set; } = Guid.Empty; public Guid AnswerAttemptId { get; set; } = Guid.Empty;
+    public string EvidenceFingerprintJson { get; set; } = "[]"; public string SnapshotJson { get; set; } = "{}"; public string Phase { get; set; } = "initial"; public string SubmissionHash { get; set; } = ""; public string CallerRefsJson { get; set; } = "[]"; public string RecentHash { get; set; } = ""; public string EvidenceTextHash { get; set; } = ""; public string DossierHash { get; set; } = "";public string DeliveredRefsJson { get; set; } = "[]"; public string DeliveredPromptHash { get; set; } = ""; public Guid AttemptId { get; set; } = Guid.Empty; public Guid AnswerAttemptId { get; set; } = Guid.Empty; public string OmittedJson { get; set; } = "[]";
     public string Error { get; set; } = "";
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;

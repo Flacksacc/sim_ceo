@@ -340,6 +340,7 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"SecretaryRequests\" ADD COLUMN IF NOT EXISTS \"RecentHash\" text NOT NULL DEFAULT \'\'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"SecretaryRequests\" ADD COLUMN IF NOT EXISTS \"EvidenceTextHash\" text NOT NULL DEFAULT \'\'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"SecretaryRequests\" ADD COLUMN IF NOT EXISTS \"DossierHash\" text NOT NULL DEFAULT \'\'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"SecretaryRequests\" ADD COLUMN IF NOT EXISTS \"OmittedJson\" text NOT NULL DEFAULT \'[]\'");
       var orphans = db.Set<SimCEO.Api.Domain.SecretaryRequest>().Where(r => r.Status == "pending" || r.Status == "inflight" || r.Status == "answering").ToList();
       foreach (var o in orphans) { o.Status = "interrupted"; o.Error = "Process restarted during generation; retry with the same nonce and payload."; o.UpdatedAt = DateTime.UtcNow; }
       if (orphans.Count > 0) db.SaveChanges();

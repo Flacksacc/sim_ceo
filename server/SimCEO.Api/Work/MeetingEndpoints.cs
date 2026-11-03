@@ -233,21 +233,32 @@ public static class MeetingEndpoints
       if (bodyIn.Length > 12000) return Results.BadRequest("body too long.");
       var kind = (input.Kind ?? "note").Trim().ToLowerInvariant();
       if (kind is not ("note" or "briefing")) kind = "note";
-      Note created;
+      Note? created = null;
+      IResult? gateErr = null;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        created = Atomic.Run(s, () =>
+        try { gateErr = Atomic.Run<IResult?>(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur) || cur.BoardId != m.BoardId) throw new InvalidOperationException("meeting moved");
+          if (!PeopleOps.Can(s, req, cur.BoardId, id, "contribute")) return PeopleOps.Denied();
           var note = new Note { BoardId = cur.BoardId, MeetingId = id, Kind = kind, Title = string.IsNullOrWhiteSpace(title) ? (kind == "briefing" ? "Briefing" : "Working note") : title, Body = bodyIn, Scope = "meeting", Provisional = true, EvidenceJson = "[]", RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
           note.RootId = note.Id;
           s.Notes[note.Id] = note;
           var h = new NoteHistory { BoardId = cur.BoardId, MeetingId = id, NoteId = note.Id, RootId = note.RootId, Revision = 1, Title = note.Title, Body = note.Body, EvidenceJson = note.EvidenceJson, Action = "created", CreatedAt = DateTime.UtcNow };
           s.NoteHistories[h.Id] = h;
           s.Notes.Flush(); s.NoteHistories.Flush();
-          return note;
-        });
+          created = note;
+          return null;
+        }); } catch (Exception ncEx)
+        {
+          if (ncEx is InvalidOperationException && (ncEx.Message ?? "").Contains("meeting moved", StringComparison.OrdinalIgnoreCase))
+            gateErr = Results.Json(new { error = "Meeting moved during note creation; retry." }, statusCode: 409);
+          else if (SimCEO.Api.Work.SecretaryEndpoints.IsStorageFault(ncEx))
+            gateErr = Results.Json(new { error = "Storage fault during note creation; safe to retry." }, statusCode: 502);
+          else throw;
+        }
       } }
-      return Results.Created($"/api/notes/{created.Id}", created);
+      if (gateErr is not null) return gateErr;
+      return Results.Created($"/api/notes/{created!.Id}", created);
     });
 
     app.MapPost("/api/meetings/{id:guid}/briefings", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -259,24 +270,32 @@ public static class MeetingEndpoints
       if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("input", out var iv2) && iv2.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(iv2.GetString())) topic = iv2.GetString() ?? topic;
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
       var callerRaw = EvidenceRef.ParseList(body, "evidence");
-      SecretarySnapshot snapBefore;
+      SecretarySnapshot snapBefore = null!;
       var restoreBeforeB = s.RestoreEpochId;
       List<EvidenceRef> deliveredB = new();
       List<string> omittedB = new();
-      string promptBText;
-      List<EvidenceRef> callerCanonPre;
+      string promptBText = "";
+      List<EvidenceRef> callerCanonPre = new();
+      IResult? prepErr = null;
       try
       {
         lock (s.SetupLock) { lock (s.MessageLock) {
-          snapBefore = SecretaryContext.CaptureSnapshot(s, m);
-          callerCanonPre = SecretaryContext.CanonicalizeCaller(s, m.BoardId, id, callerRaw);
+          prepErr = Atomic.Run<IResult?>(s, () =>
+          {
+          if (!s.Meetings.TryGetValue(id, out var curB)) return Results.NotFound("meeting");
+          // Fresh authority INSIDE the preparation unit (not just outer check): re-authorize against live meeting/board.
+          if (PeopleOps.Check(s, req, curB.BoardId, id, "contribute") is { } deniedBrPre) return deniedBrPre;
+          if (curB.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+            return Results.Conflict("Meeting is not active; resume to request a briefing.");
+          snapBefore = SecretaryContext.CaptureSnapshot(s, curB, callerRaw);
+          callerCanonPre = SecretaryContext.CanonicalizeCaller(s, curB.BoardId, id, callerRaw);
           const string bhead = "You are the board secretary. Return a provisional briefing as JSON with kind briefing, title and body. Ground only in the packet; state limitations when evidence is missing.\n";
           string btail = "\nBRIEFING TOPIC: " + topic.Trim() + "\n";
           int bbudget = 32000 - bhead.Length - btail.Length - 1000;
           if (bbudget < 4000) throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
           var tmpB = new List<EvidenceRef>(); var omB = new List<string>();
-          string packetB = SecretaryContext.BuildPacket(s, m, topic.Trim(), callerCanonPre, tmpB, bbudget, omB);
-          string bfooter = omB.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omB.Take(20)) + "\n" : "";
+          string packetB = SecretaryContext.BuildPacket(s, curB, topic.Trim(), callerCanonPre, tmpB, bbudget, omB);
+          string bfooter = omB.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omB) + "\n" : "";
           string fullB = bhead + packetB + bfooter + btail;
           if (fullB.Length > 32000) throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
           foreach (var d in tmpB.ToList())
@@ -289,11 +308,12 @@ public static class MeetingEndpoints
             }
           }
           deliveredB = tmpB; omittedB = omB; promptBText = fullB;
+          return null;
+          });
         } }
+        if (prepErr is not null) return prepErr;
       }
       catch (ProviderException pexB) { return PeopleOps.ProviderError(pexB); }
-      if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
-        return Results.Conflict("Meeting is not active; resume to request a briefing.");
       string text;
       try
       {
@@ -317,7 +337,8 @@ public static class MeetingEndpoints
           {
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
               return Results.Conflict("Meeting state changed during briefing; draft discarded.");
-            var nowSnap = SecretaryContext.CaptureSnapshot(s, cur);
+            // Identical immutable caller selection for both captures: cited-message bits must match when nothing changed.
+            var nowSnap = SecretaryContext.CaptureSnapshot(s, cur, callerRaw);
             if (!SecretaryContext.SnapshotEquals(snapBefore, nowSnap))
               return Results.Json(new { error = SecretaryContext.SnapshotMismatchReason(snapBefore, nowSnap) }, statusCode: 409);
             if (s.RestoreEpochId != restoreBeforeB)
@@ -325,6 +346,7 @@ public static class MeetingEndpoints
             if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
             var bodyText = bout.Body;
             if (deliveredB.Count == 0) bodyText = bodyText + " [Limitation: No eligible approved sources, adopted directions, or approved records were available for this meeting.]";
+            if (omittedB.Count > 0) bodyText = bodyText + " [Omitted from packet (not cited as evidence): " + string.Join("; ", omittedB) + "]";
             var note = new Note
             {
               BoardId = cur.BoardId, MeetingId = id, Kind = "secretary-briefing",

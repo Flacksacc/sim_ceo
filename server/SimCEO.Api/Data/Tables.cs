@@ -340,8 +340,9 @@ public sealed class Table<T> where T : class
   {
     var b = Pg.Backend;
     if (b is null) return _mem.TryRemove(id, out value!);
-    value = b.Find<T>(id);
-    if (value is null) return false;
+    var found = b.Find<T>(id);
+    if (found is null) { value = default!; return false; }
+    value = found;
     b.Remove<T>(id);
     SaveDeferred(b);
     return true;
@@ -503,7 +504,7 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
       return false;
     }
     var rows = b.MeetingMessages(id);
-    if (rows.Count == 0) { value = null; return false; }
+    if (rows.Count == 0) { value = null!; return false; }
     value = new MessageList(b, id, rows);
     return true;
   }

@@ -58,17 +58,30 @@ public sealed class ModelGateway
   private readonly InMemoryStore _store;
   private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(180) };
   private readonly PublicEvidenceFetcher _evidence;
+  private readonly HttpClient _httpClient;
+  // Instance-scoped whole-operation deadline override for QA fault injection.
+  // Instance state only: setting it on one gateway never affects other
+  // gateway instances (no process-static cross-instance pollution). Default
+  // whole-operation deadline remains 120s (WholeOperationTimeout).
+  public TimeSpan? WholeOperationTimeoutOverride { get; set; }
 
   public ModelGateway(InMemoryStore store)
   {
     _store = store;
     _evidence = new PublicEvidenceFetcher();
+    _httpClient = _http;
+  }
+  public ModelGateway(InMemoryStore store, HttpClient httpClient)
+  {
+    _store = store;
+    _evidence = new PublicEvidenceFetcher();
+    _httpClient = httpClient ?? _http;
   }
 
   public ModelGateway(InMemoryStore store, PublicEvidenceFetcher evidence)
   {
     _store = store;
-    _evidence = evidence;
+    _evidence = evidence; _httpClient = _http;
   }
 
   private static string Base =>
@@ -102,6 +115,37 @@ public sealed class ModelGateway
 
   private static string Truncate(string s, int maxChars) =>
     s.Length <= maxChars ? s : s[..maxChars];
+
+  // Single shared construction of the exact chat-completions message pair
+  // for secretary-style calls. Both the sender and the prompt-hash
+  // computation must use this; no divergent formula. The hash covers the
+  // actual delivered canonical ORDERED role/content message array (developer
+  // first, user second) only, never headers or keys. Total content budget
+  // includes BOTH developer and user text.
+  public static (string Developer, string UserContent) BuildSecretaryPayload(string purpose, string prompt, int inputBudget, bool truncatePrompt)
+  {
+    var dev = DeveloperInstructionFor(purpose);
+    // Total budget covers developer instruction + user packet (not user alone).
+    int totalChars = (prompt ?? "").Length + dev.Length;
+    if (!truncatePrompt && totalChars > inputBudget * 4)
+      throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
+    string user = truncatePrompt ? Truncate(prompt, System.Math.Max(0, inputBudget * 4 - dev.Length))
+      : prompt;
+    // Re-check total after truncation path (truncate could still exceed if dev alone is huge).
+    if ((user ?? "").Length + dev.Length > inputBudget * 4 + 1000 && !truncatePrompt)
+      throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
+    return (dev, user);
+  }
+  // Canonical ORDERED role/content array used by the ACTUAL sender. Hash is of this array, not a delimiter string.
+  public static object[] BuildDeliveredMessages(string developer, string userContent) =>
+    new object[] { new { role = "developer", content = developer }, new { role = "user", content = userContent } };
+  public static string HashDeliveredPrompt(string developer, string userContent)
+  {
+    var arr = BuildDeliveredMessages(developer, userContent);
+    return Hashing.HashOf(System.Text.Json.JsonSerializer.Serialize(arr));
+  }
+  public static string HashDeliveredMessages(object[] messages) =>
+    Hashing.HashOf(System.Text.Json.JsonSerializer.Serialize(messages));
 
   // Bounded reasoning: thinking tokens count against the output budget
   // (reasoning effort minimal/low/medium/high; max_completion_tokens includes
@@ -297,9 +341,9 @@ public sealed class ModelGateway
     try
     {
       if (bytes == null || bytes.Length < 16) return false;
-      if (IsPng(bytes)) return true;
-      if (IsJpeg(bytes)) return true;
-      if (IsWebP(bytes)) return true;
+      if (ImageValidation.IsPngStrict(bytes)) return true;
+      if (ImageValidation.IsJpegStrict(bytes)) return true;
+      if (ImageValidation.IsWebPStrict(bytes)) return true;
       return false;
     }
     catch { return false; }
@@ -622,16 +666,16 @@ public sealed class ModelGateway
   private async Task<JsonDocument> PostJson(string path, object body, CancellationToken ct)
   {
     using var opCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    opCts.CancelAfter(WholeOperationTimeout);
+    opCts.CancelAfter(WholeOperationTimeoutOverride ?? WholeOperationTimeout);
     var op = opCts.Token;
     using var req = new HttpRequestMessage(HttpMethod.Post, $"{Base}{path}");
     req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", EffectiveKey);
     req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-    using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, op).ConfigureAwait(false);
+    using var res = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, op).ConfigureAwait(false);
     var bound = BoundFor(path, (int)res.StatusCode);
-    var (bounded, oversized, _) = await ReadBoundedBodyAsync(res, bound, op).ConfigureAwait(false);
+    var (bounded, oversized, consumedBody) = await ReadBoundedBodyAsync(res, bound, op).ConfigureAwait(false);
     if (oversized)
-      throw new OversizedBodyException(bounded, bound + 1);
+      throw new OversizedBodyException(bounded, consumedBody);
     if (!res.IsSuccessStatusCode)
       throw new ProviderException((int)res.StatusCode, RedactedError((int)res.StatusCode), bounded);
     try { return JsonDocument.Parse(string.IsNullOrWhiteSpace(bounded) ? "{}" : bounded); }
@@ -647,7 +691,7 @@ public sealed class ModelGateway
     ThrowIfPrecancelled(ct);
     var effort = ReasoningEffortFor(purpose);
     var ensured = EnsureOutputBudget(purpose, outputBudget);
-    var dev = DeveloperInstructionFor(purpose);
+    var (dev, userContent) = BuildSecretaryPayload(purpose, prompt, inputBudget, truncatePrompt);
     var callId = Guid.NewGuid();
     var sw = System.Diagnostics.Stopwatch.StartNew();
     JsonDocument doc;
@@ -656,11 +700,7 @@ public sealed class ModelGateway
       doc = await PostJson("/chat/completions", new
       {
         model,
-        messages = new object[]
-        {
-          new { role = "developer", content = dev },
-          new { role = "user", content = truncatePrompt ? Truncate(prompt, inputBudget * 4) : (prompt.Length <= inputBudget * 4 ? prompt : throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.")) },
-        },
+        messages = BuildDeliveredMessages(dev, userContent),
         max_completion_tokens = Math.Clamp(ensured, 16, 16000),
         reasoning_effort = effort,
         stream = false,
@@ -675,7 +715,7 @@ public sealed class ModelGateway
       try { if (TryParseErrorBilling(obex.Prefix, out var oi, out var oc, out var oo, out _)) { preIn = oi; preCached = oc; preOut = oo; } } catch { }
       RecordFull(callId, model, purpose, preIn, preCached, preOut, sw.ElapsedMilliseconds, false, 0,
         "failed", prePid, null, basisOver,
-        "failed: response oversized at bound; total unknown;  id " + (prePid ?? "none"), boardId, meetingId);
+        "failed: response oversized at bound (consumed " + obex.Consumed + "); total unknown; id " + (prePid ?? "none"), boardId, meetingId);
       throw new ProviderException(502, RedactedError(502) + "; oversized body truncated at bound", "");
     }
     catch (ProviderException pex)
@@ -768,7 +808,7 @@ public sealed class ModelGateway
           {
             RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
               "unknown", pid, null, basis,
-              "unknown: finish_reason=" + finish + "; usage missing", boardId, meetingId);
+              "unknown: non-completed finish (not stop); usage missing; cost unknown", boardId, meetingId);
           }
           throw new ProviderException(502, RedactedError(502));
         }
@@ -881,7 +921,7 @@ public sealed class ModelGateway
       catch { }
       RecordFull(callId, model, purpose, preIn, preCached, preOut, sw.ElapsedMilliseconds, preObs > 0, preObs,
         "failed", prePid, null, basisOver,
-        "failed: response oversized at bound; total unknown; searches " + preObs + " observed; id " + (prePid ?? "none"), boardId, meetingId);
+        "failed: response oversized at bound (consumed " + obex.Consumed + "); total unknown; searches " + preObs + " observed; id " + (prePid ?? "none"), boardId, meetingId);
       throw new ProviderException(502, RedactedError(502) + "; oversized body truncated at bound", "");
     }
     catch (ProviderException pex)
@@ -1148,15 +1188,16 @@ public sealed class ModelGateway
     req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", EffectiveKey);
     req.Content = form;
     HttpResponseMessage? res = null;
-    string text = "";
+    string text = ""; long asrConsumed = 0;
     bool oversized = false;
     using var opCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    opCts.CancelAfter(WholeOperationTimeout);
+    opCts.CancelAfter(WholeOperationTimeoutOverride ?? WholeOperationTimeout);
     var op = opCts.Token;
     try
     {
-      res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, op).ConfigureAwait(false);
-      (text, oversized, _) = await ReadBoundedBodyAsync(res, TextBoundBytes, op).ConfigureAwait(false);
+      res = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, op).ConfigureAwait(false);
+      var asrBound = res.IsSuccessStatusCode ? TextBoundBytes : ErrorBoundBytes;
+      (text, oversized, asrConsumed) = await ReadBoundedBodyAsync(res, asrBound, op).ConfigureAwait(false);
     }
     catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException)
     {
@@ -1174,7 +1215,7 @@ public sealed class ModelGateway
       sw.Stop();
       RecordFull(callId, ModelPolicy.Voice, "voice-transcribe", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
         "failed", null, null, UsageAccounting.BasisVoice,
-        "failed: provider body oversized at bound; cost unknown", boardId, meetingId);
+        "failed: provider body oversized at bound (consumed " + asrConsumed + "); cost unknown", boardId, meetingId);
       throw new ProviderException(502, RedactedError(502) + "; oversized body truncated at bound");
     }
     if (!res!.IsSuccessStatusCode)
@@ -1247,6 +1288,14 @@ public sealed class ModelGateway
       catch { ms = null; }
       var cost = UsagePricing.VoiceCost(ms);
       var status = cost.HasValue ? "succeeded" : "unknown";
+      // Preserve an observable provider id when the ASR envelope carries one;
+      // absence stays null (both ledgers record it via RecordFull).
+      string? asrPid = null;
+      try
+      {
+        if (root.TryGetProperty("id", out var asrId) && asrId.ValueKind == JsonValueKind.String) asrPid = asrId.GetString();
+      }
+      catch { asrPid = null; }
       string note;
       if (ms.HasValue)
       {
@@ -1258,7 +1307,7 @@ public sealed class ModelGateway
         note = "audio duration unobserved; cost unknown (never 0)";
       }
       RecordFull(callId, ModelPolicy.Voice, "voice-transcribe", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
-        status, null, cost, UsageAccounting.BasisVoice, note, boardId, meetingId);
+        status, asrPid, cost, UsageAccounting.BasisVoice, note, boardId, meetingId);
       return (transcript, cost);
     }
   }
@@ -1289,7 +1338,7 @@ public sealed class ModelGateway
       var prePid = TryExtractProviderId(obex.Prefix);
       RecordFull(callId, ModelPolicy.Image, "image-generate", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
         "failed", prePid, null, UsageAccounting.BasisImage,
-        "failed: response oversized at bound; total unknown; id " + (prePid ?? "none"), boardId, meetingId);
+        "failed: response oversized at bound (consumed " + obex.Consumed + "); total unknown; id " + (prePid ?? "none"), boardId, meetingId);
       throw new ProviderException(502, RedactedError(502) + "; oversized body truncated at bound", "");
     }
     catch (ProviderException pex)

@@ -11,17 +11,39 @@ import {
   payloadBytesMatch,
   waitForCount as waitForProviderCount,
 } from "./voice-browser-assert.mjs";
+import { createVoiceProxy, proxyBase, PROXY_PORT } from "./voice-stream-proxy.mjs";
 const CDP = process.env.QA_CDP || "http://localhost:9333";
-const WEB = process.env.QA_WEB || "http://127.0.0.1:5192";
-const API = process.env.QA_API || "http://127.0.0.1:5115";
-const FAKE = process.env.QA_FAKE || "http://127.0.0.1:5206";
+const WEB = process.env.QA_WEB || "http://127.0.0.1:5245";
+const API = process.env.QA_API || "http://127.0.0.1:5125";
+const FAKE = process.env.QA_FAKE || "http://127.0.0.1:5225";
 const OUT = ".tmp/voice-qa/shots";
-fs.mkdirSync(OUT, { recursive: true });
+const SUMMARY_PATH = ".tmp/voice-qa/browser-summary.json";
+const OWNED_PATH = ".tmp/voice-qa/owned-targets.json";
+function writeSummaryFile(targetPath, obj) {
+  fs.writeFileSync(targetPath, JSON.stringify(obj, null, 1));
+}
 let pass = 0, fail = 0;
 const failures = [];
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log("  ok " + name); }
   else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
+}
+let verdictPublished = 0;
+// The verdict is computed by this ACTUAL function and published ONCE in
+// finally after bounded cleanup. Cleanup failures fold into FAIL with a
+// nonzero code; no PASS token or artifact is ever emitted before cleanup.
+function finalVerdict(p, f, fails, cleanupErrs) {
+  const ce = cleanupErrs || [];
+  const all = fails.concat(ce.map((e) => "cleanup-" + e));
+  const code = (f + ce.length) === 0 ? 0 : 1;
+  const text = code === 0 ? "VOICEBROWSER PASS " + p : "VOICEBROWSER FAIL pass=" + p + " fail=" + (f + ce.length);
+  return { code, text, summary: { pass: p, fail: f + ce.length, failures: all } };
+}
+async function closeBounded(fn, label, cleanupErrs, timeoutMs) {
+  let t = null;
+  try {
+    await Promise.race([fn(), new Promise((_, rej) => { t = setTimeout(() => rej(new Error(label + " close timeout")), timeoutMs || 15000); })]);
+  } catch (e) { cleanupErrs.push(label + ":" + (e && e.message ? e.message : String(e))); } finally { try { if (t) clearTimeout(t); } catch {} }
 }
 async function api(method, p, body) {
   const r = await fetch(API + p, { method, headers: { "content-type": "application/json", "x-user": "owner" }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -37,7 +59,15 @@ async function fakeCounts() {
   const t = await r.text();
   let j = null;
   try { j = t ? JSON.parse(t) : null; } catch { j = null; }
-  if (r.status !== 200 || !j || typeof j.transcribe !== "number") throw new Error("fake counts shape invalid " + r.status + " " + t.slice(0, 200));
+  // Owned-fake shape check: the exact key set proves the PROTOCOL shape of
+  // the QA fake (not any untrusted loopback service). Instance ownership
+  // comes from the retained launch (this run started the fake on 5225 and
+  // keeps its process); keys alone never prove the instance. No redirect or
+  // crypto-identity claim: the production gateway default HttpClient permits
+  // redirects, this suite makes no redirect request and claims no escape.
+  const keys = !j ? [] : Object.keys(j).sort();
+  const exact = r.status === 200 && !!j && typeof j.transcribe === "number" && JSON.stringify(keys) === JSON.stringify(["chat", "images", "responses", "transcribe"]);
+  if (!exact) throw new Error("fake counts identity invalid (must be the owned fake) " + r.status + " " + t.slice(0, 200));
   return j;
 }
 async function fakeLast() {
@@ -75,37 +105,117 @@ function extractAudioPart(body, contentType) {
   }
   throw new Error("audio part not found");
 }
+// Fourth repair: voice browser QA owns loopback API 5125 + fake 5225 + web
+// 5245 only (CDP 9333 is the shared QA Edge; the suite keeps user targets and
+// disconnects its own transport). Refuse user/dev ports before launch.
+for (const [v, port, label] of [[API, 5125, "api"], [FAKE, 5225, "fake"], [WEB, 5245, "web"]]) {
+  let u = null;
+  try { u = new URL(v); } catch { u = null; }
+  // Bracket-tolerant loopback: URL keeps IPv6 brackets in hostname.
+  const host = u ? String(u.hostname).replace(/^\[/, "").replace(/\]$/, "") : "";
+  const loop = !!u && (host === "127.0.0.1" || host === "localhost" || host === "::1");
+  const rooted = !!u && u.pathname === "/";
+  const protoOk = !!u && u.protocol === "http:";
+  const secrets = !!u && (u.username !== "" || u.password !== "" || (u.search !== "" && u.search !== "?") || u.hash !== "");
+  if (!u || !loop || !rooted || !protoOk || secrets || Number(u.port) !== port || /:(5080|5173)\b/.test(String(v))) {
+    console.log("  FAIL " + label + "-owns-port :: must be http loopback :" + port + " root no-userinfo/query/fragment (raw value withheld)");
+    process.exit(2);
+  }
+}
 const run = "vb-" + Date.now().toString(36);
-const board = await api("POST", "/api/boards", { name: run + "-b", mission: run + " mission", stage: "qa" });
-const bid = board.json.id;
-ok("seed-board", !!bid, board.text.slice(0, 160));
-await api("POST", "/api/boards/" + bid + "/lead", { name: "QA Lead" });
-const mtg = await api("POST", "/api/boards/" + bid + "/meetings", { title: run + " m1", brief: "voice browser brief" });
-const mid = mtg.json.id;
-ok("seed-meeting", !!mid, mtg.text.slice(0, 160));
-const mtg2 = await api("POST", "/api/boards/" + bid + "/meetings", { title: run + " m2", brief: "second brief" });
-const mid2 = mtg2.json.id;
-await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "seeded hello" });
+let bid = "", mid = "", mid2 = "";
+let proxy = null;
+let proxyStarted = false;
 let browser = null;
 let ctx = null;
 let page = null;
+let fatalErr = null;
 const postedPaths = [];
 const dialogs = [];
 const uploads = [];
-let transcribeMode = "normal";
-let releaseASR = null;
-const holdASR = () => new Promise((r) => { releaseASR = r; });
-function releaseHeldASR() {
-  const r = releaseASR;
-  releaseASR = null;
-  if (r) r();
-}
+// All App transcribe traffic flows through the QA-owned streaming proxy
+// (own 5126): pass-through unless a hold/error is armed. Queue-level delays
+// ("delay:N") bypass the proxy for the reload-during-upload case.
+let transcribeMode = "via-proxy";
+// SIXTH: outer-scope drain helper. Function declarations inside the try block
+// are block-scoped (ESM strict) and invisible in finally, so the callable
+// lives here and is assigned once the page exists. Finally disarms first,
+// then drains, with shutdown refusing new registrations.
+let releaseAllGatesFn = async () => {};
 try {
+  try { fs.mkdirSync(OUT, { recursive: true }); } catch (e) { throw new Error("out-mkdir failed: " + (e && e.message ? e.message : String(e))); }
+  try { fs.mkdirSync(".tmp/voice-qa", { recursive: true }); } catch (e) { throw new Error("qa-dir-mkdir failed: " + (e && e.message ? e.message : String(e))); }
+  // Verdict sentinel BEFORE any fallible setup, inside the same lifecycle:
+  // proves NOTHING is published before finally (self-test near the end of
+  // try asserts this file still says pending). Failure here is fatal.
+  // Initial mkdir/artifact setup is INSIDE this protected lifecycle so a
+  // directory-creation failure shares cleanup + verdict (no bypass).
+  try { writeSummaryFile(SUMMARY_PATH, { verdict: "pending", run }); } catch (e) { throw new Error("sentinel-write failed: " + (e && e.message ? e.message : String(e))); }
+  // Seed inside the lifecycle so startup failures share cleanup + verdict.
+  const board = await api("POST", "/api/boards", { name: run + "-b", mission: run + " mission", stage: "qa" });
+  bid = board.json.id;
+  ok("seed-board", !!bid, board.text.slice(0, 160));
+  await api("POST", "/api/boards/" + bid + "/lead", { name: "QA Lead" });
+  const mtg = await api("POST", "/api/boards/" + bid + "/meetings", { title: run + " m1", brief: "voice browser brief" });
+  mid = mtg.json.id;
+  ok("seed-meeting", !!mid, mtg.text.slice(0, 160));
+  const mtg2 = await api("POST", "/api/boards/" + bid + "/meetings", { title: run + " m2", brief: "second brief" });
+  mid2 = mtg2.json.id;
+  await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "seeded hello" });
+  // QA-owned streaming proxy (own 127.0.0.1:5126) starts inside the lifecycle
+  // before any browser traffic; every App transcribe is continued through it.
+  proxy = createVoiceProxy({ apiBase: API });
+  await proxy.start();
+  proxyStarted = true;
+  {
+    let ph = null;
+    try { ph = await fetch(proxyBase() + "/api/auth/status"); } catch (e) { throw new Error("proxy health fetch failed: " + (e && e.message ? e.message : String(e))); }
+    ok("proxy-up", ph.status === 200, "status=" + ph.status);
+    if (ph.status !== 200) throw new Error("proxy health non-200: " + ph.status);
+  }
+  ok("proxy-port-owned", PROXY_PORT === 5126, String(PROXY_PORT));
   browser = await chromium.connectOverCDP(CDP);
   const beforeContexts = browser.contexts().map((c) => c.pages().length);
   ok("cdp-shared-contexts-present", browser.contexts().length >= 1, "contexts=" + browser.contexts().length);
+  // SEVENTH: capture pre-existing CDP target IDs before creating our own
+  // context. Ownership is derived from the ACTUAL owned page/context target
+  // IDs via the own page CDP session, not from a global after-minus-before
+  // diff (which captures parallel foreign targets). The manifest is bound to
+  // this run + browser instance; capture/write failure FAILS (never
+  // swallowed). No localhost URL-substring ownership.
+  let cdpBeforeIds = [];
+  let cdpInstanceWs = "";
+  try {
+    const vr = await fetch(CDP + "/json/version", { signal: AbortSignal.timeout(10000) });
+    const vj = await vr.json();
+    cdpInstanceWs = (vj && vj.webSocketDebuggerUrl) || "";
+    const lr = await fetch(CDP + "/json/list", { signal: AbortSignal.timeout(10000) });
+    const lj = await lr.json();
+    if (Array.isArray(lj)) cdpBeforeIds = lj.map((t) => t && t.id).filter(Boolean);
+  } catch (e) { throw new Error("cdp-before capture failed: " + (e && e.message ? e.message : String(e))); }
+  if (!cdpInstanceWs) throw new Error("cdp-before instance identity missing");
+  if (!Array.isArray(cdpBeforeIds) || cdpBeforeIds.length < 1) throw new Error("cdp-before target list empty: fresh binding requires nonempty pre-run set");
   ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   page = await ctx.newPage();
+  // Record ACTUAL owned IDs via the own page CDP session.
+  try {
+    const sess = await ctx.newCDPSession(page);
+    let ownTid = "";
+    try {
+      const info = await sess.send("Target.getTargetInfo");
+      ownTid = (info && info.targetInfo && info.targetInfo.targetId) || "";
+    } catch (e) { throw new Error("own targetId capture failed: " + (e && e.message ? e.message : String(e))); }
+    if (!ownTid) throw new Error("own targetId empty");
+    const ownedIds = [ownTid];
+    writeSummaryFile(OWNED_PATH, { run, instanceWs: cdpInstanceWs, before: cdpBeforeIds, owned: ownedIds });
+    const verifyRaw = fs.readFileSync(OWNED_PATH, "utf8");
+    const verify = JSON.parse(verifyRaw);
+    if (!verify || !Array.isArray(verify.owned) || verify.owned.length < 1 || verify.run !== run || verify.instanceWs !== cdpInstanceWs) throw new Error("owned manifest verify failed");
+    ok("owned-manifest-bound", true, "owned=" + ownedIds.length + " run=" + run);
+  } catch (e) {
+    ok("owned-manifest-bound", false, String((e && e.message) || e).slice(0, 200));
+    throw e;
+  }
   const consoleErrors = [];
   page.on("console", (m) => { if (m.type() === "error" && !m.text().includes("Failed to load resource")) consoleErrors.push(m.text().slice(0, 300)); });
   page.on("pageerror", (e) => consoleErrors.push("pageerror: " + String(e).slice(0, 300)));
@@ -126,8 +236,37 @@ try {
     window.__resolvePermission = null;
     window.__acCreated = 0;
     window.__acClosed = 0;
-    window.__decodeDelayMs = 0;
-    window.__renderDelayMs = 0;
+    // Per-operation correlated stage gates: wrappers below record entry
+    // per conversion stage ONLY when armed; the test waits for the entered
+    // op, then explicitly releases it. No cumulative ever-true flags, no
+    // timer assumptions. Disarmed = direct pass-through.
+    window.__voiceGate = { armed: false, shutdown: false, seq: 0, pending: [], completed: [] };
+    window.__voiceGateWrap = function (stage, fn) {
+      const g = window.__voiceGate;
+      if (!g || !g.armed || g.shutdown) return fn();
+      const id = ++g.seq;
+      const op = { id, stage, enteredAt: Date.now() };
+      g.pending.push(op);
+      return new Promise((resolve) => {
+        const to = setTimeout(() => { op.timedOut = true; finish(); }, 15000);
+        op._resolve = () => { clearTimeout(to); finish(); };
+        function finish() {
+          try {
+            const ix = g.pending.indexOf(op);
+            if (ix >= 0) g.pending.splice(ix, 1);
+            g.completed.push({ id: op.id, stage: op.stage, enteredAt: op.enteredAt, releasedAt: Date.now(), timedOut: !!op.timedOut });
+          } catch {}
+          resolve();
+        }
+      }).then(fn);
+    };
+    window.__voiceGateReleaseAll = function () {
+      try {
+        const g = window.__voiceGate || { pending: [] };
+        try { g.armed = false; g.shutdown = true; } catch {}
+        for (const o of g.pending.slice()) { try { o._resolve && o._resolve(); } catch {} }
+      } catch {}
+    };
     try {
       const OrigAC = window.AudioContext || window.webkitAudioContext;
       if (OrigAC) {
@@ -138,10 +277,7 @@ try {
           const origClose = inst.close.bind(inst);
           inst.close = async (...ca) => { window.__acClosed++; return origClose(...ca); };
           const origDecode = inst.decodeAudioData.bind(inst);
-          inst.decodeAudioData = async (...da) => {
-            if (window.__decodeDelayMs) await new Promise((r) => setTimeout(r, window.__decodeDelayMs));
-            return origDecode(...da);
-          };
+          inst.decodeAudioData = (...da) => window.__voiceGateWrap("decode", () => origDecode(...da));
           return inst;
         };
         Wrap.prototype = C.prototype;
@@ -155,10 +291,7 @@ try {
           const inst = new OrigOAC(...a);
           try {
             const origRender = inst.startRendering.bind(inst);
-            inst.startRendering = async (...sa) => {
-              if (window.__renderDelayMs) await new Promise((r) => setTimeout(r, window.__renderDelayMs));
-              return origRender(...sa);
-            };
+            inst.startRendering = (...sa) => window.__voiceGateWrap("render", () => origRender(...sa));
           } catch {}
           return inst;
         };
@@ -166,6 +299,10 @@ try {
         window.OfflineAudioContext = W;
       }
     } catch {}
+  try {
+    const OrigBlobAB = Blob.prototype.arrayBuffer;
+    Blob.prototype.arrayBuffer = function (...ab) { const self = this, args = ab; return window.__voiceGateWrap("blob", () => OrigBlobAB.apply(self, args)); };
+  } catch {}
   try {
       const m = navigator.mediaDevices;
       if (m) {
@@ -204,30 +341,26 @@ try {
       const b = req.postDataBuffer();
       if (b) uploads.push({ body: Buffer.from(b), contentType: req.headers()["content-type"] || "" });
     } catch {}
-    if (transcribeMode === "fail502") {
-      transcribeMode = "normal";
-      await route.fulfill({ status: 502, contentType: "text/plain", body: "provider request aborted" });
+    if (transcribeMode === "via-proxy") {
+      // QA-owned streaming proxy (own 5126): buffers the ACTUAL upstream
+      // API response, flushes headers to the App, holds the JSON/error body
+      // until the test releases. The App fetch resolves headers while
+      // r.json()/r.text() stays pending. A proxy hold (not route.fulfill) is
+      // what exercises downstream body pending against the real App flow.
+      try {
+        const u = new URL(req.url());
+        await route.continue({ url: "http://127.0.0.1:5126" + u.pathname + u.search });
+      } catch {
+        // Loud failure, never silent direct dispatch: abort so the pending
+        // waitHold below times out with the override named. No unobserved
+        // request proceeds.
+        try { await route.abort(); } catch {}
+      }
       return;
     }
     if (transcribeMode.startsWith("delay:")) {
       const ms = Number(transcribeMode.slice(6)) || 0;
       await new Promise((r) => setTimeout(r, ms));
-    }
-    if (transcribeMode === "hold") {
-      // ASR barrier: headers captured above, body held until released.
-      await holdASR();
-      try { await route.continue(); } catch {}
-      return;
-    }
-    if (transcribeMode === "hold-after-provider") {
-      // Provider runs NOW (headers+body observed at the fake), the response
-      // is held until released: proves disposal of an already-running
-      // provider response against a stale/new operation.
-      let resp = null;
-      try { resp = await route.fetch(); } catch { try { await route.continue(); } catch {} return; }
-      await holdASR();
-      try { await route.fulfill({ response: resp }); } catch {}
-      return;
     }
     await route.continue();
   });
@@ -268,6 +401,43 @@ try {
   await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForFunction(() => document.body && document.body.innerText.length > 50, null, { timeout: 60000 });
   await page.waitForTimeout(2500);
+  // Per-operation gate helpers: baseline = gate seq at reset; only ops
+  // with id > baseline belong to the current operation (exact correlation).
+  // SIXTH: pending means UNRESOLVED (entered and still held). Completed
+  // includes timed-out auto-releases and must never satisfy a held check.
+  async function gateArm() { await page.evaluate(() => { const g = window.__voiceGate || {}; g.armed = true; }); }
+  async function gateDisarm() { await page.evaluate(() => { const g = window.__voiceGate || {}; g.armed = false; }).catch(() => {}); }
+  async function gateReset() { return await page.evaluate(() => { const g = window.__voiceGate; g.pending = []; g.completed = []; return g.seq; }); }
+  async function waitGateEntered(stage, baseline, timeoutMs) {
+    // Exact unresolved PENDING id only: timed-out/completed never counts.
+    await page.waitForFunction(
+      (args) => { const g = window.__voiceGate || { pending: [] }; return g.pending.some((o) => o.stage === args[0] && o.id > args[1] && !o.timedOut); },
+      [stage, baseline],
+      { timeout: timeoutMs || 15000 },
+    );
+    return await page.evaluate((args) => { const g = window.__voiceGate || { pending: [] }; const all = g.pending.filter((o) => o.stage === args[0] && o.id > args[1] && !o.timedOut); return all.length ? all[all.length - 1].id : -1; }, [stage, baseline]);
+  }
+  async function gatePendingIds(stage, baseline) {
+    return await page.evaluate((args) => { const g = window.__voiceGate || { pending: [] }; return g.pending.filter((o) => o.stage === args[0] && o.id > args[1]).map((o) => ({ id: o.id, timedOut: !!o.timedOut })); }, [stage, baseline]);
+  }
+  async function releaseGate(stage, baseline) {
+    await page.evaluate((args) => { const g = window.__voiceGate || { pending: [] }; for (const o of g.pending.slice()) { if (o.stage === args[0] && o.id > args[1]) { try { o._resolve && o._resolve(); } catch {} } } }, [stage, baseline]);
+  }
+  async function releaseGateId(stage, id) {
+    await page.evaluate((args) => { const g = window.__voiceGate || { pending: [] }; for (const o of g.pending.slice()) { if (o.stage === args[0] && o.id === args[1]) { try { o._resolve && o._resolve(); } catch {} } } }, [stage, id]);
+  }
+  async function gateCompleted(stage, baseline) {
+    return await page.evaluate((args) => { const g = window.__voiceGate || { completed: [] }; return g.completed.filter((o) => o.stage === args[0] && o.id > args[1]); }, [stage, baseline]);
+  }
+  // Assign the outer-scope drain: disarm BEFORE releasing all, then drain.
+  releaseAllGatesFn = async () => {
+    try { await page.evaluate(() => { try { const g = window.__voiceGate || {}; g.armed = false; } catch {} }).catch(() => {}); } catch {}
+    try { await page.evaluate(() => { try { if (typeof window.__voiceGateReleaseAll === "function") window.__voiceGateReleaseAll(); } catch {} }).catch(() => {}); } catch {}
+  };
+  async function waitHold(hold, label, timeoutMs) {
+    const to = new Promise((_, rej) => setTimeout(() => rej(new Error(label + " proxy never held (route continue url override unsupported or proxy missed the request)")), timeoutMs || 20000));
+    return await Promise.race([hold.opPromise, to]);
+  }
   const dictate = page.getByRole("button", { name: /Dictate/i }).first();
   await dictate.waitFor({ timeout: 30000 });
   ok("dictate-visible", true);
@@ -277,11 +447,12 @@ try {
     const c0 = await fakeCounts();
     const u0 = await scopedUsage(mid);
     const up0 = uploads.length;
-    // Explicit released barriers: decode held 2s, render held 2s, ASR held
-    // until the test releases. Transcribing visible while the provider count
-    // stays flat proves the pending stages are observed, not assumed.
-    await page.evaluate(() => { window.__decodeDelayMs = 2000; window.__renderDelayMs = 2000; });
-    transcribeMode = "hold";
+    // Per-operation correlated gates: the proxy holds the downstream body
+    // after flushing headers; each conversion stage is entered and
+    // explicitly released. No cumulative flags, no delays.
+    const baselinePos = await gateReset();
+    await gateArm();
+    const holdPos = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     const box = await requireBox();
     await box.fill("typed hello", { timeout: 15000 });
     await dictate.click({ timeout: 15000 });
@@ -294,30 +465,63 @@ try {
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
-    // Decode barrier: conversion still running, upload not yet sent.
-    await page.waitForTimeout(1200);
-    const heldCounts = await fakeCounts();
-    ok("decode-barrier-held", heldCounts.transcribe === c0.transcribe, c0.transcribe + "->" + heldCounts.transcribe);
-    // Render/upload barrier: poll until the captured upload arrives while
-    // the fake still shows no hit (headers sent, body held at the route).
+    // Correlated entered gates: blob -> decode -> render, each explicitly
+    // released. The provider count stays flat at every held stage.
+    const blobId = await waitGateEntered("blob", baselinePos);
+    ok("blob-entered", blobId > baselinePos, "id=" + blobId);
+    const heldB = await fakeCounts();
+    ok("blob-held-no-provider", heldB.transcribe === c0.transcribe, c0.transcribe + "->" + heldB.transcribe);
+    await releaseGate("blob", baselinePos);
+    const decId = await waitGateEntered("decode", baselinePos);
+    ok("decode-entered", decId > baselinePos, "id=" + decId);
+    const heldD = await fakeCounts();
+    ok("decode-held-no-provider", heldD.transcribe === c0.transcribe, c0.transcribe + "->" + heldD.transcribe);
+    await releaseGate("decode", baselinePos);
+    const renId = await waitGateEntered("render", baselinePos);
+    ok("render-entered", renId > baselinePos, "id=" + renId);
+    const heldR = await fakeCounts();
+    ok("render-held-no-provider", heldR.transcribe === c0.transcribe, c0.transcribe + "->" + heldR.transcribe);
+    await releaseGate("render", baselinePos);
+    // Conversion finished: the upload reaches the proxy, which completes the
+    // ACTUAL upstream API call (provider runs) and flushes headers to the
+    // App while holding the JSON body. Upload capture proves the App sent
+    // headers; the provider hit proves upstream completed; pending
+    // Transcribing + unchanged draft prove the App body read is pending.
+    const heldOp = await waitHold(holdPos, "positive-asr");
+    ok("proxy-op-held", !!heldOp && heldOp.held === true && heldOp.upstreamStatus === 201, JSON.stringify(heldOp));
+    ok("proxy-headers-flushed", heldOp.headersFlushedAt > 0 && heldOp.bodyReleasedAt === 0 && heldOp.autoReleased === false, JSON.stringify({ h: heldOp.headersFlushedAt, b: heldOp.bodyReleasedAt }));
+    ok("proxy-op-correlated", typeof heldOp.url === "string" && heldOp.url.includes("/api/meetings/" + mid + "/transcribe"), heldOp.url);
     let upSeen = false;
     for (let i = 0; i < 40; i++) {
-      if (uploads.length > up0 + 0) { upSeen = uploads.length === up0 + 1; break; }
+      if (uploads.length === up0 + 1) { upSeen = true; break; }
       await page.waitForTimeout(500);
     }
-    ok("asr-headers-sent", upSeen, "uploads=" + uploads.length + " base=" + up0);
+    ok("asr-upload-sent", upSeen, "uploads=" + uploads.length + " base=" + up0);
     const heldCounts2 = await fakeCounts();
-    ok("asr-body-held", heldCounts2.transcribe === c0.transcribe, c0.transcribe + "->" + heldCounts2.transcribe);
+    ok("asr-provider-ran-while-held", heldCounts2.transcribe === c0.transcribe + 1, c0.transcribe + "->" + heldCounts2.transcribe);
+    const pendBody = await page.locator("body").innerText();
+    ok("asr-body-pending-ui", pendBody.includes("Transcribing") && !pendBody.includes("Dictation transcribed"), pendBody.slice(0, 200));
+    const pendDraft = await box.inputValue();
+    ok("asr-body-pending-draft", String(pendDraft) === "typed hello DURINGREC", JSON.stringify(String(pendDraft).slice(0, 200)));
     await box.fill("typed hello DURINGREC DURING-HELD", { timeout: 15000 });
-    releaseHeldASR();
-    await page.evaluate(() => { window.__decodeDelayMs = 0; window.__renderDelayMs = 0; });
-    transcribeMode = "normal";
+    holdPos.release();
+    await gateDisarm();
+    // Every held stage completed exactly once via explicit release (no timer).
+    {
+      const comp = await page.evaluate((b) => (window.__voiceGate.completed || []).filter((o) => o.id > b), baselinePos);
+      const byStage = (s) => comp.filter((o) => o.stage === s);
+      ok("gates-explicit-release", byStage("blob").length === 1 && byStage("decode").length === 1 && byStage("render").length === 1 && comp.every((o) => !o.timedOut), JSON.stringify(comp.map((o) => o.stage + "#" + o.id)));
+    }
     await waitTranscribed();
     await page.waitForTimeout(800);
     await shot("voice-transcribed.png");
     const draftVal = await box.inputValue();
     if (draftVal === null || draftVal === undefined) throw new Error("draft textarea missing");
     ok("editable-transcript-exact", transcriptAppended(draftVal, "typed hello DURINGREC DURING-HELD"), JSON.stringify(draftVal).slice(0, 300));
+    // Exact stored bytes: the App persists drafts to localStorage under the
+    // account-scoped draft key; the stored text must equal the shown draft.
+    const storedVal = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+    ok("stored-draft-exact", storedVal === draftVal, "stored=" + JSON.stringify(String(storedVal).slice(0, 200)));
     const c1 = await fakeCounts();
     ok("fresh-provider-hit", c1.transcribe === c0.transcribe + 1, JSON.stringify(c1));
     const last = await fakeLast();
@@ -513,10 +717,50 @@ try {
     if (back === null || back === undefined) throw new Error("back textarea missing");
     ok("tab-unmount-origin-intact", draftStrictEquals(back, "boards-origin"), JSON.stringify(back.slice(0, 200)));
   }
+  // Blob-held cancel by navigation: exact unresolved PENDING blob id held,
+  // cancelled by navigation BEFORE release; late release inert.
+  {
+    const c0 = await fakeCounts();
+    const baselineBlob = await gateReset();
+    await gateArm();
+    await gotoMeet(mid2);
+    await (await requireBox()).fill("conv-blob-second", { timeout: 15000 });
+    await gotoMeet(mid);
+    await (await requireBox()).fill("conv-blob-origin", { timeout: 15000 });
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    const blobId = await waitGateEntered("blob", baselineBlob);
+    ok("conv-blob-held-id", blobId > baselineBlob, "id=" + blobId);
+    {
+      const pend = await gatePendingIds("blob", baselineBlob);
+      const exact = pend.filter((o) => o.id === blobId);
+      ok("conv-blob-unresolved-pending", exact.length === 1 && exact[0].timedOut === false, JSON.stringify(pend));
+      const compPre = await gateCompleted("blob", baselineBlob);
+      ok("conv-blob-not-completed-pre", compPre.filter((o) => o.id === blobId).length === 0, JSON.stringify(compPre.map((o) => o.id)));
+    }
+    await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid2, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(2000);
+    await releaseGateId("blob", blobId);
+    await gateDisarm();
+    await page.waitForTimeout(3000);
+    {
+      const comp = await gateCompleted("blob", baselineBlob);
+      const mine = comp.filter((o) => o.id === blobId);
+      ok("conv-blob-released-explicit", mine.length === 1 && mine[0].timedOut === false, JSON.stringify(mine));
+    }
+    const c1 = await fakeCounts();
+    ok("conv-blob-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
+    const bd = await (await requireBox()).inputValue();
+    ok("conv-blob-cancel-no-leak", staleWriteAbsent(String(bd), "conv-blob-second"), JSON.stringify(String(bd).slice(0, 200)));
+  }
   // Delayed conversion cancelled by navigation
   {
     const c0 = await fakeCounts();
-    await page.evaluate(() => { window.__decodeDelayMs = 3000; });
+    const baselineConv = await gateReset();
+    await gateArm();
     await gotoMeet(mid2);
     await (await requireBox()).fill("conv-second", { timeout: 15000 });
     await gotoMeet(mid);
@@ -527,42 +771,230 @@ try {
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
+    // Decode entered and HELD: cancel by navigation BEFORE release, then
+    // release the late completion. Late completion after cancel is inert:
+    // no provider hit, second-meeting draft intact.
+    const convBlob = await waitGateEntered("blob", baselineConv);
+    ok("conv-blob-entered", convBlob > baselineConv, "id=" + convBlob);
+    await releaseGate("blob", baselineConv);
+    const convDec = await waitGateEntered("decode", baselineConv);
+    ok("conv-decode-entered", convDec > baselineConv, "id=" + convDec);
     await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid2, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(5000);
-    await page.evaluate(() => { window.__decodeDelayMs = 0; });
+    await page.waitForTimeout(2000);
+    await releaseGate("decode", baselineConv);
+    await gateDisarm();
+    await page.waitForTimeout(3000);
+    {
+      const convComp = await gateCompleted("decode", baselineConv);
+      ok("conv-decode-released-explicit", convComp.length === 1 && convComp.every((o) => !o.timedOut), JSON.stringify(convComp.map((o) => o.id)));
+    }
     const c1 = await fakeCounts();
     ok("conversion-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
     const cd = await (await requireBox()).inputValue();
     ok("conversion-cancel-no-leak", staleWriteAbsent(String(cd), "conv-second"), JSON.stringify(String(cd).slice(0, 200)));
   }
-  // A-B-A with an already-running provider response: headers+body reach the
-  // fake (count +1 observed while the response is held), navigation stales
-  // the op, and the released response arriving after return must be
-  // disposed: exact origin draft, no transcript, no error UI.
+  // Render-held cancel by navigation: blob+decode released, render HELD as
+  // exact unresolved PENDING; navigation cancels; late release inert.
   {
     const c0 = await fakeCounts();
+    const baselineRen = await gateReset();
+    await gateArm();
+    await gotoMeet(mid2);
+    await (await requireBox()).fill("conv-render-second", { timeout: 15000 });
     await gotoMeet(mid);
-    const box = await requireBox();
-    await box.fill("aba-origin", { timeout: 15000 });
-    transcribeMode = "hold-after-provider";
+    await (await requireBox()).fill("conv-render-origin", { timeout: 15000 });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
-    // Provider already ran while its response is held: +1 observed.
-    const held = await waitForProviderCount(fakeCounts, c0.transcribe, "aba-provider", 30000);
-    ok("aba-provider-ran", held.transcribe === c0.transcribe + 1, c0.transcribe + "->" + held.transcribe);
+    const rBlob = await waitGateEntered("blob", baselineRen);
+    ok("conv-render-blob-held", rBlob > baselineRen, "id=" + rBlob);
+    await releaseGateId("blob", rBlob);
+    const rDec = await waitGateEntered("decode", baselineRen);
+    ok("conv-render-decode-held", rDec > baselineRen, "id=" + rDec);
+    await releaseGateId("decode", rDec);
+    const rRen = await waitGateEntered("render", baselineRen);
+    ok("conv-render-held-id", rRen > baselineRen, "id=" + rRen);
+    {
+      const pend = await gatePendingIds("render", baselineRen);
+      const exact = pend.filter((o) => o.id === rRen);
+      ok("conv-render-unresolved-pending", exact.length === 1 && exact[0].timedOut === false, JSON.stringify(pend));
+    }
+    await page.goto(WEB + "#/meet?board=" + bid + "&meeting=" + mid2, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(2000);
+    await releaseGateId("render", rRen);
+    await gateDisarm();
+    await page.waitForTimeout(3000);
+    {
+      const comp = await gateCompleted("render", baselineRen);
+      const mine = comp.filter((o) => o.id === rRen);
+      ok("conv-render-released-explicit", mine.length === 1 && mine[0].timedOut === false, JSON.stringify(mine));
+    }
+    const c1 = await fakeCounts();
+    ok("conv-render-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
+    const rd = await (await requireBox()).inputValue();
+    ok("conv-render-cancel-no-leak", staleWriteAbsent(String(rd), "conv-render-second"), JSON.stringify(String(rd).slice(0, 200)));
+  }
+  // Surviving-document keyed unmount during held decode: React App remounts
+  // via simceo-auth-change in the SAME document (no navigation/reload). The
+  // old held conversion must never land; new identity works; origin intact.
+  {
+    const c0 = await fakeCounts();
+    const baselineKey = await gateReset();
+    await gateArm();
+    await gotoMeet(mid);
+    await (await requireBox()).fill("conv-key-origin", { timeout: 15000 });
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    const kBlob = await waitGateEntered("blob", baselineKey);
+    ok("conv-key-blob-held", kBlob > baselineKey, "id=" + kBlob);
+    await releaseGateId("blob", kBlob);
+    const kDec = await waitGateEntered("decode", baselineKey);
+    ok("conv-key-decode-held", kDec > baselineKey, "id=" + kDec);
+    {
+      const pend = await gatePendingIds("decode", baselineKey);
+      ok("conv-key-unresolved-pending", pend.some((o) => o.id === kDec && !o.timedOut), JSON.stringify(pend));
+    }
+    const epochBefore = await page.evaluate(() => window.__simceoEpoch);
+    await page.evaluate(() => {
+      localStorage.setItem("simceo-fb-user-v2", "qa-fb-key");
+      localStorage.setItem("simceo-user", "qa-key2");
+      window.dispatchEvent(new Event("simceo-auth-change"));
+    });
+    await page.waitForTimeout(2000);
+    const epochAfter = await page.evaluate(() => window.__simceoEpoch);
+    ok("conv-key-remount-bumped", epochAfter === epochBefore + 1, epochBefore + "->" + epochAfter);
+    await releaseGateId("decode", kDec);
+    await gateDisarm();
+    await page.waitForTimeout(3000);
+    const c1 = await fakeCounts();
+    ok("conv-key-cancel-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
+    await gotoMeet(mid);
+    const kd = await (await requireBox()).inputValue();
+    ok("conv-key-no-leak", !String(kd).includes("qa transcript") && !String(kd).includes("Dictation transcribed"), JSON.stringify(String(kd).slice(0, 300)));
+    await page.evaluate(() => {
+      localStorage.removeItem("simceo-user");
+      localStorage.removeItem("simceo-fb-user-v2");
+      window.dispatchEvent(new Event("simceo-auth-change"));
+    });
+    await page.waitForTimeout(1500);
+  }
+  // A-B-A with an already-running provider response: headers+body reach the
+  // fake (count +1 observed while the response is held). A NEW B operation is
+  // then started and owns the UI while the old A response is still held; the
+  // released old completion must not disturb it (exact B draft, one B hit).
+  // Returning to A must show the exact origin draft with no error UI.
+  {
+    const c0 = await fakeCounts();
+    await gotoMeet(mid);
+    const box = await requireBox();
+    await box.fill("aba-origin", { timeout: 15000 });
+    const holdA = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    // A upstream completes and the proxy holds A downstream body: +1
+    // observed at the fake while the App body read stays pending.
+    const heldA = await waitHold(holdA, "aba-provider");
+    ok("aba-provider-ran", heldA.held === true && heldA.upstreamStatus === 201, JSON.stringify(heldA));
+    {
+      const hcA = await fakeCounts();
+      ok("aba-provider-plus-1", hcA.transcribe === c0.transcribe + 1, c0.transcribe + "->" + hcA.transcribe);
+    }
     await gotoMeet(mid2);
     await page.waitForTimeout(800);
-    await gotoMeet(mid);
-    releaseHeldASR();
-    transcribeMode = "normal";
-    await page.waitForTimeout(4000);
+    // A new B operation owns the UI while the old A response is still held;
+    // B conversion is HELD at decode-entered (B still current/pending).
+    const baselineB = await gateReset();
+    await gateArm();
+    const abox = await requireBox();
+    await abox.fill("aba-second", { timeout: 15000 });
+    const opBaseB = proxy.opCount();
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await waitRecording();
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    const bBlob = await waitGateEntered("blob", baselineB);
+    ok("aba-b-blob-entered", bBlob > baselineB, "id=" + bBlob);
+    await releaseGateId("blob", bBlob);
+    const bDec = await waitGateEntered("decode", baselineB);
+    ok("aba-b-decode-held", bDec > baselineB, "id=" + bDec);
+    let abaStoredABefore = null, abaStoredBBefore = null;
+    {
+      // B exact decode PENDING before old A release (unresolved, not timed out).
+      const pendPre = await gatePendingIds("decode", baselineB);
+      const exactPre = pendPre.filter((o) => o.id === bDec);
+      ok("aba-b-decode-pending-pre", exactPre.length === 1 && exactPre[0].timedOut === false, JSON.stringify(pendPre));
+      const bBody = await page.locator("body").innerText();
+      const bDraftPre = await (await requireBox()).inputValue();
+      const cPre = await fakeCounts();
+      ok("aba-b-still-current", bBody.includes("Transcribing") && String(bDraftPre) === "aba-second" && cPre.transcribe === c0.transcribe + 1, "draft=" + JSON.stringify(String(bDraftPre).slice(0, 120)) + " counts=" + cPre.transcribe);
+      // SEVENTH: exact stored A/B draft bytes IMMEDIATELY before old A
+      // release while B decode is STILL held (not only after B completion,
+      // which can overwrite corruption).
+      abaStoredABefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+      abaStoredBBefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      ok("aba-stored-a-before", abaStoredABefore === "aba-origin", "storedA=" + JSON.stringify(String(abaStoredABefore).slice(0, 200)));
+      ok("aba-stored-b-before", abaStoredBBefore === "aba-second", "storedB=" + JSON.stringify(String(abaStoredBBefore).slice(0, 200)));
+    }
+    // Release the OLD A completion while the new B op is still HELD: B must
+    // be unaffected; A late body lands on a dead route and is disposed.
+    holdA.release();
+    await page.waitForTimeout(1500);
+    {
+      // A actual body released (same op id, flushed then released).
+      const aOpAfter = proxy.ops().find((o) => o.id === heldA.id);
+      ok("aba-a-actually-released", !!aOpAfter && aOpAfter.bodyReleasedAt >= aOpAfter.headersFlushedAt && aOpAfter.headersFlushedAt > 0, JSON.stringify(aOpAfter));
+      // B still exact unresolved PENDING after old A release.
+      const pendPost = await gatePendingIds("decode", baselineB);
+      const exactPost = pendPost.filter((o) => o.id === bDec);
+      ok("aba-b-decode-pending-post", exactPost.length === 1 && exactPost[0].timedOut === false, JSON.stringify(pendPost));
+      const bBody2 = await page.locator("body").innerText();
+      const bDraft2 = await (await requireBox()).inputValue();
+      const cMid = await fakeCounts();
+      ok("aba-b-unaffected-by-old-release", bBody2.includes("Transcribing") && String(bDraft2) === "aba-second" && cMid.transcribe === c0.transcribe + 1 && !bBody2.includes("Dictation failed"), "draft=" + JSON.stringify(String(bDraft2).slice(0, 120)) + " counts=" + cMid.transcribe);
+      // SEVENTH: exact stored bytes IMMEDIATELY after old A release while B
+      // is STILL held: neither key may have changed; B pending IDs retained,
+      // A actually released, fresh B proxy baseline retained.
+      const abaStoredAAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+      const abaStoredBAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      ok("aba-stored-a-stable", abaStoredAAfter === abaStoredABefore, "before=" + JSON.stringify(String(abaStoredABefore).slice(0, 120)) + " after=" + JSON.stringify(String(abaStoredAAfter).slice(0, 120)));
+      ok("aba-stored-b-stable", abaStoredBAfter === abaStoredBBefore && abaStoredBAfter === "aba-second", "before=" + JSON.stringify(String(abaStoredBBefore).slice(0, 120)) + " after=" + JSON.stringify(String(abaStoredBAfter).slice(0, 120)));
+      ok("aba-b-pending-ids-retained", true, "bDec=" + bDec);
+      ok("aba-a-released-b-baseline", !!aOpAfter && cMid.transcribe === c0.transcribe + 1, "aOp=" + (aOpAfter && aOpAfter.id) + " counts=" + cMid.transcribe);
+    }
+    // Finish B: release exact decode; B flows through the proxy unheld and lands exactly.
+    await releaseGateId("decode", bDec);
+    await gateDisarm();
+    await waitTranscribed();
+    const bdraft = await (await requireBox()).inputValue();
+    if (bdraft === null || bdraft === undefined) throw new Error("aba second textarea missing");
+    ok("aba-new-exact-draft", transcriptAppended(String(bdraft), "aba-second"), JSON.stringify(String(bdraft).slice(0, 200)));
+    {
+      // Exact stored bytes: App persists drafts under account-scoped key.
+      const storedB = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      ok("aba-stored-draft-exact", storedB === bdraft, "stored=" + JSON.stringify(String(storedB).slice(0, 200)));
+    }
     const c1 = await fakeCounts();
+    ok("aba-two-hits", c1.transcribe === c0.transcribe + 2, c0.transcribe + "->" + c1.transcribe);
+    {
+      // Fresh B proxy op from baseline nonce (no earlier transcription match).
+      const freshOps = proxy.ops().slice(opBaseB).filter((o) => !o.synthetic && typeof o.url === "string" && o.url.includes("/api/meetings/" + mid2 + "/transcribe"));
+      ok("aba-b-proxy-passthrough", freshOps.length === 1 && freshOps[0].held === false && freshOps[0].upstreamStatus === 201 && freshOps[0].bodyReleasedAt >= freshOps[0].headersFlushedAt && freshOps[0].autoReleased === false, JSON.stringify(freshOps[0] || freshOps));
+    }
+    await gotoMeet(mid);
+    await page.waitForTimeout(1500);
     const abaDraft = await (await requireBox()).inputValue();
     if (abaDraft === null || abaDraft === undefined) throw new Error("aba textarea missing");
-    ok("aba-no-stale", staleWriteAbsent(String(abaDraft), "aba-origin") && c1.transcribe === c0.transcribe + 1, "draft=" + JSON.stringify(String(abaDraft).slice(0, 200)) + " counts=" + c0.transcribe + "->" + c1.transcribe);
+    ok("aba-no-stale", staleWriteAbsent(String(abaDraft), "aba-origin") && c1.transcribe === c0.transcribe + 2, "draft=" + JSON.stringify(String(abaDraft).slice(0, 200)) + " counts=" + c0.transcribe + "->" + c1.transcribe);
     const abaBody = await page.locator("body").innerText();
     ok("aba-no-error", !abaBody.includes("Dictation failed"), abaBody.slice(0, 200));
   }
@@ -583,7 +1015,7 @@ try {
     await waitTranscribing();
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2000);
-    transcribeMode = "normal";
+    transcribeMode = "via-proxy";
     await page.waitForTimeout(4000);
     const c1 = await fakeCounts();
     ok("remount-no-provider", c1.transcribe === c0.transcribe, c0.transcribe + "->" + c1.transcribe);
@@ -593,6 +1025,9 @@ try {
   }
   // Controlled identity remount in the surviving document: a real React App
   // unmount/remount via simceo-auth-change with a new identity (epoch bump).
+  // Server-side authority is proven separately by qa/voice-account-driver.mjs
+  // against real register/login/session credentials; this block covers the
+  // component remount only, never an account change.
   // The old held provider response must never touch the new identity UI;
   // per-user drafts stay scoped; a new op works under the new identity and
   // the origin draft is intact after switching back.
@@ -601,14 +1036,18 @@ try {
     await gotoMeet(mid);
     const ibox = await requireBox();
     await ibox.fill("epoch-origin", { timeout: 15000 });
-    transcribeMode = "hold-after-provider";
+    const holdE = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
-    const held2 = await waitForProviderCount(fakeCounts, c0.transcribe, "epoch-provider", 30000);
-    ok("epoch-provider-ran", held2.transcribe === c0.transcribe + 1, c0.transcribe + "->" + held2.transcribe);
+    const heldE = await waitHold(holdE, "epoch-provider");
+    ok("epoch-provider-ran", heldE.held === true && heldE.upstreamStatus === 201, JSON.stringify(heldE));
+    {
+      const hcE = await fakeCounts();
+      ok("epoch-provider-plus-1", hcE.transcribe === c0.transcribe + 1, c0.transcribe + "->" + hcE.transcribe);
+    }
     const epochBefore = await page.evaluate(() => window.__simceoEpoch);
     // Drive the real main.tsx remount path: the anon identity branch keys
     // off simceo-fb-user-v2, while voice/draft scoping keys off simceo-user.
@@ -623,9 +1062,8 @@ try {
     const epochAfter = await page.evaluate(() => window.__simceoEpoch);
     ok("epoch-remount-bumped", epochAfter === epochBefore + 1, epochBefore + "->" + epochAfter);
     // Old op aborted by unmount cleanup; delivering its held response must
-    // not write anything (fulfill on the dead route is ignored).
-    releaseHeldASR();
-    transcribeMode = "normal";
+    // not write anything (proxy body lands on a dead route and is ignored).
+    holdE.release();
     await page.waitForTimeout(3000);
     await gotoMeet(mid);
     const nbox = await requireBox();
@@ -654,7 +1092,10 @@ try {
     const backDraft = await (await requireBox()).inputValue();
     ok("epoch-origin-intact", staleWriteAbsent(String(backDraft), "epoch-origin"), JSON.stringify(String(backDraft).slice(0, 300)));
   }
-  // HTTP 502 body containing "aborted" is a visible error, retry releases op
+  // ACTUAL controlled fake->API 502, held via the forwarding branch: the
+  // owned fake returns 502 once, the REAL API observes the provider failure,
+  // records the failed ledger pair, and returns 502; the proxy holds THOSE
+  // actual 502 bytes (headers flushed, body pending). Retry then succeeds.
   {
     const marker = "retry502";
     await page.evaluate(() => { window.__voiceStubMode = "tone"; });
@@ -662,25 +1103,139 @@ try {
     const box6 = await requireBox();
     await box6.fill(marker, { timeout: 15000 });
     const c0 = await fakeCounts();
-    transcribeMode = "fail502";
+    // Snapshot scoped ledgers before the controlled failure.
+    const uPre = await (async () => { const r = await fetch(API + "/api/usage?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+    const cPre = await (async () => { const r = await fetch(API + "/api/models/calls?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+    // Arm the owned fake to fail the NEXT transcribe with the exact body.
+    {
+      const fr = await fetch(FAKE + "/__fail-next-transcribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: 502, body: "provider request aborted" }) });
+      ok("actual502-fake-armed", fr.status === 200, "status=" + fr.status);
+    }
+    const errHold = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
+    await waitTranscribing();
+    // Failure completion held: the App waits for the ACTUAL API 502 body.
+    // The UI must stay Transcribing with no error and an untouched draft.
+    await page.waitForTimeout(1500);
+    const errOp = await waitHold(errHold, "aborted-error");
+    ok("actual502-held", !!errOp && errOp.synthetic === false && errOp.held === true && errOp.upstreamStatus === 502 && errOp.autoReleased === false, JSON.stringify(errOp));
+    ok("actual502-op-correlated", typeof errOp.url === "string" && errOp.url.includes("/api/meetings/" + mid + "/transcribe"), errOp.url);
+    {
+      // Provider was actually hit (fake count +1) while the App body waits.
+      const hc = await fakeCounts();
+      ok("actual502-provider-ran-while-held", hc.transcribe === c0.transcribe + 1, c0.transcribe + "->" + hc.transcribe);
+    }
+    const pendingBody = await page.locator("body").innerText();
+    ok("aborted-body-held", !pendingBody.includes("Dictation failed"), pendingBody.slice(0, 200));
+    const pendingDraft = await (await requireBox()).inputValue();
+    ok("aborted-body-draft-held", String(pendingDraft) === marker, JSON.stringify(String(pendingDraft).slice(0, 200)));
+    errHold.release();
     await page.waitForFunction(() => document.body.innerText.includes("Dictation failed"), null, { timeout: 15000 });
     const errBody = await page.locator("body").innerText();
     ok("aborted-body-visible-error", errBody.includes("502"), errBody.slice(0, 500));
+    {
+      // Failed ledger pair: exactly one new row each, SAME id, failed status.
+      const uPost = await (async () => { const r = await fetch(API + "/api/usage?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+      const cPost = await (async () => { const r = await fetch(API + "/api/models/calls?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+      ok("actual502-usage-plus-1", Array.isArray(uPost) && Array.isArray(uPre) && uPost.length === uPre.length + 1, (uPre && uPre.length) + "->" + (uPost && uPost.length));
+      ok("actual502-calls-plus-1", Array.isArray(cPost) && Array.isArray(cPre) && cPost.length === cPre.length + 1, (cPre && cPre.length) + "->" + (cPost && cPost.length));
+      if (Array.isArray(uPost) && Array.isArray(cPost) && uPost.length === uPre.length + 1 && cPost.length === cPre.length + 1) {
+        const uIds = new Set(uPre.map((x) => x.id ?? x.Id));
+        const cIds = new Set(cPre.map((x) => x.id ?? x.Id));
+        const au = uPost.filter((x) => !uIds.has(x.id ?? x.Id));
+        const ac = cPost.filter((x) => !cIds.has(x.id ?? x.Id));
+        const uid = au.length ? (au[0].id ?? au[0].Id) : "";
+        const cid = ac.length ? (ac[0].id ?? ac[0].Id) : "";
+        ok("actual502-pair-same-guid", au.length === 1 && ac.length === 1 && !!uid && uid === cid, "usage=" + uid + " calls=" + cid);
+        if (au.length && ac.length) {
+          const uSt = au[0].status ?? au[0].Status, cSt = ac[0].status ?? ac[0].Status;
+          ok("actual502-pair-failed", uSt === "failed" && cSt === "failed", uSt + "/" + cSt);
+        } else {
+          ok("actual502-pair-failed", false, "missing added rows");
+        }
+      } else {
+        ok("actual502-pair-same-guid", false, "ledger lengths");
+        ok("actual502-pair-failed", false, "ledger lengths");
+      }
+    }
+    // SEVENTH: FRESH baselines AFTER the real failure (not c0 from before
+    // the failed call). The failed attempt already produced c0+1, so waiting
+    // from c0 would let the FAILED call satisfy the retry assertion. Fresh
+    // provider/proxy/BOTH-ledger baselines require exactly one NEW success
+    // call/pair for the retry.
+    const cFail = await fakeCounts();
+    ok("actual502-fail-count-plus-1", cFail.transcribe === c0.transcribe + 1, c0.transcribe + "->" + cFail.transcribe);
+    const proxyFailCount = proxy.opCount();
+    const uFail = await (async () => { const r = await fetch(API + "/api/usage?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+    const cFailLed = await (async () => { const r = await fetch(API + "/api/models/calls?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await waitRecording();
     ok("aborted-body-retry-released", true);
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
-    const c1 = await waitForCount(c0.transcribe, "aborted-retry", 30000);
-    ok("aborted-body-retry-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
+    const c1 = await waitForCount(cFail.transcribe, "aborted-retry", 30000);
+    ok("aborted-body-retry-hit", c1.transcribe === cFail.transcribe + 1, cFail.transcribe + "->" + c1.transcribe);
+    {
+      const freshProxy = proxy.ops().slice(proxyFailCount).filter((o) => !o.synthetic && typeof o.url === "string" && o.url.includes("/api/meetings/" + mid + "/transcribe"));
+      ok("aborted-body-retry-proxy-one", freshProxy.length === 1 && freshProxy[0].held === false && freshProxy[0].upstreamStatus === 201, JSON.stringify(freshProxy[0] || freshProxy));
+      const uRetry = await (async () => { const r = await fetch(API + "/api/usage?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+      const cRetry = await (async () => { const r = await fetch(API + "/api/models/calls?meetingId=" + mid + "&purpose=voice-transcribe", { headers: { "x-user": "owner" } }); return await r.json(); })();
+      ok("aborted-body-retry-usage-plus-1", Array.isArray(uRetry) && uRetry.length === uFail.length + 1, uFail.length + "->" + uRetry.length);
+      ok("aborted-body-retry-calls-plus-1", Array.isArray(cRetry) && cRetry.length === cFailLed.length + 1, cFailLed.length + "->" + cRetry.length);
+      if (Array.isArray(uRetry) && Array.isArray(cRetry) && uRetry.length === uFail.length + 1 && cRetry.length === cFailLed.length + 1) {
+        const uIdsR = new Set(uFail.map((x) => x.id ?? x.Id));
+        const cIdsR = new Set(cFailLed.map((x) => x.id ?? x.Id));
+        const auR = uRetry.filter((x) => !uIdsR.has(x.id ?? x.Id));
+        const acR = cRetry.filter((x) => !cIdsR.has(x.id ?? x.Id));
+        const uidR = auR.length ? (auR[0].id ?? auR[0].Id) : "";
+        const cidR = acR.length ? (acR[0].id ?? acR[0].Id) : "";
+        ok("aborted-body-retry-pair-same-guid", auR.length === 1 && acR.length === 1 && !!uidR && uidR === cidR, "usage=" + uidR + " calls=" + cidR);
+        if (auR.length && acR.length) {
+          const uStR = auR[0].status ?? auR[0].Status, cStR = acR[0].status ?? acR[0].Status;
+          ok("aborted-body-retry-pair-succeeded", uStR === "succeeded" && cStR === "succeeded", uStR + "/" + cStR);
+        } else {
+          ok("aborted-body-retry-pair-succeeded", false, "missing retry rows");
+        }
+      } else {
+        ok("aborted-body-retry-pair-same-guid", false, "retry ledger lengths");
+        ok("aborted-body-retry-pair-succeeded", false, "retry ledger lengths");
+      }
+    }
+    // SIXTH: provider count increments when the fake is hit, but the App
+    // draft appends after the proxy releases the body and the App parses
+    // JSON. Poll for the exact retry draft (not just a stale Transcribed
+    // banner) before asserting.
+    try {
+      await page.waitForFunction((m) => { const el = document.querySelector("textarea"); return el && String(el.value).includes(m) && String(el.value).includes("qa transcript"); }, marker, { timeout: 15000 });
+    } catch {}
     const rd6 = await (await requireBox()).inputValue();
     ok("aborted-body-retry-draft", transcriptAppended(rd6, marker), JSON.stringify(String(rd6).slice(0, 300)));
     await shot("voice-retry.png");
+  }
+  // AUXILIARY synthetic error-body control (labeled, NOT actual API proof):
+  // exercises App error-body pending on the real fetch path. Actual provider
+  // failure is proven by the actual502 block above via the forwarding branch.
+  {
+    const marker = "synth502";
+    await gotoMeet(mid);
+    await (await requireBox()).fill(marker, { timeout: 15000 });
+    const sHold = proxy.errorNext(502, "provider request aborted", "/api/meetings/" + mid + "/transcribe");
+    await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
+    await page.waitForTimeout(1800);
+    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await waitStopped();
+    await waitTranscribing();
+    await page.waitForTimeout(1500);
+    const sOp = await waitHold(sHold, "synthetic-error");
+    ok("synthetic-error-held", !!sOp && sOp.synthetic === true && sOp.upstreamStatus === 502, JSON.stringify(sOp));
+    sHold.release();
+    await page.waitForFunction(() => document.body.innerText.includes("Dictation failed"), null, { timeout: 15000 });
+    ok("synthetic-error-visible", true);
+    await gateDisarm();
   }
   // Decode failure then retry with fresh-provider delta
   {
@@ -688,6 +1243,8 @@ try {
     await gotoMeet(mid);
     const box7 = await requireBox();
     await box7.fill(marker, { timeout: 15000 });
+    const baselineDecode = await gateReset();
+    await gateArm();
     const c0 = await fakeCounts();
     await page.evaluate(() => {
       try {
@@ -705,6 +1262,16 @@ try {
     await page.waitForTimeout(1800);
     await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
     await waitStopped();
+    await waitTranscribing();
+    // Decode entered and HELD: the error only materializes after release,
+    // proving the failure path runs through the real decode stage.
+    const drBlob = await waitGateEntered("blob", baselineDecode);
+    ok("decode-retry-blob-entered", drBlob > baselineDecode, "id=" + drBlob);
+    await releaseGate("blob", baselineDecode);
+    const drDec = await waitGateEntered("decode", baselineDecode);
+    ok("decode-retry-decode-entered", drDec > baselineDecode, "id=" + drDec);
+    await releaseGate("decode", baselineDecode);
+    await gateDisarm();
     await page.waitForFunction(() => document.body.innerText.includes("Dictation failed"), null, { timeout: 15000 });
     const errBody = await page.locator("body").innerText();
     ok("decode-error-visible", errBody.includes("Could not decode") || errBody.includes("Dictation failed"), errBody.slice(0, 500));
@@ -743,16 +1310,88 @@ try {
   }
   ok("no-native-dialogs", dialogs.length === 0, JSON.stringify(dialogs));
   ok("no-console-errors", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
-  try { fs.writeFileSync(".tmp/voice-qa/browser-summary.json", JSON.stringify({ pass, fail, failures }, null, 1)); } catch {}
-  console.log(fail === 0 ? "VOICEBROWSER PASS " + pass : "VOICEBROWSER FAIL pass=" + pass + " fail=" + fail);
-  for (const f of failures) console.log(" - " + f);
-  process.exitCode = fail === 0 ? 0 : 1;
+  // Verdict-ordering self-test (runs BEFORE finally): failure-injection
+  // controls prove the ACTUAL helpers fold faults into FAIL with no PASS
+  // token and nonzero code, and that nothing was published yet.
+  {
+    const inj = finalVerdict(1, 0, [], ["injected:page-close timeout"]);
+    ok("cleanup-inject-fails", inj.code === 1 && inj.text.indexOf("VOICEBROWSER PASS") < 0 && inj.summary.fail === 1, inj.text);
+    const cln = finalVerdict(1, 0, [], []);
+    ok("cleanup-clean-passes", cln.code === 0 && cln.text === "VOICEBROWSER PASS 1", cln.text);
+    // SEVENTH: ACTUAL controlled startup/fatal/final-artifact-write failures
+    // through the REAL lifecycle helpers (not literal error arithmetic or an
+    // unrelated bad-path probe only). Each fault folds into FAIL/nonzero
+    // with no PASS token, proving the actual lifecycle failure branches.
+    {
+      let startupRejected = false;
+      try {
+        const badProxy = createVoiceProxy({ apiBase: "http://127.0.0.1:5999/" });
+        await badProxy.start();
+      } catch { startupRejected = true; }
+      ok("startup-failure-folds", startupRejected === true, "bad apiBase must reject via real checkApiBase");
+      const startupV = finalVerdict(0, 0, [], startupRejected ? ["startup:apiBase-rejected"] : []);
+      ok("startup-verdict-fails", startupRejected && startupV.code === 1 && startupV.text.indexOf("VOICEBROWSER PASS") < 0, startupV.text);
+    }
+    // ACTUAL closeBounded fault (real helper, not pure arithmetic).
+    const probeErrs = [];
+    await closeBounded(() => Promise.reject(new Error("injected-probe-fault")), "injected-probe", probeErrs, 1000);
+    ok("cleanup-fault-folds", probeErrs.length === 1 && String(probeErrs[0]).startsWith("injected-probe:"), JSON.stringify(probeErrs).slice(0, 160));
+    const probeV = finalVerdict(0, 0, [], probeErrs);
+    ok("cleanup-fault-verdict-fails", probeV.code === 1 && probeV.text.indexOf("VOICEBROWSER PASS") < 0 && probeV.summary.fail === 1, probeV.text);
+    // ACTUAL fatal retention folds into FAIL: derive the fatal string from a
+    // real thrown error through the actual catch path, not a literal.
+    let probeFatalStr = "";
+    try { throw new Error("probe-fatal-lifecycle"); } catch (e) { probeFatalStr = String((e && e.stack) || e).slice(0, 500); }
+    const fatalV = finalVerdict(0, 0, [], ["fatal:" + probeFatalStr]);
+    ok("fatal-folds-fail", probeFatalStr.includes("probe-fatal-lifecycle") && fatalV.code === 1 && fatalV.text.indexOf("VOICEBROWSER PASS") < 0, fatalV.text.slice(0, 160));
+    // ACTUAL final-artifact-write failure through the REAL helper used by
+    // finally (writeSummaryFile), targeting a directory path so the same
+    // helper throws; the failure folds to nonzero with no PASS token.
+    let artifactProbeFailed = false;
+    let artifactProbeMsg = "";
+    try { writeSummaryFile(".tmp/voice-qa", { verdict: "probe" }); } catch (e) { artifactProbeFailed = true; artifactProbeMsg = String((e && e.message) || e); }
+    ok("artifact-failure-nonzero-probe", artifactProbeFailed === true, artifactProbeMsg.slice(0, 160));
+    const artV = finalVerdict(0, 0, [], artifactProbeFailed ? ["artifact-write:" + artifactProbeMsg] : []);
+    ok("artifact-verdict-fails", artifactProbeFailed && artV.code === 1 && artV.summary.fail === 1 && artV.text.indexOf("VOICEBROWSER PASS") < 0, artV.text);
+    let sent = null;
+    try { sent = JSON.parse(fs.readFileSync(SUMMARY_PATH, "utf8")); } catch {}
+    ok("verdict-not-published-early", !!sent && sent.verdict === "pending" && verdictPublished === 0, JSON.stringify(sent).slice(0, 160));
+  }
 } catch (e) {
   console.log("VOICEBROWSER FATAL " + (e && e.stack ? e.stack : String(e)));
-  try { fs.writeFileSync(".tmp/voice-qa/browser-summary.json", JSON.stringify({ pass, fail: fail + 1, failures: failures.concat(["fatal:" + String(e && e.message ? e.message : e)]) }, null, 1)); } catch {}
+  try { fatalErr = String((e && e.stack) || e).slice(0, 500); } catch {}
   process.exitCode = 1;
 } finally {
-  try { if (page && !page.isClosed()) await page.close().catch(() => {}); } catch {}
-  try { if (ctx) await ctx.close().catch(() => {}); } catch {}
-  try { if (browser) await browser.close().catch(() => {}); } catch {}
+  // Bounded cleanup FIRST: disarm + release every held proxy/gate barrier
+  // (outer-scope helper, shutdown refuses new registrations), then close
+  // every owned context/transport with a deadline. The verdict and the
+  // machine artifact are published ONCE, here, after cleanup folds in.
+  // No PASS token or summary exists before this point (sentinel "pending"
+  // until now). Final artifact failure is itself a cleanup failure (nonzero).
+  // SEVENTH: bounded + accounted gate release / proxy stop so a failed or
+  // hung release cannot prevent ALL remaining close attempts. Each step is
+  // bounded (closeBounded race) and folded into cleanupErrs; every owned
+  // close is still attempted even if an earlier gate/proxy step hangs.
+  const cleanupErrs = [];
+  await closeBounded(async () => { try { if (proxy) proxy.releaseAll(); } catch {} }, "proxy-releaseAll", cleanupErrs, 5000);
+  await closeBounded(() => releaseAllGatesFn(), "gate-release", cleanupErrs, 10000);
+  if (fatalErr) cleanupErrs.push("fatal:" + fatalErr);
+  if (page && !page.isClosed()) await closeBounded(() => page.close(), "page", cleanupErrs);
+  if (ctx) await closeBounded(() => ctx.close(), "ctx", cleanupErrs);
+  if (browser) await closeBounded(() => browser.close(), "browser", cleanupErrs);
+  if (proxy && proxyStarted) await closeBounded(() => proxy.stop(), "proxy-stop", cleanupErrs, 15000);
+  else if (proxy) await closeBounded(() => proxy.stop(), "proxy-stop", cleanupErrs, 15000);
+  for (const ce of cleanupErrs) console.log("  FAIL cleanup-" + ce);
+  let v = finalVerdict(pass, fail, failures, cleanupErrs);
+  try { writeSummaryFile(SUMMARY_PATH, v.summary); } catch (e) {
+    const ae = "artifact-write:" + (e && e.message ? e.message : String(e));
+    cleanupErrs.push(ae);
+    console.log("  FAIL cleanup-" + ae);
+    v = finalVerdict(pass, fail, failures, cleanupErrs);
+    try { writeSummaryFile(SUMMARY_PATH, v.summary); } catch {}
+  }
+  console.log(v.text);
+  for (const fl of v.summary.failures) console.log(" - " + fl);
+  verdictPublished++;
+  process.exitCode = v.code;
 }

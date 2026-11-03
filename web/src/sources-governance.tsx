@@ -16,6 +16,20 @@ type HistEvent = { id: string; action: string; detail: string; createdAt: string
 type SecRow = { id: string; ordinal: number; heading: string; location: string; text: string; indexGeneration: number };
 type SecResp = { sourceId: string; version: number; contentHash: string; indexState: string; indexGeneration: number; indexError: string; indexCompletedAt?: string | null; sections: SecRow[] };
 
+// Host-guarded identity transport. The host App owns the canonical
+// authority (Bearer-precedes-applied identity + auth epoch) and the central
+// 401 transition; this panel never fetches with its own identity snapshot and
+// never clicks a download URL without rechecking the origin identity.
+export type GovTransport = {
+  get: <T>(u: string) => Promise<T>;
+  post: <T>(u: string, b?: unknown) => Promise<T>;
+  put: <T>(u: string, b: unknown) => Promise<T>;
+  del: <T>(u: string) => Promise<T>;
+  upload: <T>(u: string, f: FormData) => Promise<T>;
+  download: (u: string, filename: string) => Promise<void>;
+  origin: () => { epoch: number; token: string; user: string };
+  stale: (o: { epoch: number; token: string; user: string }) => boolean;
+};
 function authHeaders(actAs: string): Record<string, string> {
   const h: Record<string, string> = {};
   const t = localStorage.getItem("simceo-token");
@@ -36,10 +50,32 @@ const post = <T,>(actAs: string, u: string, b?: unknown): Promise<T> =>
 const putPolicy = (actAs: string, bid: string, blockedTypes: string, mode: string) =>
   fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean }) {
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; transport?: GovTransport }) {
   const { boardId, meetingId, meetings, actAs, readOnly, canManage } = props;
   const canWrite = !readOnly;
   const canManagePolicy = canManage === true;
+  // Host transport carries the canonical identity/epoch and the central 401
+  // transition. The local fallback preserves standalone rendering only; the
+  // integrated app always supplies the host transport.
+  const T: GovTransport = props.transport ?? {
+    get: <T,>(u: string) => get<T>(actAs, u),
+    post: <T,>(u: string, b?: unknown) => post<T>(actAs, u, b),
+    put: <T,>(u: string, b: unknown) => fetch(u, { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify(b ?? {}) }).then(j<T>),
+    del: <T,>(u: string) => fetch(u, { method: "DELETE", headers: authHeaders(actAs) }).then(j<T>),
+    upload: <T,>(u: string, f: FormData) => fetch(u, { method: "POST", headers: authHeaders(actAs), body: f }).then(j<T>),
+    download: async (u: string, filename: string) => {
+      const r = await fetch(u, { headers: authHeaders(actAs) });
+      if (!r.ok) throw new Error(r.status + " " + (await r.text()));
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename || "source.bin";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    },
+    origin: () => ({ epoch: 0, token: "", user: (actAs || "").trim() || "owner" }),
+    stale: () => false,
+  };
   const [groups, setGroups] = useState<ReviewGroup[] | null>(null);
   const [policy, setPolicy] = useState<{ blockedTypes: string; mode: string } | null>(null);
   const [blocked, setBlocked] = useState("");
@@ -71,55 +107,55 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
     if (boardRef.current !== myBoard) return;
     if (!boardId) return;
     const seq = ++seqRef.current;
+    const o = T.origin();
     setLoading(true); setConflict("");
     try {
-      const g = await get<ReviewGroup[]>(actAs, "/api/boards/" + boardId + "/sources/review");
-      if (boardRef.current !== myBoard || seq !== seqRef.current) return;
+      const g = await T.get<ReviewGroup[]>("/api/boards/" + boardId + "/sources/review");
+      if (boardRef.current !== myBoard || seq !== seqRef.current || T.stale(o)) return;
       setGroups(g);
       if (canWrite) {
         try {
           const [p, c] = await Promise.all([
-            get<{ blockedTypes: string; mode: string }>(actAs, "/api/boards/" + boardId + "/source-policy"),
-            get<unknown>(actAs, "/api/boards/" + boardId + "/context"),
+            T.get<{ blockedTypes: string; mode: string }>("/api/boards/" + boardId + "/source-policy"),
+            T.get<unknown>("/api/boards/" + boardId + "/context"),
           ]);
-          if (boardRef.current !== myBoard || seq !== seqRef.current) return;
+          if (boardRef.current !== myBoard || seq !== seqRef.current || T.stale(o)) return;
           setPolicy(p); setBlocked(p.blockedTypes ?? ""); setMode(p.mode ?? "allowAll"); setCtx(c);
-        } catch (e) { if (boardRef.current === myBoard && seq === seqRef.current) setConflict(String(e)); }
+        } catch (e) { if (boardRef.current === myBoard && seq === seqRef.current && !T.stale(o)) setConflict(String(e)); }
       }
     } catch (e) {
-      if (boardRef.current === myBoard && seq === seqRef.current) setConflict(String(e));
-    } finally { if (boardRef.current === myBoard && seq === seqRef.current) setLoading(false); }
+      if (boardRef.current === myBoard && seq === seqRef.current && !T.stale(o)) setConflict(String(e));
+    } finally { if (boardRef.current === myBoard && seq === seqRef.current && !T.stale(o)) setLoading(false); }
   }
   useEffect(() => { refresh(); }, [boardId]);
 
   async function downloadFile(id: string, name: string) {
     setConflict("");
+    // The host download pins the originating identity at fetch and rechecks
+    // it at click: an account switch between fetch and click discards the
+    // download instead of saving it under the new identity.
+    const o = T.origin();
     try {
-      const r = await fetch("/api/sources/" + id + "/download", { headers: authHeaders(actAs) });
-      if (!r.ok) throw new Error(r.status + " " + (await r.text()));
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = name || "source.bin";
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-    } catch (e) { setConflict(String(e)); }
+      await T.download("/api/sources/" + id + "/download", name || "source.bin");
+    } catch (e) { if (!T.stale(o)) setConflict(String(e)); }
   }
   async function act(id: string, op: string) {
     setConflict(""); setNotice("");
     const opBoard = boardId;
+    const o = T.origin();
     try {
-      await post(actAs, "/api/sources/" + id + "/" + op, {});
-      if (boardRef.current !== opBoard) return;
+      await T.post("/api/sources/" + id + "/" + op, {});
+      if (boardRef.current !== opBoard || T.stale(o)) return;
       if (op === "approve" || op === "reject" || op === "exclude" || op === "restore") setNotice("Meeting evidence re-evaluated; affected active meetings paused.");
       await refresh(); notifyWikiChanged();
-    } catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
+    } catch (e) { if (boardRef.current === opBoard && !T.stale(o)) setConflict(String(e)); }
   }
   async function savePolicy() {
     setConflict(""); setNotice("");
     const opBoard = boardId;
-    try { await putPolicy(actAs, boardId, blocked, mode); if (boardRef.current !== opBoard) return; setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); notifyWikiChanged(); }
-    catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
+    const o = T.origin();
+    try { await T.put("/api/boards/" + boardId + "/source-policy", { blockedTypes: blocked, mode }); if (boardRef.current !== opBoard || T.stale(o)) return; setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); notifyWikiChanged(); }
+    catch (e) { if (boardRef.current === opBoard && !T.stale(o)) setConflict(String(e)); }
   }
   const [uploadMeetingId, setUploadMeetingId] = useState("");
   const effUploadMeeting = uploadScope === "meeting" ? (uploadMeetingId || meetingId || "") : "";
@@ -129,6 +165,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
     // is blocked client-side and rejected server-side — never widened to board.
     if (!f || !boardId) return;
     setConflict(""); setNotice("");
+    const o = T.origin();
     try {
       if (uploadScope === "meeting" && !effUploadMeeting)
         throw new Error("Pick a meeting for meeting scope; uploads never silently fall back to board.");
@@ -136,27 +173,30 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
       fd.append("file", f);
       fd.append("scope", uploadScope);
       if (uploadScope === "meeting" && effUploadMeeting) fd.append("meetingId", effUploadMeeting);
-      const res = await fetch("/api/boards/" + boardId + "/sources/upload", { method: "POST", headers: authHeaders(actAs), body: fd });
-      if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 400));
-      if (boardRef.current !== boardId) return;
+      await T.upload("/api/boards/" + boardId + "/sources/upload", fd);
+      if (boardRef.current !== boardId || T.stale(o)) return;
       setNotice("Uploaded as pending; explicit approval required before it becomes evidence.");
       await refresh(); notifyWikiChanged();
-    } catch (e) { if (boardRef.current === boardId) setConflict(String(e)); }
+    } catch (e) { if (boardRef.current === boardId && !T.stale(o)) setConflict(String(e)); }
   }
   async function loadHist(id: string) {
-    try { const h = await get<HistEvent[]>(actAs, "/api/sources/" + id + "/history"); setHist((m) => ({ ...m, [id]: h })); }
-    catch (e) { setConflict(String(e)); }
+    const o = T.origin();
+    try { const h = await T.get<HistEvent[]>("/api/sources/" + id + "/history"); if (T.stale(o)) return; setHist((m) => ({ ...m, [id]: h })); }
+    catch (e) { if (!T.stale(o)) setConflict(String(e)); }
   }
   async function loadSecs(id: string) {
-    try { const s = await get<SecResp>(actAs, "/api/sources/" + id + "/sections"); setSecs((m) => ({ ...m, [id]: s })); }
-    catch (e) { setConflict(String(e)); }
+    const o = T.origin();
+    try { const s = await T.get<SecResp>("/api/sources/" + id + "/sections"); if (T.stale(o)) return; setSecs((m) => ({ ...m, [id]: s })); }
+    catch (e) { if (!T.stale(o)) setConflict(String(e)); }
   }
   async function runRecall() {
     setConflict("");
+    const o = T.origin();
     try {
-      const hits = await get<{ kind: string; ref: string; text: string; score: number }[]>(actAs, "/api/boards/" + boardId + "/recall?q=" + encodeURIComponent(recallQ) + (meetingId ? "&meetingId=" + meetingId : ""));
+      const hits = await T.get<{ kind: string; ref: string; text: string; score: number }[]>("/api/boards/" + boardId + "/recall?q=" + encodeURIComponent(recallQ) + (meetingId ? "&meetingId=" + meetingId : ""));
+      if (T.stale(o)) return;
       setRecallHits(hits);
-    } catch (e) { setConflict(String(e)); }
+    } catch (e) { if (!T.stale(o)) setConflict(String(e)); }
   }
 
   const flat: GovSource[] = (groups ?? []).flatMap((g) => g.versions);
@@ -211,10 +251,10 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
               {s.isHead && <span className="badge">head</span>}
               {s.indexState === "failed" && <span className="badge">evidence blocked{s.indexError ? ": " + s.indexError.slice(0, 120) : ""}</span>}
               <div className="meetctl">
-                {canWrite && (<button onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
-                {canWrite && (<button onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
-                {canWrite && (<button onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
-                {canWrite && (<button onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
+                {canManagePolicy && (<button onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
+                {canManagePolicy && (<button onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
+                {canManagePolicy && (<button onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
+                {canManagePolicy && (<button onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
                 {canWrite && (<button onClick={() => act(s.id, "reindex")}>Reindex</button>)}
                 {canWrite && (<button onClick={() => act(s.id, "retry")}>Retry extraction</button>)}

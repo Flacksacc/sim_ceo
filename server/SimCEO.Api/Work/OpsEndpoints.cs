@@ -530,8 +530,16 @@ public static class OpsEndpoints
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
       if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2 or 3 or 4))
         return Results.BadRequest("Unsupported backup version.");
-      var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
-        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+      BackupSnapshot? restored;
+      try
+      {
+        restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
+          new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+      }
+      catch (Exception ex) when (ex is JsonException || ex is NotSupportedException || ex is InvalidOperationException || ex is FormatException)
+      {
+        return Results.Json(new { error = "Backup snapshot has invalid typed data: " + ex.GetType().Name }, statusCode: 422);
+      }
       if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
       if (restored.jobs is not null)
       {
@@ -575,6 +583,15 @@ public static class OpsEndpoints
       List<WikiBackupRecord>? wikiValidated = null;
       try
       {
+        // Secretary-domain strict graph check (preserved): typed nested validation
+        {
+          string? secGraphError = BackupGraphValidator.Validate(restored);
+          if (secGraphError is not null) return Results.Json(new { error = secGraphError }, statusCode: 422);
+          foreach (var kv in restored.messages)
+          {
+            if (!Guid.TryParse(kv.Key, out _)) return Results.Json(new { error = "Backup message key is not a meeting id." }, statusCode: 422);
+          }
+        }
         using var vdoc = JsonDocument.Parse(snapshot);
         var (recs, werr) = WikiBackup.Validate(vdoc.RootElement, s);
         if (werr is not null) return Results.BadRequest(werr);
@@ -624,7 +641,7 @@ public static class OpsEndpoints
               if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss;
               if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh;
               if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
-              if (restored.secretaryRequests is not null) foreach (var sr in restored.secretaryRequests) s.SecretaryRequests[sr.Id] = sr;
+              if (restored.secretaryRequests is not null) foreach (var sr in restored.secretaryRequests) { if (sr.Status == "pending" || sr.Status == "inflight" || sr.Status == "answering") { sr.Status = "interrupted"; sr.Error = "Restored as interrupted; old workers are invalid. Retry with the same nonce."; sr.UpdatedAt = DateTime.UtcNow; } s.SecretaryRequests[sr.Id] = sr; }
               if (restored.noteHistories is not null) foreach (var hh in restored.noteHistories) s.NoteHistories[hh.Id] = hh;
               if (restored.jobs is not null) foreach (var j in restored.jobs) { if (string.Equals(j.State, "running", System.StringComparison.OrdinalIgnoreCase)) { j.State = "interrupted"; j.Error = "Restored from backup; retry explicitly to resume."; j.UpdatedAt = DateTime.UtcNow; } s.Jobs[j.Id] = j; }
               if (restored.voiceTurns is not null) foreach (var vt in restored.voiceTurns) s.VoiceTurns[vt.Id] = vt;
@@ -662,18 +679,27 @@ public static class OpsEndpoints
               // completed-without-sections metadata is failed-closed until
               // reindex; established heads cover families the snapshot left
               // headless. All inside this same transaction.
+              // Effective binaries were validated BEFORE clear; decode must succeed here.
+              // Any failure throws and triggers real rollback (never silent Data=null loss).
               foreach (var kv in restored.blobs)
               {
                 if (Guid.TryParse(kv.Key, out var bid2))
                   if (s.Sources.TryGetValue(bid2, out var bdoc) && !string.IsNullOrEmpty(kv.Value))
-                    try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
+                  {
+                    try { bdoc.Original = Convert.FromBase64String(kv.Value); }
+                    catch (FormatException) { throw new InvalidOperationException("Backup blob is not valid base64."); }
+                  }
               }
               SourceGovernance.MigrateRestoredSources(s);
               s.Sources.Flush();
               foreach (var img in restored.images)
               {
                 byte[]? data = null;
-                if (!string.IsNullOrEmpty(img.data)) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
+                if (!string.IsNullOrEmpty(img.data))
+                {
+                  try { data = Convert.FromBase64String(img.data); }
+                  catch (FormatException) { throw new InvalidOperationException("Backup image data is not valid base64."); }
+                }
                 s.Images[img.id] = new AdvisorImage
                 {
                   Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
@@ -1121,17 +1147,91 @@ public static class BackupGraphValidator
     foreach (var g in r.grants) if (g is null || Empty(g.Id) || Empty(g.BoardId)) return "Backup grant missing lineage.";
     foreach (var i in r.invites) if (i is null || Empty(i.Id) || Empty(i.BoardId)) return "Backup invite missing lineage.";
     foreach (var w in r.wizardDrafts ?? new List<Domain.WizardDraft>()) if (w is null || Empty(w.Id)) return "Backup wizard draft is null or missing id.";
+    foreach (var hh in r.heads ?? new List<Domain.SourceFamilyHead>()) if (hh is null || Empty(hh.Id)) return "Backup source head is null or missing id.";
+    foreach (var ee in r.events ?? new List<Domain.SourceEvent>()) if (ee is null || Empty(ee.Id)) return "Backup source event is null or missing id.";
+    foreach (var img in r.images) if (img is null || Empty(img.id)) return "Backup image is null or missing id.";
+    foreach (var kv in r.messages)
+    {
+      if (kv.Value is null) continue;
+      foreach (var mm in kv.Value)
+      {
+        if (mm is null) return "Backup message row is null.";
+        if (mm.Sender is null || mm.Content is null) return "Backup message has null sender or content.";
+      }
+    }
     foreach (var x in r.sources) if (x is null || Empty(x.Id) || Empty(x.BoardId)) return "Backup source missing lineage.";
     foreach (var ss in r.sections ?? new List<Domain.SourceSection>()) if (ss is null || Empty(ss.Id) || Empty(ss.SourceId)) return "Backup source section missing lineage.";
-    foreach (var d in r.drafts) if (d is null || Empty(d.Id) || Empty(d.BoardId) || Empty(d.MeetingId)) return "Backup record draft missing lineage.";
+    foreach (var d in r.drafts)
+    {
+      if (d is null || Empty(d.Id) || Empty(d.BoardId) || Empty(d.MeetingId)) return "Backup record draft missing lineage.";
+      if (!string.IsNullOrWhiteSpace(d.ApprovedJson))
+      {
+        try
+        {
+          using var _ap = System.Text.Json.JsonDocument.Parse(d.ApprovedJson);
+          // Typed shape: approved list must be an array of string ids ([1] is malformed and must reject before any write).
+          if (_ap.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft ApprovedJson must be an array.";
+          foreach (var _ae in _ap.RootElement.EnumerateArray())
+          {
+            if (_ae.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft ApprovedJson entries must be strings.";
+          }
+        }
+        catch { return "Backup record draft ApprovedJson is not valid JSON."; }
+      }
+      foreach (var dj in new[] { d.ItemsJson, d.SupersedesJson })
+      {
+        if (string.IsNullOrWhiteSpace(dj)) continue;
+        try
+        {
+          using var _dd = System.Text.Json.JsonDocument.Parse(dj);
+          // Typed shape: record graphs must be arrays of objects (object {}, [1], numeric ids are malformed and must reject before any write).
+          if (_dd.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft JSON must be an array.";
+          foreach (var _de in _dd.RootElement.EnumerateArray())
+          {
+            if (_de.ValueKind != System.Text.Json.JsonValueKind.Object) return "Backup record draft entries must be objects.";
+            if (_de.TryGetProperty("id", out var _did) && _did.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft entry id must be a string.";
+          }
+        }
+        catch { return "Backup record draft JSON is not valid JSON."; }
+      }
+    }
+    // Effective binaries must decode before any live mutation: malformed base64 rejects (no silent Data=null loss).
+    if (r.blobs is not null)
+    {
+      foreach (var kv in r.blobs)
+      {
+        if (string.IsNullOrEmpty(kv.Value)) continue;
+        try { Convert.FromBase64String(kv.Value); }
+        catch (FormatException) { return "Backup blob is not valid base64."; }
+      }
+    }
     var noteIds = new HashSet<Guid>();
     foreach (var n in r.notes)
     {
       if (n is null || Empty(n.Id)) return "Backup note missing id.";
+      if (!string.IsNullOrWhiteSpace(n.EvidenceJson))
+      {
+        try
+        {
+          using var _ne = System.Text.Json.JsonDocument.Parse(n.EvidenceJson);
+          if (_ne.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup note evidence must be an array.";
+          foreach (var _el in _ne.RootElement.EnumerateArray())
+          {
+            if (EvidenceRef.Parse(_el) is null) return "Backup note evidence entry must carry kind and ref.";
+          }
+        }
+        catch (System.Text.Json.JsonException) { return "Backup note evidence is not valid JSON."; }
+      }
       if (!noteIds.Add(n.Id)) return "Backup note ids are not unique.";
       if (Empty(n.RootId)) n.RootId = n.Id;
-      if (Empty(n.BoardId) || Empty(n.MeetingId)) return "Backup note missing parent scope.";
-      if (!meetingById.TryGetValue(n.MeetingId, out var pm) || pm.BoardId != n.BoardId) return "Backup note references a missing parent meeting.";
+      if (Empty(n.BoardId)) return "Backup note missing parent scope.";
+      if (n.Kind != "direction" || n.Scope != "board") { if (Empty(n.MeetingId)) return "Backup note missing parent scope."; }
+      else if (!Empty(n.MeetingId)) return "Backup board-wide note must not carry a meeting scope.";
+      if (!Empty(n.MeetingId))
+      {
+        if (!meetingById.TryGetValue(n.MeetingId, out var pm) || pm.BoardId != n.BoardId) return "Backup note references a missing parent meeting.";
+      }
+      else if (!boardIds.Contains(n.BoardId)) return "Backup note references a missing parent board.";
       if (n.Revision < 1) return "Backup note revision invalid.";
       if (n.NoteStatus != "current" && n.NoteStatus != "superseded" && n.NoteStatus != "reversed") return "Backup note status invalid.";
     }
@@ -1140,12 +1240,16 @@ public static class BackupGraphValidator
     foreach (var n in r.notes)
     {
       var root = n!.RootId;
-      if (!byId.ContainsKey(root) && !r.notes.Any(x => x!.Id == root)) return "Backup note root has no chain head.";
+      if (!byId.TryGetValue(root, out var head)) return "Backup note root has no chain head.";
+      if (head.BoardId != n.BoardId || head.MeetingId != n.MeetingId) return "Backup note chain crosses board or meeting scope.";
+      if (head.Revision != 1 || head.PredecessorId.HasValue) return "Backup note root is not the chain head revision.";
       if (n.NoteStatus == "current") currentsPerRoot[root] = currentsPerRoot.TryGetValue(root, out var c) ? c + 1 : 1;
+      if (n.Revision > 1 && !n.PredecessorId.HasValue) return "Backup note revision above one requires a predecessor.";
       if (n.PredecessorId.HasValue)
       {
         if (!byId.TryGetValue(n.PredecessorId.Value, out var pred)) return "Backup note predecessor missing.";
         if ((pred.RootId == Guid.Empty ? pred.Id : pred.RootId) != root) return "Backup note predecessor crosses lineage.";
+        if (pred.BoardId != n.BoardId || pred.MeetingId != n.MeetingId) return "Backup note predecessor crosses scope.";
         if (pred.Revision != n.Revision - 1) return "Backup note revision chain is not continuous.";
         var steps = 0;
         var walk = n;
@@ -1159,6 +1263,55 @@ public static class BackupGraphValidator
       }
     }
     foreach (var kv in currentsPerRoot) if (kv.Value != 1) return "Backup note root has duplicate current revisions.";
+    // Linear unique chain: no duplicate revisions, no forks, single terminal tip consistent.
+    {
+      var byRoot = new Dictionary<Guid, List<Domain.Note>>();
+      foreach (var n in r.notes)
+      {
+        var rt = n!.RootId == Guid.Empty ? n.Id : n.RootId;
+        if (!byRoot.TryGetValue(rt, out var lst)) { lst = new List<Domain.Note>(); byRoot[rt] = lst; }
+        lst.Add(n);
+      }
+      foreach (var kv in byRoot)
+      {
+        var chain = kv.Value.OrderBy(x => x.Revision).ToList();
+        // No duplicate revisions per root
+        if (chain.Select(x => x.Revision).Distinct().Count() != chain.Count) return "Backup note revisions are not unique per chain.";
+        // Non-root revision-1 forbidden: revision 1 must be the self-identifying root
+        foreach (var nn in chain)
+        {
+          var isRoot = nn.Id == kv.Key;
+          if (nn.Revision == 1 && !isRoot) return "Backup note revision 1 must be the chain root.";
+          if (isRoot && nn.Revision != 1) return "Backup note root must be revision 1.";
+          if (isRoot && nn.PredecessorId.HasValue) return "Backup note root must not have a predecessor.";
+        }
+        // No forks: each predecessor may have at most one successor
+        var succCount = new Dictionary<Guid, int>();
+        foreach (var nn in chain)
+        {
+          if (nn.PredecessorId.HasValue)
+          {
+            var pk = nn.PredecessorId.Value;
+            succCount[pk] = succCount.TryGetValue(pk, out var c) ? c + 1 : 1;
+            if (succCount[pk] > 1) return "Backup note chain has a fork.";
+          }
+        }
+        // Terminal tip consistent: at most one current per chain; when present it must be the max revision.
+        // Backward compatible: legacy/operational chains with zero currents remain readable (no auto-repair).
+        var maxRev = chain.Max(x => x.Revision);
+        var currents = chain.Where(x => x.NoteStatus == "current").ToList();
+        if (currents.Count > 1) return "Backup note chain must have exactly one current tip.";
+        if (currents.Count == 1 && currents[0].Revision != maxRev) return "Backup note current tip is not the terminal revision.";
+        if (currents.Count == 0)
+        {
+          var tip0 = chain.OrderByDescending(x => x.Revision).First();
+          bool legacyReadable = chain.All(x => !x.Provisional) || chain.All(x => x.Kind == "direction");
+          if (tip0.NoteStatus != "reversed" && !legacyReadable) return "Backup note chain has no current or reversed terminal tip.";
+        }
+        // Backward-compatible operational notes / board directions: they share the same linear shape above.
+      }
+    }
+    var histIds = new HashSet<Guid>();
     foreach (var h in r.noteHistories ?? new List<Domain.NoteHistory>())
     {
       if (h is null || Empty(h.Id) || Empty(h.RootId) || Empty(h.NoteId)) return "Backup history row missing lineage.";
@@ -1168,6 +1321,24 @@ public static class BackupGraphValidator
       if (h.RootId != hroot) return "Backup history root does not match its note lineage.";
       if (h.BoardId != hn.BoardId || h.MeetingId != hn.MeetingId) return "Backup history scope does not match its note.";
       if (h.Revision != hn.Revision) return "Backup history revision does not match its note revision.";
+      if (!histIds.Add(h.Id)) return "Backup history ids are not unique.";
+      if (h.Action != "created" && h.Action != "edited" && h.Action != "superseded" && h.Action != "reversed") return "Backup history action is not a known lifecycle action.";
+      // History must match its EXACT addressed note (not any same-numbered sibling).
+      if (!string.Equals(hn.Title ?? "", h.Title ?? "", StringComparison.Ordinal) || !string.Equals(hn.Body ?? "", h.Body ?? "", StringComparison.Ordinal) || !string.Equals(hn.EvidenceJson ?? "[]", h.EvidenceJson ?? "[]", StringComparison.Ordinal))
+        return "Backup history body does not match its referenced revision content.";
+      if (!string.IsNullOrWhiteSpace(h.EvidenceJson))
+      {
+        try
+        {
+          using var _he = System.Text.Json.JsonDocument.Parse(h.EvidenceJson);
+          if (_he.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup history evidence must be an array.";
+          foreach (var _hel in _he.RootElement.EnumerateArray())
+          {
+            if (EvidenceRef.Parse(_hel) is null) return "Backup history evidence entry must carry kind and ref.";
+          }
+        }
+        catch { return "Backup history evidence is not valid JSON."; }
+      }
     }
     var noncePerMeeting = new Dictionary<string, int>();
     var reqIds = new HashSet<Guid>();
@@ -1186,8 +1357,15 @@ public static class BackupGraphValidator
         return "Backup secretary request status invalid.";
       if (sr.Phase != "initial" && sr.Phase != "continuation") return "Backup secretary request phase invalid.";
       if (string.IsNullOrWhiteSpace(sr.InputHash) || string.IsNullOrWhiteSpace(sr.InputText)) return "Backup secretary request missing input identity.";
+      // Complete phase/question/answer/status relationships: initial must have no question/answer; continuation must have question.
+      if (sr.Phase == "initial" && !string.IsNullOrWhiteSpace(sr.Question)) return "Backup initial request must not carry a question.";
+      if (sr.Phase == "initial" && !string.IsNullOrWhiteSpace(sr.Answer)) return "Backup initial request must not carry an answer.";
       if (sr.Phase == "continuation" && string.IsNullOrWhiteSpace(sr.Question)) return "Backup continuation request missing question lineage.";
       if (!string.IsNullOrWhiteSpace(sr.Answer) && string.IsNullOrWhiteSpace(sr.Question)) return "Backup answer is missing its question lineage.";
+      // Unusable accepted state: initial + question + failed must reject (neither endpoint can use it).
+      if (sr.Phase == "initial" && !string.IsNullOrWhiteSpace(sr.Question)) return "Backup request has unusable initial+question state.";
+      if (sr.Status == "answering" && (sr.Phase != "continuation" || string.IsNullOrWhiteSpace(sr.Question))) return "Backup answering request must be a continuation with a question.";
+      if (sr.Status == "needs-clarification" && (sr.Phase != "continuation" || string.IsNullOrWhiteSpace(sr.Question))) return "Backup needs-clarification request must be a continuation with a question.";
       if (sr.NoteId.HasValue)
       {
         if (!byId.TryGetValue(sr.NoteId.Value, out var rn)) return "Backup secretary request references a missing note.";
@@ -1195,13 +1373,77 @@ public static class BackupGraphValidator
         if (sr.Status != "completed") return "Backup secretary request note pointer without completed status.";
       }
       if (sr.Status == "completed" && !sr.NoteId.HasValue) return "Backup completed request is missing its note pointer.";
+      if (sr.Status == "completed" && sr.Phase == "continuation" && (string.IsNullOrWhiteSpace(sr.Answer) || sr.AnswerAttemptId == Guid.Empty)) return "Backup completed continuation is missing its answer lineage.";
       if (!SimCEO.Api.Work.SecretaryContext.TryParseSnapshot(sr.SnapshotJson, out _)) return "Backup secretary request snapshot is invalid.";
       if (Empty(sr.AttemptId)) return "Backup secretary request is missing its attempt identity.";
       if (!string.IsNullOrWhiteSpace(sr.CallerRefsJson))
       {
         try { using var d = System.Text.Json.JsonDocument.Parse(sr.CallerRefsJson); if (d.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup caller refs are not an array."; }
         catch { return "Backup caller refs are not valid JSON."; }
+        var rehydrated = SimCEO.Api.Work.SecretaryDirect.RehydrateRawCallerRefs(sr.CallerRefsJson);
+        var recanon = SimCEO.Api.Work.SecretaryDirect.RawCallerIdentityJson(rehydrated);
+        List<SimCEO.Api.Work.EvidenceRef> resorted;
+        try
+        {
+          using var ds = System.Text.Json.JsonDocument.Parse(sr.CallerRefsJson);
+          resorted = new List<SimCEO.Api.Work.EvidenceRef>();
+          foreach (var el in ds.RootElement.EnumerateArray())
+          {
+            var one = SimCEO.Api.Work.EvidenceRef.Parse(el);
+            if (one is not null) resorted.Add(one);
+          }
+        }
+        catch { return "Backup caller refs are not valid JSON."; }
+        var storedCanon = SimCEO.Api.Work.SecretaryDirect.RawCallerIdentityJson(resorted);
+        if (!string.Equals(recanon, storedCanon, StringComparison.Ordinal)) return "Backup caller refs identity is inconsistent.";
+        if (!string.IsNullOrWhiteSpace(sr.SubmissionHash))
+        {
+          var recomputed = SimCEO.Api.Work.Hashing.HashOf((sr.InputText ?? "") + "\n||SUBMIT||\n" + storedCanon);
+          var subOk = string.Equals(recomputed, sr.SubmissionHash, StringComparison.OrdinalIgnoreCase);
+          if (!subOk && SimCEO.Api.Work.SecretaryDirect.IsLegacyCallerIdentityJson(sr.CallerRefsJson))
+          {
+            var legacyCanon = SimCEO.Api.Work.SecretaryDirect.RawCallerIdentityJsonLegacy(resorted);
+            var legacyRecomputed = SimCEO.Api.Work.Hashing.HashOf((sr.InputText ?? "") + "\n||SUBMIT||\n" + legacyCanon);
+            subOk = string.Equals(legacyRecomputed, sr.SubmissionHash, StringComparison.OrdinalIgnoreCase);
+          }
+          if (!subOk) return "Backup submission hash does not match its input identity (request " + sr.Id + ").";
+        }
       }
+      else if (!string.IsNullOrWhiteSpace(sr.SubmissionHash)) return "Backup submission hash has no caller identity.";
+      if ((sr.Status == "inflight" || sr.Status == "answering" || sr.Status == "pending") && sr.AnswerAttemptId == Guid.Empty && sr.AttemptId == Guid.Empty)
+        return "Backup in-flight request is missing its attempt identity.";
+      if (!string.IsNullOrWhiteSpace(sr.Answer) && sr.AnswerAttemptId == Guid.Empty && (sr.Status == "answering" || sr.Status == "completed"))
+        return "Backup answered request is missing its continuation attempt identity.";
+      if (!string.IsNullOrWhiteSpace(sr.Answer) && sr.AnswerAttemptId == Guid.Empty)
+        return "Backup continuation answer is missing its attempt identity.";
+      if (!string.IsNullOrWhiteSpace(sr.DeliveredRefsJson))
+      {
+        try
+        {
+          using var _dr = System.Text.Json.JsonDocument.Parse(sr.DeliveredRefsJson);
+          if (_dr.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup delivered refs must be an array.";
+          foreach (var _el in _dr.RootElement.EnumerateArray())
+          {
+            if (EvidenceRef.Parse(_el) is null) return "Backup delivered ref entry must carry kind and ref.";
+          }
+        }
+        catch { return "Backup delivered refs are not valid JSON."; }
+      }
+      // Omitted manifest (persisted complete omission list) must be an array when present.
+      try
+      {
+        var _om = sr.OmittedJson;
+        if (!string.IsNullOrWhiteSpace(_om))
+        {
+          using var _do = System.Text.Json.JsonDocument.Parse(_om);
+          if (_do.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup omitted manifest must be an array.";
+          foreach (var _oe in _do.RootElement.EnumerateArray())
+          {
+            if (_oe.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup omitted manifest entries must be strings.";
+          }
+        }
+      }
+      catch { return "Backup omitted manifest is not valid JSON."; }
     }
     return null;
   }
