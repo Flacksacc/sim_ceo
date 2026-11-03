@@ -131,7 +131,9 @@ public static class SecretaryContext
     var gen = m.Generation;
     var rev = m.DeliveredRevision;
     var boardCfg = BoardConfigJson(s, m.BoardId);
-    var leadFp = LeadFingerprint(LeadSetup.ResolveLeadFor(s, m.BoardId));
+    LeadProfile? __capLead = null;
+    try { if (s.Boards.TryGetValue(m.BoardId, out var __capBoard)) __capLead = LeadSetup.ResolveLeadForBoard(s, __capBoard); } catch { __capLead = null; }
+    var leadFp = LeadFingerprint(__capLead);
     var evFp = EvidenceFingerprint(s, m.BoardId, m.Id);
     var dirs = s.Notes.Values.Where(n => n.BoardId == m.BoardId && n.Kind == "direction" && !n.Provisional && (n.Scope == "board" || n.MeetingId == m.Id)).OrderBy(n => n.Id.ToString()).ToList();
     var dirIds = dirs.Select(d => d.Id.ToString()).ToList();
@@ -338,7 +340,8 @@ public static class SecretaryContext
       return true;
     }
     AppendLineBudgeted("BOARD: " + Trunc(eff, 600), true);
-    var lead = LeadSetup.ResolveLeadFor(s, m.BoardId);
+    var __pb = s.Boards.TryGetValue(m.BoardId, out var __pbb) ? __pbb : null;
+    var lead = __pb is null ? LeadSetup.ResolveLeadFor(s, m.BoardId) : LeadSetup.ResolveLeadForBoard(s, __pb);
     if (lead is not null) AppendLineBudgeted("LEAD: " + Trunc(lead.Name + " (" + lead.RoleLabel + "). " + lead.Background, 600), true);
     AppendLineBudgeted("MEETING BRIEF: " + Trunc(m.Brief ?? "", 800), true);
     AppendLineBudgeted("OWNER REQUEST: " + (ownerInput ?? ""), true);
@@ -751,7 +754,7 @@ public static class SecretaryEndpoints
           bool canContrib = PeopleOps.Can(s, req, cur0.BoardId, id, "contribute");
           if (!canContrib) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
           var setupFixes = new List<string>();
-          if (LeadSetup.ResolveLeadFor(s, cur0.BoardId) is null) setupFixes.Add("Save the board-lead profile.");
+          { var __sb = s.Boards.TryGetValue(cur0.BoardId, out var __sbb) ? __sbb : null; var __sl = __sb is null ? LeadSetup.ResolveLeadFor(s, cur0.BoardId) : LeadSetup.ResolveLeadForBoard(s, __sb); if (__sl is null) setupFixes.Add("Save the board-lead profile."); }
           if (!s.Advisors.Values.Any(a => a.BoardId == cur0.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");
           if (setupFixes.Count > 0) return Results.Json(new { error = "Board setup is incomplete.", fixes = setupFixes }, statusCode: 409);
           if (PeopleOps.Guard(gw, req) is { } capped) return capped;

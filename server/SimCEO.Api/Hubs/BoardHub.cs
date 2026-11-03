@@ -358,7 +358,9 @@ public sealed class BoardHub : Hub
       foreach (var kv in Conns.ToList())
       {
         var c = kv.Value;
-        if (c.MeetingId != meetingId) continue;
+        // Joined-group membership is authoritative: one connection may hold several
+        // meetings (M1 then M2). The single last-recorded MeetingId must NOT filter
+        // delivery, or M1 events are suppressed on still-joined connections.
         bool inGroup = false;
         if (JoinedGroups.TryGetValue(kv.Key, out var gs))
         { lock (gs) { inGroup = gs.Contains(grp); } }

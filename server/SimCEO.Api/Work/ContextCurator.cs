@@ -182,7 +182,9 @@ public static class ContextCurator
       if (string.IsNullOrWhiteSpace(text)) continue;
       hits.Add(new RecallHit("source", $"{doc.FileName} v{doc.Version}", Truncate(text, 600), Score(text, words)));
     }
-    foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.BoardId == boardId)))
+    // Meeting-scoped recall sees only that meeting's records; board-wide recall
+    // sees every meeting. A reader confined to M1 must never receive M2 record text.
+    foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.BoardId == boardId && (!meetingId.HasValue || d.MeetingId == meetingId.Value))))
     {
       if (v.EffectiveIds.Count == 0) continue;
       // One hit per effective item pinned to its exact approving owner:
@@ -194,7 +196,8 @@ public static class ContextCurator
         hits.Add(new RecallHit("record", own.RecordId + "#" + id2, Truncate($"[{id2}] record v{own.Version}: " + et, 600), Score(et, words) + 2));
       }
     }
-    foreach (var n in s.Notes.Values.Where(n => n.BoardId == boardId && n.Kind == "direction" && !n.Provisional))
+    // Board-wide directions apply to every meeting; meeting directions only to their own.
+    foreach (var n in s.Notes.Values.Where(n => n.BoardId == boardId && n.Kind == "direction" && !n.Provisional && (!meetingId.HasValue || n.Scope == "board" || n.MeetingId == meetingId.Value)))
       hits.Add(new RecallHit("direction", n.Id.ToString(), Truncate(n.Body, 400), Score(n.Body, words) + 2));
     return hits.OrderByDescending(h => h.Score).Take(Math.Clamp(take, 1, 20)).ToList();
   }

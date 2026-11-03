@@ -200,7 +200,7 @@ public static class SourceEndpoints
       if (!SourceGovernance.TryBeginIndex(s, req, doc.Id, "contribute", out var res, out var beginErr) || res is null)
         return Results.Json(new { error = beginErr }, statusCode: 500);
       var extr = await Extraction.ExtractAsync(bytes, file.FileName);
-      SourceGovernance.StampExtraction(s, res, Extraction.ToJson(extr));
+      SourceGovernance.StampExtraction(s, req, res, Extraction.ToJson(extr), "contribute");
       var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, false, "contribute");
       if (!ok)
         return Results.Json(new { error = finErr, stale }, statusCode: status);
@@ -352,7 +352,7 @@ public static class SourceEndpoints
       if (snap is not null && snap.Original is not null)
       {
         var ext = await Extraction.ExtractAsync(snap.Original, snap.FileName);
-        SourceGovernance.StampExtraction(s, res, Extraction.ToJson(ext));
+        SourceGovernance.StampExtraction(s, req, res, Extraction.ToJson(ext), "contribute");
       }
       var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, true, "contribute");
       if (!ok)
@@ -519,12 +519,12 @@ public static class SourceEndpoints
                 var h = s.SourceHeads.Values.FirstOrDefault(x => x.BoardId == cur.BoardId && x.FamilyKey == cur.FamilyKey);
                 if (h is null)
                 {
-                  h = new SourceFamilyHead { BoardId = cur.BoardId, FamilyKey = cur.FamilyKey, HeadVersion = cur.Version, HeadSourceId = cur.Id, UpdatedAt = DateTime.UtcNow };
+                  h = new SourceFamilyHead { BoardId = cur.BoardId, FamilyKey = cur.FamilyKey, HeadVersion = cur.Version, HeadSourceId = cur.Id, HighWater = cur.Version, UpdatedAt = DateTime.UtcNow };
                   s.SourceHeads[h.Id] = h;
                 }
                 else if (cur.Version > h.HeadVersion)
                 {
-                  h.HeadVersion = cur.Version; h.HeadSourceId = cur.Id; h.UpdatedAt = DateTime.UtcNow;
+                  h.HeadVersion = cur.Version; h.HeadSourceId = cur.Id; if (cur.Version > h.HighWater) h.HighWater = cur.Version; h.UpdatedAt = DateTime.UtcNow;
                 }
                 else if (cur.Version == h.HeadVersion && h.HeadSourceId != Guid.Empty && h.HeadSourceId != cur.Id)
                 {
@@ -571,7 +571,7 @@ public static class SourceEndpoints
       if (snap is not null && snap.Original is not null)
       {
         var ext = await Extraction.ExtractAsync(snap.Original, snap.FileName);
-        SourceGovernance.StampExtraction(s, res, Extraction.ToJson(ext));
+        SourceGovernance.StampExtraction(s, req, res, Extraction.ToJson(ext), "contribute");
       }
       var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, true, "contribute");
       if (!ok)

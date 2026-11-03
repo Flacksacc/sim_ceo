@@ -318,17 +318,12 @@ public static class SecurityOps
           if (PeopleOps.WasExplicitlyLeft(s, inv.BoardId, inv.MeetingId.Value, user)) continue;
           var hasScoped = s.Grants.Values.Any(g => g.BoardId == inv.BoardId && g.MeetingId == inv.MeetingId
             && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
-          if (!hasScoped)
-          {
-            var g = new Grant { BoardId = inv.BoardId, MeetingId = inv.MeetingId, UserKey = user, Access = "discuss", CreatedAt = DateTime.UtcNow };
-            s.Grants[g.Id] = g;
-            narrowed++;
-            if (__mem is null)
-            {
-              var mem = new Membership { BoardId = inv.BoardId, MeetingId = inv.MeetingId.Value, UserKey = user, Active = true, JoinedAt = DateTime.UtcNow };
-              s.Memberships[mem.Id] = mem;
-            }
-          }
+          // NEVER reconstruct access from accepted history alone (predecessor
+          // accepted-but-revoked rows carry nonblank UserKey yet no live grant).
+          // The live accept flow binds grants/memberships at accept time; any
+          // accepted invite without current rights is owner-review material,
+          // surfaced via repair-access, never auto-resurrected here.
+          if (!hasScoped) { reviewed++; continue; }
           // Independent board-wide grants are NEVER deleted here; explicit narrowing is a separate admin action.
           var hasBoardWide = s.Grants.Values.Any(g => g.BoardId == inv.BoardId && g.MeetingId == null
             && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));

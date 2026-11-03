@@ -34,25 +34,78 @@ builder.Services.AddAntiforgery();
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
+// Suppress hosting request-start logs: they echo the raw URL incl. hub access_token query.
+// Hub tokens stay isolated to the hub transport path; no code logs URLs or tokens.
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 var app = builder.Build();
 app.UseCors();
 app.UseAntiforgery();
-// Common invalid-bearer gate.
+// Common auth gate. Public credential routes never reject on stale bearer so
+// expired credentials cannot block re-authentication. Security-state failure -> 503.
 app.Use(async (ctx, next) =>
 {
   if (ctx.Request.Path.StartsWithSegments("/api"))
   {
     var store = ctx.RequestServices.GetRequiredService<InMemoryStore>();
-    if (PeopleOps.HasInvalidToken(store, ctx.Request))
+    var path = ctx.Request.Path.Value ?? "";
+    bool pub = path.StartsWith("/api/auth/register") || path.StartsWith("/api/auth/login")
+      || path.StartsWith("/api/auth/me") || path.StartsWith("/api/auth/status")
+      || path.StartsWith("/api/presets") || path.StartsWith("/api/backend")
+      || (path.Contains("/invites/") && path.EndsWith("/public"));
+    if (!pub && PeopleOps.HasInvalidToken(store, ctx.Request))
     {
       ctx.Response.StatusCode = 401;
       await ctx.Response.WriteAsJsonAsync(new { error = "Invalid or expired session token." });
       return;
     }
+    bool secure;
+    try { secure = PeopleOps.IsSecure(store); }
+    catch
+    {
+      ctx.Response.StatusCode = 503;
+      await ctx.Response.WriteAsJsonAsync(new { error = "Security state unavailable." });
+      return;
+    }
+    if (!pub && secure)
+    {
+      bool ok = false;
+      try { ok = AuthOps.TrySession(store, ctx.Request, out _); }
+      catch
+      {
+        ctx.Response.StatusCode = 503;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Session store unavailable." });
+        return;
+      }
+      if (!ok)
+      {
+        ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Authentication required." });
+        return;
+      }
+    }
+    if (!pub)
+    {
+      // Fail closed: never continue serving when migration cannot complete.
+      try { SecurityOps.EnsureMigrated(store); }
+      catch
+      {
+        ctx.Response.StatusCode = 503;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Security state unavailable." });
+        return;
+      }
+    }
   }
   await next();
 });
-app.UseDefaultFiles();
+// NOTE: no query-string mutation here. Browser hub transport authenticates via access_token
+// query; clearing it breaks SignalR authentication. Request-start log suppression above keeps
+// tokens out of hosting logs.
+try
+{
+  var hubCtx = app.Services.GetRequiredService<Microsoft.AspNetCore.SignalR.IHubContext<SimCEO.Api.Hubs.BoardHub>>();
+  SimCEO.Api.Hubs.BoardHub.Wire(hubCtx, app.Services);
+}
+catch { }app.UseDefaultFiles();
 app.UseStaticFiles();
 app.MapFallbackToFile("index.html");
 if (app.Environment.IsDevelopment()) { }
@@ -280,7 +333,44 @@ app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
 }));
 app.MapHub<BoardHub>("/hubs/board");
 
-app.MapGet("/api/boards", (InMemoryStore s) => Results.Ok(s.Boards.Values.Where(b => !b.Archived).OrderByDescending(b => b.CreatedAt).Take(100)));
+static (string mission, string stage, string policy) EffectiveGuestView(InMemoryStore s, SimCEO.Api.Domain.Board b)
+{
+  // Canonical activated effective view: blank activated fields stay blank and
+  // never resurrect draft/live text (Auth R13). Single source of truth is
+  // LeadSetup.EffectiveView; this helper only normalizes the policy default.
+  var ev = LeadSetup.EffectiveView(s, b);
+  return (ev.mission, ev.stage, string.IsNullOrWhiteSpace(ev.policy) ? "balanced" : ev.policy);
+}
+
+// Scoped board DTO for non-managing readers: effective mission/stage/policy
+// only. DraftJson/ActiveJson/OwnerKey/lead internals stay manager-only.
+static object ScopedBoardView(InMemoryStore s, SimCEO.Api.Domain.Board b)
+{
+  var (em, es, ep) = EffectiveGuestView(s, b);
+  return new { id = b.Id, name = b.Name, mission = em, stage = es, discussionPolicy = ep, archived = b.Archived, createdAt = b.CreatedAt };
+}
+
+static List<object> BoardsFor(InMemoryStore s, HttpRequest req)
+{
+  var all = s.Boards.Values.Where(b => !b.Archived).OrderByDescending(b => b.CreatedAt).Take(100).ToList();
+  if (!PeopleOps.IsSecure(s)) return all.Cast<object>().ToList();
+  if (!AuthOps.TrySession(s, req, out var user)) return new List<object>();
+  var admin = PeopleOps.AdminEmail(s);
+  if (!string.IsNullOrWhiteSpace(admin) && string.Equals(admin, user, StringComparison.OrdinalIgnoreCase)) return all.Cast<object>().ToList();
+  var out_ = new List<object>();
+  foreach (var b in all)
+  {
+    if (!string.IsNullOrWhiteSpace(b.OwnerKey) && string.Equals(b.OwnerKey, user, StringComparison.OrdinalIgnoreCase)) { out_.Add(b); continue; }
+    if (PeopleOps.Can(s, req, b.Id, null, "manage")) { out_.Add(b); continue; }
+    if (s.Grants.Values.Any(g => g.BoardId == b.Id && g.MeetingId == null && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase))) { out_.Add(ScopedBoardView(s, b)); continue; }
+    // Meeting-only guests: minimal scrubbed DTO only (no DraftJson/ActiveJson/OwnerKey/lead internals).
+    var mids = PeopleOps.GuestMeetingIds(s, user, b.Id);
+    if (mids.Count > 0) { var (lm, ls, lp) = EffectiveGuestView(s, b); out_.Add(new { id = b.Id, name = b.Name, mission = lm, stage = ls, discussionPolicy = lp, guest = true, meetingIds = mids }); continue; }
+  }
+  return out_;
+}
+
+app.MapGet("/api/boards", (InMemoryStore s, HttpRequest req) => Results.Ok(BoardsFor(s, req)));
 
 app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
 {
@@ -290,7 +380,10 @@ app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
     return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   input.Id = Guid.NewGuid();
-  input.OwnerKey = PeopleOps.UserOf(s, req);
+  var owner = AuthOps.TrySession(s, req, out var em) ? em : PeopleOps.UserOf(s, req);
+  input.OwnerKey = owner;
+  input.AccessEnforced = false;
+  try { s.Boards.Flush(); } catch { }
   input.CreatedAt = DateTime.UtcNow;
   input.ActiveConfig = false;
   input.ActiveJson = "{}";
@@ -303,18 +396,39 @@ app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
 app.MapGet("/api/boards/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) =>
 {
   if (!s.Boards.TryGetValue(id, out var b)) return Results.NotFound();
-  if (PeopleOps.BadToken(s, req) is { } badBd) return badBd;
+  if (PeopleOps.BadToken(s, req) is { } bad) return bad;
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
     return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-  var bu = PeopleOps.UserOf(s, req);
-  if (!PeopleOps.Can(s, req, id, null, "read") && PeopleOps.GuestMeetingIds(s, bu, id).Count == 0)
-    return PeopleOps.Denied();
-  return Results.Ok(b);
+  if (PeopleOps.Can(s, req, id, null, "manage")) return Results.Ok(b);
+  if (PeopleOps.Can(s, req, id, null, "read")) return Results.Ok(ScopedBoardView(s, b));
+  var user = PeopleOps.UserOf(s, req);
+  var meetings = PeopleOps.GuestMeetingIds(s, user, id);
+  if (meetings.Count > 0)
+  {
+    var (gm, gs, gp) = EffectiveGuestView(s, b);
+    LeadProfile? lead = null;
+    try { lead = LeadSetup.ResolveLeadForStrict(s, id); } catch { }
+    return Results.Ok(new { id = b.Id, name = b.Name, mission = gm, stage = gs, guest = true, meetingIds = meetings, discussionPolicy = gp, lead = lead is null ? null : new { lead.Name, lead.RoleLabel } });
+  }
+  return PeopleOps.Denied();
 });
 
-app.MapGet("/api/roster", (InMemoryStore s, Guid accountId, string? q, string? type, string? tag, Guid? boardId) =>
+app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, string? q, string? type, string? tag, Guid? boardId) =>
 {
-  var list = s.Roster.Values.Where(r => r.AccountId == accountId && !r.Archived);
+  if (PeopleOps.BadToken(s, req) is { } badR) return badR;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+  var me = PeopleOps.UserOf(s, req);
+  var admin = PeopleOps.AdminEmail(s);
+  var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, me, StringComparison.OrdinalIgnoreCase);
+  IEnumerable<RosterEntry> list0 = s.Roster.Values.Where(r => !r.Archived);
+  // Meeting-only guests see only their own templates here; their discussion needs are served
+  // by the approved-participant board-advisors projection, not the template collection.
+  if (PeopleOps.IsSecure(s) && !isAdmin)
+    list0 = list0.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
+      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read")));
+  else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty)
+    list0 = list0.Where(r => r.AccountId == accountId);
+  var list = list0;
   if (!string.IsNullOrWhiteSpace(q))
     list = list.Where(r => r.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
       || r.ProfileJson.Contains(q, StringComparison.OrdinalIgnoreCase));
@@ -325,15 +439,34 @@ app.MapGet("/api/roster", (InMemoryStore s, Guid accountId, string? q, string? t
   if (boardId.HasValue)
     list = list.Where(r => s.Advisors.Values.Any(a => a.BoardId == boardId.Value && a.RosterEntryId == r.Id && !a.Removed));
   return Results.Ok(list.OrderByDescending(r => r.UpdatedAt).Take(200)
-    .Select(r => { var (ok, missing) = RosterOps.Completeness(s, r.Id); return new { entry = r, boards = RosterOps.BoardsFor(s, r.Id), imageCount = s.Images.Values.Count(i => i.RosterEntryId == r.Id), complete = ok, missing }; }));
+    .Select(r => { var (ok, missing) = RosterOps.Completeness(s, r.Id);
+      var __readBoards = RosterOps.BoardsFor(s, r.Id);
+      try { __readBoards = s.Advisors.Values.Where(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+        .Select(a => new { boardId = a.BoardId, board = s.Boards.TryGetValue(a.BoardId, out var __bb) ? __bb.Name : "?", role = a.BoardRole, approved = a.Approved }).ToList<object>(); } catch {}
+      var __isFull = isAdmin || string.Equals(r.OwnerKey ?? "", me, System.StringComparison.OrdinalIgnoreCase)
+        || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
+      object __entry = __isFull ? r : new { r.Id, r.Name, r.Description, r.Version, r.UpdatedAt };
+      var __imgs = __isFull ? s.Images.Values.Count(i => i.RosterEntryId == r.Id) : s.Images.Values.Count(i => i.RosterEntryId == r.Id && i.Review == "accepted");
+      return new { entry = __entry, boards = __readBoards, imageCount = __imgs, complete = ok, missing }; }));
 });
 
-app.MapGet("/api/roster/count", (InMemoryStore s, Guid accountId) =>
-  Results.Ok(new { total = s.Roster.Values.Count(r => r.AccountId == accountId && !r.Archived) }));
+app.MapGet("/api/roster/count", (InMemoryStore s, HttpRequest req, Guid accountId) =>
+{
+  if (PeopleOps.BadToken(s, req) is { } badRc) return badRc;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+  var me = PeopleOps.UserOf(s, req);
+  var admin = PeopleOps.AdminEmail(s);
+  var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, me, StringComparison.OrdinalIgnoreCase);
+  var q = s.Roster.Values.Where(r => !r.Archived);
+  if (PeopleOps.IsSecure(s) && !isAdmin) q = q.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase));
+  else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty) q = q.Where(r => r.AccountId == accountId);
+  return Results.Ok(new { total = q.Count() });
+});
 
 app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input) =>
 {
   if (PeopleOps.BadToken(s, req) is { } badRaw) return badRaw;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   input.Id = Guid.NewGuid();
   input.OwnerKey = PeopleOps.UserOf(s, req);
   input.Version = 1;
@@ -348,18 +481,38 @@ app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input)
   s.Roster[input.Id] = input;
   return Results.Created($"/api/roster/{input.Id}", input);
 });
-
-app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, Guid boardId) =>
-  Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).ToList()));
+app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId) =>
+{
+  if (PeopleOps.BadToken(s, req) is { } badA) return badA;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+  if (!s.Boards.ContainsKey(boardId)) return Results.NotFound();
+  if (PeopleOps.Can(s, req, boardId, null, "read"))
+    return Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).ToList());
+  var user = PeopleOps.UserOf(s, req);
+  var meetings = PeopleOps.GuestMeetingIds(s, user, boardId);
+  if (meetings.Count == 0) return PeopleOps.Denied();
+  var parts = new HashSet<Guid>();
+  foreach (var mid in meetings)
+    if (s.Meetings.TryGetValue(mid, out var mm))
+      try { using var d = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(mm.ParticipantIdsJson) ? "[]" : mm.ParticipantIdsJson); foreach (var e in d.RootElement.EnumerateArray()) if (e.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)) parts.Add(g); } catch { }
+  var list = s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed && a.Approved);
+  if (parts.Count > 0) list = list.Where(a => parts.Contains(a.Id));
+  return Results.Ok(list.Select(a => new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId }).ToList());
+});
 
 app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>
 {
   if (PeopleOps.BadToken(s, req) is { } badAttach) return badAttach;
   if (!s.Boards.ContainsKey(boardId)) return Results.NotFound("Board not found.");
-  if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
+  if (PeopleOps.Check(s, req, boardId, null, "manage") is { } deniedA) return deniedA;
   var rosterId = body.TryGetProperty("rosterEntryId", out var re) && re.ValueKind == JsonValueKind.String
     && Guid.TryParse(re.GetString(), out var rg) ? rg : Guid.Empty;
   if (rosterId == Guid.Empty) return Results.BadRequest("Advisors must be created in the roster first: supply a rosterEntryId.");
+  if (!s.Roster.TryGetValue(rosterId, out var __src) || __src.Archived) return Results.NotFound("Roster entry not found.");
+  { var __me2 = PeopleOps.UserOf(s, req); var __adm2 = PeopleOps.AdminEmail(s); var __isAdm2 = !string.IsNullOrWhiteSpace(__adm2) && string.Equals(__adm2, __me2, StringComparison.OrdinalIgnoreCase);
+    var __canSrc = __isAdm2 || string.Equals(__src.OwnerKey ?? "", __me2, StringComparison.OrdinalIgnoreCase)
+      || s.Advisors.Values.Any(a => a.RosterEntryId == rosterId && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
+    if (!__canSrc) return PeopleOps.Denied(); }
   var role = body.TryGetProperty("boardRole", out var br) ? (br.GetString() ?? "") : "";
   var (copy, error, status) = RosterOps.TryCopy(s, rosterId, boardId, role);
   return copy is not null ? Results.Created($"/api/boards/{boardId}/advisors/{copy.Id}", copy)
@@ -390,15 +543,46 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
     "archived-entry" => "Roster entry is archived.",
     _ => "Advisor is not eligible for approval.",
   } }, statusCode: 409);
-  a.Approved = true;
-  s.Advisors.Flush();
-  s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = a.BoardRole }) });
-  return Results.Ok(a);
+  // ONE durable unit: recheck CURRENT authority + eligibility inside the commit so a
+  // concurrent revocation cannot approve; storage failure returns 500, not false Ok.
+  try
+  {
+    lock (s.SetupLock)
+    {
+      Atomic.Run(() =>
+      {
+        if (PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+        if (!s.Advisors.TryGetValue(advisorId, out var a2) || a2.BoardId != boardId || a2.Removed) throw new InvalidOperationException("Advisor is gone.");
+        var gate2 = RosterOps.ApprovalGate(s, a2);
+        if (gate2 is not null) throw new InvalidOperationException("gate:" + gate2);
+        a2.Approved = true;
+      });
+    }
+  }
+  catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+  catch (InvalidOperationException iox) when (iox.Message == "Advisor is gone.") { return Results.NotFound(); }
+  catch (InvalidOperationException iox) when (iox.Message.StartsWith("gate:")) { return Results.Json(new { error = "Advisor became ineligible (" + iox.Message["gate:".Length..] + "); review, then approve." }, statusCode: 409); }
+  catch (Exception ex) { return Results.Json(new { error = "Approval could not be stored: " + ex.Message }, statusCode: 500); }
+  if (!s.Advisors.TryGetValue(advisorId, out var done)) return Results.NotFound();
+  s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = done.BoardRole }) });
+  return Results.Ok(done);
 });
 
-app.MapGet("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, Guid boardId, string? q, string? state) =>
+app.MapGet("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest req, Guid boardId, string? q, string? state) =>
 {
-  var list = s.Meetings.Values.Where(m => m.BoardId == boardId);
+  if (PeopleOps.BadToken(s, req) is { } badM) return badM;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+  if (!s.Boards.ContainsKey(boardId)) return Results.NotFound();
+  IEnumerable<Meeting> list;
+  if (PeopleOps.Can(s, req, boardId, null, "read"))
+    list = s.Meetings.Values.Where(m => m.BoardId == boardId);
+  else
+  {
+    var user = PeopleOps.UserOf(s, req);
+    var allowed = PeopleOps.GuestMeetingIds(s, user, boardId);
+    if (allowed.Count == 0) return PeopleOps.Denied();
+    list = s.Meetings.Values.Where(m => m.BoardId == boardId && allowed.Contains(m.Id));
+  }
   if (!string.IsNullOrWhiteSpace(q))
     list = list.Where(m => m.Title.Contains(q, StringComparison.OrdinalIgnoreCase)
       || m.Brief.Contains(q, StringComparison.OrdinalIgnoreCase));
@@ -410,7 +594,7 @@ app.MapGet("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, Guid boardId
 app.MapPost("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>
 {
   if (PeopleOps.BadToken(s, req) is { } badMc) return badMc;
-  if (PeopleOps.Check(s, req, boardId, null, "contribute") is { } deniedMc) return deniedMc;
+  if (PeopleOps.Check(s, req, boardId, null, "manage") is { } deniedMc) return deniedMc;
   var input = new Meeting
   {
     Id = Guid.NewGuid(), BoardId = boardId,
@@ -450,7 +634,7 @@ app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequ
 app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid meetingId, Message input) =>
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
-  if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "contribute") is { } deniedMsg) return deniedMsg;
+  if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "discuss") is { } deniedMsg) return deniedMsg;
   IResult? msgGate = null;
   lock (s.MessageLock)
   {
@@ -460,7 +644,16 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
     // meeting row must never source the mutation after an intervening
     // rollback clears the tracker.
     if (!s.Meetings.TryGetValue(meetingId, out var curM)) { msgGate = Results.NotFound("meeting"); return; }
-    if (PeopleOps.Check(s, req, curM.BoardId, meetingId, "contribute") is { } deniedMsgIn) { msgGate = deniedMsgIn; return; }
+    if (PeopleOps.BadToken(s, req) is { } badMsg2) { msgGate = badMsg2; return; }
+    var freshUser = "";
+    if (PeopleOps.IsSecure(s))
+    {
+      if (!AuthOps.TrySession(s, req, out var mu)) { msgGate = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+      freshUser = mu;
+    }
+    else freshUser = PeopleOps.UserOf(s, req);
+    var freshHave = PeopleOps.AccessFor(s, curM.BoardId, meetingId, freshUser);
+    if (freshHave != "discuss" && freshHave != "contribute" && freshHave != "manage") { msgGate = PeopleOps.Denied(); return; }
     var list = s.Messages.GetOrAdd(meetingId, _ => new List<Message>());
     input.MeetingId = meetingId;
     input.BoardId = curM.BoardId;

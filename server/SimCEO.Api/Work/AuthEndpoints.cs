@@ -166,13 +166,23 @@ public static class AuthEndpoints
       // either observes the live session (and commits first) or observes the
       // removal (and refuses). Logout can no longer complete between another
       // request's authority check and its commit.
+      // Session revocation shares the full publication serialization boundary
+      // (SetupLock -> MessageLock -> backend unit), so an in-flight message/record
+      // gate either observes the live session and commits first, or observes the
+      // removal inside the same unit and refuses. Hub revocation stays a post-commit
+      // live effect below.
       lock (s.SetupLock)
       {
-        if (req.Headers.TryGetValue("Authorization", out var auth)
-          && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        lock (s.MessageLock)
         {
-          tok = auth.ToString()["Bearer ".Length..].Trim();
-          s.Sessions.TryRemove(tok, out _);
+          Atomic.Run(() =>
+          {
+            string? cur = null;
+            if (req.Headers.TryGetValue("Authorization", out var auth)
+              && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+              cur = auth.ToString()["Bearer ".Length..].Trim();
+            if (!string.IsNullOrEmpty(cur)) { tok = cur; s.Sessions.TryRemove(tok, out _); }
+          });
         }
       }
       try { if (!string.IsNullOrEmpty(tok)) SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(tok); } catch { }

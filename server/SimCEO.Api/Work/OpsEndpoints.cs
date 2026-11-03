@@ -807,8 +807,13 @@ public static class OpsEndpoints
     foreach (var n in r.notes)
     {
       if (!bids.Contains(n.BoardId)) return Err("Backup graph: note references unknown board.");
-      // Board-wide notes (e.g. adopted directions) legitimately carry an empty
-      // meeting id; only meeting-scoped notes must resolve to a same-board meeting.
+      // Only board-wide notes (e.g. adopted directions) may carry an empty
+      // meeting id. A meeting-scoped note with an empty meeting id is malformed.
+      var nscope = (n.Scope ?? "").Trim().ToLowerInvariant();
+      if (nscope != "board" && nscope != "meeting")
+        return Err("Backup graph: note has an unknown scope.");
+      if (nscope == "meeting" && n.MeetingId == Guid.Empty)
+        return Err("Backup graph: meeting-scoped note is missing its meeting.");
       if (n.MeetingId != Guid.Empty && (!mids.Contains(n.MeetingId) || meetingBoard[n.MeetingId] != n.BoardId))
         return Err("Backup graph: note references unknown or foreign meeting.");
     }

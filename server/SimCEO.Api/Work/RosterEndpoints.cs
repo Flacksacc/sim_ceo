@@ -290,7 +290,7 @@ public static class RosterEndpoints
 
   // Resource ownership/readability for direct roster reads: owner, installation admin,
   // or a board-level read on a board the entry is attached to.
-  private static bool CanReadRoster(InMemoryStore s, HttpRequest req, RosterEntry entry)
+  internal static bool CanReadRoster(InMemoryStore s, HttpRequest req, RosterEntry entry)
   {
     var me = PeopleOps.UserOf(s, req);
     if (PeopleOps.IsInstallationAdmin(s, me)) return true;

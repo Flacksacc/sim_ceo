@@ -75,6 +75,7 @@ public static partial class RecordsOps
     catch (JsonException) { return ""; }
     using (items) using (approved)
     {
+    if (items.RootElement.ValueKind != JsonValueKind.Array || approved.RootElement.ValueKind != JsonValueKind.Array) return "";
     var ok = new HashSet<string>(approved.RootElement.EnumerateArray().Select(e => e.GetString() ?? ""), StringComparer.Ordinal);
     var sb = new StringBuilder();
     foreach (var el in items.RootElement.EnumerateArray())
@@ -289,11 +290,13 @@ public static partial class RecordsOps
     // Sequence numbers are integral and start at 1; revisions/viewed counters
     // must be integral (fractional or negative counters are never written by
     // the builders, so their presence proves foreign or corrupt state).
-    if (e.TryGetProperty("seq", out var sq))
-    {
-      if (sq.ValueKind != JsonValueKind.Number || !sq.TryGetInt32(out var si) || si < 1)
-      { error = "Decision history field 'seq' must be a positive integer."; return false; }
-    }
+    // Builders always emit seq, revision and token: their absence proves foreign rows.
+    if (!e.TryGetProperty("seq", out var sq) || sq.ValueKind != JsonValueKind.Number || !sq.TryGetInt32(out var si) || si < 1)
+    { error = "Decision history field 'seq' must be a positive integer."; return false; }
+    if (!e.TryGetProperty("revision", out var rv) || rv.ValueKind != JsonValueKind.Number || !rv.TryGetInt32(out var ri) || ri < 1)
+    { error = "Decision history field 'revision' must be a positive integer."; return false; }
+    if (!e.TryGetProperty("token", out var tk) || tk.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(tk.GetString()))
+    { error = "Decision history entries must carry a non-empty string token."; return false; }
     foreach (var name in new[] { "viewedVersion", "viewedWatermark", "revision" })
     {
       if (e.TryGetProperty(name, out var n))
@@ -342,14 +345,42 @@ public static partial class RecordsOps
     if (!StrictSupersedesEntries(d.SupersedesJson, d.Id, out var serr)) { error = serr; return false; }
     try
     {
-      var closure = ClosureIds(s, d);
-      closure.Remove(d.Id.ToString());
-      if (closure.Contains(d.Id.ToString())) { error = "Supersedes chain is cyclic; explicit repair required."; return false; }
+      // Cycle probe WITHOUT seeding self: ClosureIds always contains the root,
+      // so removing it first would make the check vacuously true. A cycle exists
+      // only if following supersedes links returns to this record.
+      var seenCyc = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      var qcyc = new Queue<string>(SupersededIdSet(d));
+      var cyclic = false;
+      while (qcyc.Count > 0 && !cyclic)
+      {
+        var xid = qcyc.Dequeue();
+        if (string.Equals(xid, d.Id.ToString(), StringComparison.OrdinalIgnoreCase)) { cyclic = true; break; }
+        if (!seenCyc.Add(xid)) continue;
+        if (Guid.TryParse(xid, out var xg) && s.Drafts.TryGetValue(xg, out var xdd) && xdd is not null)
+          foreach (var xp in SupersededIdSet(xdd)) qcyc.Enqueue(xp);
+      }
+      if (cyclic) { error = "Supersedes chain is cyclic; explicit repair required."; return false; }
     }
     catch { error = "Supersedes chain unreadable; explicit repair required."; return false; }
     if (string.IsNullOrWhiteSpace(d.EvidenceSnapshotJson)) { error = "Evidence snapshot state is blank; explicit repair required."; return false; }
     if (!StrictSnapshotEntries(d.EvidenceSnapshotJson, out var eerr)) { error = eerr; return false; }
     if (string.IsNullOrWhiteSpace(d.ReviewToken)) { error = "Review state uninitialized; explicit repair required."; return false; }
+    // Revision relationship: a non-empty history must end at the drafts current
+    // revision/token. A foreign or rolled-back history that no longer matches the
+    // row it is attached to fails closed instead of approving under stale guards.
+    try
+    {
+      using var hdoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.HistoryJson) ? "[]" : d.HistoryJson);
+      if (hdoc.RootElement.ValueKind == JsonValueKind.Array && hdoc.RootElement.GetArrayLength() > 0)
+      {
+        var last = hdoc.RootElement.EnumerateArray().Last();
+        var lrev = last.TryGetProperty("revision", out var lrv) && lrv.ValueKind == JsonValueKind.Number && lrv.TryGetInt32(out var lriv) ? lriv : -1;
+        var ltok = last.TryGetProperty("token", out var ltk) && ltk.ValueKind == JsonValueKind.String ? (ltk.GetString() ?? "") : "";
+        if (lrev != d.ReviewRevision || !string.Equals(ltok, d.ReviewToken, StringComparison.Ordinal))
+        { error = "Decision history is detached from the current review state; explicit repair required."; return false; }
+      }
+    }
+    catch (JsonException) { error = "Decision history is malformed; explicit repair required."; return false; }
     return true;
   }
 
@@ -793,14 +824,16 @@ public static partial class RecordsOps
         if (kind == "source" && Guid.TryParse(rf, out var sid) && s.Sources.TryGetValue(sid, out var doc) && doc is not null)
         {
           var okBoard = doc.BoardId == d.BoardId;
-          var okState = doc.Approved && !doc.Excluded;
-          var okScope = doc.Scope == "board" || doc.MeetingId == null || doc.MeetingId == d.MeetingId;
-          var okVersion = !parsed.Version.HasValue || parsed.Version.Value == doc.Version;
+          // Governed eligibility (not raw approved flags): superseded, failed,
+          // running, blocked, excluded, or headless sources never supply live text.
+          // Version pins honor the server-owned legacy alias after renumbering.
+          var okElig = okBoard && SourceGovernance.IsEligible(s, doc, d.MeetingId);
+          var okVersion = !parsed.Version.HasValue || parsed.Version.Value == doc.Version || parsed.Version.Value == SourceGovernance.OriginalVersionOf(s, doc);
           // Current referenced-resource authorization BEFORE any title/text:
           // a reader confined to another meeting must not receive this source.
           var okAuth = okBoard && PeopleOps.Can(s, req, doc.BoardId, doc.MeetingId, "read");
-          if (okBoard && okState && okScope && okVersion && okAuth)
-            cards.Add(new EvidenceCard(itemId, kind, rf, doc.Version, doc.FileName, Trunc(ReadableSourceText(s, doc), 600), true, true, false));
+          if (okBoard && okElig && okVersion && okAuth)
+            cards.Add(new EvidenceCard(itemId, kind, rf, doc.Version, doc.FileName, Trunc(SourceGovernance.CanonicalSectionText(s, doc), 600), true, true, false));
           else
             cards.Add(Unavailable(itemId, kind, rf, parsed.Version));
         }
@@ -852,7 +885,12 @@ public static partial class RecordsOps
         }
         else if (kind == "dossier" && Guid.TryParse(rf, out var eid) && s.Roster.TryGetValue(eid, out var ent) && ent is not null)
         {
-          var linked = s.Advisors.Values.Any(a => a.BoardId == d.BoardId && a.RosterEntryId == ent.Id && !a.Removed);
+          // Private-profile boundary: the referenced roster template must be readable
+          // by THIS caller (owner/admin/readable-board link). Meeting guests without
+          // board read cannot pull unselected or pending advisor profiles through evidence.
+          var linked = !ent.Archived
+            && s.Advisors.Values.Any(a => a.BoardId == d.BoardId && a.RosterEntryId == ent.Id && !a.Removed)
+            && RosterEndpoints.CanReadRoster(s, req, ent);
           var okVersion = !parsed.Version.HasValue || parsed.Version.Value == ent.Version;
           if (linked && okVersion)
             cards.Add(new EvidenceCard(itemId, kind, rf, ent.Version, ent.Name ?? "", Trunc(ent.ProfileJson ?? "", 600), true, true, false));
@@ -1029,10 +1067,28 @@ public static partial class RecordsOps
     {
       if (!approved.Contains(sn.ItemId)) continue;
       snapKeys.Add(SnapshotKeyV(sn.ItemId, sn.Kind, sn.Ref, sn.Version));
+      // Version-less identity too: a capture keyed by resolved version satisfies the original unversioned request.
+      snapKeys.Add(SnapshotKey(sn.ItemId, sn.Kind, sn.Ref));
       if (sn.Available && SnapshotAuthorize(s, req, d, sn))
       {
         var stillEligible = live.Any(c => !c.Missing && c.ItemId == sn.ItemId && c.Kind == sn.Kind && c.Ref == sn.Ref
           && ((!c.Version.HasValue && !sn.Version.HasValue) || c.Version == sn.Version));
+        // Record references: current eligibility follows the per-item approving owner.
+        // A replaced approved item keeps its readable historical snapshot, but is no
+        // longer current when another record+version now owns that item.
+        if (stillEligible && string.Equals(sn.Kind, "record", StringComparison.OrdinalIgnoreCase) && Guid.TryParse(sn.Ref, out var ownRid) && s.Drafts.TryGetValue(ownRid, out var ownRd) && ownRd is not null)
+        {
+          var ownerMatch = false;
+          try
+          {
+            foreach (var v in EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == ownRd.BoardId && x.MeetingId == ownRd.MeetingId)))
+            {
+              if (v.EffectiveOwners.TryGetValue(sn.ItemId, out var eo) && string.Equals(eo.RecordId, sn.Ref, StringComparison.OrdinalIgnoreCase) && eo.Version == sn.Version) { ownerMatch = true; break; }
+            }
+          }
+          catch { ownerMatch = false; }
+          stillEligible = ownerMatch;
+        }
         result.Add(new EvidenceCard(sn.ItemId, sn.Kind, sn.Ref, sn.Version, sn.Title, sn.Excerpt, stillEligible, true, false));
       }
       else result.Add(Unavailable(sn.ItemId, sn.Kind, sn.Ref, sn.Version));
@@ -1082,33 +1138,60 @@ public static partial class RecordsOps
   // Guest projection: approved items/content only. Pending/discarded text,
   // provisional notes, recent messages and the version graph are withheld;
   // evidence is limited to approved item refs (authorized bytes or explicit
-  // unavailable cards). Shape stays 200 so authorized readers always render.
   public static Dictionary<string, object?> GuestDraftView(InMemoryStore s, RecordDraft d)
   {
-    // Approved-item content with exact owner provenance: approved text only,
-    // each item pinned to the record+version that approved it. Pending text
-    // never leaves the server for unauthorized readers.
+    // Requested-version content, immutable.
     var items = new List<object>();
+    try
+    {
+      var ownMap = ItemMap(d.ItemsJson, out var ownErr);
+      if (ownErr == "")
+      {
+        foreach (var id in ParseIdList(d.ApprovedJson))
+        {
+          if (!ownMap.TryGetValue(id, out var el)) continue;
+          items.Add(new
+          {
+            id,
+            text = ItemText(el),
+            approvedBy = new { recordId = d.Id.ToString(), version = d.Version },
+          });
+        }
+      }
+    }
+    catch { }
+    object? effective = null;
     try
     {
       var chain = EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
       var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
       if (mine is not null)
+      {
+        var effItems = new List<object>();
         foreach (var id in mine.EffectiveIds)
-          items.Add(new
+          effItems.Add(new
           {
             id,
             text = mine.EffectiveTexts.TryGetValue(id, out var tx) ? tx : "",
             approvedBy = mine.EffectiveOwners.TryGetValue(id, out var ow)
               ? new { recordId = ow.RecordId, version = ow.Version } : null,
           });
+        effective = new
+        {
+          headId = mine.Head.Id,
+          headVersion = mine.Head.Version,
+          approvedIds = mine.EffectiveIds,
+          approvedItems = effItems,
+          conciseExport = mine.ConciseExport,
+        };
+      }
     }
     catch { }
     return new Dictionary<string, object?>
     {
       ["id"] = d.Id, ["boardId"] = d.BoardId, ["meetingId"] = d.MeetingId,
       ["version"] = d.Version, ["decided"] = d.Decided, ["status"] = d.Status,
-      ["approvedJson"] = d.ApprovedJson, ["approvedItems"] = items, ["createdAt"] = d.CreatedAt,
+      ["approvedJson"] = d.ApprovedJson, ["approvedItems"] = items, ["effective"] = effective, ["createdAt"] = d.CreatedAt,
     };
   }
 

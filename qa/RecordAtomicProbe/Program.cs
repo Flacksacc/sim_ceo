@@ -39,7 +39,8 @@ var badHistoryBuilt = RecordsOps.TryBuildHistoryJson("[null]", "approve", "m1", 
 Check(!badHistoryBuilt, "memory-malformed-history-rejected", badHistErr);
 var badSnapsBuilt = RecordsOps.TryBuildSnapshots("[null]", new Dictionary<string, System.Text.Json.JsonElement>(), new List<EvidenceCard>(), new[] { "m1" }, 2, out _, out var badSnapErr);
 Check(!badSnapsBuilt, "memory-malformed-snapshots-rejected", badSnapErr);
-var badStrict = RecordsOps.StrictStateCheck(new RecordDraft
+var probeStore = new InMemoryStore();
+var badStrict = RecordsOps.StrictStateCheck(probeStore, new RecordDraft
 {
   ItemsJson = """[{"id":"m1","text":"keep"}]""", ApprovedJson = "[]", DiscardedJson = "[]",
   HistoryJson = "[null]", SupersedesJson = "[]", EvidenceSnapshotJson = "[]", ReviewToken = "t",

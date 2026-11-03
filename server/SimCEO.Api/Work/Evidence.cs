@@ -54,13 +54,13 @@ public sealed record EvidenceRef(
     var kind = SafeStr(el, "kind") ?? "";
     var rf = SafeStr(el, "ref") ?? SafeStr(el, "id") ?? "";
     if (!ValidKind(kind) || string.IsNullOrWhiteSpace(rf)) return null;
-    // Strict version gate (Records R4/R6): null or non-negative integer only;
-    // fractional/negative versions invalidate the whole ref (never defaulted).
+    // Strict version gate (Records R4/R6): null or positive integer only, matching the
+    // snapshot parser. Zero/fractional/negative versions invalidate the whole ref (never defaulted).
     int? version = null;
     if (el.TryGetProperty("version", out var v))
     {
       if (v.ValueKind == JsonValueKind.Null) version = null;
-      else if (v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vi) || vi < 0) return null;
+      else if (v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var vi) || vi < 1) return null;
       else version = vi;
     }
     // Exact section provenance for source refs; old rows without them stay readable.

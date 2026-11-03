@@ -212,14 +212,21 @@ public static class SourceGovernance
       .ToList();
     foreach (var g in fams)
     {
-      if (s.SourceHeads.Values.Any(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey)) continue;
+      if (s.SourceHeads.Values.Any(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && !(h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty))) continue;
       // Winner by ORIGINAL version (alias), then earliest creation: an old
       // duplicate renumbered above the actual newer version never wins.
       var ordered = g.Select(x => new { row = x, orig = OriginalVersionOf(s, x) })
         .OrderByDescending(x => x.orig).ThenBy(x => x.row.CreatedAt).ThenBy(x => x.row.Id).ToList();
       var win = ordered.First();
-      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = win.row.Version, HeadSourceId = win.row.Id, HighWater = g.Max(x => x.Version), UpdatedAt = DateTime.UtcNow };
+      // Fold any stub allocation tracker water into the promoted head so no
+      // allocation history is lost when the real head materializes.
+      var stubHw = s.SourceHeads.Values.Where(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty).Select(h => (int?)h.HighWater).Max() ?? 0;
+      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = win.row.Version, HeadSourceId = win.row.Id, HighWater = Math.Max(g.Max(x => x.Version), stubHw), UpdatedAt = DateTime.UtcNow };
       s.SourceHeads[head.Id] = head;
+      // Remove absorbed stubs in the same unit: a leftover zero-version row would
+      // make unordered head lookups ambiguous between the stub and the real head.
+      foreach (var sh in s.SourceHeads.Values.Where(h => h.Id != head.Id && h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey && h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty).ToList())
+        s.SourceHeads.TryRemove(sh.Id, out _);
     }
     // Maintain monotonic high-water on existing heads.
     foreach (var h in s.SourceHeads.Values.ToList())
@@ -302,7 +309,10 @@ public static class SourceGovernance
               .ThenByDescending(h => h.HeadVersion).ThenBy(h => h.UpdatedAt).ThenBy(h => h.Id)
               .First();
             foreach (var drop in hg.Where(h => h.Id != keep.Id).ToList())
+            {
+              if (drop.HighWater > keep.HighWater) keep.HighWater = drop.HighWater;
               s.SourceHeads.TryRemove(drop.Id, out _);
+            }
           }
           foreach (var head in s.SourceHeads.Values.ToList())
           {
@@ -660,7 +670,9 @@ public static class SourceGovernance
         foreach (var h in restored.heads)
         {
           if (h is null) continue;
-          headed.Add(h.BoardId.ToString("N") + "|" + (h.FamilyKey ?? ""));
+          // Stub allocation trackers (version 0, empty identity) are not heads:
+          // a pending-only family backed only by a stub is still headless by design.
+          if (h.HeadVersion <= 0 && h.HeadSourceId == Guid.Empty) continue;
         }
       foreach (var d in byId.Values)
       {
@@ -696,11 +708,16 @@ public static class SourceGovernance
         }
         else if (!string.Equals(e.FamilyKey ?? "", ownerFam, StringComparison.Ordinal))
         { error = "snapshot event belongs to another family than its source."; return false; }
-        var famKey = owner.BoardId.ToString("N") + "|" + ownerFam;
-        if (!famVersions.TryGetValue(famKey, out var fset) || !fset.Contains(e.Version))
-        { error = "snapshot event pins a version with no matching source in its family."; return false; }
+        if (e.Version != owner.Version)
+        { error = "snapshot event pins a version other than its owning source row."; return false; }
       }
     }
+    // Effective-bytes identity: the restored row carries inline Original bytes AND/OR a blobs entry.
+    // The blob wins when present and non-empty (restore overwrites inline bytes with it);
+    // otherwise the inline bytes are effective. Whichever bytes will land must hash to
+    // the server-computed content hash, so swapped inline payloads with a removed blob
+    // entry cannot reindex under a false approved identity.
+    var blobBytes = new Dictionary<Guid, byte[]>(restored.blobs.Count);
     foreach (var kv in restored.blobs)
     {
       if (!Guid.TryParse(kv.Key, out var blobId))
@@ -708,24 +725,28 @@ public static class SourceGovernance
       if (!byId.TryGetValue(blobId, out var bowner) || bowner is null)
       { error = "snapshot blob references an unknown source."; return false; }
       if (string.IsNullOrWhiteSpace(kv.Value)) continue;
-      byte[] raw;
-      try { raw = Convert.FromBase64String(kv.Value); }
+      try { blobBytes[blobId] = Convert.FromBase64String(kv.Value); }
       catch (FormatException) { error = "snapshot blob is not valid base64."; return false; }
-      // Original bytes must hash to the owning source's server-computed hash:
-      // swapped payloads would otherwise reindex under a false identity.
-      string hex;
+    }
+    foreach (var d in byId.Values)
+    {
+      byte[]? eff = null;
+      if (blobBytes.TryGetValue(d.Id, out var bb)) eff = bb;
+      else if (d.Original is not null && d.Original.Length > 0) eff = d.Original;
+      if (eff is null || eff.Length == 0) continue;
+      string hex2;
       try
       {
-        using var sha = System.Security.Cryptography.SHA256.Create();
-        hex = Convert.ToHexString(sha.ComputeHash(raw)).ToLowerInvariant();
+        using var sha2 = System.Security.Cryptography.SHA256.Create();
+        hex2 = Convert.ToHexString(sha2.ComputeHash(eff)).ToLowerInvariant();
       }
-      catch { error = "snapshot blob cannot be hashed."; return false; }
-      var claimed = (bowner.ContentHash ?? "").Trim().ToLowerInvariant();
-      var isRealHash = claimed.Length == 64 && System.Text.RegularExpressions.Regex.IsMatch(claimed, "^[0-9a-f]{64}$");
-      if (isRealHash)
+      catch { error = "snapshot original bytes cannot be hashed."; return false; }
+      var claimed2 = (d.ContentHash ?? "").Trim().ToLowerInvariant();
+      var isRealHash2 = claimed2.Length == 64 && System.Text.RegularExpressions.Regex.IsMatch(claimed2, "^[0-9a-f]{64}$");
+      if (isRealHash2)
       {
-        if (!string.Equals(hex, claimed, StringComparison.Ordinal))
-        { error = "snapshot blob bytes do not match the owning source content hash."; return false; }
+        if (!string.Equals(hex2, claimed2, StringComparison.Ordinal))
+        { error = "snapshot effective bytes do not match the owning source content hash."; return false; }
       }
       else if (!legacyKeys)
       { error = "snapshot source carries a placeholder content hash outside a legacy graph; re-upload instead."; return false; }
@@ -904,12 +925,23 @@ public static class SourceGovernance
           return (false, "Board policy forbids this source; approval blocked.", 409);
         var rs = (seen.ReviewState ?? "").Trim().ToLowerInvariant();
         var head = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == seen.BoardId && h.FamilyKey == seen.FamilyKey);
+        // Ordering is by ORIGINAL version (server-owned alias), not canonical number:
+        // a renumbered old duplicate (orig v1, now v3) must never supersede the actual
+        // newer version (orig v2). Without migrate history the alias equals the version.
+        var seenOrig = OriginalVersionOf(s, seen);
+        var headOrig = head is null ? 0 : head.HeadVersion;
+        if (head is not null && head.HeadSourceId != Guid.Empty && s.Sources.TryGetValue(head.HeadSourceId, out var headDoc) && headDoc is not null && headDoc.BoardId == seen.BoardId && headDoc.FamilyKey == seen.FamilyKey)
+          headOrig = OriginalVersionOf(s, headDoc);
         if (head is not null && head.HeadVersion > 0)
         {
-          if (seen.Version < head.HeadVersion)
+          if (seenOrig < headOrig)
             return (false, "Superseded by newer approved version v" + head.HeadVersion + "; approval rejected.", 409);
           if (seen.Version == head.HeadVersion && head.HeadSourceId != Guid.Empty && seen.Id != head.HeadSourceId)
             return (false, "Family/version collision: another approved document already heads v" + head.HeadVersion + ".", 409);
+          // Same original position but a different row (competing renumbered duplicate):
+          // never promote above the current head; rebase onto the authoritative head.
+          if (seenOrig == headOrig && head.HeadSourceId != Guid.Empty && seen.Id != head.HeadSourceId)
+            return (false, "Superseded by the current family head; approval rejected.", 409);
         }
         if (rs == "approved")
         {
@@ -951,12 +983,12 @@ public static class SourceGovernance
             var h = s.SourceHeads.Values.FirstOrDefault(x => x.BoardId == d.BoardId && x.FamilyKey == d.FamilyKey);
             if (h is null)
             {
-              h = new SourceFamilyHead { BoardId = d.BoardId, FamilyKey = d.FamilyKey, HeadVersion = d.Version, HeadSourceId = d.Id, UpdatedAt = DateTime.UtcNow };
+              h = new SourceFamilyHead { BoardId = d.BoardId, FamilyKey = d.FamilyKey, HeadVersion = d.Version, HeadSourceId = d.Id, HighWater = d.Version, UpdatedAt = DateTime.UtcNow };
               s.SourceHeads[h.Id] = h;
             }
             else if (d.Version > h.HeadVersion)
             {
-              h.HeadVersion = d.Version; h.HeadSourceId = d.Id; h.UpdatedAt = DateTime.UtcNow;
+              h.HeadVersion = d.Version; h.HeadSourceId = d.Id; if (d.Version > h.HighWater) h.HighWater = d.Version; h.UpdatedAt = DateTime.UtcNow;
             }
             else if (d.Version == h.HeadVersion && h.HeadSourceId != Guid.Empty && h.HeadSourceId != d.Id)
             {
@@ -1276,7 +1308,20 @@ public static class SourceGovernance
       .Select(x => (int?)x.Version).Max() ?? 0;
     var head = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == boardId && h.FamilyKey == familyKey);
     var high = head is null ? 0 : Math.Max(head.HeadVersion, head.HighWater);
-    return Math.Max(live, high) + 1;
+    var next = Math.Max(live, high) + 1;
+    // Durable allocation history IN the reservation unit: even a family with no
+    // approved head (stub head: version 0, empty identity) carries its high-water
+    // forward, so deleting a trailing pending version can never recycle its number.
+    // Stub heads never satisfy headship (version 0 / empty identity fail closed
+    // everywhere a current head is required) and are replaced by real promotions.
+    if (head is null)
+    {
+      head = new SourceFamilyHead { BoardId = boardId, FamilyKey = familyKey, HeadVersion = 0, HeadSourceId = Guid.Empty, HighWater = next, UpdatedAt = DateTime.UtcNow };
+      s.SourceHeads[head.Id] = head;
+    }
+    else if (next > head.HighWater) head.HighWater = next;
+    try { s.SourceHeads.Flush(); } catch { }
+    return next;
   }
 
   // Index reservation for the retry/reindex/upload extraction window.
@@ -1332,6 +1377,14 @@ public static class SourceGovernance
           if (!string.Equals(PolicyRevisionKey(s, cur.BoardId), policyKey, StringComparison.Ordinal))
           {
             gateErr = "Source policy changed before index reservation; retry with current policy.";
+            return;
+          }
+          // Effective allowance for THIS operation: a board that now forbids
+          // this kind (wiki-only mode, blocked extension) must not reserve or
+          // process it, even if the policy revision key is unchanged.
+          if (!s.Boards.TryGetValue(cur.BoardId, out var polBoard) || polBoard is null || !PolicyAllows(polBoard, cur))
+          {
+            gateErr = "Source type is blocked on this board; uploads and retries are disabled by policy.";
             return;
           }
           var jobId = Guid.NewGuid();
@@ -1487,7 +1540,7 @@ public static class SourceGovernance
   // Stamp extractor output only when this reservation is still the current
   // running attempt for the current epoch; a superseded attempt must not
   // overwrite newer output.
-  public static void StampExtraction(InMemoryStore s, IndexReservation res, string extractionJson)
+  public static void StampExtraction(InMemoryStore s, HttpRequest req, IndexReservation res, string extractionJson, string need)
   {
     lock (s.SetupLock)
     {
@@ -1506,6 +1559,9 @@ public static class SourceGovernance
               if (!s.Sources.TryGetValue(res.SourceId, out var stamped) || stamped is null) return;
               if (!string.Equals(stamped.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
                 || stamped.IndexGeneration != res.Generation) return;
+              // Caller + authority revalidated inside the unit: a revocation or
+              // logout between reservation and stamping must not mutate the row.
+              if (PeopleOps.Check(s, req, stamped.BoardId, stamped.Scope == "meeting" ? stamped.MeetingId : null, need) is not null) return;
               stamped.ExtractionJson = extractionJson;
               s.Sources.Flush();
             });

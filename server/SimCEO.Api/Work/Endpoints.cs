@@ -18,12 +18,30 @@ public static class SimCEOEndpoints
   // content swap discards the stale reply instead of publishing it.
   static string DiscussionDirFingerprint(SimCEO.Api.Data.InMemoryStore s, Guid boardId, Guid meetingId)
     {
-      try { return string.Join(",", s.Notes.Values.Where(n => n.BoardId == boardId && (n.MeetingId == meetingId || n.Scope == "board") && n.Kind == "direction").OrderBy(n => n.Id).Select(n => n.Id.ToString("N") + ":" + ((n.Body ?? "").Length).ToString())); }
+      try { var parts = s.Notes.Values.Where(n => n.BoardId == boardId && (n.MeetingId == meetingId || n.Scope == "board") && n.Kind == "direction").OrderBy(n => n.Id).Select(n => n.Id.ToString("N") + "|" + (n.Scope ?? "") + "|" + n.MeetingId.ToString("N") + "|" + (n.Body ?? "")); return SimCEO.Api.Work.Hashing.HashOf(string.Join("\n", parts)); }
       catch { return ""; }
     }
   static string DiscussionEffFingerprint(SimCEO.Api.Data.InMemoryStore s, Guid boardId, Guid meetingId)
     {
-      try { return string.Join("|", global::SimCEO.Api.RecordsOps.EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == boardId && x.MeetingId == meetingId)).OrderBy(v => v.Head.ToString()).Select(v => v.Head.ToString() + "=" + v.ConciseExport.Length.ToString())); }
+      // Exact per-item content + approving owner identity, hashed: a same-length text
+      // swap (BUY->CUT) or an owner change (A v1 -> B v2) always changes the fingerprint.
+      // RecordDraft has no identity-bearing ToString; pin head id+version explicitly.
+      try
+      {
+        var views = global::SimCEO.Api.RecordsOps.EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == boardId && x.MeetingId == meetingId));
+        var parts = new System.Collections.Generic.List<string>();
+        foreach (var v in views.OrderBy(v => v.Head.Id.ToString()))
+        {
+          parts.Add("head:" + v.Head.Id.ToString("N") + ":v" + v.Head.Version);
+          foreach (var id in v.EffectiveIds.OrderBy(x => x, System.StringComparer.Ordinal))
+          {
+            var tx = v.EffectiveTexts.TryGetValue(id, out var t) ? t : "";
+            var ow = v.EffectiveOwners.TryGetValue(id, out var o) ? (o.RecordId + ":v" + o.Version) : "unowned";
+            parts.Add(id + "=" + ow + "=" + tx);
+          }
+        }
+        return SimCEO.Api.Work.Hashing.HashOf(string.Join("\n", parts));
+      }
       catch { return ""; }
     }
 
@@ -403,7 +421,7 @@ public static class SimCEOEndpoints
       if (!SourceGovernance.TryBeginIndex(s, req, inlineDoc.Id, "contribute", out var inlineRes, out var inlineBeginErr) || inlineRes is null)
         return Results.Json(new { error = inlineBeginErr }, statusCode: 500);
       var inlineExt = await Extraction.ExtractAsync(inlineRaw, fname);
-      SourceGovernance.StampExtraction(s, inlineRes, Extraction.ToJson(inlineExt));
+      SourceGovernance.StampExtraction(s, req, inlineRes, Extraction.ToJson(inlineExt), "contribute");
       var (inlineOk, inlineStale, _, inlineErr, inlineStatus) = SourceGovernance.FinishIndex(s, req, inlineRes, false, "contribute");
       if (!inlineOk)
         return Results.Json(new { error = inlineErr, stale = inlineStale }, statusCode: inlineStatus);
@@ -683,7 +701,7 @@ public static class SimCEOEndpoints
       if (policy is not ("focused" or "balanced" or "open")) policy = "balanced";
       var prompt = body.TryGetProperty("prompt", out var q) ? (q.GetString() ?? "") : "";
       s.Boards.TryGetValue(m.BoardId, out var runBoard);
-    var lead = LeadSetup.ResolveLeadFor(s, m.BoardId);
+    var lead = runBoard is null ? LeadSetup.ResolveLeadFor(s, m.BoardId) : LeadSetup.ResolveLeadForBoard(s, runBoard);
     var leadVersion = lead?.Version ?? 0;
     // P1 #5: capture the full effective-lead identity/content fingerprint BEFORE
     // model work; commit compares the fresh fingerprint under the publication
@@ -949,7 +967,7 @@ public static class SimCEOEndpoints
                 { laneBGate = LaneBFail("adopted directions changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
               if (!string.Equals(DiscussionEffFingerprint(s, cur.BoardId, id), effBefore, StringComparison.Ordinal))
                 { laneBGate = LaneBFail("approved record context changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
-            var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
+            var curLead = s.Boards.TryGetValue(cur.BoardId, out var curBoard) ? LeadSetup.ResolveLeadForBoard(s, curBoard) : LeadSetup.ResolveLeadFor(s, cur.BoardId);
             var curLeadVersion = curLead?.Version ?? 0;
             if (curLeadVersion != leadVersion
                 || !string.Equals(LeadIdentityFingerprint(curLead), leadFingerprint, StringComparison.Ordinal))
