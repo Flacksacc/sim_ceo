@@ -172,6 +172,17 @@ public static class MeetingEndpoints
       if (PeopleOps.Guard(gw, req) is { } cappedBr) return cappedBr;
       var topic = body.TryGetProperty("topic", out var t) ? (t.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
+      if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+        return Results.Conflict("Meeting is not active; resume to request a briefing.");
+      // Capture generation + eligible-input fingerprint BEFORE the provider
+      // await: a policy change, exclusion, or revocation during generation must
+      // discard the stale draft instead of publishing it (P1 #4).
+      var genBefore = m.Generation;
+      List<string> EligibleFingerprint() => s.Sources.Values
+        .Where(x => x.BoardId == m.BoardId && SourceGovernance.IsEligible(s, x, id))
+        .OrderBy(x => x.Id.ToString("N")).Select(x => x.Id.ToString("N") + ":v" + x.Version + ":" + (x.ContentHash ?? "")).ToList();
+      var fpBefore = EligibleFingerprint();
+      var evidenceBefore = SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
       string text;
       try
       {
@@ -180,14 +191,29 @@ public static class MeetingEndpoints
         ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
-      var note = new Note
+      // Publication boundary: recheck state, generation, and the eligible
+      // input fingerprint under the governance locks before storing.
+      lock (s.SetupLock)
       {
-        BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
-        Title = topic, Body = text, Scope = "meeting", Provisional = true,
-        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
-      };
-      s.Notes[note.Id] = note;
-      return Results.Created($"/api/notes/{note.Id}", note);
+        lock (s.MessageLock)
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+            return Results.Conflict("Meeting state changed during briefing; draft discarded.");
+          if (cur.Generation != genBefore)
+            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
+          if (!EligibleFingerprint().SequenceEqual(fpBefore))
+            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
+          var resolved = SourceGovernance.ResolveEvidence(s, evidenceBefore, m.BoardId, id);
+          var note = new Note
+          {
+            BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
+            Title = topic, Body = text, Scope = "meeting", Provisional = true,
+            EvidenceJson = EvidenceRef.ToJsonList(resolved),
+          };
+          s.Notes[note.Id] = note;
+          return Results.Created($"/api/notes/{note.Id}", note);
+        }
+      }
     });
 
     app.MapGet("/api/meetings/{id:guid}/voice", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -227,7 +253,7 @@ public static class MeetingEndpoints
         BoardId = bid, MeetingId = meetingId, Kind = "direction", Scope = scope,
         Title = scope == "board" ? "Adopted board-wide" : "Adopted for meeting",
         Body = text, Provisional = false,
-        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
+        EvidenceJson = EvidenceRef.ToJsonList(SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), bid, meetingId == Guid.Empty ? null : meetingId)),
       };
       s.Notes[note.Id] = note;
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });

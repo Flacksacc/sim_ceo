@@ -27,6 +27,16 @@ const argIdx = process.argv.indexOf("--port");
 const PORT = Number(argIdx >= 0 ? process.argv[argIdx + 1] : 5199);
 let seq = 0;
 const counts = { chat: 0, responses: 0, transcribe: 0, images: 0 };
+const promptLog = [];
+const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
+function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
+function gateWait(text) { const w = sleepMsOf(text); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
+function logPrompt(path, text) {
+  try {
+    promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length });
+    if (promptLog.length > 500) promptLog.splice(0, promptLog.length - 500);
+  } catch { }
+}
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -78,6 +88,17 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ ok: true, fake: true }));
     return;
   }
+  if (req.method === "GET" && url.pathname === "/__log") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(promptLog));
+    return;
+  }
+  if (req.method === "DELETE" && url.pathname === "/__log") {
+    promptLog.length = 0;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/__counts") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(counts));
@@ -90,7 +111,8 @@ const server = http.createServer(async (req, res) => {
     counts.chat++;
     const msgs = Array.isArray(body?.messages) ? body.messages : [];
     const prompt = msgs.map((m) => m.content).join("\n") || "";
-    const wait = sleepMsOf(prompt);
+    logPrompt("chat", prompt);
+    const wait = gateWait(prompt);
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
     if (out.envelope) {
@@ -121,7 +143,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "qa research failure" }));
       return;
     }
-    if (input.includes("QA-SLEEP")) await sleep(sleepMsOf(input));
+    logPrompt("responses", input);
+    if (input.includes("QA-SLEEP")) await sleep(gateWait(input));
     seq++;
     const noSearch = input.includes("QA-NOSEARCH");
     const output = [

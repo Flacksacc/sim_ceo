@@ -241,7 +241,7 @@ if (args.Contains("--selftest"))
   Environment.Exit(failures.Count == 0 ? 0 : 1);
 }
 
-app.MapGet("/health", () => Results.Ok(new { ok = true, service = "simceo-api", time = DateTime.UtcNow }));
+app.MapGet("/health", () => Results.Ok(new { ok = true, service = "simceo-api", time = DateTime.UtcNow, instance = Environment.GetEnvironmentVariable("SIMCEO_INSTANCE") ?? "dev" }));
 app.MapGet("/ready", (InMemoryStore s) => string.IsNullOrEmpty(s.PgError) ? Results.Ok(new { ready = true, store = Pg.Backend is null ? "inmemory" : "postgres" }) : Results.Json(new { ready = false, store = "unavailable", error = s.PgError }, statusCode: 503));
 app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
 {

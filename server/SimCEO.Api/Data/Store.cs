@@ -16,7 +16,7 @@ public sealed class InMemoryStore
   public Table<Domain.Meeting> Meetings { get; } = new();
   public MessageTable Messages { get; } = new();
   public Table<Domain.RecordDraft> Drafts { get; } = new();
-  public Table<Domain.SourceDoc> Sources { get; } = new();
+  public Table<Domain.SourceDoc> Sources { get; } = new(); public Table<Domain.SourceSection> SourceSections { get; } = new(); public Table<Domain.SourceFamilyHead> SourceHeads { get; } = new(); public Table<Domain.SourceEvent> SourceEvents { get; } = new();
   public Table<Domain.WizardDraft> WizardDrafts { get; } = new();
   public Table<Domain.VoiceTurn> VoiceTurns { get; } = new();
   public Table<Domain.LeadProfile> LeadProfiles { get; } = new();

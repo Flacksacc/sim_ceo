@@ -17,7 +17,7 @@ public sealed class PostgresDb : DbContext
   public DbSet<Meeting> Meetings => Set<Meeting>();
   public DbSet<Message> Messages => Set<Message>();
   public DbSet<RecordDraft> Drafts => Set<RecordDraft>();
-  public DbSet<SourceDoc> Sources => Set<SourceDoc>();
+  public DbSet<SourceDoc> Sources => Set<SourceDoc>(); public DbSet<SourceSection> SourceSections => Set<SourceSection>(); public DbSet<SourceFamilyHead> SourceHeads => Set<SourceFamilyHead>(); public DbSet<SourceEvent> SourceEvents => Set<SourceEvent>();
   public DbSet<WizardDraft> WizardDrafts => Set<WizardDraft>();
   public DbSet<VoiceTurn> VoiceTurns => Set<VoiceTurn>();
   public DbSet<LeadProfile> LeadProfiles => Set<LeadProfile>();
@@ -250,6 +250,23 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchJobId\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"ResearchBaseVersion\" integer NOT NULL DEFAULT 0");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"RosterEntries\" ADD COLUMN IF NOT EXISTS \"OwnerKey\" text NOT NULL DEFAULT ''");
+ db.Database.ExecuteSqlRaw("ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"SourcePolicyMode\" text NOT NULL DEFAULT 'allowAll'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"ReviewState\" text NOT NULL DEFAULT 'pending'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"Origin\" text NOT NULL DEFAULT 'upload'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"ResourceId\" uuid NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"FamilyKey\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexState\" text NOT NULL DEFAULT 'queued'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexGeneration\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexError\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexCompletedAt\" timestamp with time zone NULL");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceSections\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"SourceVersion\" integer NOT NULL DEFAULT 1, \"ContentHash\" text NOT NULL DEFAULT '', \"Ordinal\" integer NOT NULL DEFAULT 1, \"Heading\" text NOT NULL DEFAULT '', \"Location\" text NOT NULL DEFAULT '', \"Text\" text NOT NULL DEFAULT '', \"IndexGeneration\" integer NOT NULL DEFAULT 1, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");
+      // One-time idempotent legacy migration: pending for new, approved stays, then heads backfill runs at request time.
+      db.Database.ExecuteSqlRaw("UPDATE \"Sources\" SET \"ReviewState\" = CASE WHEN \"Approved\" THEN 'approved' ELSE 'pending' END WHERE (\"ReviewState\" = 'pending' OR \"ReviewState\" = '') AND \"Approved\" = TRUE");
+      // FamilyKey backfill runs in app code (EnsureMigratedAll) to compute board/scope/origin-aware keys; SQL leaves new rows empty.
       Pg.Backend = new PostgresBackend(db);
       return true;
     }

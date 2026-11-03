@@ -47,7 +47,7 @@ public static class OpsEndpoints
           total = meetings.Count,
           active = meetings.Count(m => m.State is MeetingState.Active or MeetingState.Paused),
         },
-        sourcesPending = s.Sources.Values.Count(x => x.BoardId == bid && !x.Approved && !x.Excluded),
+        sourcesPending = s.Sources.Values.Count(x => x.BoardId == bid && string.Equals(string.IsNullOrWhiteSpace(x.ReviewState) ? (x.Approved ? "approved" : "pending") : x.ReviewState, "pending", StringComparison.OrdinalIgnoreCase) && !x.Excluded),
         jobsFailed = s.Jobs.Values.Count(j => j.State == "failed"),
         policy = b.DiscussionPolicy,
         retainAudio = b.RetainAudio,
@@ -58,8 +58,8 @@ public static class OpsEndpoints
     {
       if (!PeopleOps.Can(s, req, bid, null, "read")) return PeopleOps.Denied();
       if (string.IsNullOrWhiteSpace(q)) return Results.BadRequest("q is required.");
-      var local = ContextCurator.Recall(s, bid, q, take);
-      var remote = await Hindsight.SearchAsync(bid, q, take);
+      Guid? recallMeeting = null; if (req.Query.TryGetValue("meetingId", out var rmv) && Guid.TryParse(rmv.ToString(), out var rmg)) recallMeeting = rmg; var local = ContextCurator.Recall(s, bid, q, take, recallMeeting);
+      var remoteRaw = await Hindsight.SearchAsync(bid, q, take); var remote = SourceGovernance.FilterExternalHits(s, bid, remoteRaw, recallMeeting);
       if (remote.Count == 0) return Results.Ok(local);
       return Results.Ok(local.Concat(remote)
         .OrderByDescending(h => h.Score).Take(Math.Clamp(take, 1, 20)).ToList());
@@ -125,6 +125,22 @@ public static class OpsEndpoints
       foreach (var pn in new[] { "discussionPolicy", "dataUse" })
         if (src.TryGetProperty(pn, out var pvy) && pvy.ValueKind != JsonValueKind.String)
           return Results.BadRequest("Snapshot board field must be a string.");
+      // Phase 6 contract: the source policy round-trips with the configuration
+      // (P2 #8). Validate BEFORE any mutation; unknown modes are rejected.
+      var snapshotPolicy = "allowAll";
+      if (src.TryGetProperty("sourcePolicyMode", out var spmEl))
+      {
+        if (spmEl.ValueKind != JsonValueKind.String)
+          return Results.BadRequest("Snapshot board sourcePolicyMode must be a string.");
+        var spmRaw = (spmEl.GetString() ?? "").Trim();
+        if (!string.IsNullOrEmpty(spmRaw))
+        {
+          var spmLower = spmRaw.ToLowerInvariant();
+          if (spmLower is not ("allowall" or "allow-all" or "wikionly" or "wiki-only" or "wiki_only"))
+            return Results.BadRequest("Snapshot board sourcePolicyMode must be allowAll or wikiOnly.");
+          snapshotPolicy = spmLower.StartsWith("wiki") ? "wikiOnly" : "allowAll";
+        }
+      }
       Guid? overrideAccount = null;
       if (body.TryGetProperty("accountId", out var bac) && bac.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(bac.GetString())) {
         if (!Guid.TryParse(bac.GetString(), out var bag) || bag == Guid.Empty)
@@ -210,6 +226,7 @@ public static class OpsEndpoints
         DataUse = src.TryGetProperty("dataUse", out var du) && du.ValueKind == JsonValueKind.String
           && (du.GetString() is "standard" or "contributor") ? du.GetString()! : "contributor",
         BlockedTypes = src.TryGetProperty("blockedTypes", out var bt) && bt.ValueKind == JsonValueKind.String ? bt.GetString() ?? "" : "",
+        SourcePolicyMode = snapshotPolicy,
       };
       Dictionary<string, Guid> rosterMap = new();
       var plannedRoster = new List<RosterEntry>();
@@ -325,7 +342,7 @@ public static class OpsEndpoints
         fileName = doc.FileName,
         version = doc.Version,
         contentHash = doc.ContentHash,
-        approved = doc.Approved,
+        approved = doc.Approved, reviewState = doc.ReviewState, eligible = SourceGovernance.IsEligible(s, doc, doc.Scope == "meeting" ? doc.MeetingId : null), indexState = doc.IndexState,
         extractedAt = DateTime.UtcNow,
         chars = doc.Original?.Length ?? 0,
         extractor = "direct-read",
@@ -356,7 +373,7 @@ public static class OpsEndpoints
         messages = s.Messages.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
         notes = s.Notes.Values.ToList(),
         drafts = s.Drafts.Values.ToList(),
-        sources = s.Sources.Values.ToList(),
+        sources = s.Sources.Values.ToList(), sections = s.SourceSections.Values.ToList(), heads = s.SourceHeads.Values.ToList(), events = s.SourceEvents.Values.ToList(),
         blobs = s.Sources.Values.ToDictionary(
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
         leads = s.LeadProfiles.Values.ToList(),
@@ -388,7 +405,7 @@ public static class OpsEndpoints
       lock (s.SetupLock)
       {
         s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
-        s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear();
+        s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
         s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
         foreach (var b in restored.boards) s.Boards[b.Id] = b;
         foreach (var r in restored.roster) s.Roster[r.Id] = r;
@@ -398,7 +415,13 @@ public static class OpsEndpoints
           if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
         foreach (var n in restored.notes) s.Notes[n.Id] = n;
         foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
-        foreach (var x in restored.sources) s.Sources[x.Id] = x;
+        foreach (var x in restored.sources) s.Sources[x.Id] = x; if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss; if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh; if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
+        // Deliberate legacy migration (P2 #9): pre-phase-6 snapshots carry
+        // Approved=true with no ReviewState field. The "" sentinel promotes
+        // those to "approved" without touching explicit decisions (rejected
+        // rows stay rejected), and completed-without-sections metadata is
+        // failed-closed until reindex.
+        SourceGovernance.MigrateRestoredSources(s);
         foreach (var kv in restored.blobs)
           if (Guid.TryParse(kv.Key, out var bid2))
             if (s.Sources.TryGetValue(bid2, out var bdoc))
@@ -477,7 +500,7 @@ public sealed record BackupSnapshot(int version, DateTime at,
   List<Meeting> meetings, Dictionary<string, List<Message>> messages,
   List<Note> notes, List<RecordDraft> drafts, List<SourceDoc> sources,
   Dictionary<string, string> blobs, List<LeadProfile> leads,
-  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null);
+  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null);
 
 public static class CommandMap
 {

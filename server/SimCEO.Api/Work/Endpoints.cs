@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
@@ -213,20 +215,57 @@ public static class SimCEOEndpoints
       }
     });
 
-    // ---- Sources: approval inbox; excluded/replaced never current ----
-    app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, Guid bid) =>
-      Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid).OrderByDescending(x => x.Version)));
+    // ---- Sources: governed via SourceEndpoints (single predicate); these are compatibility shims ----
     app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badSrc) return badSrc;
-      if (!s.Boards.ContainsKey(bid)) return Results.NotFound("Board not found.");
+      if (!s.Boards.TryGetValue(bid, out var bboard)) return Results.NotFound("Board not found.");
       if (!PeopleOps.Can(s, req, bid, null, "contribute")) return PeopleOps.Denied();
+      // Public inline creation is always server-owned "upload" provenance: the
+      // caller cannot claim wiki origin or any connector identity (P2 #11).
+      // Wiki-only policy therefore denies every inline document unconditionally.
+      if (SourceGovernance.PolicyModeOf(bboard) == "wikiOnly")
+        return Results.Json(new { error = "Board policy is wiki-only; uploads are disabled. Add a Wiki connector resource instead." }, statusCode: 415);
+      var fname = string.IsNullOrWhiteSpace(d.FileName) ? "untitled.txt" : d.FileName;
+      if (!SourceGovernance.PolicyAllows(bboard, new SourceDoc { FileName = fname, Origin = "upload" }))
+        return Results.Json(new { error = "Source type is blocked on this board." }, statusCode: 415);
+      var effScope = d.Scope == "meeting" ? "meeting" : "board";
+      Guid? effMeeting = effScope == "meeting" ? d.MeetingId : null;
+      if (effScope == "meeting")
+      {
+        if (!effMeeting.HasValue) return Results.BadRequest("meetingId is required for meeting scope.");
+        if (!s.Meetings.TryGetValue(effMeeting.Value, out var mmtg) || mmtg.BoardId != bid)
+          return Results.Json(new { error = "Meeting does not belong to this board." }, statusCode: 409);
+      }
+      var familyKey = SourceGovernance.FamilyKeyFor(bid, effScope, effMeeting, "upload", fname);
+      var version = s.Sources.Values.Where(x => x.BoardId == bid && x.FamilyKey == familyKey).Select(x => (int?)x.Version).Max() ?? 0;
+      // Server-computed content hash over the stored bytes (P2 #11): caller
+      // ContentHash is never trusted and is never copied into index sections.
+      var inlineText = Extraction.MarkdownOf(d.ExtractionJson) ?? "";
+      if (d.Original is null && !string.IsNullOrEmpty(inlineText))
+      {
+        var inlineRaw = Encoding.UTF8.GetBytes(inlineText);
+        if (inlineRaw.Length > 10 * 1024 * 1024) return Results.BadRequest("Inline content exceeds 10 MB.");
+        d.Original = inlineRaw;
+      }
+      var hashBytes = d.Original ?? Encoding.UTF8.GetBytes(d.ExtractionJson ?? "");
+      var serverHash = Convert.ToHexString(SHA256.HashData(hashBytes)).ToLowerInvariant();
       d.Id = Guid.NewGuid();
       d.BoardId = bid;
-      d.Version = 1;
-      d.Approved = false;
-      d.Excluded = false;
+      d.FileName = fname;
+      d.ContentHash = serverHash;
+      d.Origin = "upload";
+      d.ResourceId = null;
+      d.FamilyKey = familyKey;
+      d.Version = version + 1;
+      d.Approved = false; d.Excluded = false; d.ReviewState = "pending";
+      d.Scope = effScope; d.MeetingId = effMeeting;
+      d.IndexState = "queued"; d.IndexGeneration = 0; d.IndexError = ""; d.IndexCompletedAt = null;
+      if (string.IsNullOrWhiteSpace(d.ExtractionJson)) d.ExtractionJson = "{}";
       s.Sources[d.Id] = d;
+      s.Sources.Flush();
+      SourceGovernance.IndexSource(s, d, false);
+      SourceGovernance.RecordEvent(s, d, "create", "inline scope=" + effScope);
       return Results.Created($"/api/sources/{d.Id}", d);
     });
     app.MapPost("/api/sources/{id:guid}/exclude", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -234,11 +273,9 @@ public static class SimCEOEndpoints
       if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badEx) return badEx;
       if (!PeopleOps.Can(s, req, d.BoardId, d.MeetingId, "contribute")) return PeopleOps.Denied();
-      d.Excluded = true;
-      s.Sources.Flush();
+      SourceGovernance.SetExcluded(s, d, true);
       return Results.Ok(d);
     });
-
     // ---- Jobs with idempotency + safe retry ----
     app.MapGet("/api/activity/jobs", (InMemoryStore s) => Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100)));
     app.MapPost("/api/jobs", (InMemoryStore s, HttpRequest req, JobRow j) =>
@@ -585,7 +622,7 @@ public static class SimCEOEndpoints
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
               if (!laneBPrints.TryGetValue(adv.Id, out var laneBWanted) || !string.Equals(LaneBFingerprint(freshAdv), laneBWanted, StringComparison.Ordinal))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "stale-profile" }); continue; }
-              if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
+              if (SourcePubCheck.ManifestRevoked(s, manifest, id)) { yielded.Add(new { advisor = adv.BoardRole, reason = "evidence-revoked" }); continue; } if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // one reply per advisor per lead turn; stable advisor identity
               if (room <= 0)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "cap-omitted" }); continue; }
