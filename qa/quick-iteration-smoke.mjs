@@ -9,8 +9,9 @@
 // responses / Save / Register / Sign in. Local keystrokes stay in the isolated
 // context (discarded on close) and are reverted by reload. Never reads or writes
 // real user browser profiles; field contents are hashed in-page, never logged.
-// Own isolated context in all modes; only that context closes (never the browser).
-// Exit 0 = every executed check passed (SKIPs are explicit, never false passes).
+// Own isolated context in all modes. Cleanup: owned headless Edge closes in
+// finally; shared CDP connection never closes (only our context does).
+// Exit 0 = every executed check passed (SKIPs only for genuinely absent data).
 // Exit 1 = any FAIL. Screenshots -> QA_SHOTS (default .tmp/qa, git-ignored).
 import { chromium } from "playwright-core";
 import fs from "node:fs";
@@ -40,139 +41,158 @@ function skipLine(name, why) { skip++; console.log("  SKIP - " + name + " :: " +
 const run = "qi-" + Date.now().toString(36);
 const pageErrs = [];
 const nonGet = new Set();
-const snapFn = "(root) => { const els = [...root.querySelectorAll('label textarea')]; const h = (s) => { let x = 0; for (let i = 0; i < s.length; i++) x = ((x * 31 + s.charCodeAt(i)) | 0); return (x >>> 0).toString(36); }; return els.map((el) => el.value.length + ':' + h(el.value)); }";
+const hashOf = (page) => page.evaluate(() => window.location.hash);
+const noOverflow = (page) => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
 
 async function main() {
-  let browser = null, owned = false;
-  if (CDP) {
-    browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
-  } else {
-    browser = await chromium.launch({ executablePath: EDGE, headless: true, args: ["--no-first-run"] });
-    owned = true;
-  }
-  // Own isolated context: fresh storage, discarded on close. Never the user profile.
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-  const page = await ctx.newPage();
-  page.setDefaultTimeout(15000);
-  page.on("pageerror", (e) => pageErrs.push(String(e).split("\n")[0].slice(0, 120)));
-  page.on("console", (m) => { if (m.type() === "error") pageErrs.push("console: " + m.text().slice(0, 120)); });
-  page.on("request", (r) => {
-    const m = r.method();
-    if (m !== "GET" && m !== "HEAD" && m !== "OPTIONS") {
-      const u = r.url();
-      if (!/hub|negotiate/i.test(u)) nonGet.add(m + " " + u.slice(0, 60));
-    }
-  });
-  console.log("quick-iteration smoke run=" + run + " web=" + WEB + " via=" + (CDP ? "existing-cdp-own-context" : "own-headless-edge"));
-
-  await page.goto(WEB + "/", { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2500);
-
-  // ---------- Profile: 4 paragraph controls ----------
-  const openProfile = page.getByRole("button", { name: "Open profile" });
-  if (await openProfile.count() === 0) {
-    skipLine("profile-textareas", "no Open profile control in this backend/auth state");
-    skipLine("profile-multiline-local-newline", "profile not reachable");
-    skipLine("profile-prefs-stable-across-reload", "profile not reachable");
-    skipLine("profile-custom-prefs-preserved", "profile not reachable");
-  } else {
-    await openProfile.click();
-    const section = page.locator('section[aria-label="Profile"]');
-    ok("profile-section-visible", await section.isVisible());
-    const labels = ["Background", "Subjects already familiar", "Subjects needing simpler explanation", "Communication preferences"];
-    for (const label of labels) {
-      ok("profile-control-present:" + label, await section.getByLabel(label, { exact: true }).count() === 1);
-    }
-    const tags = await section.evaluate((root) => {
-      const out = [];
-      for (const el of root.querySelectorAll("label textarea, label input")) out.push(el.tagName + ":" + (el.getAttribute("rows") || "-"));
-      return out;
-    });
-    const roomy = tags.filter((t) => t.startsWith("TEXTAREA:"));
-    ok("profile-four-textareas", roomy.length === 4);
-    ok("profile-textarea-rows", roomy.length === 4 && roomy.every((t) => Number(t.split(":")[1]) >= 3));
-    const heights = await section.evaluate((root) => {
-      const out = [];
-      for (const el of root.querySelectorAll("label textarea")) out.push(Math.round(el.getBoundingClientRect().height));
-      return out;
-    });
-    ok("profile-textarea-roomy-height", heights.length === 4 && heights.every((h) => h >= 60));
-    await page.screenshot({ path: path.join(SHOTDIR, "qi-profile-1440.png") });
-
-    // Fingerprint values as length:hash only (never log contents).
-    const snap0 = await section.evaluate(new Function("return " + snapFn)());
-    const customPresent = snap0.length === 4 && snap0[3] !== DEFAULT_FP && Number(snap0[3].split(":")[0]) > 0;
-
-    // Local multiline input without saving (no Save click anywhere in this script).
-    const comm = section.getByLabel("Communication preferences", { exact: true });
-    await comm.focus();
-    await comm.press("End");
-    await page.keyboard.insertText("\nlocal-qa-line");
-    ok("profile-multiline-local-newline", await comm.evaluate((el) => el.value.includes("\n")));
-
-    // Reload: unsaved keystrokes vanish (read-only proof) and restored values are stable.
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-    await page.getByRole("button", { name: "Open profile" }).click();
-    const section2 = page.locator('section[aria-label="Profile"]');
-    const snap1 = await section2.evaluate(new Function("return " + snapFn)());
-    ok("profile-prefs-stable-across-reload", JSON.stringify(snap0) === JSON.stringify(snap1));
-    if (customPresent) ok("profile-custom-prefs-preserved", JSON.stringify(snap0) === JSON.stringify(snap1));
-    else skipLine("profile-custom-prefs-preserved", "no saved/custom lead content in this backend state");
-  }
-  // ---------- Meeting actions: new labels + helpers, old labels absent ----------
-  await page.goto(WEB + "/#/boards", { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2500);
-  if (await page.locator('a[href*="#/meet?board="]').count() === 0) {
-    skipLine("meeting-new-labels", "no existing board link in this backend/auth state");
-    skipLine("meeting-old-labels-absent", "no existing board link in this backend/auth state");
-    skipLine("meeting-helper-text", "no existing board link in this backend/auth state");
-  } else {
-    await page.locator('a[href*="#/meet?board="]').first().click();
-    await page.waitForTimeout(2500);
-    const meetSection = page.locator('section[aria-label="Meetings and conversation"]');
-    ok("meet-section-visible", await meetSection.count() > 0);
-    const agendaN = await page.locator("ol.agenda button").count();
-    if (agendaN > 0) {
-      await page.locator("ol.agenda button").first().click();
-      await page.waitForTimeout(2500);
-    }
-    if (await meetSection.locator("h2").count() === 0 && agendaN === 0) {
-      skipLine("meeting-new-labels", "board has no existing meeting to open");
-      skipLine("meeting-old-labels-absent", "board has no existing meeting to open");
-      skipLine("meeting-helper-text", "board has no existing meeting to open");
+  let browser = null, owned = false, ctx = null;
+  try {
+    if (CDP) {
+      browser = await chromium.connectOverCDP(CDP, { timeout: 15000 });
+      owned = false;
     } else {
-      ok("meeting-new-meeting-label", await page.getByRole("button", { name: "New meeting", exact: true }).count() >= 1);
-      ok("meeting-request-label", await page.getByRole("button", { name: "Request advisor responses", exact: true }).count() >= 1);
-      ok("meeting-old-start-absent", await page.getByRole("button", { name: "Start meeting", exact: true }).count() === 0);
-      ok("meeting-old-run-absent", await page.getByRole("button", { name: "Run discussion", exact: true }).count() === 0);
-      ok("meeting-helper-new", await page.getByText("Starts a new separate conversation.", { exact: true }).count() >= 1);
-      ok("meeting-helper-request", await page.getByText("Asks the advisors in the current meeting to respond.", { exact: true }).count() >= 1);
-      await page.screenshot({ path: path.join(SHOTDIR, "qi-meet-1440.png") });
+      browser = await chromium.launch({ executablePath: EDGE, headless: true, args: ["--no-first-run"] });
+      owned = true;
     }
+    // Own isolated context: fresh storage, discarded on close. Never the user profile.
+    ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(15000);
+    page.on("pageerror", (e) => pageErrs.push(String(e).split("\n")[0].slice(0, 120)));
+    page.on("console", (m) => { if (m.type() === "error") pageErrs.push("console: " + m.text().slice(0, 120)); });
+    page.on("request", (r) => {
+      const m = r.method();
+      if (m !== "GET" && m !== "HEAD" && m !== "OPTIONS") {
+        const u = r.url();
+        if (!/hub|negotiate/i.test(u)) nonGet.add(m + " " + u.slice(0, 60));
+      }
+    });
+    const rail = (name) => page.locator("nav.rail").getByRole("button", { name, exact: true });
+    const section = (label) => page.locator('main section[aria-label="' + label + '"]');
+    // Fingerprint textarea values as length:hash only (never log contents).
+    const snapFn = () => {
+      const els = [...document.querySelectorAll('main section[aria-label="Profile"] label textarea')];
+      const h = (s) => { let x = 0; for (let i = 0; i < s.length; i++) x = ((x * 31 + s.charCodeAt(i)) | 0); return (x >>> 0).toString(36); };
+      return els.map((el) => el.value.length + ":" + h(el.value));
+    };
+    console.log("quick-iteration smoke run=" + run + " web=" + WEB + " via=" + (CDP ? "existing-cdp-own-context" : "own-headless-edge"));
+
+    await page.goto(WEB + "/", { waitUntil: "domcontentloaded" });
+    await page.locator("main section .card").first().waitFor({ timeout: 20000 });
+
+    // ---------- Board first: profile lead is board-scoped ----------
+    const boardBtns = page.locator(".listpanel-rows button");
+    await boardBtns.first().waitFor({ timeout: 15000 }).catch(() => null);
+    const boardN = await boardBtns.count();
+    ok("board-list-present", boardN > 0);
+    if (boardN === 0) {
+      skipLine("profile-textareas", "no boards in backend");
+      skipLine("meeting-new-labels", "no boards in backend");
+    } else {
+      await boardBtns.first().click();
+      await page.waitForFunction(() => /board=/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
+      ok("board-select-writes-hash", /board=/.test(await hashOf(page)));
+
+      // ---------- Profile: 4 paragraph controls ----------
+      const leadWait = page.waitForResponse(/\/api\/boards\/[^/]+\/lead/, { timeout: 15000 }).catch(() => null);
+      await rail("Profile").click();
+      await section("Profile").waitFor({ timeout: 10000 });
+      ok("profile-section-visible", await section("Profile").isVisible());
+      await leadWait;
+      const prof = section("Profile");
+      const labels = ["Background", "Subjects already familiar", "Subjects needing simpler explanation", "Communication preferences"];
+      await prof.getByLabel(labels[0]).first().waitFor({ timeout: 10000 }).catch(() => null);
+      for (const label of labels) {
+        ok("profile-control-present:" + label, await prof.getByLabel(label).count() === 1);
+      }
+      const tags = await prof.evaluate((root) => {
+        const out = [];
+        for (const el of root.querySelectorAll("label textarea, label input")) out.push(el.tagName + ":" + (el.getAttribute("rows") || "-"));
+        return out;
+      });
+      const roomy = tags.filter((t) => t.startsWith("TEXTAREA:"));
+      ok("profile-four-textareas", roomy.length === 4);
+      ok("profile-textarea-rows", roomy.length === 4 && roomy.every((t) => Number(t.split(":")[1]) >= 3));
+      const heights = await prof.evaluate((root) => {
+        const out = [];
+        for (const el of root.querySelectorAll("label textarea")) out.push(Math.round(el.getBoundingClientRect().height));
+        return out;
+      });
+      ok("profile-textarea-roomy-height", heights.length === 4 && heights.every((h) => h >= 60));
+      await page.screenshot({ path: path.join(SHOTDIR, "qi-profile-1440.png") });
+
+      const snap0 = await page.evaluate(snapFn);
+      const customPresent = snap0.length === 4 && snap0[3] !== DEFAULT_FP && Number(snap0[3].split(":")[0]) > 0;
+
+      // Local multiline input without saving (no Save click anywhere in this script).
+      const comm = prof.getByLabel("Communication preferences");
+      await comm.focus();
+      await comm.press("End");
+      await page.keyboard.insertText("\nlocal-qa-line");
+      ok("profile-multiline-local-newline", await comm.evaluate((el) => el.value.includes("\n")));
+
+      // Reload: unsaved keystrokes vanish (read-only proof); wait for the actual
+      // lead GET (not a fixed sleep) before comparing restored values.
+      const leadWait2 = page.waitForResponse(/\/api\/boards\/[^/]+\/lead/, { timeout: 15000 }).catch(() => null);
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator("main section .card").first().waitFor({ timeout: 20000 });
+      await rail("Profile").click();
+      await section("Profile").waitFor({ timeout: 10000 });
+      await leadWait2;
+      const snap1 = await page.evaluate(snapFn);
+      ok("profile-prefs-stable-across-reload", snap0.length === 4 && JSON.stringify(snap0) === JSON.stringify(snap1));
+      if (customPresent) ok("profile-custom-prefs-preserved", JSON.stringify(snap0) === JSON.stringify(snap1));
+      else skipLine("profile-custom-prefs-preserved", "no saved/custom lead content in this backend state");
+
+      // ---------- Meeting actions: new labels + helpers, old labels absent ----------
+      await rail("Meetings").click();
+      await page.locator("ol.agenda, .listpanel-rows").first().waitFor({ timeout: 15000 });
+      const hMeet = await hashOf(page);
+      ok("meet-destination-board-context", hMeet.includes("/meet") && hMeet.includes("board="));
+      await page.waitForFunction(() => document.querySelectorAll("ol.agenda button").length > 0, null, { timeout: 10000 }).catch(() => null);
+      const agendaN = await page.locator("ol.agenda button").count();
+      if (agendaN === 0) {
+        skipLine("meeting-new-labels", "selected board has no meetings");
+        skipLine("meeting-old-labels-absent", "selected board has no meetings");
+        skipLine("meeting-helper-text", "selected board has no meetings");
+      } else {
+        await page.locator("ol.agenda button").first().click();
+        await page.waitForFunction(() => /meeting=/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
+        ok("meeting-select-writes-hash", /meeting=/.test(await hashOf(page)));
+        ok("meeting-heading-renders", await page.locator('section[aria-label="Meetings and conversation"] h2').count() > 0);
+        ok("meeting-new-meeting-label", await page.getByRole("button", { name: "New meeting", exact: true }).count() >= 1);
+        ok("meeting-request-label", await page.getByRole("button", { name: "Request advisor responses", exact: true }).count() >= 1);
+        ok("meeting-old-start-absent", await page.getByRole("button", { name: "Start meeting", exact: true }).count() === 0);
+        ok("meeting-old-run-absent", await page.getByRole("button", { name: "Run discussion", exact: true }).count() === 0);
+        ok("meeting-helper-new", await page.getByText("Starts a new separate conversation.", { exact: true }).count() >= 1);
+        ok("meeting-helper-request", await page.getByText("Asks the advisors in the current meeting to respond.", { exact: true }).count() >= 1);
+        await page.screenshot({ path: path.join(SHOTDIR, "qi-meet-1440.png") });
+      }
+    }
+
+    // ---------- Overflow: 1440 + 390, read-only ----------
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.waitForTimeout(500);
+    ok("no-overflow-1440", await noOverflow(page));
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(500);
+    ok("no-overflow-390", await noOverflow(page));
+    await page.screenshot({ path: path.join(SHOTDIR, "qi-390.png") });
+
+    // ---------- Read-only + error report ----------
+    console.log("non-get-requests=" + nonGet.size);
+    ok("no-api-mutations", nonGet.size === 0);
+    console.log("page-errors=" + pageErrs.length);
+    ok("no-page-errors", pageErrs.length === 0);
+
+    console.log("RESULT pass=" + pass + " fail=" + fail + " skip=" + skip);
+    if (failures.length) console.log("FAILURES:\n" + failures.join("\n"));
+    process.exitCode = fail ? 1 : 0;
+  } finally {
+    // Shared CDP connection is never closed; only our own context is.
+    if (ctx) { try { await ctx.close(); } catch {} }
+    if (owned && browser) { try { await browser.close(); } catch {} }
   }
-
-  // ---------- Overflow: 1440 + 390, read-only ----------
-  const noOverflow = () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(500);
-  ok("no-overflow-1440", await noOverflow());
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(500);
-  ok("no-overflow-390", await noOverflow());
-  await page.screenshot({ path: path.join(SHOTDIR, "qi-390.png") });
-
-  // ---------- Read-only + error report ----------
-  console.log("non-get-requests=" + nonGet.size);
-  ok("no-api-mutations", nonGet.size === 0);
-  console.log("page-errors=" + pageErrs.length);
-  ok("no-page-errors", pageErrs.length === 0);
-
-  await ctx.close();
-  if (!owned) { try { await browser.close(); } catch {} }
-  console.log("RESULT pass=" + pass + " fail=" + fail + " skip=" + skip);
-  if (failures.length) console.log("FAILURES:\n" + failures.join("\n"));
-  process.exit(fail ? 1 : 0);
 }
 
 main().catch((e) => { console.error("FATAL " + String(e).split("\n")[0].slice(0, 160)); process.exit(1); });
