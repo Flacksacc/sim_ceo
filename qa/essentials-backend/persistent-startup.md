@@ -18,7 +18,7 @@ are separate and never mounted here.
   has LOWER precedence than process env, so process env always wins, and every Compose call additionally passes an explicit env file (the selected approved file, or a controlled empty file), so a missing field is never backfilled from another discovered repo env).
   Never commit `.env`; never print keys, full `config`, or container env;
   the helper logs set/empty status only (never values, suffixes, full config, or container env).
-- Ports: API `${APP_HOST_PORT:-5080}` (human default 5080, matches dev API + Vite 5173 origin). The human entry point :5173 must match API :5080 after cutover (Vite/proper forwarder or concrete start below). Stop any dev API on the chosen port first; the helper preflights this and fails before acquisition if busy.
+- Ports: app publishes `127.0.0.1:${APP_HOST_PORT:-5080}:5080` (loopback-only; helper generic default stays 5080). Final human concrete uses `-AppPort 5173` so compiled UI+API both serve on `localhost:5173` with no Vite proxy. Legacy old in-memory API on 5080 MUST STAY ALIVE for unsupported-auth-state/rollback; PRIMARY only backs up/releases the dev Vite 5173 holder during final handoff. The helper preflights the chosen port and fails before acquisition if busy.
 - Build context is the repo root relative to the compose file (`../..`), so
   the same file works in a MAIN checkout and in a runnable worktree. The
   runtime image installs a portable curl/wget probe (apt/tdnf/apk covered;
@@ -37,20 +37,21 @@ are separate and never mounted here.
   proven by the owned QA runner in this directory (`run.ps1`, per-run
   artifacts under `art-*`).
 
-## Human commands (from the repo root, MAIN checkout)
+## Human commands — FINAL handoff (primary-only cutover)
+Final human stack serves compiled UI+API together on `localhost:5173` (loopback-only) from NEW project `simceo-essentials` with NEW volumes `simceo_essentials_pgdata` / `simceo_essentials_appdata` and the existing private MAIN `.env`. This is a different project from the `simceo-ess-final-15180` verification and uses NEW volumes — not old `sim_ceo_pgdata` and not QA volumes. No Vite proxy is needed for the compiled production UI. Legacy old API on 5080 stays alive for rollback. Helper generic default stays 5080 via `-AppPort`; final human passes `-AppPort 5173`.
 ```powershell
 # review-only render (quiet; no containers, no volumes, no secrets printed):
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
-# start with the selected existing app .env (private; never modified). Concrete final start (primary cutover only): -File qa/essentials-backend/essentials-persist.ps1 -Action start -EnvFile .env
+# FINAL human start — only after PRIMARY backs up/releases the dev Vite 5173 holder (legacy 5080 stays alive). Startup is already user-authorized; agent launch is currently blocked at the execution layer, so human manual fallback with this reviewed command may be required:
+pwsh -NoProfile -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/essentials-persist.ps1 -Action start -Project simceo-essentials -AppPort 5173 -EnvFile C:/Users/War/scrach/sim_ceo/.env
 # status / stop (same explicit config works from a fresh shell; without
 # private config, status lists owned containers by label and stop halts them
 # by label, secret-free, volumes preserved):
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action status
 powershell -File qa/essentials-backend/essentials-persist.ps1 -Action stop
 ```
-Readiness: `GET http://localhost:5080/health` 200 and
-`GET http://localhost:5080/ready` 200 `{"ready":true,"store":"postgres"}`
-plus `healthy` container status (`docker inspect` on the app container).
+Readiness (final human): `GET http://localhost:5173/health` 200 and `GET http://localhost:5173/ready` 200 `{"ready":true,"store":"postgres"}` plus `healthy` container status (`docker inspect` on the app container). Generic helper default remains 5080 when `-AppPort` is omitted.
+PRIMARY must fresh-capture/merge-coherently/restore the preserved legacy v2 data into the NEW PG ONLY and read-only smoke before declaring ready. Never claim already deployed or data restored.
 Rollback: `stop` ONLY and PRESERVE all volumes (NEVER `down -v` for the persistent human project). `sim_ceo_pgdata` and the old stack are unaffected.
 
 ## Isolated verification (agents/primary ONLY; never user ports)

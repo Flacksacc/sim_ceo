@@ -39,7 +39,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    ports: ["${APP_HOST_PORT:-5080}:5080"]
+    ports: ["127.0.0.1:${APP_HOST_PORT:-5080}:5080"]
     volumes:
       - simceo_essentials_appdata:/app/data
 volumes:
