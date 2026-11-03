@@ -222,9 +222,32 @@ async function main() {
     const alA = await get("/api/roster?accountId=" + RND, { token: tO });
     const alB = await get("/api/roster?accountId=" + RND, { token: tO });
     ok("sec-no-clone-mutation", alA.status === 200 && alB.status === 200 && JSON.stringify(alA.json) === JSON.stringify(alB.json) && alA.json.length === alArr.length, "n=" + (alA.json || []).length);
-    // Owner edit flows into the next board-direct-chat prompt from the same canonical entry.
+    // Owner edit of the ACTIVE legacy entry flows into the next board-direct-chat
+    // prompt from the same canonical entry. Asserted on the fake provider's
+    // delivered prompt log (not the answer text or self-rating).
+    const FAKEB = "http://127.0.0.1:15962";
+    async function fakeLog() { const r = await fetch(FAKEB + "/__log"); return r.ok ? await r.json() : []; }
+    async function clearFakeLog() { await fetch(FAKEB + "/__log", { method: "DELETE" }); }
+    const chatPrompts = async () => (await fakeLog()).filter((e) => e.path === "chat").map((e) => e.full || "");
+    const oldName1 = run + "-L1";
+    const newName1 = "Proven-" + run;
+    const proofMark = "CANONICAL-PROMPT-PROOF-77";
+    const ch0 = await post("/api/boards/" + a1 + "/advisors/" + aid1 + "/chat", { message: "baseline" }, { token: tO });
+    const basePrompts = await chatPrompts();
+    const baseLast = basePrompts.length ? basePrompts[basePrompts.length - 1] : "";
+    ok("sec-chat-prompt-baseline", ch0.status === 200 && baseLast.includes(oldName1) && !baseLast.includes(proofMark), String(ch0.status));
+    await clearFakeLog();
+    const newProfile1 = JSON.stringify({ proof: proofMark, background: "edited canonical background for " + run, strengths: ["tradeoffs"], methods: ["comparison"], evidenceNeeded: ["sources"], limits: ["defers"] });
+    const ed1 = await put("/api/roster/" + e1.id, { name: newName1, profileJson: newProfile1 }, { token: tO });
+    ok("sec-active-edit", ed1.status === 200 && norm(ci(ed1.json, "id")) === norm(e1.id), ed1.status + " " + ed1.text.slice(0, 160));
+    const sy1 = await post("/api/boards/" + a1 + "/advisors/" + aid1 + "/sync-roster", {}, { token: tO });
+    ok("sec-sync", sy1.status === 200, sy1.status + " " + sy1.text.slice(0, 160));
+    const ap1b = await post("/api/boards/" + a1 + "/advisors/" + aid1 + "/approve", {}, { token: tO });
+    ok("sec-reapprove", ap1b.status === 200, ap1b.status + " " + ap1b.text.slice(0, 160));
     const chA = await post("/api/boards/" + a1 + "/advisors/" + aid1 + "/chat", { message: "hello advisor" }, { token: tO });
-    ok("sec-chat-canonical", chA.status === 200 && typeof ci(chA.json, "answer") === "string" && ci(chA.json, "answer").length > 0, String(chA.status) + " " + chA.text.slice(0, 160));
+    const postPrompts = await chatPrompts();
+    const lastPrompt = postPrompts.length ? postPrompts[postPrompts.length - 1] : "";
+    ok("sec-chat-canonical", chA.status === 200 && lastPrompt.includes(newName1) && lastPrompt.includes(proofMark) && !lastPrompt.includes(oldName1), String(chA.status) + " prompt=" + lastPrompt.slice(0, 200));
     // Stranger Bob: no access to Alice's legacy entries; ambiguous E3 editable by neither linker.
     const bl = await get("/api/roster?accountId=" + RND, { token: tS });
     const blIds = (Array.isArray(bl.json) ? bl.json : []).map((e) => norm(ci(ci(e, "entry"), "id")));
