@@ -250,7 +250,7 @@ public sealed class ModelGateway
     }
     try
     {
-      Atomic.Run(() =>
+      Atomic.Run(_store, () =>
       {
         _store.ModelCalls.Add(call);
         _store.Usage.Add(row);

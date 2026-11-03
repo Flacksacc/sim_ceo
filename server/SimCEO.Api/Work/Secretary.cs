@@ -383,7 +383,7 @@ public static class SecretaryContext
           if (!(msg.Content ?? "").Contains(r.Excerpt!, StringComparison.Ordinal)) continue;
           outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, r.Excerpt!));
         }
-        else outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, EvidenceRef.ExactExcerpt(msg.Content.Trim(), 240)));
+        else outRefs.Add(new EvidenceRef("message", meetingId.ToString() + ":" + seq, null, null, (msg.Sender ?? "") + " #" + seq, EvidenceRef.ExactExcerpt(msg.Content ?? "", 240)));
       }
       else if (kind == "dossier")
       {
@@ -402,7 +402,7 @@ public static class SecretaryContext
         }
         else
         {
-          var dex = EvidenceRef.ExactExcerpt(dossierText.Trim(), 240);
+          var dex = EvidenceRef.ExactExcerpt(dossierText, 240);
           outRefs.Add(new EvidenceRef("dossier", ent.Id.ToString(), ent.Version, null, ent.Name, dex));
         }
       }

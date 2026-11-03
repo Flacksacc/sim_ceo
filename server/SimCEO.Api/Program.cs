@@ -451,18 +451,21 @@ app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
     return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   input.Id = Guid.NewGuid();
-  var owner = AuthOps.TrySession(s, req, out var em) ? em : PeopleOps.UserOf(s, req);
-  input.OwnerKey = owner;
+  IResult gateErrBc = null;
+  Atomic.Run(s, () =>
+  {
+    if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) { gateErrBc = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+    var owner = AuthOps.TrySession(s, req, out var em) ? em : PeopleOps.UserOf(s, req);
+    input.OwnerKey = owner;
   input.AccessEnforced = false;
   input.CreatedAt = DateTime.UtcNow;
   input.ActiveConfig = false;
   input.ActiveJson = "{}";
   input.LeadProfileVersion = 0;
-  Atomic.Run(s, () =>
-  {
     s.Boards[input.Id] = input;
     Atomic.Audit(s, new AuditEvent { BoardId = input.Id, Action = "board.create", Detail = JsonSerializer.Serialize(new { input.Name }) });
   });
+  if (gateErrBc is not null) return gateErrBc;
   return Results.Created($"/api/boards/{input.Id}", input);
 });
 
@@ -541,17 +544,23 @@ app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input)
   if (PeopleOps.BadToken(s, req) is { } badRaw) return badRaw;
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   input.Id = Guid.NewGuid();
-  input.OwnerKey = PeopleOps.UserOf(s, req);
-  input.Version = 1;
-  input.UpdatedAt = DateTime.UtcNow;
-  input.ResearchRequested = false;
-  input.ResearchedAt = null;
-  input.EvidenceCount = 0;
-  input.ResearchJson = "{}";
   if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest("Name is required.");
   if (string.IsNullOrWhiteSpace(input.Description)) return Results.BadRequest("Description is required.");
   if (string.IsNullOrWhiteSpace(input.ProfileJson) || input.ProfileJson.Trim().Length < 20) return Results.BadRequest("Profile is required (describe background, strengths, and limits).");
-  Atomic.Run(s, () => { s.Roster[input.Id] = input; });
+  IResult gateErrRoster = null;
+  Atomic.Run(s, () =>
+  {
+    if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) { gateErrRoster = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
+    input.OwnerKey = PeopleOps.UserOf(s, req);
+    input.Version = 1;
+    input.UpdatedAt = DateTime.UtcNow;
+    input.ResearchRequested = false;
+    input.ResearchedAt = null;
+    input.EvidenceCount = 0;
+    input.ResearchJson = "{}";
+    s.Roster[input.Id] = input;
+  });
+  if (gateErrRoster is not null) return gateErrRoster;
   return Results.Created($"/api/roster/{input.Id}", input);
 });
 app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId) =>

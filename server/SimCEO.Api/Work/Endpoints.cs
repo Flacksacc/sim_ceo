@@ -116,7 +116,10 @@ public static class SimCEOEndpoints
     {
       if (PeopleOps.BadToken(s, req) is { } badLead) return badLead;
       if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedLead) return deniedLead;
-      var (saved, error, status) = LeadSetup.SaveLead(s, bid, input);
+      LeadProfile saved = null; string error = null; int status = 200;
+      try { var r = LeadSetup.SaveLead(s, bid, input, req, "contribute"); saved = r.saved; error = r.error; status = r.status; }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (Exception ex) { return Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return saved is not null ? Results.Ok(saved) : Results.Json(new { error }, statusCode: status);
     });
     app.MapGet("/api/lead", (InMemoryStore s, HttpRequest req) =>
@@ -139,7 +142,12 @@ public static class SimCEOEndpoints
         if (!AuthOps.TrySession(s, req, out var le2)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
         if (!PeopleOps.IsInstallationAdmin(s, le2)) return Results.Json(new { error = "Installation admin only." }, statusCode: 403);
       }} catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
-      var (gsaved, gerror, gstatus) = LeadSetup.SaveLead(s, Guid.Empty, input);
+      LeadProfile gsaved = null; string gerror = null; int gstatus = 200;
+      try { var gr = LeadSetup.SaveLead(s, Guid.Empty, input, req, "admin"); gsaved = gr.saved; gerror = gr.error; gstatus = gr.status; }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (UnauthorizedAccessException) { return Results.Json(new { error = "Installation admin only." }, statusCode: 403); }
+      catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      catch (Exception ex) { return Results.Json(new { error = "Lead save failed; no state changed: " + ex.Message }, statusCode: 500); }
       return gsaved is not null ? Results.Ok(gsaved) : Results.Json(new { error = gerror }, statusCode: gstatus);
     });
 
@@ -213,8 +221,11 @@ public static class SimCEOEndpoints
       if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedAct) return deniedAct;
       string? hash = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("hash", out var h)
         ? h.GetString() : null;
-      var (board, error, status) = LeadSetup.Activate(s, bid, hash);
-      return board is not null ? Results.Ok(board) : Results.Json(new { error }, statusCode: status);
+      Board actBoard = null; string actError = null; int actStatus = 200;
+      try { var ar = LeadSetup.Activate(s, bid, hash, req); actBoard = ar.board; actError = ar.error; actStatus = ar.status; }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (Exception ex) { return Results.Json(new { error = "Activation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return actBoard is not null ? Results.Ok(actBoard) : Results.Json(new { error = actError }, statusCode: actStatus);
     });
 
     // ---- Wizard drafts (resumable, autosaved) ----
@@ -290,9 +301,9 @@ public static class SimCEOEndpoints
     {
       if (!s.WizardDrafts.TryGetValue(id, out var d)) return Results.NotFound();
       if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedWg)) return deniedWg;
-      var before = d.InterviewJson;
-      WizardGuide.NormalizeInterview(d);
-      if (!string.Equals(before, d.InterviewJson, StringComparison.Ordinal))
+      var probe = new WizardDraft { InterviewJson = d.InterviewJson };
+      WizardGuide.NormalizeInterview(probe);
+      if (!string.Equals(probe.InterviewJson ?? "", d.InterviewJson ?? "", StringComparison.Ordinal))
       {
         var normId = d.Id;
         try
@@ -324,19 +335,28 @@ public static class SimCEOEndpoints
       if (PeopleOps.BadToken(s, req) is { } badVoice) return badVoice;
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedVoice) return deniedVoice;
-      var __vc = PeopleOps.UserOf(s, req);
-      var t = new VoiceTurn
+      var newTurn = new VoiceTurn
       {
-        BoardId = m.BoardId, MeetingId = id, CreatorKey = __vc, State = "draft",
+        MeetingId = id, State = "draft",
         Transcript = body.TryGetProperty("partial", out var p) ? (p.GetString() ?? "") : "",
         AudioRetained = body.TryGetProperty("retainAudio", out var r) && r.GetBoolean(),
       };
-      var newTurn = t;
+      IResult gateErrVd = null;
       try
       {
-        Atomic.Run(s, () => { s.VoiceTurns[newTurn.Id] = newTurn; });
+        Atomic.Run(s, () =>
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur) || cur is null) { gateErrVd = Results.NotFound("meeting"); return; }
+          if (PeopleOps.BadToken(s, req) is not null) { gateErrVd = Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401); return; }
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "discuss") is { } deniedVd) { gateErrVd = deniedVd; return; }
+          newTurn.BoardId = cur.BoardId;
+          newTurn.MeetingId = id;
+          newTurn.CreatorKey = PeopleOps.UserOf(s, req);
+          s.VoiceTurns[newTurn.Id] = newTurn;
+        });
       }
       catch (Exception ex) { return Results.Json(new { error = "Voice draft failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (gateErrVd is not null) return gateErrVd;
       return Results.Created($"/api/voice/{newTurn.Id}", newTurn);
     });
     app.MapPost("/api/voice/{id:guid}/finalize", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -924,18 +944,23 @@ public static class SimCEOEndpoints
         }
         if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
         var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
-        if (priorCapNoteId != Guid.Empty && s.Notes.TryGetValue(priorCapNoteId, out var priorCapNote))
+        Atomic.Run(s, () =>
         {
-          priorCapNote.Body = capBody;
-          s.Notes[priorCapNoteId] = priorCapNote;
-        }
-        else
-        {
-          var freshCapNote = new Note { BoardId = m.BoardId, MeetingId = id, Kind = "run-cap", Scope = "meeting", Provisional = false, Title = "cap:" + leadFloor, Body = capBody, RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current" };
-          freshCapNote.RootId = freshCapNote.Id;
-          s.Notes[freshCapNote.Id] = freshCapNote;
-        }
-        s.Notes.Flush();
+          var capBoard = m.BoardId;
+          if (s.Meetings.TryGetValue(id, out var capMtg) && capMtg is not null) capBoard = capMtg.BoardId;
+          if (priorCapNoteId != Guid.Empty && s.Notes.TryGetValue(priorCapNoteId, out var priorCapNote))
+          {
+            priorCapNote.Body = capBody;
+            s.Notes[priorCapNoteId] = priorCapNote;
+          }
+          else
+          {
+            var freshCapNote = new Note { BoardId = capBoard, MeetingId = id, Kind = "run-cap", Scope = "meeting", Provisional = false, Title = "cap:" + leadFloor, Body = capBody, RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current" };
+            freshCapNote.RootId = freshCapNote.Id;
+            s.Notes[freshCapNote.Id] = freshCapNote;
+          }
+          s.Notes.Flush();
+        });
       }
       int CommittedThisTurn()
       {
@@ -955,8 +980,11 @@ public static class SimCEOEndpoints
         Title = "Run in progress",
         Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = 0, published = 0, leadSeq = leadFloor, cap = effectiveCap }),
       };
-      s.Notes[outcome.Id] = outcome;
-      s.Notes.Flush();
+      Atomic.Run(s, () =>
+      {
+        s.Notes[outcome.Id] = outcome;
+        s.Notes.Flush();
+      });
       var completedGroups = 0;
       long LaneBRevision()
       {
@@ -973,8 +1001,11 @@ public static class SimCEOEndpoints
         var laneBRev = LaneBRevision();
         outcome.Title = "Run interrupted: " + laneBReason;
         outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = laneBRev, rounds = laneBPlannedRounds, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, status = "interrupted", reason = laneBReason, remaining = laneBRemaining });
-        s.Notes[outcome.Id] = outcome;
-        s.Notes.Flush();
+        Atomic.Run(s, () =>
+        {
+          s.Notes[outcome.Id] = outcome;
+          s.Notes.Flush();
+        });
         return Results.Conflict("Interrupted: " + laneBReason + "; partial progress preserved in run outcome.");
       }
       using var bidSem = new SemaphoreSlim(4);
@@ -1190,10 +1221,15 @@ public static class SimCEOEndpoints
       await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, id, "run-complete",
         new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) }, "read");
       outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
-      outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
-      s.Notes[outcome.Id] = outcome;
-      s.Notes.Flush();
-      s.Meetings.Flush();
+      Atomic.Run(s, () =>
+      {
+        var finalRev = m.DeliveredRevision;
+        if (s.Meetings.TryGetValue(id, out var finalMtg) && finalMtg is not null) finalRev = finalMtg.DeliveredRevision;
+        outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = finalRev, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
+        s.Notes[outcome.Id] = outcome;
+        s.Notes.Flush();
+        s.Meetings.Flush();
+      });
             return Results.Ok(new { rounds = rounds.Select(r => r.Select(a => a.BoardRole)), published, challenged = lastChallenged, abstained, bidErrors, yielded, overflow });
       }
       finally

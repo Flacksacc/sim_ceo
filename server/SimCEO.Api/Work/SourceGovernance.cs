@@ -1412,7 +1412,10 @@ public static class SourceGovernance
           cur.IndexGeneration = cur.IndexGeneration <= 0 ? 1 : cur.IndexGeneration + 1;
           cur.IndexError = "";
           s.Sources.Flush();
+          var hadPriorIndex = s.ActiveIndexJobs.TryGetValue(id, out var priorIndex);
           s.ActiveIndexJobs[id] = new ActiveIndexJob(jobId, s.SourceEpoch, cur.IndexGeneration);
+          var capPrior = priorIndex; var capHad = hadPriorIndex;
+          Atomic.Compensate(s, () => { if (capHad && capPrior is not null) s.ActiveIndexJobs[id] = capPrior; else s.ActiveIndexJobs.TryRemove(id, out _); });
           if (wasEligible) InvalidateLocked(s, cur.BoardId);
           made = new IndexReservation(jobId, s.SourceEpoch, cur.Id, cur.Version, cur.ContentHash ?? "",
             cur.FamilyKey ?? "", cur.BoardId, cur.Scope ?? "board", cur.MeetingId, policyKey,
