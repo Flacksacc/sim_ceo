@@ -176,8 +176,8 @@ public static class MeetingEndpoints
       try
       {
         text = await gw.CompleteAsync(ModelPolicy.SparkFor(s, m.BoardId), "briefing",
-        $"Provisional briefing on '{topic}' from saved board context only.", ContextBudget.BidTokens, 2048,
-        ownerOverride: PeopleOps.IsOwner(req));
+        "Provisional briefing on " + topic + " from saved board context only.", ContextBudget.BidTokens, 2048,
+        ownerOverride: PeopleOps.IsOwner(req), boardId: m.BoardId, meetingId: id);
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
       var note = new Note

@@ -483,9 +483,14 @@ public static class RosterEndpoints
       var focus = body.TryGetProperty("focus", out var aaf) ? (aaf.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(role))
         return Results.BadRequest("name and role are required; focus steers the research.");
-      var dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkFor(s, null), "advisor-research",
+      ModelGateway.GroundedResult dossier;
+      try
+      {
+        dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkFor(s, null), "advisor-research",
         "Research this fictional advisor persona for a business advisory board. Name: " + name + ". Role: " + role + ". Focus: " + focus + ". Return concise factual-style guidance: what such an advisor should know, typical methods, key risks they watch, and limits. One claim per line.",
         ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
+      }
+      catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
       string profile;
       try
       {
@@ -888,7 +893,6 @@ public static class RosterEndpoints
         created.Add(new { img.Id, img.Kind, img.Provenance });
       }
       if (created.Count > 0) RosterOps.UnapproveBoardCopies(s, id);
-      s.Usage.Add(new UsageRow { Kind = "image-generate", Model = ModelPolicy.Image, InputTokens = 0, Note = $"{created.Count} options; unselected previews carry no retention promise" });
       return Results.Ok(created);
     });
 

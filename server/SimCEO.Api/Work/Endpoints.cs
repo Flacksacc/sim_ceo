@@ -181,7 +181,6 @@ public static class SimCEOEndpoints
         AudioRetained = body.TryGetProperty("retainAudio", out var r) && r.GetBoolean(),
       };
       s.VoiceTurns[t.Id] = t;
-      s.Usage.Add(new UsageRow { Kind = "voice-transcribe", Model = "muse-voice-transcribe", InputTokens = 0, Note = "metered; cost unknown (stub)", BoardId = m.BoardId, MeetingId = id });
       return Results.Created($"/api/voice/{t.Id}", t);
     });
     app.MapPost("/api/voice/{id:guid}/finalize", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -252,22 +251,174 @@ public static class SimCEOEndpoints
       return Results.Created($"/api/jobs/{j.Id}", j);
     });
 
-    // ---- Usage + audit + model-call ledger ----
-    app.MapGet("/api/usage", (InMemoryStore s, Guid? boardId, Guid? meetingId, string? day, string? from, string? to) =>
+    // ---- Usage + audit + model-call ledger (Phase 9) ----
+    app.MapGet("/api/usage", (InMemoryStore s, HttpRequest req, Guid? boardId, Guid? meetingId, string? day, string? from, string? to, string? purpose, string? status, string? allocation, string? summary, int? limit) =>
     {
+      if (meetingId.HasValue)
+      {
+        if (!s.Meetings.TryGetValue(meetingId.Value, out var mtgU)) return Results.NotFound("meeting");
+        if (boardId.HasValue && mtgU.BoardId != boardId.Value) return Results.Json(new { error = "board/meeting mismatch." }, statusCode: 400);
+        if (!PeopleOps.Can(s, req, mtgU.BoardId, meetingId, "read")) return PeopleOps.Denied();
+      }
+      else if (boardId.HasValue)
+      {
+        if (!s.Boards.ContainsKey(boardId.Value)) return Results.NotFound("board");
+        if (!PeopleOps.Can(s, req, boardId.Value, null, "read")) return PeopleOps.Denied();
+      }
+      else
+      {
+        if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
+      }
+      DateOnly? dayD = null, fromD = null, toD = null;
+      if (day is not null)
+      {
+        if (!DateOnly.TryParse(day, out var ddp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        dayD = ddp;
+      }
+      if (from is not null)
+      {
+        if (!DateOnly.TryParse(from, out var ffp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        fromD = ffp;
+      }
+      if (to is not null)
+      {
+        if (!DateOnly.TryParse(to, out var ttp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        toD = ttp;
+      }
+      if (fromD.HasValue && toD.HasValue && fromD.Value > toD.Value)
+        return Results.Json(new { error = "Invalid range: from must not be after to." }, statusCode: 400);
       var q = s.Usage.AsEnumerable();
-      if (boardId.HasValue) q = q.Where(u => u.BoardId == boardId);
       if (meetingId.HasValue) q = q.Where(u => u.MeetingId == meetingId);
-      if (day is not null && DateOnly.TryParse(day, out var d))
-        q = q.Where(u => DateOnly.FromDateTime(u.At) == d);
-      if (from is not null && DateOnly.TryParse(from, out var f))
-        q = q.Where(u => DateOnly.FromDateTime(u.At) >= f);
-      if (to is not null && DateOnly.TryParse(to, out var t))
-        q = q.Where(u => DateOnly.FromDateTime(u.At) <= t);
-      return Results.Ok(q.OrderByDescending(u => u.At).Take(500));
+      else if (boardId.HasValue) q = q.Where(u => u.BoardId == boardId);
+      if (!string.IsNullOrWhiteSpace(purpose)) q = q.Where(u => string.Equals(u.Kind, purpose, StringComparison.OrdinalIgnoreCase));
+      if (!string.IsNullOrWhiteSpace(status)) q = q.Where(u => string.Equals(u.Status, status, StringComparison.OrdinalIgnoreCase));
+      if (dayD.HasValue)
+        q = q.Where(u => DateOnly.FromDateTime(u.At) == dayD.Value);
+      if (fromD.HasValue)
+        q = q.Where(u => DateOnly.FromDateTime(u.At) >= fromD.Value);
+      if (toD.HasValue)
+        q = q.Where(u => DateOnly.FromDateTime(u.At) <= toD.Value);
+      var ordered = q.OrderByDescending(u => u.At).ToList();
+      if (!string.IsNullOrWhiteSpace(allocation))
+        ordered = ordered.Where(u => string.Equals(UsageAccounting.AllocationFor(u.BoardId, u.MeetingId, s), allocation, StringComparison.OrdinalIgnoreCase)).ToList();
+      var lim = Math.Clamp(limit ?? 500, 1, 2000);
+      var wantSummary = string.Equals(summary, "true", StringComparison.OrdinalIgnoreCase) || summary == "1";
+      if (!wantSummary) return Results.Ok(ordered.Take(lim));
+      var scoped = ordered.Take(lim).ToList();
+      var enriched = scoped.Select(u => new
+      {
+        u.Id, u.Kind, u.Model, u.InputTokens, u.OutputTokens, u.CachedInputTokens, u.SearchCalls,
+        u.LatencyMs, u.RanSearch, u.Status, u.ProviderCallId, u.CostBasis, u.Cost,
+        u.BoardId, u.MeetingId, u.At, u.Note,
+        scope = UsageAccounting.ScopeLabel(u.BoardId, u.MeetingId),
+        allocationLabel = UsageAccounting.AllocationFor(u.BoardId, u.MeetingId, s),
+        hiddenPurpose = UsageAccounting.IsHiddenPurpose(u.Kind),
+        unknownCost = !u.Cost.HasValue,
+      }).ToList();
+      var storageMode = Pg.Backend is null ? "memory-session-lifetime" : "postgres-durable";
+      return Results.Ok(new
+      {
+        rows = enriched,
+        total = ordered.Count,
+        returned = enriched.Count,
+        scope = meetingId.HasValue ? "meeting" : boardId.HasValue ? "board" : "installation",
+        boardId, meetingId,
+        summary = UsageAccounting.ScopeSummary(ordered, s),
+        pricingBasis = new
+        {
+          checkedDate = UsageAccounting.PricingCheckedDate,
+          pricing = UsageAccounting.PricingDocs,
+          searchGrounding = UsageAccounting.SearchDocs,
+          speechToText = UsageAccounting.SpeechDocs,
+          imageGeneration = UsageAccounting.ImageDocs,
+          note = "Costs are ESTIMATES from the pinned basis above, not provider invoices. Unknown models or unobservable units are unknown (Cost null), never fabricated zero. Known 0 only when actually known.",
+          storage = storageMode,
+        },
+        storage = storageMode,
+      });
     });
     app.MapGet("/api/activity/audit", (InMemoryStore s) => Results.Ok(s.Audit.OrderByDescending(a => a.CreatedAt).Take(200)));
-    app.MapGet("/api/models/calls", (InMemoryStore s) => Results.Ok(s.ModelCalls.Take(200)));
+    app.MapGet("/api/models/calls", (InMemoryStore s, HttpRequest req, Guid? boardId, Guid? meetingId, string? purpose, string? status, string? day, string? from, string? to, string? summary, int? limit) =>
+    {
+      if (meetingId.HasValue)
+      {
+        if (!s.Meetings.TryGetValue(meetingId.Value, out var mtgC)) return Results.NotFound("meeting");
+        if (boardId.HasValue && mtgC.BoardId != boardId.Value) return Results.Json(new { error = "board/meeting mismatch." }, statusCode: 400);
+        if (!PeopleOps.Can(s, req, mtgC.BoardId, meetingId, "read")) return PeopleOps.Denied();
+      }
+      else if (boardId.HasValue)
+      {
+        if (!s.Boards.ContainsKey(boardId.Value)) return Results.NotFound("board");
+        if (!PeopleOps.Can(s, req, boardId.Value, null, "read")) return PeopleOps.Denied();
+      }
+      else
+      {
+        if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
+      }
+      DateOnly? dayDc = null, fromDc = null, toDc = null;
+      if (day is not null)
+      {
+        if (!DateOnly.TryParse(day, out var ddcp)) return Results.Json(new { error = "Invalid day; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        dayDc = ddcp;
+      }
+      if (from is not null)
+      {
+        if (!DateOnly.TryParse(from, out var ffcp)) return Results.Json(new { error = "Invalid from; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        fromDc = ffcp;
+      }
+      if (to is not null)
+      {
+        if (!DateOnly.TryParse(to, out var ttcp)) return Results.Json(new { error = "Invalid to; expected ISO date YYYY-MM-DD." }, statusCode: 400);
+        toDc = ttcp;
+      }
+      if (fromDc.HasValue && toDc.HasValue && fromDc.Value > toDc.Value)
+        return Results.Json(new { error = "Invalid range: from must not be after to." }, statusCode: 400);
+      var qc = s.ModelCalls.AsEnumerable();
+      if (meetingId.HasValue) qc = qc.Where(c => c.MeetingId == meetingId);
+      else if (boardId.HasValue) qc = qc.Where(c => c.BoardId == boardId);
+      if (!string.IsNullOrWhiteSpace(purpose)) qc = qc.Where(c => string.Equals(c.Purpose, purpose, StringComparison.OrdinalIgnoreCase));
+      if (!string.IsNullOrWhiteSpace(status)) qc = qc.Where(c => string.Equals(c.Status, status, StringComparison.OrdinalIgnoreCase));
+      if (dayDc.HasValue)
+        qc = qc.Where(c => DateOnly.FromDateTime(c.At) == dayDc.Value);
+      if (fromDc.HasValue)
+        qc = qc.Where(c => DateOnly.FromDateTime(c.At) >= fromDc.Value);
+      if (toDc.HasValue)
+        qc = qc.Where(c => DateOnly.FromDateTime(c.At) <= toDc.Value);
+      var orderedc = qc.OrderByDescending(c => c.At).ToList();
+      var limc = Math.Clamp(limit ?? 200, 1, 2000);
+      var wantSummaryc = string.Equals(summary, "true", StringComparison.OrdinalIgnoreCase) || summary == "1";
+      if (!wantSummaryc) return Results.Ok(orderedc.Take(limc));
+      var scopedc = orderedc.Take(limc).ToList();
+      var storageModec = Pg.Backend is null ? "memory-session-lifetime" : "postgres-durable";
+      return Results.Ok(new
+      {
+        rows = scopedc.Select(c => new
+        {
+          c.Id, c.Model, c.Purpose, c.InputTokens, c.OutputTokens, c.CachedInputTokens,
+          c.LatencyMs, c.RanSearch, c.SearchCalls, c.ProviderCallId, c.Status, c.Cost, c.CostBasis,
+          c.BoardId, c.MeetingId, c.SearchNote, c.At,
+          scope = UsageAccounting.ScopeLabel(c.BoardId, c.MeetingId),
+          allocationLabel = UsageAccounting.AllocationFor(c.BoardId, c.MeetingId, s),
+          hiddenPurpose = UsageAccounting.IsHiddenPurpose(c.Purpose),
+          unknownCost = !c.Cost.HasValue,
+        }).ToList(),
+        total = orderedc.Count,
+        returned = Math.Min(limc, orderedc.Count),
+        scope = meetingId.HasValue ? "meeting" : boardId.HasValue ? "board" : "installation",
+        boardId, meetingId,
+        storage = storageModec,
+        pricingBasis = new
+        {
+          checkedDate = UsageAccounting.PricingCheckedDate,
+          pricing = UsageAccounting.PricingDocs,
+          searchGrounding = UsageAccounting.SearchDocs,
+          speechToText = UsageAccounting.SpeechDocs,
+          imageGeneration = UsageAccounting.ImageDocs,
+          note = "Costs are ESTIMATES, not provider invoices. Unknown costs are null.",
+          storage = storageModec,
+        },
+      });
+    });
 
     // ---- Meeting controls ----
     foreach (var (path, state) in new[] { ("pause", MeetingState.Paused), ("resume", MeetingState.Active), ("end", MeetingState.WrappingUp) })
@@ -654,7 +805,7 @@ public static class SimCEOEndpoints
       try
       {
         answer = await gw.CompleteAsync(ModelPolicy.SparkFor(s, m.BoardId), "secretary", text, ContextBudget.BidTokens, 2048,
-        ownerOverride: PeopleOps.IsOwner(req));
+        ownerOverride: PeopleOps.IsOwner(req), boardId: m.BoardId, meetingId: id);
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
       return Results.Ok(new { answer, provisional = true });

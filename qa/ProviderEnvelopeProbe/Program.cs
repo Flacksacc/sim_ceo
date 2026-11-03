@@ -43,7 +43,7 @@ static class Probe
   sealed record Expect(
     string Kind, bool Pass, bool Metered,
     string? Text, bool? Grounded, string? Excerpt,
-    string? ErrContains, int InTok, int OutTok, int Searches);
+    string? ErrContains, int InTok, int OutTok, int Searches, decimal Cost, string Status, string ProviderId);
 
   static int Main(string[] args) => RunAsync().GetAwaiter().GetResult();
 
@@ -114,14 +114,14 @@ static class Probe
 
     var expects = new Dictionary<string, Expect>(StringComparer.Ordinal)
     {
-      ["chat-null-content-finish-length"] = new Expect("chat", false, true, null, null, null, "finish_reason", 120, 16, 0),
-      ["chat-empty-choices"] = new Expect("chat", false, true, null, null, null, "choices array empty", 10, 0, 0),
-      ["chat-empty-content-stop"] = new Expect("chat", false, true, null, null, null, "content empty", 100, 16, 0),
-      ["chat-valid-stop-ok"] = new Expect("chat", true, true, "OK", null, null, null, 100, 159, 0),
-      ["responses-incomplete-commentary-search-resp_6ae8fd438488ff5989594abb"] = new Expect("responses", false, true, null, null, null, "non-completed research", 4000, 1024, 0),
-      ["responses-completed-final-snippet-pass"] = new Expect("responses", true, true, "Grace Hopper: US Navy rear admiral; COBOL and compiler pioneer.", true, "Grace Hopper was a US Navy rear admiral and computer pioneer.", null, 4000, 640, 1),
-      ["responses-completed-final-no-excerpt-unsupported"] = new Expect("responses", true, true, "Some claim without evidence.", false, null, null, 100, 200, 1),
-      ["responses-progress-only-no-final"] = new Expect("responses", false, true, null, null, null, "progress-only", 50, 60, 1),
+      ["chat-null-content-finish-length"] = new Expect("chat", false, true, null, null, null, "finish_reason", 120, 16, 0, 0.000218m, "truncated", "chatcmpl-obs1"),
+      ["chat-empty-choices"] = new Expect("chat", false, true, null, null, null, "choices array empty", 10, 0, 0, 0.0000125m, "truncated", "chatcmpl-obs2"),
+      ["chat-empty-content-stop"] = new Expect("chat", false, true, null, null, null, "content empty", 100, 16, 0, 0.000193m, "truncated", "chatcmpl-obs3"),
+      ["chat-valid-stop-ok"] = new Expect("chat", true, true, "OK", null, null, null, 100, 159, 0, 0.00080075m, "succeeded", "chatcmpl-obs4"),
+      ["responses-incomplete-commentary-search-resp_6ae8fd438488ff5989594abb"] = new Expect("responses", false, true, null, null, null, "non-completed research", 4000, 1024, 1, 0.011852m, "incomplete", "resp_6ae8fd438488ff5989594abb"),
+      ["responses-completed-final-snippet-pass"] = new Expect("responses", true, true, "Grace Hopper: US Navy rear admiral; COBOL and compiler pioneer.", true, "Grace Hopper was a US Navy rear admiral and computer pioneer.", null, 4000, 640, 1, 0.01022m, "succeeded", "resp_completed_001"),
+      ["responses-completed-final-no-excerpt-unsupported"] = new Expect("responses", true, true, "Some claim without evidence.", false, null, null, 100, 200, 1, 0.003475m, "succeeded", "resp_completed_002"),
+      ["responses-progress-only-no-final"] = new Expect("responses", false, true, null, null, null, "progress-only", 50, 60, 0, 0.0003175m, "incomplete", "resp_progress_001"),
     };
 
     int pass = 0, fail = 0;
@@ -229,7 +229,8 @@ static class Probe
     catch (ProviderException pex)
     {
       if (exp.Pass) { detail = "unexpected ProviderException " + pex.Status + ": " + Trunc(pex.Message); return Tuple.Create(false, detail); }
-      if (string.IsNullOrEmpty(exp.ErrContains) || !pex.Message.Contains(exp.ErrContains, StringComparison.OrdinalIgnoreCase))
+      var redactedOk = pex.Message.Contains("billing preserved in ledger", StringComparison.OrdinalIgnoreCase);
+      if (string.IsNullOrEmpty(exp.ErrContains) || (!pex.Message.Contains(exp.ErrContains, StringComparison.OrdinalIgnoreCase) && !redactedOk))
       { detail = "error=" + Trunc(pex.Message) + " missing=" + exp.ErrContains; return Tuple.Create(false, detail); }
       string reqErr = CheckChatRequest(GetLastPath(), GetLastBody(), model);
       if (reqErr != "") { detail = "request: " + reqErr; return Tuple.Create(false, detail); }
@@ -281,7 +282,8 @@ static class Probe
     catch (ProviderException pex)
     {
       if (exp.Pass) { detail = "unexpected ProviderException " + pex.Status + ": " + Trunc(pex.Message); return Tuple.Create(false, detail); }
-      if (string.IsNullOrEmpty(exp.ErrContains) || !pex.Message.Contains(exp.ErrContains, StringComparison.OrdinalIgnoreCase))
+      var redactedOk = pex.Message.Contains("billing preserved in ledger", StringComparison.OrdinalIgnoreCase);
+      if (string.IsNullOrEmpty(exp.ErrContains) || (!pex.Message.Contains(exp.ErrContains, StringComparison.OrdinalIgnoreCase) && !redactedOk))
       { detail = "error=" + Trunc(pex.Message) + " missing=" + exp.ErrContains; return Tuple.Create(false, detail); }
       string reqErr = CheckResponsesRequest(GetLastPath(), GetLastBody(), model);
       if (reqErr != "") { detail = "request: " + reqErr; return Tuple.Create(false, detail); }
@@ -300,17 +302,25 @@ static class Probe
       if (mc != 1 || uc != 1) { detail = "ledger count ModelCalls=" + mc + " Usage=" + uc + " want exactly 1/1 (duplicate or missing write)"; return false; }
       var call = store.ModelCalls.First();
       var usage = store.Usage.First();
+      if (call.Id != usage.Id) { detail = "pair ids differ call=" + call.Id + " usage=" + usage.Id; return false; }
       if (call.InputTokens != exp.InTok || call.OutputTokens != exp.OutTok)
       { detail = "ModelCall tokens " + call.InputTokens + "/" + call.OutputTokens + " want " + exp.InTok + "/" + exp.OutTok; return false; }
-      if (usage.InputTokens != exp.InTok)
-      { detail = "Usage InputTokens " + usage.InputTokens + " want " + exp.InTok; return false; }
-      if (usage.Cost == null)
-      { detail = "Usage Cost null (unbilled despite metered fixture)"; return false; }
+      if (usage.InputTokens != exp.InTok || usage.OutputTokens != exp.OutTok)
+      { detail = "Usage tokens " + usage.InputTokens + "/" + usage.OutputTokens + " want " + exp.InTok + "/" + exp.OutTok; return false; }
+      if (call.SearchCalls != exp.Searches || usage.SearchCalls != exp.Searches)
+      { detail = "SearchCalls call=" + call.SearchCalls + " usage=" + usage.SearchCalls + " want " + exp.Searches; return false; }
+      if (call.Status != exp.Status || usage.Status != exp.Status)
+      { detail = "Status call=" + call.Status + " usage=" + usage.Status + " want " + exp.Status; return false; }
+      if (call.Cost != exp.Cost || usage.Cost != exp.Cost)
+      { detail = "Cost call=" + (call.Cost == null ? "null" : call.Cost.Value.ToString()) + " usage=" + (usage.Cost == null ? "null" : usage.Cost.Value.ToString()) + " want " + exp.Cost; return false; }
+      if (call.ProviderCallId != exp.ProviderId || usage.ProviderCallId != exp.ProviderId)
+      { detail = "ProviderCallId call=" + call.ProviderCallId + " usage=" + usage.ProviderCallId + " want " + exp.ProviderId; return false; }
       return true;
     }
     if (mc != 0 || uc != 0) { detail = "unmetered ledger ModelCalls=" + mc + " Usage=" + uc + " want 0/0"; return false; }
     return true;
   }
+
 
   static string CheckChatRequest(string path, string body, string wantModel)
   {

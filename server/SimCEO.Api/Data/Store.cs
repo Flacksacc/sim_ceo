@@ -38,12 +38,13 @@ public sealed class InMemoryStore
   public bool ModelLastTestOk { get; set; }
   public string ModelLastTestError { get; set; } = string.Empty;
   public string ModelLastTestModel { get; set; } = string.Empty;
-  public Bag<Domain.AuditEvent> Audit { get; } = new();
-  public Bag<Domain.UsageRow> Usage { get; } = new();
-  public Bag<Work.ModelCall> ModelCalls { get; } = new();
+  public Bag<Domain.AuditEvent> Audit { get; } = new(); // audit stays session-lifetime by design
+  public DurableBag<Domain.UsageRow> Usage { get; } = new(); // durable installation history in PG; session-lifetime in memory mode
+  public DurableBag<Work.ModelCall> ModelCalls { get; } = new(); // durable ledger in PG; session-lifetime in memory mode
   public object MessageLock { get; } = new();
   public object SetupLock { get; } = new();
   public HashSet<Guid> RunningRuns { get; } = new();
   public ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim> DraftLocks { get; } = new();
   public string PgError { get; set; } = "";
 }
+

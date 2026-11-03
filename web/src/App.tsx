@@ -242,14 +242,69 @@ type Job = {
   updatedAt: string;
 };
 type UsageRow = {
+  id?: string;
   kind: string;
   model: string;
   inputTokens: number;
-  cost?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  searchCalls?: number;
+  latencyMs?: number;
+  ranSearch?: boolean;
+  status?: string;
+  providerCallId?: string | null;
+  costBasis?: string | null;
+  cost?: number | null;
   note: string;
-  boardId?: string;
-  meetingId?: string;
+  boardId?: string | null;
+  meetingId?: string | null;
   at: string;
+  scope?: string;
+  allocationLabel?: string;
+  hiddenPurpose?: boolean;
+  unknownCost?: boolean;
+};
+type UsageSummaryEnvelope = {
+  rows: UsageRow[];
+  total: number;
+  returned: number;
+  scope: string;
+  boardId?: string | null;
+  meetingId?: string | null;
+  summary: { total: number; knownCostUsd: number; unknownCostCalls: number; allocated: number; unallocated: number; missing: number };
+  pricingBasis: { checkedDate: string; pricing: string; searchGrounding: string; speechToText: string; imageGeneration: string; note: string; storage: string };
+  storage: string;
+};
+type ModelCallRow = {
+  id?: string;
+  model: string;
+  purpose: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  latencyMs: number;
+  ranSearch: boolean;
+  searchCalls?: number;
+  providerCallId?: string | null;
+  status?: string;
+  cost?: number | null;
+  costBasis?: string | null;
+  boardId?: string | null;
+  meetingId?: string | null;
+  searchNote?: string | null;
+  at: string;
+  scope?: string;
+  allocationLabel?: string;
+  hiddenPurpose?: boolean;
+  unknownCost?: boolean;
+};
+type ModelCallsEnvelope = {
+  rows: ModelCallRow[];
+  total: number;
+  returned: number;
+  scope: string;
+  storage: string;
+  pricingBasis: { checkedDate: string; note: string; storage: string };
 };
 type Cmd = { command: string; view: string; action: string };
 type BoardStatus = {
@@ -767,6 +822,7 @@ export default function App() {
     if (prevBoard.current !== boardId) {
       prevBoard.current = boardId;
       setMeetingId("");
+      setUsageMeeting("");
       resetBoardOwnedState();
       setReplyTo(null);
       setRecId("");
@@ -833,6 +889,9 @@ export default function App() {
   const [uday, setUday] = useState("");
   const [ufrom, setUfrom] = useState("");
   const [uto, setUto] = useState("");
+  const [usageScope, setUsageScope] = useState("installation");
+  const [usageMeeting, setUsageMeeting] = useState("");
+  const [usagePurpose, setUsagePurpose] = useState("");
   const boards = useQuery({
     queryKey: ["boards"],
     queryFn: () => get<Board[]>("/api/boards"),
@@ -1305,12 +1364,18 @@ export default function App() {
     enabled: tab === "activity",
   });
   const usage = useQuery({
-    queryKey: ["usage", uday, ufrom, uto, boardId],
-    queryFn: () =>
-      get<UsageRow[]>(
-        `/api/usage?${new URLSearchParams({ ...(boardId ? { boardId } : {}), ...(uday ? { day: uday } : {}), ...(ufrom ? { from: ufrom } : {}), ...(uto ? { to: uto } : {}) })}`,
-      ),
-    enabled: tab === "activity" && (!boardId || boardOk),
+    queryKey: ["usage", uday, ufrom, uto, boardId, usageScope, usageMeeting, usagePurpose],
+    queryFn: () => {
+      const params: Record<string, string> = { summary: "true" };
+      if (usageScope !== "installation" && boardId) params.boardId = boardId;
+      if (usageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
+      if (uday) params.day = uday;
+      if (ufrom) params.from = ufrom;
+      if (uto) params.to = uto;
+      if (usagePurpose) params.purpose = usagePurpose;
+      return get<UsageSummaryEnvelope>(`/api/usage?${new URLSearchParams(params)}`);
+    },
+    enabled: tab === "activity" && (usageScope === "installation" || (!!boardId && boardOk)) && (usageScope !== "meeting" || !!usageMeeting),
   });
   const lead = useQuery({
     queryKey: ["lead", boardId],
@@ -2509,19 +2574,18 @@ const tabCount = (k: Tab): number | null => {
     enabled: tab === "activity",
   });
   const modelCalls = useQuery({
-    queryKey: ["modelcalls"],
-    queryFn: () =>
-      get<
-        {
-          model: string;
-          purpose: string;
-          inputTokens: number;
-          outputTokens: number;
-          latencyMs: number;
-          ranSearch: boolean;
-        }[]
-      >("/api/models/calls"),
-    enabled: tab === "activity",
+    queryKey: ["modelcalls", boardId, usageScope, usageMeeting, usagePurpose, uday, ufrom, uto],
+    queryFn: () => {
+      const params: Record<string, string> = { summary: "true", limit: "200" };
+      if (usageScope !== "installation" && boardId) params.boardId = boardId;
+      if (usageScope === "meeting" && usageMeeting) params.meetingId = usageMeeting;
+      if (usagePurpose) params.purpose = usagePurpose;
+      if (uday) params.day = uday;
+      if (ufrom) params.from = ufrom;
+      if (uto) params.to = uto;
+      return get<ModelCallsEnvelope>(`/api/models/calls?${new URLSearchParams(params)}`);
+    },
+    enabled: tab === "activity" && (usageScope === "installation" || (!!boardId && boardOk)) && (usageScope !== "meeting" || !!usageMeeting),
   });
   const retryJob = (j: Job) =>
     post<Job>(`/api/jobs/${j.id}/retry`, {})
@@ -6451,32 +6515,65 @@ const testModel = useMutation({
                 {" "}
                 <label>
                   {" "}
+                  Scope{" "}
+                  <select value={usageScope} onChange={(e) => { setUsageScope(e.target.value); setUsageMeeting(""); }} aria-label="Usage scope">
+                    {" "}
+                    <option value="installation">Installation (owner only)</option>{" "}
+                    <option value="board">Board</option>{" "}
+                    <option value="meeting">Meeting</option>{" "}
+                  </select>{" "}
+                </label>{" "}
+                {usageScope === "meeting" && (
+                  <label>
+                    {" "}
+                    Meeting{" "}
+                    <select value={usageMeeting} onChange={(e) => setUsageMeeting(e.target.value)} aria-label="Usage meeting">
+                      {" "}
+                      <option value="">Pick a meeting</option>{" "}
+                      {((allMeetings.data ?? meetings.data ?? []) as { id: string; title: string }[]).map((m) => (
+                        <option key={m.id} value={m.id}>{m.title}</option>
+                      ))}{" "}
+                    </select>{" "}
+                  </label>
+                )}{" "}
+                <label>
+                  {" "}
+                  Purpose (all visible by default){" "}
+                  <select value={usagePurpose} onChange={(e) => setUsagePurpose(e.target.value)} aria-label="Usage purpose">
+                    {" "}
+                    <option value="">All purposes</option>{" "}
+                    <option value="advisor-bid">advisor-bid (hidden)</option>{" "}
+                    <option value="advisor-reply">advisor-reply</option>{" "}
+                    <option value="advisor-chat">advisor-chat</option>{" "}
+                    <option value="advisor-research">advisor-research (hidden)</option>{" "}
+                    <option value="advisor-profile">advisor-profile (hidden)</option>{" "}
+                    <option value="audition">audition (hidden)</option>{" "}
+                    <option value="secretary">secretary (hidden)</option>{" "}
+                    <option value="briefing">briefing (hidden)</option>{" "}
+                    <option value="wizard-guide">wizard-guide (hidden)</option>{" "}
+                    <option value="wizard-interview">wizard-interview (hidden)</option>{" "}
+                    <option value="model-test">model-test (hidden)</option>{" "}
+                    <option value="image-generate">image-generate</option>{" "}
+                    <option value="voice-transcribe">voice-transcribe</option>{" "}
+                  </select>{" "}
+                </label>{" "}
+                <label>
+                  {" "}
                   Day{" "}
-                  <input
-                    type="date"
-                    value={uday}
-                    onChange={(e) => setUday(e.target.value)}
-                  />{" "}
+                  <input type="date" value={uday} onChange={(e) => setUday(e.target.value)} />{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   From{" "}
-                  <input
-                    type="date"
-                    value={ufrom}
-                    onChange={(e) => setUfrom(e.target.value)}
-                  />{" "}
+                  <input type="date" value={ufrom} onChange={(e) => setUfrom(e.target.value)} />{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   To{" "}
-                  <input
-                    type="date"
-                    value={uto}
-                    onChange={(e) => setUto(e.target.value)}
-                  />{" "}
+                  <input type="date" value={uto} onChange={(e) => setUto(e.target.value)} />{" "}
                 </label>{" "}
               </div>{" "}
+              {usageScope !== "installation" && !boardId && <p role="status">Pick a board to view board or meeting usage.</p>}{" "}
               <h3>Jobs</h3>{" "}
               {(jobs.data ?? []).map((j) => (
                 <div key={j.id}>
@@ -6498,90 +6595,91 @@ const testModel = useMutation({
                   <p role="status">
                     {" "}
                     {spending.data.month}: known ${spending.data.knownSpendUsd}{" "}
-                    {spending.data.monthlyCapUsd != null
-                      ? ` / cap $${spending.data.monthlyCapUsd}`
-                      : " / no cap"}{" "}
+                    {spending.data.monthlyCapUsd != null ? ` / cap $${spending.data.monthlyCapUsd}` : " / no cap"}{" "}
                     {" · "} {spending.data.unknownCostCalls} unknown-cost calls{" "}
                     {spending.data.overCap ? " · OVER CAP" : ""}{" "}
-                    {spending.data.enforced
-                      ? " · blocking non-owner calls"
-                      : ""}{" "}
+                    {spending.data.enforced ? " · blocking non-owner calls" : ""}{" "}
                   </p>
                 )}{" "}
                 {spending.data && <p>{spending.data.note}</p>}{" "}
+                {spending.data && (spending.data as { storage?: string }).storage && (
+                  <p className="muted">Storage: {(spending.data as { storage?: string }).storage === "postgres-durable" ? "Postgres durable history" : "In-memory session-lifetime"}</p>
+                )}{" "}
                 <label>
                   {" "}
                   Monthly cap USD (empty = none){" "}
-                  <input
-                    value={capInput}
-                    onChange={(e) => setCapInput(e.target.value)}
-                    placeholder="e.g. 50"
-                  />{" "}
+                  <input value={capInput} onChange={(e) => setCapInput(e.target.value)} placeholder="e.g. 50" />{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   At cap{" "}
-                  <select
-                    value={capMode}
-                    onChange={(e) => setCapMode(e.target.value)}
-                  >
+                  <select value={capMode} onChange={(e) => setCapMode(e.target.value)}>
                     {" "}
-                    <option value="warn">
-                      {" "}
-                      Warn (calls continue, status shows over){" "}
-                    </option>{" "}
-                    <option value="block">
-                      {" "}
-                      Block non-owner model calls (owner override always
-                      works){" "}
-                    </option>{" "}
+                    <option value="warn">Warn (calls continue, status shows over)</option>{" "}
+                    <option value="block">Block non-owner model calls (owner override always works)</option>{" "}
                   </select>{" "}
                 </label>{" "}
-                <button onClick={() => saveSpending.mutate()}>
-                  {" "}
-                  Save spending controls{" "}
-                </button>{" "}
+                <button onClick={() => saveSpending.mutate()}>Save spending controls</button>{" "}
               </div>{" "}
-
               <h3>Usage (live ledger)</h3>{" "}
+              {usage.data && (
+                <p role="status">
+                  Scope: {usage.data.scope}
+                  {" · "} {usage.data.summary.total} calls
+                  {" · "} known ${(usage.data.summary.knownCostUsd as number).toFixed(6)}
+                  {" · "} {usage.data.summary.unknownCostCalls} unknown-cost
+                  {" · "} allocated {usage.data.summary.allocated} / unallocated {usage.data.summary.unallocated} / missing {usage.data.summary.missing}
+                  {" · "} storage: {usage.data.storage === "postgres-durable" ? "Postgres durable history" : "In-memory session-lifetime"}
+                </p>
+              )}{" "}
+              {usage.data && (
+                <p className="muted">Pricing basis {usage.data.pricingBasis.checkedDate}: estimates only, not provider invoices. Unknown models or unobserved units stay Unknown, never $0 unless actually $0.</p>
+              )}{" "}
+              {usage.isError ? (<p role="alert" data-testid="usage-ledger-error">Could not load usage for this scope. Check the board and meeting selection, then retry.</p>) : usage.isSuccess && (usage.data?.rows ?? []).length === 0 ? (<p>No usage in this scope yet. Hidden purposes (bids, research, setup, secretary, tool calls) appear here when they run.</p>) : null}{" "}
               <div className="table-scroll">
                 {" "}
-                <table className="grid">
+                <table className="grid" data-testid="usage-ledger-table">
                   <thead>
                     <tr>
-                      <th>Kind</th><th>Model</th><th className="num">In</th>
-                      <th>Note</th>
+                      <th>Purpose</th><th>Model</th><th className="num">In/cached/out</th><th>Cost</th><th>Status</th><th>Scope</th><th>Note</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {(usage.data ?? []).map((u, i) => (
-                      <tr key={i}>
-                        <td>{u.kind}</td><td>{u.model}</td>
-                        <td className="num">{u.inputTokens}</td>
-                        <td>{u.note}</td>
+                    {(usage.data?.rows ?? []).map((u, i) => (
+                      <tr key={u.id ?? i} data-row-id={u.id ?? ""} data-testid={"usage-row-" + (u.id ?? i)}>
+                        <td>{u.kind}{u.hiddenPurpose ? (<span className="badge"> hidden</span>) : null}</td>
+                        <td>{u.model}</td>
+                        <td className="num">{u.inputTokens}/{u.cachedInputTokens ?? 0}/{u.outputTokens ?? 0}{u.searchCalls ? ` +${u.searchCalls} searches` : ""}</td>
+                        <td>{u.cost == null ? (<span className="badge live">Unknown</span>) : `$${(u.cost as number).toFixed(6)}`}</td>
+                        <td><span className="badge">{u.status ?? "succeeded"}</span></td>
+                        <td>{u.scope ?? (u.meetingId ? "meeting" : u.boardId ? "board" : "installation")}{" "}{u.allocationLabel ? (<span className="badge">{u.allocationLabel}</span>) : (u.boardId ? null : (<span className="badge">Unallocated</span>))}</td>
+                        <td title={u.costBasis ?? ""}>{u.note}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>{" "}
               </div>{" "}
               <h3>Model calls</h3>{" "}
+              {modelCalls.isError ? (<p role="alert" data-testid="modelcall-ledger-error">Could not load model calls for this scope. Check the board and meeting selection, then retry.</p>) : modelCalls.isSuccess && (modelCalls.data?.rows ?? []).length === 0 ? (<p>No model calls in this scope yet.</p>) : null}{" "}
               <div className="table-scroll">
                 {" "}
-                <table className="grid">
+                <table className="grid" data-testid="modelcall-ledger-table">
                   <thead>
                     <tr>
-                      <th>Model</th><th>Purpose</th>
-                      <th className="num">In/out</th>
-                      <th className="num">Latency</th><th>Search</th>
+                      <th>Model</th><th>Purpose</th><th className="num">In/cached/out</th><th className="num">Latency</th><th>Search</th><th>Cost</th><th>Status</th><th>Scope</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {(modelCalls.data ?? []).map((m, i) => (
-                      <tr key={i}>
-                        <td>{m.model}</td><td>{m.purpose}</td>
-                        <td className="num">{m.inputTokens}/{m.outputTokens}</td>
+                    {(modelCalls.data?.rows ?? []).map((m, i) => (
+                      <tr key={m.id ?? i} data-row-id={m.id ?? ""} data-testid={"modelcall-row-" + (m.id ?? i)}>
+                        <td>{m.model}</td>
+                        <td>{m.purpose}{m.hiddenPurpose ? (<span className="badge"> hidden</span>) : null}</td>
+                        <td className="num">{m.inputTokens}/{m.cachedInputTokens ?? 0}/{m.outputTokens}</td>
                         <td className="num">{m.latencyMs}ms</td>
-                        <td>{m.ranSearch ? "grounded" : "—"}</td>
+                        <td>{m.ranSearch || (m.searchCalls ?? 0) > 0 ? `grounded (${m.searchCalls ?? 0})` : "—"}</td>
+                        <td>{m.cost == null ? (<span className="badge live">Unknown</span>) : `$${(m.cost as number).toFixed(6)}`}</td>
+                        <td><span className="badge">{m.status ?? "succeeded"}</span></td>
+                        <td>{m.scope ?? (m.meetingId ? "meeting" : m.boardId ? "board" : "installation")}{" "}{m.allocationLabel ? (<span className="badge">{m.allocationLabel}</span>) : null}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -6591,24 +6689,9 @@ const testModel = useMutation({
                 {" "}
                 <h3>Compare models (live ledger)</h3>{" "}
                 {(() => {
-                  const byModel = new Map<
-                    string,
-                    {
-                      calls: number;
-                      inTok: number;
-                      outTok: number;
-                      ms: number;
-                      searches: number;
-                    }
-                  >();
-                  for (const m of modelCalls.data ?? []) {
-                    const e = byModel.get(m.model) ?? {
-                      calls: 0,
-                      inTok: 0,
-                      outTok: 0,
-                      ms: 0,
-                      searches: 0,
-                    };
+                  const byModel = new Map<string, { calls: number; inTok: number; outTok: number; ms: number; searches: number }>();
+                  for (const m of modelCalls.data?.rows ?? []) {
+                    const e = byModel.get(m.model) ?? { calls: 0, inTok: 0, outTok: 0, ms: 0, searches: 0 };
                     e.calls++;
                     e.inTok += m.inputTokens;
                     e.outTok += m.outputTokens;
@@ -6616,10 +6699,10 @@ const testModel = useMutation({
                     if (m.ranSearch) e.searches++;
                     byModel.set(m.model, e);
                   }
+                  if (modelCalls.isError) return null;
+                  if (!modelCalls.isSuccess) return null;
                   const rows = [...byModel.entries()];
-                  return rows.length === 0 ? (
-                    <p>No model calls yet.</p>
-                  ) : (
+                  return rows.length === 0 ? (<p>No model calls yet.</p>) : (
                     <ul>
                       {" "}
                       {rows.map(([model, e]) => (
