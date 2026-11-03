@@ -607,7 +607,8 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
   // by the approved-participant board-advisors projection, not the template collection.
   if (PeopleOps.IsSecure(s) && !isAdmin)
     list0 = list0.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
-      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read")));
+      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
+      || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
   else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty)
     list0 = list0.Where(r => r.AccountId == accountId
       // Canonical visibility (demo mode): a random browser-local account filter must not
