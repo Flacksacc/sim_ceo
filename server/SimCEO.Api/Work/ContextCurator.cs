@@ -11,6 +11,8 @@ namespace SimCEO.Api.Work;
 // and ranked source excerpts. Never full transcripts or whole documents.
 // Every packet's manifest (ids, versions, token estimate) is returned for
 // the audit trail; full context blobs are never stored.
+// Phase 6: ALL source selection routes through SourceGovernance.IsEligible;
+// excerpts prefer persisted SourceSections; raw text never bypasses.
 public sealed record CuratorManifest(
   List<string> SourceIds, List<long> MessageSeqs, int LeadVersion,
   string Policy, int TokenEstimate, long SnapshotRevision,
@@ -69,9 +71,7 @@ public static class ContextCurator
     }
     var words = Keywords(prompt);
     var ranked = s.Sources.Values
-      .Where(x => x.BoardId == m.BoardId && x.Approved && !x.Excluded
-        && (x.Scope == "board" || x.MeetingId == m.Id)
-        && x.Original is not null)
+      .Where(x => x.BoardId == m.BoardId && SourceGovernance.IsEligible(s, x, m.Id))
       .Select(x => (doc: x, text: ReadableText(s, x)))
       .Where(e => !string.IsNullOrWhiteSpace(e.text))
       .OrderByDescending(e => Score(e.text, words))
@@ -84,7 +84,7 @@ public static class ContextCurator
       foreach (var (doc, text) in ranked)
       {
         sb.AppendLine($"[SOURCE:{doc.FileName} v{doc.Version}]: {Truncate(text, share)}");
-        sourceIds.Add($"{doc.Id}:v{doc.Version}");
+        sourceIds.Add($"{doc.Id}:v{doc.Version}:g{doc.IndexGeneration}:{doc.ContentHash}:s{SourceGovernance.SectionRevision(s, doc.Id)}");
         evidence.Add(EvidenceRef.ForSource(doc, Truncate(text, 200)));
       }
     }
@@ -151,12 +151,13 @@ public static class ContextCurator
 
   public sealed record RecallHit(string Kind, string Ref, string Text, int Score);
 
-  public static List<RecallHit> Recall(InMemoryStore s, Guid boardId, string query, int take = 8)
+  public static List<RecallHit> Recall(InMemoryStore s, Guid boardId, string query, int take = 8, Guid? meetingId = null)
   {
     var words = Keywords(query);
     var hits = new List<RecallHit>();
-    foreach (var doc in s.Sources.Values.Where(x => x.BoardId == boardId && x.Approved && !x.Excluded))
+    foreach (var doc in s.Sources.Values.Where(x => x.BoardId == boardId))
     {
+      if (!SourceGovernance.VisibleForRecall(s, doc, boardId, meetingId)) continue;
       var text = ReadableText(s, doc);
       if (string.IsNullOrWhiteSpace(text)) continue;
       hits.Add(new RecallHit("source", $"{doc.FileName} v{doc.Version}", Truncate(text, 600), Score(text, words)));
@@ -173,11 +174,16 @@ public static class ContextCurator
     return hits.OrderByDescending(h => h.Score).Take(Math.Clamp(take, 1, 20)).ToList();
   }
 
-  private static string ReadableText(InMemoryStore s, SourceDoc doc)
+  // Phase 6: excerpts come ONLY from persisted sections. Raw extraction or
+  // original bytes must never bypass the section graph (P2 #13): when the
+  // index is not completed or no valid sections exist there is no usable text.
+  internal static string ReadableText(InMemoryStore s, SourceDoc doc)
   {
-    if (Extraction.MarkdownOf(doc.ExtractionJson) is { } md && !string.IsNullOrWhiteSpace(md))
-      return md;
-    return doc.Original is null ? "" : DecodeText(doc.Original);
+    if (!string.Equals(doc.IndexState, "completed", StringComparison.OrdinalIgnoreCase)) return "";
+    if (!SourceGovernance.HasValidSections(s, doc)) return "";
+    var secs = s.SourceSections.Values.Where(x => x.SourceId == doc.Id).OrderBy(x => x.Ordinal).Take(6).ToList();
+    if (secs.Count == 0) return "";
+    return string.Join("\n\n", secs.Select(x => (string.IsNullOrWhiteSpace(x.Heading) ? "" : "## " + x.Heading + "\n") + x.Text));
   }
 
   private static string DecodeText(byte[] bytes)
@@ -187,7 +193,7 @@ public static class ContextCurator
     catch (DecoderFallbackException) { return ""; }
     if (text.Length == 0) return "";
     var printable = text.Count(c => !char.IsControl(c) || c is '\n' or '\r' or '\t');
-    if ((double)printable / text.Length < 0.7) return ""; // binary: waits for Docling extraction
+    if ((double)printable / text.Length < 0.7) return "";
     return text.Length > 12000 ? text[..12000] : text;
   }
 }

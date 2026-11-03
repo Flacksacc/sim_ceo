@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
-import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
+import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr"; import SourcesGovernance from "./sources-governance";
 type Board = { id: string; name: string; mission: string };
 type Meeting = { id: string; title: string; state: number };
 type Msg = {
@@ -1091,6 +1091,10 @@ export default function App() {
     return a;
   });
   const [actAsState, setActAsState] = useState("");
+  // Applied demo identity: the value actually sent as X-User by every app
+  // request, updated ONLY through "Apply identity". The draft input above
+  // stays editable without affecting traffic until applied.
+  const [appliedActAs, setAppliedActAs] = useState("");
   const [mq, setMq] = useState("");
   const [mstate, setMstate] = useState("");
   const [uday, setUday] = useState("");
@@ -6590,205 +6594,7 @@ const testModel = useMutation({
             <section aria-label="Resources and Inbox">
               {" "}
               <h2>Resources and Inbox</h2>{" "}
-              <p>
-                {" "}
-                Uploads enter an approval inbox. Excluded sources never serve as
-                current evidence.{" "}
-              </p>{" "}
-              <p role="status" className="source-summary">
-                {" "}
-                <span className="badge">
-                  {" "}
-                  {
-                    (sources.data ?? []).filter(
-                      (s) => !s.approved && !s.excluded,
-                    ).length
-                  }{" "}
-                  pending{" "}
-                </span>{" "}
-                <span className="badge ok">
-                  {" "}
-                  {(sources.data ?? []).filter((s) => s.approved).length}{" "}
-                  approved{" "}
-                </span>{" "}
-                <span className="badge">
-                  {" "}
-                  {(sources.data ?? []).filter((s) => s.excluded).length}{" "}
-                  excluded{" "}
-                </span>{" "}
-              </p>{" "}
-              <div className="meetctl">
-                {" "}
-                {!guestView && (<label>
-                  {" "}
-                  Upload file{" "}
-                  <input
-                    type="file"
-                    onChange={(e) =>
-                      uploadSrc(
-                        e.target.files?.[0],
-                        meetingId ? "meeting" : "board",
-                      )
-                    }
-                  />{" "}
-                </label>)}{" "}
-              </div>{" "}
-              {(sources.data ?? []).map((s) => (
-                <div className="card" key={s.id}>
-                  {" "}
-                  <b>{s.fileName}</b>{" "}
-                  <span className="badge">
-                    {" "}
-                    v{s.version} · {s.scope}{" "}
-                  </span>{" "}
-                  <span className="badge">
-                    {" "}
-                    {s.approved ? "approved" : "pending"}{" "}
-                  </span>{" "}
-                  {s.excluded && <span className="badge">excluded</span>}{" "}
-                  <div>
-                    {" "}
-                    {!guestView && (<button
-                      onClick={() => srcOp(s.id, "approve")}
-                      disabled={s.approved}
-                    >
-                      {" "}
-                      Approve{" "}
-                    </button>)}{" "}
-                    {!guestView && (<button
-                      onClick={() => srcOp(s.id, "exclude")}
-                      disabled={s.excluded}
-                    >
-                      {" "}
-                      Exclude{" "}
-                    </button>)}{" "}
-                    <button
-                      onClick={() => srcOp(s.id, "restore")}
-                      disabled={!s.excluded}
-                    >
-                      {" "}
-                      Restore{" "}
-                    </button>{" "}
-                    <button onClick={() => srcOp(s.id, "retry")}>
-                      {" "}
-                      Retry extraction{" "}
-                    </button>{" "}
-                    {!guestView && (<button
-                      onClick={() => {
-                        setScopeId(s.id);
-                        setScopeSel(s.scope);
-                        setScopeMeeting(s.meetingId ?? meetingId);
-                        scopeDlg.current?.showModal();
-                      }}
-                    >
-                      {" "}
-                      Set scope…{" "}
-                    </button>)}{" "}
-                    <button type="button" onClick={() => authedDownload(`/api/sources/${s.id}/download`, s.fileName || "source.bin")}>
-                      {" "}
-                      Download original{" "}
-                    </button>{" "}
-                  </div>{" "}
-                </div>
-              ))}{" "}
-              <dialog
-                ref={scopeDlg}
-                aria-label="Set source scope"
-                onClose={() => setScopeId("")}
-              >
-                {" "}
-                <h3>Source scope</h3>{" "}
-                <label>
-                  {" "}
-                  <input
-                    type="radio"
-                    name="scope"
-                    value="board"
-                    checked={scopeSel === "board"}
-                    onChange={() => setScopeSel("board")}
-                  />{" "}
-                  Whole board{" "}
-                </label>{" "}
-                <label>
-                  {" "}
-                  <input
-                    type="radio"
-                    name="scope"
-                    value="meeting"
-                    checked={scopeSel === "meeting"}
-                    onChange={() => setScopeSel("meeting")}
-                  />{" "}
-                  One meeting{" "}
-                </label>{" "}
-                {scopeSel === "meeting" && (
-                  <label>
-                    {" "}
-                    Meeting{" "}
-                    <select
-                      value={scopeMeeting}
-                      onChange={(e) => setScopeMeeting(e.target.value)}
-                    >
-                      {" "}
-                      <option value="">— pick —</option>{" "}
-                      {(meetings.data ?? []).map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {" "}
-                          {m.title}{" "}
-                        </option>
-                      ))}{" "}
-                    </select>{" "}
-                  </label>
-                )}{" "}
-                <div className="meetctl">
-                  {" "}
-                  <button
-                    disabled={scopeSel === "meeting" && !scopeMeeting}
-                    onClick={saveScope}
-                  >
-                    {" "}
-                    Save scope{" "}
-                  </button>{" "}
-                  <button onClick={() => scopeDlg.current?.close()}>
-                    {" "}
-                    Cancel{" "}
-                  </button>{" "}
-                </div>{" "}
-              </dialog>{" "}
-              <div className="card">
-                {" "}
-                <h3>Recall approved material (local ranked search)</h3>{" "}
-                <input
-                  aria-label="Recall query"
-                  value={recallQ}
-                  onChange={(e) => setRecallQ(e.target.value)}
-                  placeholder="Search approved sources, records, directions"
-                />{" "}
-                <button onClick={runRecall}>Recall</button>{" "}
-                {recallHits.map((h, i) => (
-                  <div key={i}>
-                    {" "}
-                    <span className="badge">{h.kind}</span> <b>{h.ref}</b>{" "}
-                    (score {h.score}): {h.text}{" "}
-                  </div>
-                ))}{" "}
-              </div>{" "}
-              <div className="card">
-                {" "}
-                <h3>Source policy</h3>{" "}
-                <label>
-                  {" "}
-                  Blocked file types (comma-separated extensions){" "}
-                  <input
-                    value={blocked}
-                    onChange={(e) => setBlocked(e.target.value)}
-                    placeholder="exe, zip"
-                  />{" "}
-                </label>{" "}
-                <button onClick={() => savePolicy.mutate()}>
-                  {" "}
-                  Save policy{" "}
-                </button>{" "}
-              </div>{" "}
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={guestView} />
             </section>
           )}{" "}
           {tab === "records" && (
@@ -7203,6 +7009,7 @@ const testModel = useMutation({
                     <button
                       onClick={() => {
                         actAs = actAsState.trim();
+                        setAppliedActAs(actAsState.trim());
                         setItemTexts({});
                         setReviewError(null);
                         qc.invalidateQueries();

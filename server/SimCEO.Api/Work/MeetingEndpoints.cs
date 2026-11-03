@@ -187,6 +187,20 @@ public static class MeetingEndpoints
       if (PeopleOps.Guard(gw, req) is { } cappedBr) return cappedBr;
       var topic = body.TryGetProperty("topic", out var t) ? (t.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
+      if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+        return Results.Conflict("Meeting is not active; resume to request a briefing.");
+      // Capture generation + eligible-input fingerprint BEFORE the provider
+      // await: a policy change, exclusion, revocation, or index-generation
+      // change during generation must discard the stale draft instead of
+      // publishing it (P1 #3/#4). The fingerprint pins the exact eligible
+      // set with per-source version, index generation, content hash, and
+      // section-graph shape, so a same-bytes/version reindex that swaps
+      // text still discards the in-flight draft.
+      var genBefore = m.Generation;
+      var epochBefore = s.SourceEpoch;
+      List<string> EligibleFingerprint() => SourceGovernance.EligibleFingerprint(s, m.BoardId, id);
+      var fpBefore = EligibleFingerprint();
+      var evidenceBefore = SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
       string text;
       try
       {
@@ -199,14 +213,30 @@ public static class MeetingEndpoints
       if (PeopleOps.BadToken(s, req) is { } badBr2) return badBr2;
       if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedBr2) return deniedBr2;
       if (!s.Meetings.TryGetValue(id, out m)) return Results.NotFound("meeting");
-      var note = new Note
+      // Publication boundary: recheck state, generation, and the eligible
+      // input fingerprint under the governance locks before storing.
+      lock (s.SetupLock)
       {
-        BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
-        Title = topic, Body = text, Scope = "meeting", Provisional = true,
-        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
-      };
-      s.Notes[note.Id] = note;
-      return Results.Created($"/api/notes/{note.Id}", note);
+        lock (s.MessageLock)
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+            return Results.Conflict("Meeting state changed during briefing; draft discarded.");
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
+          if (cur.Generation != genBefore || s.SourceEpoch != epochBefore)
+            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
+          if (!EligibleFingerprint().SequenceEqual(fpBefore))
+            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
+            var resolved = SourceGovernance.ResolveEvidence(s, evidenceBefore, m.BoardId, id);
+          var note = new Note
+          {
+            BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
+            Title = topic, Body = text, Scope = "meeting", Provisional = true,
+            EvidenceJson = EvidenceRef.ToJsonList(resolved),
+          };
+          s.Notes[note.Id] = note;
+          return Results.Created($"/api/notes/{note.Id}", note);
+        }
+      }
     });
 
     app.MapGet("/api/meetings/{id:guid}/voice", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -248,7 +278,7 @@ public static class MeetingEndpoints
         BoardId = bid, MeetingId = meetingId, Kind = "direction", Scope = scope,
         Title = scope == "board" ? "Adopted board-wide" : "Adopted for meeting",
         Body = text, Provisional = false,
-        EvidenceJson = EvidenceRef.ToJsonList(EvidenceRef.ParseList(body, "evidence")),
+        EvidenceJson = EvidenceRef.ToJsonList(SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), bid, meetingId == Guid.Empty ? null : meetingId)),
       };
       s.Notes[note.Id] = note;
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });

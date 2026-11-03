@@ -17,7 +17,7 @@ public sealed class PostgresDb : DbContext
   public DbSet<Meeting> Meetings => Set<Meeting>();
   public DbSet<Message> Messages => Set<Message>();
   public DbSet<RecordDraft> Drafts => Set<RecordDraft>();
-  public DbSet<SourceDoc> Sources => Set<SourceDoc>();
+  public DbSet<SourceDoc> Sources => Set<SourceDoc>(); public DbSet<SourceSection> SourceSections => Set<SourceSection>(); public DbSet<SourceFamilyHead> SourceHeads => Set<SourceFamilyHead>(); public DbSet<SourceEvent> SourceEvents => Set<SourceEvent>();
   public DbSet<WizardDraft> WizardDrafts => Set<WizardDraft>();
   public DbSet<VoiceTurn> VoiceTurns => Set<VoiceTurn>();
   public DbSet<LeadProfile> LeadProfiles => Set<LeadProfile>();
@@ -34,6 +34,13 @@ public sealed class PostgresDb : DbContext
   {
     b.Entity<Message>().HasKey(m => new { m.MeetingId, m.Sequence });
     b.Entity<SourceDoc>().HasIndex(x => x.BoardId);
+    // Phase 6 uniqueness: one version identity per family, one head per family.
+    // Legacy collisions are resolved by the controlled startup migration BEFORE
+    // these constraints are enforced (see PgBoot.EnsureUniqueIndexes), and all
+    // writes allocate+insert in one serialized transaction, so these constraints
+    // only ever guard against out-of-band writes.
+    b.Entity<SourceDoc>().HasIndex(x => new { x.BoardId, x.FamilyKey, x.Version }).IsUnique();
+    b.Entity<SourceFamilyHead>().HasIndex(x => new { x.BoardId, x.FamilyKey }).IsUnique();
     b.Entity<BoardAdvisor>().HasIndex(x => x.BoardId);
     b.Entity<Meeting>().HasIndex(x => x.BoardId);
     b.Entity<SimCEO.Api.Account>().HasIndex(a => a.Email).IsUnique();
@@ -336,6 +343,25 @@ public static class PgBoot
         }
       }
       db.SaveChanges();
+ db.Database.ExecuteSqlRaw("ALTER TABLE \"Boards\" ADD COLUMN IF NOT EXISTS \"SourcePolicyMode\" text NOT NULL DEFAULT 'allowAll'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"ReviewState\" text NOT NULL DEFAULT 'pending'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"Origin\" text NOT NULL DEFAULT 'upload'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"ResourceId\" uuid NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"FamilyKey\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexState\" text NOT NULL DEFAULT 'queued'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexGeneration\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexError\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexCompletedAt\" timestamp with time zone NULL");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceSections\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"SourceVersion\" integer NOT NULL DEFAULT 1, \"ContentHash\" text NOT NULL DEFAULT '', \"Ordinal\" integer NOT NULL DEFAULT 1, \"Heading\" text NOT NULL DEFAULT '', \"Location\" text NOT NULL DEFAULT '', \"Text\" text NOT NULL DEFAULT '', \"IndexGeneration\" integer NOT NULL DEFAULT 1, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");
+      // Unique identity constraints are NOT created here: they are enforced by
+      // EnsureUniqueIndexes AFTER the controlled startup migration has
+      // canonicalized families and resolved legacy collisions in app code.
+      db.Database.ExecuteSqlRaw("UPDATE \"Sources\" SET \"ReviewState\" = CASE WHEN \"Approved\" THEN 'approved' ELSE 'pending' END WHERE (\"ReviewState\" = 'pending' OR \"ReviewState\" = '') AND \"Approved\" = TRUE");
+      // Canonical family keys and legacy collision resolution run in app code (SourceGovernance.MigrateStore); SQL leaves new rows empty.
       Pg.Backend = new PostgresBackend(db);
       return true;
     }
@@ -343,6 +369,29 @@ public static class PgBoot
     {
       var inner = ex; while (inner.InnerException is not null) inner = inner.InnerException;
       error = $"Postgres wire-up failed step {DdlStep} ({ex.GetType().Name}: {inner.Message}); refusing in-memory fallback for requested PG mode.";
+      return false;
+    }
+  }
+
+  // Unique identity constraints, enforced ONLY after the controlled
+  // startup migration has canonicalized families and deterministically
+  // resolved legacy collisions. Creating them earlier would fail on
+  // reachable legacy shapes (e.g. two pre-family v1 rows that canonicalize
+  // to one family). Called by Program after SourceGovernance.MigrateStore.
+  public static bool EnsureUniqueIndexes(string cs, out string error)
+  {
+    error = "";
+    try
+    {
+      var options = new DbContextOptionsBuilder<PostgresDb>().UseNpgsql(cs).Options;
+      using var db = new PostgresDb(options);
+      db.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX IF NOT EXISTS \"UX_Sources_FamilyVersion\" ON \"Sources\" (\"BoardId\",\"FamilyKey\",\"Version\")");
+      db.Database.ExecuteSqlRaw("CREATE UNIQUE INDEX IF NOT EXISTS \"UX_SourceHeads_Family\" ON \"SourceHeads\" (\"BoardId\",\"FamilyKey\")");
+      return true;
+    }
+    catch (Exception ex)
+    {
+      error = $"Postgres unique-index enforcement failed ({ex.GetType().Name}: {ex.Message}).";
       return false;
     }
   }

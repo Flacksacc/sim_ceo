@@ -59,7 +59,7 @@ public static class OpsEndpoints
           total = stGuest ? PeopleOps.GuestMeetingIds(s, stUser, bid).Count : meetings.Count,
           active = stGuest ? 0 : meetings.Count(m => m.State is MeetingState.Active or MeetingState.Paused),
         },
-        sourcesPending = stCanContrib ? s.Sources.Values.Count(x => x.BoardId == bid && !x.Approved && !x.Excluded) : 0,
+        sourcesPending = stCanContrib ? s.Sources.Values.Count(x => x.BoardId == bid && string.Equals(string.IsNullOrWhiteSpace(x.ReviewState) ? (x.Approved ? "approved" : "pending") : x.ReviewState, "pending", StringComparison.OrdinalIgnoreCase) && !x.Excluded) : 0,
         jobsFailed = stIsAdmin ? s.Jobs.Values.Count(j => j.State == "failed") : 0,
         policy = b.DiscussionPolicy,
         retainAudio = b.RetainAudio,
@@ -71,10 +71,17 @@ public static class OpsEndpoints
     {
       if (PeopleOps.Check(s, req, bid, meetingId, "read") is { } deniedRecall) return deniedRecall;
       if (string.IsNullOrWhiteSpace(q)) return Results.BadRequest("q is required.");
+      Guid? recallMeeting = null; if (req.Query.TryGetValue("meetingId", out var rmv) && Guid.TryParse(rmv.ToString(), out var rmg)) recallMeeting = rmg;
       var isBoardReader = PeopleOps.Can(s, req, bid, null, "read");
-      if (!isBoardReader) return PeopleOps.Denied();
-      var local = ContextCurator.Recall(s, bid, q, take);
-      var remote = await Hindsight.SearchAsync(bid, q, take);
+      if (!isBoardReader)
+      {
+        var ru = PeopleOps.UserOf(s, req);
+        var rallowed = PeopleOps.GuestMeetingIds(s, ru, bid);
+        if (!recallMeeting.HasValue || !rallowed.Contains(recallMeeting.Value)) return PeopleOps.Denied();
+      }
+      var local = ContextCurator.Recall(s, bid, q, take, recallMeeting);
+      var remoteRaw = await Hindsight.SearchAsync(bid, q, take);
+      var remote = SourceGovernance.FilterExternalHits(s, bid, remoteRaw, recallMeeting);
       if (remote.Count == 0) return Results.Ok(local);
       return Results.Ok(local.Concat(remote)
         .OrderByDescending(h => h.Score).Take(Math.Clamp(take, 1, 20)).ToList());
@@ -144,6 +151,22 @@ public static class OpsEndpoints
       foreach (var pn in new[] { "discussionPolicy", "dataUse" })
         if (src.TryGetProperty(pn, out var pvy) && pvy.ValueKind != JsonValueKind.String)
           return Results.BadRequest("Snapshot board field must be a string.");
+      // Phase 6 contract: the source policy round-trips with the configuration
+      // (P2 #8). Validate BEFORE any mutation; unknown modes are rejected.
+      var snapshotPolicy = "allowAll";
+      if (src.TryGetProperty("sourcePolicyMode", out var spmEl))
+      {
+        if (spmEl.ValueKind != JsonValueKind.String)
+          return Results.BadRequest("Snapshot board sourcePolicyMode must be a string.");
+        var spmRaw = (spmEl.GetString() ?? "").Trim();
+        if (!string.IsNullOrEmpty(spmRaw))
+        {
+          var spmLower = spmRaw.ToLowerInvariant();
+          if (spmLower is not ("allowall" or "allow-all" or "wikionly" or "wiki-only" or "wiki_only"))
+            return Results.BadRequest("Snapshot board sourcePolicyMode must be allowAll or wikiOnly.");
+          snapshotPolicy = spmLower.StartsWith("wiki") ? "wikiOnly" : "allowAll";
+        }
+      }
       Guid? overrideAccount = null;
       if (body.TryGetProperty("accountId", out var bac) && bac.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(bac.GetString())) {
         if (!Guid.TryParse(bac.GetString(), out var bag) || bag == Guid.Empty)
@@ -230,6 +253,7 @@ public static class OpsEndpoints
         DataUse = src.TryGetProperty("dataUse", out var du) && du.ValueKind == JsonValueKind.String
           && (du.GetString() is "standard" or "contributor") ? du.GetString()! : "contributor",
         BlockedTypes = src.TryGetProperty("blockedTypes", out var bt) && bt.ValueKind == JsonValueKind.String ? bt.GetString() ?? "" : "",
+        SourcePolicyMode = snapshotPolicy,
       };
       Dictionary<string, Guid> rosterMap = new();
       var plannedRoster = new List<RosterEntry>();
@@ -347,7 +371,7 @@ public static class OpsEndpoints
         fileName = doc.FileName,
         version = doc.Version,
         contentHash = doc.ContentHash,
-        approved = doc.Approved,
+        approved = doc.Approved, reviewState = doc.ReviewState, eligible = SourceGovernance.IsEligible(s, doc, doc.Scope == "meeting" ? doc.MeetingId : null), indexState = doc.IndexState,
         extractedAt = DateTime.UtcNow,
         chars = doc.Original?.Length ?? 0,
         extractor = "direct-read",
@@ -388,7 +412,7 @@ public static class OpsEndpoints
         messages = s.Messages.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
         notes = s.Notes.Values.ToList(),
         drafts = s.Drafts.Values.ToList(),
-        sources = s.Sources.Values.ToList(),
+        sources = s.Sources.Values.ToList(), sections = s.SourceSections.Values.ToList(), heads = s.SourceHeads.Values.ToList(), events = s.SourceEvents.Values.ToList(),
         blobs = s.Sources.Values.ToDictionary(
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
         leads = s.LeadProfiles.Values.ToList(),
@@ -434,6 +458,11 @@ public static class OpsEndpoints
       // IDs, complete parent relationships, valid GUID keys and strict base64 binaries.
       var graphError = ValidateRestoreGraph(restored);
       if (graphError is not null) return Results.BadRequest(graphError);
+      // Phase 6 graph validation: canonical identities, uniqueness, parent
+      // relationships, heads, section metadata, legal states. Malformed or
+      // forged graphs are rejected with zero partial state.
+      if (!SourceGovernance.ValidateRestoreGraph(restored, out var srcGraphErr))
+        return Results.Json(new { error = "Backup graph rejected: " + srcGraphErr }, statusCode: 422);
       // Fresh generation base: in-flight publications captured gen <= live max. Restored
       // meetings restart strictly above it, so stale runs can never commit (no snapshot reuse).
       var liveMaxGen = 0L;
@@ -446,6 +475,9 @@ public static class OpsEndpoints
       var snapNotes = memMode ? s.Notes.Values.ToList() : new System.Collections.Generic.List<Domain.Note>();
       var snapDrafts = memMode ? s.Drafts.Values.ToList() : new System.Collections.Generic.List<Domain.RecordDraft>();
       var snapSources = memMode ? s.Sources.Values.ToList() : new System.Collections.Generic.List<Domain.SourceDoc>();
+      var snapSections = memMode ? s.SourceSections.Values.ToList() : new System.Collections.Generic.List<Domain.SourceSection>();
+      var snapHeads = memMode ? s.SourceHeads.Values.ToList() : new System.Collections.Generic.List<Domain.SourceFamilyHead>();
+      var snapEvents = memMode ? s.SourceEvents.Values.ToList() : new System.Collections.Generic.List<Domain.SourceEvent>();
       var snapLeads = memMode ? s.LeadProfiles.Values.ToList() : new System.Collections.Generic.List<Domain.LeadProfile>();
       var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
       var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
@@ -453,81 +485,103 @@ public static class OpsEndpoints
       int restoredCount = 0;
       lock (s.SetupLock)
       {
-        try
+        lock (s.MessageLock)
         {
-          restoredCount = Atomic.Run(() =>
+          try
           {
-            s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
-            s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear();
-            s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
-            foreach (var b in restored.boards) s.Boards[b.Id] = b;
-            foreach (var r in restored.roster) s.Roster[r.Id] = r;
-            foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
-            foreach (var m in restored.meetings)
+            restoredCount = Atomic.Run(() =>
             {
-              m.Generation = System.Math.Max(m.Generation, liveMaxGen) + 1;
-              s.Meetings[m.Id] = m;
-            }
-            foreach (var kv in restored.messages)
-            {
-              var mid = Guid.Parse(kv.Key);
-              s.Messages[mid] = MessageList.Detached(mid, kv.Value);
-            }
-            foreach (var n in restored.notes) s.Notes[n.Id] = n;
-            foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
-            foreach (var x in restored.sources) s.Sources[x.Id] = x;
-            foreach (var kv in restored.blobs)
-            {
-              var bid2 = Guid.Parse(kv.Key);
-              if (s.Sources.TryGetValue(bid2, out var bdoc) && !string.IsNullOrEmpty(kv.Value))
-                bdoc.Original = Convert.FromBase64String(kv.Value);
-            }
-            s.Sources.Flush();
-            foreach (var img in restored.images)
-            {
-              s.Images[img.id] = new AdvisorImage
+              s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
+              s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
+              s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
+              foreach (var b in restored.boards) s.Boards[b.Id] = b;
+              foreach (var r in restored.roster) s.Roster[r.Id] = r;
+              foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
+              foreach (var m in restored.meetings)
               {
-                Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
-                Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
-                Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
-                ContentType = img.contentType ?? "image/png",
-                Data = string.IsNullOrEmpty(img.data) ? null : Convert.FromBase64String(img.data),
-                CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
-              };
-            }
-            foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
-            // ACL preserved: restored.grants / restored.invites are IGNORED by design.
-            if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
-            return restored.boards.Count;
-          });
-          s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restoredCount, aclPreserved = true }) });
-        }
-        catch (Exception __ex)
-        {
-          if (memMode)
-          {
-            // Real memory rollback: validation passed but a write failed; restore snapshots.
-            try
-            {
-              s.Boards.Clear(); foreach (var b in snapBoards) s.Boards[b.Id] = b;
-              s.Roster.Clear(); foreach (var r in snapRoster) s.Roster[r.Id] = r;
-              s.Advisors.Clear(); foreach (var a in snapAdvisors) s.Advisors[a.Id] = a;
-              s.Meetings.Clear(); foreach (var m in snapMeetings) s.Meetings[m.Id] = m;
-              s.Messages.Clear(); foreach (var kv in snapMessages) s.Messages[kv.Key] = MessageList.Detached(kv.Key, kv.Value);
-              s.Notes.Clear(); foreach (var n in snapNotes) s.Notes[n.Id] = n;
-              s.Drafts.Clear(); foreach (var d in snapDrafts) s.Drafts[d.Id] = d;
-              s.Sources.Clear(); foreach (var x in snapSources) s.Sources[x.Id] = x;
-              s.LeadProfiles.Clear(); foreach (var l in snapLeads) s.LeadProfiles[l.Id] = l;
-              s.Images.Clear(); foreach (var im in snapImages) s.Images[im.Id] = im;
-              s.WizardDrafts.Clear(); foreach (var w in snapWiz) s.WizardDrafts[w.Id] = w;
-            }
-            catch { }
+                m.Generation = System.Math.Max(m.Generation, liveMaxGen) + 1;
+                s.Meetings[m.Id] = m;
+              }
+              foreach (var kv in restored.messages)
+              {
+                if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
+              }
+              foreach (var n in restored.notes) s.Notes[n.Id] = n;
+              foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
+              foreach (var x in restored.sources) s.Sources[x.Id] = x;
+              if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss;
+              if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh;
+              if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
+              // Deliberate legacy migration: pre-phase-6 snapshots carry
+              // Approved=true with no ReviewState field. The "" sentinel promotes
+              // those to "approved" without touching explicit decisions (rejected
+              // rows stay rejected); empty legacy family keys are canonicalized;
+              // completed-without-sections metadata is failed-closed until
+              // reindex; established heads cover families the snapshot left
+              // headless. All inside this same transaction.
+              SourceGovernance.MigrateRestoredSources(s);
+              foreach (var kv in restored.blobs)
+              {
+                if (Guid.TryParse(kv.Key, out var bid2))
+                  if (s.Sources.TryGetValue(bid2, out var bdoc) && !string.IsNullOrEmpty(kv.Value))
+                    try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
+              }
+              s.Sources.Flush();
+              foreach (var img in restored.images)
+              {
+                byte[]? data = null;
+                if (!string.IsNullOrEmpty(img.data)) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
+                s.Images[img.id] = new AdvisorImage
+                {
+                  Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
+                  Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
+                  Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
+                  ContentType = img.contentType ?? "image/png", Data = data,
+                  CreatedAt = img.createdAt == default ? DateTime.UtcNow : DateTime.UtcNow,
+                };
+              }
+              foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
+              // ACL preserved: restored.grants / restored.invites are IGNORED by design.
+              if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
+              return restored.boards.Count;
+            });
+            // Replacement succeeded: advance the runtime epoch and retire all
+            // outstanding index reservations so in-flight extraction and
+            // publication work fails closed instead of committing against the
+            // replaced state. No generation reuse is observable afterwards.
+            s.ActiveIndexJobs.Clear();
+            s.SourceEpoch++;
+            s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restoredCount, aclPreserved = true }) });
           }
-          return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
+          catch (Exception __ex)
+          {
+            if (memMode)
+            {
+              // Real memory rollback: validation passed but a write failed; restore snapshots.
+              try
+              {
+                s.Boards.Clear(); foreach (var b in snapBoards) s.Boards[b.Id] = b;
+                s.Roster.Clear(); foreach (var r in snapRoster) s.Roster[r.Id] = r;
+                s.Advisors.Clear(); foreach (var a in snapAdvisors) s.Advisors[a.Id] = a;
+                s.Meetings.Clear(); foreach (var m in snapMeetings) s.Meetings[m.Id] = m;
+                s.Messages.Clear(); foreach (var kv in snapMessages) s.Messages[kv.Key] = MessageList.Detached(kv.Key, kv.Value);
+                s.Notes.Clear(); foreach (var n in snapNotes) s.Notes[n.Id] = n;
+                s.Drafts.Clear(); foreach (var d in snapDrafts) s.Drafts[d.Id] = d;
+                s.Sources.Clear(); foreach (var x in snapSources) s.Sources[x.Id] = x;
+                s.SourceSections.Clear(); foreach (var ss in snapSections) s.SourceSections[ss.Id] = ss;
+                s.SourceHeads.Clear(); foreach (var hh in snapHeads) s.SourceHeads[hh.Id] = hh;
+                s.SourceEvents.Clear(); foreach (var ee in snapEvents) s.SourceEvents[ee.Id] = ee;
+                s.LeadProfiles.Clear(); foreach (var l in snapLeads) s.LeadProfiles[l.Id] = l;
+                s.Images.Clear(); foreach (var im in snapImages) s.Images[im.Id] = im;
+                s.WizardDrafts.Clear(); foreach (var w in snapWiz) s.WizardDrafts[w.Id] = w;
+              }
+              catch { }
+            }
+            return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
+          }
         }
       }
       return Results.Ok(new { restored = restoredCount, at = restored.at });
-
     });
 
     app.MapGet("/api/commands", () => Results.Ok(CommandMap.All));
@@ -707,7 +761,7 @@ public sealed record BackupSnapshot(int version, DateTime at,
   List<Meeting> meetings, Dictionary<string, List<Message>> messages,
   List<Note> notes, List<RecordDraft> drafts, List<SourceDoc> sources,
   Dictionary<string, string> blobs, List<LeadProfile> leads,
-  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null);
+  List<Grant> grants, List<Invite> invites, List<BackupImage> images, List<Domain.WizardDraft>? wizardDrafts = null, List<Domain.SourceSection>? sections = null, List<Domain.SourceFamilyHead>? heads = null, List<Domain.SourceEvent>? events = null);
 
 public static class CommandMap
 {

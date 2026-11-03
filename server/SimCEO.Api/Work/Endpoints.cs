@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
@@ -301,41 +303,88 @@ public static class SimCEOEndpoints
       }
     });
 
-    // ---- Sources: approval inbox; excluded/replaced never current ----
-    app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid) =>
-    {
-      if (PeopleOps.BadToken(s, req) is { } badSL) return badSL;
-      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-      if (PeopleOps.Can(s, req, bid, null, "read"))
-        return Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid).OrderByDescending(x => x.Version));
-      var user = PeopleOps.UserOf(s, req);
-      var allowed = PeopleOps.GuestMeetingIds(s, user, bid);
-      if (allowed.Count == 0) return PeopleOps.Denied();
-      return Results.Ok(s.Sources.Values.Where(x => x.BoardId == bid && x.Approved && !x.Excluded && (x.Scope == "board" || (x.MeetingId.HasValue && allowed.Contains(x.MeetingId.Value)))).OrderByDescending(x => x.Version));
-    });
-    app.MapPost("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
+    // ---- Sources: governed via SourceEndpoints (single predicate); these are compatibility shims ----
+    app.MapPost("/api/boards/{bid:guid}/sources", async (InMemoryStore s, HttpRequest req, Guid bid, SourceDoc d) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badSrc) return badSrc;
-      if (!s.Boards.ContainsKey(bid)) return Results.NotFound("Board not found.");
-      if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedSrc) return deniedSrc;
+      if (!s.Boards.TryGetValue(bid, out var bboard)) return Results.NotFound("Board not found.");
+      if (PeopleOps.Check(s, req, bid, null, "contribute") is { } deniedSrcPost) return deniedSrcPost;
+      // Public inline creation is always server-owned "upload" provenance: the
+      // caller cannot claim wiki origin or any connector identity (P2 #11).
+      // Wiki-only policy therefore denies every inline document unconditionally.
+      if (SourceGovernance.PolicyModeOf(bboard) == "wikiOnly")
+        return Results.Json(new { error = "Board policy is wiki-only; uploads are disabled. Add a Wiki connector resource instead." }, statusCode: 415);
+      var fname = string.IsNullOrWhiteSpace(d.FileName) ? "untitled.txt" : d.FileName;
+      if (!SourceGovernance.PolicyAllows(bboard, new SourceDoc { FileName = fname, Origin = "upload" }))
+        return Results.Json(new { error = "Source type is blocked on this board." }, statusCode: 415);
+      var effScope = d.Scope == "meeting" ? "meeting" : "board";
+      Guid? effMeeting = effScope == "meeting" ? d.MeetingId : null;
+      if (effScope == "meeting")
+      {
+        if (!effMeeting.HasValue) return Results.BadRequest("meetingId is required for meeting scope.");
+        if (!s.Meetings.TryGetValue(effMeeting.Value, out var mmtg) || mmtg.BoardId != bid)
+          return Results.Json(new { error = "Meeting does not belong to this board." }, statusCode: 409);
+      }
+      var familyKey = SourceGovernance.FamilyKeyFor(bid, effScope, effMeeting, "upload", fname);
+      // The caller-supplied extraction JSON is untrusted: the server derives
+      // content bytes first, then runs actual extraction itself (textual
+      // formats decode locally, binary goes to the extractor) under the
+      // index reservation. Nothing caller-supplied becomes indexed text.
+      var inlineText = Extraction.MarkdownOf(d.ExtractionJson) ?? "";
+      var inlineRaw = d.Original ?? (string.IsNullOrEmpty(inlineText) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(inlineText));
+      if (inlineRaw.Length > 10 * 1024 * 1024) return Results.BadRequest("Inline content exceeds 10 MB.");
+      // Server-computed content hash over the stored bytes: caller
+      // ContentHash is never trusted and is never copied into index sections.
+      var serverHash = Convert.ToHexString(SHA256.HashData(inlineRaw)).ToLowerInvariant();
       d.Id = Guid.NewGuid();
       d.BoardId = bid;
-      d.Version = 1;
-      d.Approved = false;
-      d.Excluded = false;
-      s.Sources[d.Id] = d;
-      return Results.Created($"/api/sources/{d.Id}", d);
+      d.FileName = fname;
+      d.ContentHash = serverHash;
+      d.Origin = "upload";
+      d.ResourceId = null;
+      d.FamilyKey = familyKey;
+      d.Approved = false; d.Excluded = false; d.ReviewState = "pending";
+      d.Scope = effScope; d.MeetingId = effMeeting;
+      d.IndexState = "queued"; d.IndexGeneration = 0; d.IndexError = ""; d.IndexCompletedAt = null;
+      d.ExtractionJson = "{}";
+      d.Original = inlineRaw;
+      // Allocation AND insertion happen in one serialized transaction so two
+      // concurrent creations can never reserve and store the same version.
+      SourceDoc? inlineDoc = null;
+      string? inlineDup = null;
+      lock (s.SetupLock)
+      {
+        lock (s.MessageLock)
+        {
+          Atomic.Run(() =>
+          {
+            var dupe = s.Sources.Values.FirstOrDefault(x => x.BoardId == bid && x.FamilyKey == familyKey && x.ContentHash == d.ContentHash);
+            if (dupe is not null) { inlineDup = $"Identical content already stored as {dupe.Id} (v{dupe.Version})."; return; }
+            d.Version = SourceGovernance.ReserveVersion(s, bid, familyKey);
+            s.Sources[d.Id] = d;
+            s.Sources.Flush();
+            SourceGovernance.RecordEvent(s, d, "create", "inline scope=" + effScope);
+            inlineDoc = d;
+          });
+        }
+      }
+      if (inlineDoc is null) return Results.Conflict(inlineDup ?? "Identical content already stored.");
+      if (!SourceGovernance.TryBeginIndex(s, inlineDoc.Id, out var inlineRes, out var inlineBeginErr) || inlineRes is null)
+        return Results.Json(new { error = inlineBeginErr }, statusCode: 500);
+      var inlineExt = await Extraction.ExtractAsync(inlineRaw, fname);
+      SourceGovernance.StampExtraction(s, inlineRes, Extraction.ToJson(inlineExt));
+      var (inlineOk, inlineStale, _, inlineErr, inlineStatus) = SourceGovernance.FinishIndex(s, inlineRes, false);
+      if (!inlineOk)
+        return Results.Json(new { error = inlineErr, stale = inlineStale }, statusCode: inlineStatus);
+      if (!s.Sources.TryGetValue(inlineDoc.Id, out var created) || created is null) return Results.NotFound();
+      return Results.Created($"/api/sources/{created.Id}", created);
     });
     app.MapPost("/api/sources/{id:guid}/exclude", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (!s.Sources.TryGetValue(id, out var d)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badEx) return badEx;
-      if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedEx) return deniedEx;
-      d.Excluded = true;
-      s.Sources.Flush();
-      return Results.Ok(d);
+      var (exOk, exErr, exStatus) = SourceGovernance.SetExcludedById(s, req, id, true); if (!exOk) return Results.Json(new { error = exErr }, statusCode: exStatus); if (!s.Sources.TryGetValue(id, out var exd) || exd is null) return Results.NotFound(); return Results.Ok(exd);
+      // (exclude shim returns the fresh row above; auth runs inside the helper)
     });
-
     // ---- Jobs with idempotency + safe retry ----
     app.MapGet("/api/activity/jobs", (InMemoryStore s, HttpRequest req) =>
     {
@@ -500,6 +549,10 @@ public static class SimCEOEndpoints
       var spark = ModelPolicy.SparkFor(s, m.BoardId);
       Board? board = runBoard;
       var gen = m.Generation;
+      // Source-epoch pin: a restore replaces all state and bumps the epoch,
+      // so any in-flight publication generated before it must be discarded
+      // even if meeting generation numbers happen to coincide.
+      var epochBefore = s.SourceEpoch;
       var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
       // Lane B: capture which candidates were explicitly invited; non-invited must stay Approved at commit.
       var invitedIds = new HashSet<Guid>();
@@ -711,7 +764,11 @@ public static class SimCEOEndpoints
               { laneBGate = LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
             if (cur.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
               { laneBGate = LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
-            { var __tok = ""; try { var __ah = req.Headers["Authorization"].ToString(); if (__ah.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok = __ah["Bearer ".Length..].Trim(); } catch { } string __em = ""; bool __sessOk = false; try { if (!string.IsNullOrEmpty(__tok) && s.Sessions.TryGetValue(__tok, out var __ss) && __ss.ExpiresAt > System.DateTime.UtcNow) { __sessOk = true; __em = __ss.Email; } } catch { } if (PeopleOps.IsSecure(s) && !__sessOk) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have = PeopleOps.AccessFor(s, cur.BoardId, id, __em); bool __ok = PeopleOps.IsSecure(s) ? (__have is "manage" or "contribute" or "discuss") : (__have == "open" || __have is "manage" or "contribute" or "discuss"); if (!__ok) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } } }
+              // Re-authorize AFTER the model await: a caller revoked or expired during
+              // generation must not publish (Auth8 publication boundary).
+              { var __tok2 = ""; try { var __ah2 = req.Headers["Authorization"].ToString(); if (__ah2.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok2 = __ah2["Bearer ".Length..].Trim(); } catch { } string __em2 = ""; bool __sessOk2 = false; try { if (!string.IsNullOrEmpty(__tok2) && s.Sessions.TryGetValue(__tok2, out var __ss2) && __ss2.ExpiresAt > System.DateTime.UtcNow) { __sessOk2 = true; __em2 = __ss2.Email; } } catch { } if (PeopleOps.IsSecure(s) && !__sessOk2) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have2 = PeopleOps.AccessFor(s, cur.BoardId, id, __em2); bool __ok2 = PeopleOps.IsSecure(s) ? (__have2 is "manage" or "contribute" or "discuss") : (__have2 == "open" || __have2 is "manage" or "contribute" or "discuss"); if (!__ok2) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } }
+              if (s.SourceEpoch != epochBefore)
+                { laneBGate = LaneBFail("source evidence changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
             var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
             var curLeadVersion = curLead?.Version ?? 0;
             if (curLeadVersion != leadVersion
@@ -751,7 +808,7 @@ public static class SimCEOEndpoints
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
               if (!laneBPrints.TryGetValue(adv.Id, out var laneBWanted) || !string.Equals(LaneBFingerprint(freshAdv), laneBWanted, StringComparison.Ordinal))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "stale-profile" }); continue; }
-              if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
+              if (SourcePubCheck.ManifestRevoked(s, manifest, id)) { yielded.Add(new { advisor = adv.BoardRole, reason = "evidence-revoked" }); continue; } if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // one reply per advisor per lead turn; stable advisor identity
               if (room <= 0)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "cap-omitted" }); continue; }

@@ -21,7 +21,7 @@ public sealed class Board
   public string ActiveJson { get; set; } = "{}";
   public int LeadProfileVersion { get; set; } = 1;
   public bool RetainAudio { get; set; }
-  public string BlockedTypes { get; set; } = "";
+  public string BlockedTypes { get; set; } = ""; public string SourcePolicyMode { get; set; } = "allowAll";
   public string DiscussionPolicy { get; set; } = "balanced";
   public string DataUse { get; set; } = "contributor";
   public string OwnerKey { get; set; } = "";
@@ -135,7 +135,7 @@ public sealed class SourceDoc
   public string ContentHash { get; set; } = "";
   public int Version { get; set; } = 1;
   public bool Approved { get; set; }
-  public bool Excluded { get; set; }
+  public bool Excluded { get; set; } public string ReviewState { get; set; } = ""; public string Origin { get; set; } = "upload"; public Guid? ResourceId { get; set; } public string FamilyKey { get; set; } = ""; public string IndexState { get; set; } = "queued"; public int IndexGeneration { get; set; } = 0; public string IndexError { get; set; } = ""; public DateTime? IndexCompletedAt { get; set; }
   public string Scope { get; set; } = "board";
   public Guid? MeetingId { get; set; }
   public string ExtractionJson { get; set; } = "{}";
@@ -143,6 +143,41 @@ public sealed class SourceDoc
   public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
+public sealed class SourceSection
+{
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public Guid BoardId { get; set; }
+  public Guid SourceId { get; set; }
+  public string FamilyKey { get; set; } = "";
+  public int SourceVersion { get; set; } = 1;
+  public string ContentHash { get; set; } = "";
+  public int Ordinal { get; set; }
+  public string Heading { get; set; } = "";
+  public string Location { get; set; } = "";
+  public string Text { get; set; } = "";
+  public int IndexGeneration { get; set; } = 1;
+  public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+public sealed class SourceFamilyHead
+{
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public Guid BoardId { get; set; }
+  public string FamilyKey { get; set; } = "";
+  public int HeadVersion { get; set; } = 0;
+  public Guid HeadSourceId { get; set; } = Guid.Empty;
+  public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+}
+public sealed class SourceEvent
+{
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
+  public Guid BoardId { get; set; }
+  public Guid SourceId { get; set; }
+  public string FamilyKey { get; set; } = "";
+  public int Version { get; set; } = 1;
+  public string Action { get; set; } = "";
+  public string Detail { get; set; } = "";
+  public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
 public sealed class WizardDraft
 {
   [Key] public Guid Id { get; set; } = Guid.NewGuid();
