@@ -296,8 +296,13 @@ try {
         const lexBrow = (lexDetB.get(id) || {});
         for (const col of new Set([...Object.keys(oa), ...Object.keys(ob)])) {
           const aL = lexArow[col], bL = lexBrow[col];
-          const same = (aL !== undefined && bL !== undefined) ? oldLexEqual(aL, bL) : normVal(oa[col]) === normVal(ob[col]);
-          if (!same) changed.push({ col, before: String(aL !== undefined ? aL : normVal(oa[col])).slice(0, 220), after: String(bL !== undefined ? bL : normVal(ob[col])).slice(0, 220) });
+          let same;
+          if (aL !== undefined && bL !== undefined) same = oldLexEqual(aL, bL);
+          else same = false;
+          if (!same) {
+            const mark = (v, lex) => String(lex !== undefined ? lex : "lexeme-missing:" + normVal(v)).slice(0, 220);
+            changed.push({ col, before: mark(oa[col], aL), after: mark(ob[col], bL) });
+          }
         }
         if (changed.length > 0) detail.push({ key: id.slice(0, 60), changedCols: changed.map((x) => x.col), changed });
       }
@@ -429,10 +434,17 @@ try {
       if (!ob) { justified = false; justification = "row lost " + String(id).slice(0, 40); break; }
       for (const col of Object.keys(oa)) {
         if (!colsB.includes(col)) { justified = false; changedOldCols.add("dropped-col:" + col); continue; }
-        const aLex = (lexA.get(String(id)) || {})[col];
-        const bLex = (lexB.get(String(id)) || {})[col];
-        if (aLex !== undefined && bLex !== undefined) { if (oldLexEqual(aLex, bLex)) continue; }
-        else if (normVal(oa[col]) === normVal(ob[col])) continue;
+        const lexRowA = lexA.get(String(id));
+        const lexRowB = lexB.get(String(id));
+        const aLex = (lexRowA || {})[col];
+        const bLex = (lexRowB || {})[col];
+        if (aLex === undefined || bLex === undefined) {
+          if (addedCols.includes(col)) continue;
+          justified = false;
+          changedOldCols.add("lexeme-missing:" + col + ":[" + String(lexRowA === undefined ? "rowA-missing" : "colA-missing") + "/" + String(lexRowB === undefined ? "rowB-missing" : "colB-missing") + "]");
+          continue;
+        }
+        if (oldLexEqual(aLex, bLex)) continue;
         if (addedCols.includes(col)) continue;
         // Sources collision renumber: Version may move ONLY with a
         // server-owned migrate-version event AND preserved content bytes.
