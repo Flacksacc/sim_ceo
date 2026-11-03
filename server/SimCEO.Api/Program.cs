@@ -261,9 +261,15 @@ app.MapHub<BoardHub>("/hubs/board");
 
 app.MapGet("/api/boards", (InMemoryStore s) => Results.Ok(s.Boards.Values.Where(b => !b.Archived).OrderByDescending(b => b.CreatedAt).Take(100)));
 
-app.MapPost("/api/boards", (InMemoryStore s, Board input) =>
+app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
 {
+  if (PeopleOps.BadToken(s, req) is { } badBc) return badBc;
+  // Secure installations require a session to create boards; the open demo
+  // allows local creation. Ownership is recorded for later enforcement.
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+    return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   input.Id = Guid.NewGuid();
+  input.OwnerKey = PeopleOps.UserOf(s, req);
   input.CreatedAt = DateTime.UtcNow;
   input.ActiveConfig = false;
   input.ActiveJson = "{}";
@@ -273,8 +279,17 @@ app.MapPost("/api/boards", (InMemoryStore s, Board input) =>
   return Results.Created($"/api/boards/{input.Id}", input);
 });
 
-app.MapGet("/api/boards/{id:guid}", (InMemoryStore s, Guid id) =>
-  s.Boards.TryGetValue(id, out var b) ? Results.Ok(b) : Results.NotFound());
+app.MapGet("/api/boards/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) =>
+{
+  if (!s.Boards.TryGetValue(id, out var b)) return Results.NotFound();
+  if (PeopleOps.BadToken(s, req) is { } badBd) return badBd;
+  if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+    return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+  var bu = PeopleOps.UserOf(s, req);
+  if (!PeopleOps.Can(s, req, id, null, "read") && PeopleOps.GuestMeetingIds(s, bu, id).Count == 0)
+    return PeopleOps.Denied();
+  return Results.Ok(b);
+});
 
 app.MapGet("/api/roster", (InMemoryStore s, Guid accountId, string? q, string? type, string? tag, Guid? boardId) =>
 {
@@ -371,8 +386,10 @@ app.MapGet("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, Guid boardId
   return Results.Ok(list.OrderByDescending(m => m.CreatedAt).Take(200));
 });
 
-app.MapPost("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, Guid boardId, JsonElement body) =>
+app.MapPost("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>
 {
+  if (PeopleOps.BadToken(s, req) is { } badMc) return badMc;
+  if (PeopleOps.Check(s, req, boardId, null, "contribute") is { } deniedMc) return deniedMc;
   var input = new Meeting
   {
     Id = Guid.NewGuid(), BoardId = boardId,
@@ -412,14 +429,20 @@ app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequ
 app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid meetingId, Message input) =>
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
-  if (!PeopleOps.Can(s, req, meeting.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+  if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "contribute") is { } deniedMsg) return deniedMsg;
+  IResult? msgGate = null;
   lock (s.MessageLock)
   {
     Atomic.Run(() =>
     {
+    // Fresh fetch + authority inside the backend unit: a detached pre-lock
+    // meeting row must never source the mutation after an intervening
+    // rollback clears the tracker.
+    if (!s.Meetings.TryGetValue(meetingId, out var curM)) { msgGate = Results.NotFound("meeting"); return; }
+    if (PeopleOps.Check(s, req, curM.BoardId, meetingId, "contribute") is { } deniedMsgIn) { msgGate = deniedMsgIn; return; }
     var list = s.Messages.GetOrAdd(meetingId, _ => new List<Message>());
     input.MeetingId = meetingId;
-    input.BoardId = meeting.BoardId;
+    input.BoardId = curM.BoardId;
     input.Sender = "lead";
     input.AdvisorId = Guid.Empty;
     input.AdvisorName = null;
@@ -432,13 +455,14 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
     input.CreatedAt = DateTime.UtcNow;
     input.Status = "committed";
     list.Add(input);
-    meeting.DeliveredRevision = input.Sequence;
+    curM.DeliveredRevision = input.Sequence;
     if (string.Equals(input.Sender, "lead", StringComparison.OrdinalIgnoreCase))
-      meeting.Generation++;
+      curM.Generation++;
     s.Meetings.Flush();
     });
   }
-  await hub.Clients.Group($"meeting:{meetingId}").SendAsync("message", new { input.MeetingId, input.Sequence, input.Sender, input.Content });
+  if (msgGate is not null) return msgGate;
+  await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, meetingId, "message", new { input.MeetingId, input.Sequence, input.Sender, input.Content }, "read");
   return Results.Created($"/api/meetings/{meetingId}/messages/{input.Sequence}", input);
 });
 
@@ -446,7 +470,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound();
   if (PeopleOps.BadToken(s, req) is { } badRecDraft) return badRecDraft;
-  if (!PeopleOps.Can(s, req, meeting.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+  if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "contribute") is { } deniedRecDraft) return deniedRecDraft;
   if (!RecordsOps.ValidateDraftItems(items, out var draftErr))
     return Results.Json(new { error = draftErr }, statusCode: 422);
   var canon = items.GetRawText();
@@ -470,7 +494,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
       created = Atomic.Run(() =>
       {
         if (!s.Meetings.TryGetValue(meetingId, out var curMtg2) || curMtg2 is null) return Results.NotFound();
-        if (!PeopleOps.Can(s, req, curMtg2.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+        if (PeopleOps.Check(s, req, curMtg2.BoardId, meetingId, "contribute") is { } deniedRecDraftIn) return deniedRecDraftIn;
         if (!RecordsOps.ValidateDraftItems(items, out var recreateErr))
           return Results.Json(new { error = recreateErr }, statusCode: 422);
         draft.BoardId = curMtg2.BoardId;
@@ -596,7 +620,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
           return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
         if (draft.Decided)
           return Results.Conflict("Stale or already-decided draft.");
-        if (!RecordsOps.StrictStateCheck(draft, out var serr))
+        if (!RecordsOps.StrictStateCheck(s, draft, out var serr))
           return Results.Json(new { error = serr }, statusCode: 422);
         if (!RecordsOps.CheckGuard(body, draft, mtg, out var gs, out var ge))
           return Results.Json(new { error = ge }, statusCode: gs);
@@ -626,6 +650,8 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
       var gone = new HashSet<string>(goneList, StringComparer.Ordinal);
       if (itemIds.Any(x => already.Contains(x!) || gone.Contains(x!)))
         return Results.Conflict("One or more selected items are already decided; refresh review.");
+      if (!RecordsOps.CheckApprovalAuthority(s, draft, out var authErrLegacy))
+        return Results.Json(new { error = authErrLegacy }, statusCode: 409);
       var actor = PeopleOps.UserOf(s, req);
       var av = draft.Version; var ah = draft.Hash; var aw = draft.Watermark; var at = draft.ReviewToken;
       {

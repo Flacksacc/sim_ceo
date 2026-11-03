@@ -30,6 +30,25 @@ public static class LeadSetup
   public static LeadProfile? ResolveLeadForStrict(InMemoryStore s, Guid boardId) =>
     s.LeadProfiles.Values.Where(l => l.BoardId == boardId).OrderByDescending(l => l.UpdatedAt).FirstOrDefault();
 
+  // Installation-data boundary for lead inheritance: the global (Guid.Empty)
+  // profile may stand in only for boards owned by the installation admin or
+  // for legacy demo boards (blank/"owner" key). Any other board must carry
+  // its own profile; otherwise there is no effective lead (never another
+  // owner's or the installation's private content).
+  public static bool InheritsGlobalLead(InMemoryStore s, Board board)
+  {
+    try
+    {
+      if (string.IsNullOrWhiteSpace(board.OwnerKey) || string.Equals(board.OwnerKey, "owner", StringComparison.OrdinalIgnoreCase))
+        return true;
+      try { return PeopleOps.IsInstallationAdmin(s, board.OwnerKey); } catch { return false; }
+    }
+    catch { return false; }
+  }
+
+  public static LeadProfile? ResolveLeadForBoard(InMemoryStore s, Board board) =>
+    ResolveLeadForStrict(s, board.Id) ?? (InheritsGlobalLead(s, board) ? ResolveLead(s) : null);
+
   public static bool IsFallback(LeadProfile? lead, Guid boardId) =>
     lead is not null && lead.BoardId != boardId;
 
@@ -39,7 +58,7 @@ public static class LeadSetup
   // changes this hash.
   public static string CanonicalDraftJson(InMemoryStore s, Board board)
   {
-    var lead = ResolveLeadFor(s, board.Id);
+    var lead = ResolveLeadForBoard(s, board);
     var advisorViews = s.Advisors.Values.Where(a => a.BoardId == board.Id && !a.Removed)
       .OrderBy(a => a.Id).Select(a =>
       {
@@ -95,9 +114,11 @@ public static class LeadSetup
         var r = doc.RootElement;
         if (r.ValueKind == JsonValueKind.Object)
         {
+          // Activated blanks are preserved verbatim: a blank activated name
+          // must NOT resurrect draft text. Only a missing/malformed snapshot
+          // falls through to live fields.
           string Str(string n) => r.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? "") : "";
-          var snap = (Str("name"), mission: Str("mission"), stage: Str("stage"), policy: Str("discussionPolicy"), dataUse: Str("dataUse"));
-          if (!string.IsNullOrWhiteSpace(snap.Item1)) return snap;
+          return (Str("name"), mission: Str("mission"), stage: Str("stage"), policy: Str("discussionPolicy"), dataUse: Str("dataUse"));
         }
       }
       catch (JsonException) { }
@@ -158,7 +179,9 @@ public static class LeadSetup
     {
       if (string.IsNullOrWhiteSpace(board.Name))
         return (null, "Board name is required before activation.", 409);
-      var hasLead = ResolveLeadFor(s, boardId) is not null;
+      // Activation requires the board's OWN lead, except admin/legacy boards
+      // which may inherit the installation-global profile.
+      var hasLead = (ResolveLeadForStrict(s, boardId) ?? (InheritsGlobalLead(s, board) ? ResolveLead(s) : null)) is not null;
       if (!hasLead)
         return (null, "Reviewed board-lead profile is required before activation.", 409);
       var approved = s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed && a.Approved

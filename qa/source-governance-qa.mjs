@@ -591,7 +591,7 @@ fs.appendFileSync(OUT, tag + "-MID pass=" + pass + " fail=" + fail + "\n");
   const gl = await get("/api/boards/" + legBid + "/sources/review");
   const legFam = (gl.json || []).find((x) => (x.familyKey || x.FamilyKey || "").includes("legacy.txt"));
   const rejFam = (gl.json || []).find((x) => (x.familyKey || x.FamilyKey || "").includes("rej.txt"));
-  ok(tag + "-legacy-approved-preserved", !!legFam && (legFam.versions[0].reviewState || legFam.versions[0].ReviewState) === "approved" && (legFam.versions[0].approved === true || legFam.versions[0].Approved === true), JSON.stringify(legFam).slice(0, 400));
+  ok(tag + "-legacy-approved-preserved", !!legFam && (legFam.versions[0].reviewState || legFam.versions[0].ReviewState) === "approved" && (legFam.versions[0].approved === true || legFam.versions[0].Approved === true), String(JSON.stringify(legFam)).slice(0, 400));
   ok(tag + "-legacy-family-backfilled", !!legFam && ((legFam.familyKey || legFam.FamilyKey) || "").includes("legacy.txt"), JSON.stringify(legFam).slice(0, 200));
   ok(tag + "-legacy-explicit-rejected-kept", !!rejFam && (rejFam.versions[0].reviewState || rejFam.versions[0].ReviewState) === "rejected" && (rejFam.versions[0].approved === false || rejFam.versions[0].Approved === false), JSON.stringify(rejFam).slice(0, 400));
   const rl = await post("/api/sources/" + legSid + "/reindex", {});

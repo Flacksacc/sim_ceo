@@ -25,11 +25,15 @@ function ok(name, cond, extra) {
   else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
 }
 function skip(name) { skipped++; console.log("  SKIP " + name); }
+const TOK = {};
 async function req(method, path, body, opts = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), opts.timeout || 30000);
   try {
-    const headers = { "x-user": (opts.user || "owner") };
+    const headers = {};
+    const tok = TOK[opts.user || "owner"];
+    if (tok) headers["authorization"] = "Bearer " + tok;
+    else headers["x-user"] = (opts.user || "owner");
     if (body !== undefined) headers["content-type"] = "application/json";
     Object.assign(headers, opts.headers || {});
     const r = await fetch(API + path, { method, signal: ctl.signal, headers, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -87,6 +91,31 @@ function pgRow(did) {
   return psql(`SELECT row_to_json(t) FROM "Drafts" t WHERE "Id"='${did}'`);
 }
 console.log("records-review repair-closure [" + TAG + "] api=" + API);
+// Integration: meeting grants/revocation require secure accounts (Auth8
+// narrow migration). Register collaboration identities up front; the first
+// account on a fresh instance becomes installation admin and flips the
+// instance to secure mode. Pre/post processes share one SEED so post-run
+// processes log back into the SAME accounts that own the seeded boards.
+const SEED = process.env.QA_AUTH_SEED || run;
+const PW = "qa-only-pass-9";
+const adminEmail = "radmin." + SEED + "@qa.local";
+const readerEmail = "m1reader." + SEED + "@qa.local";
+const writerEmail = "writer." + SEED + "@qa.local";
+async function ensureSecure() {
+  const pairs = [["owner", adminEmail], ["m1reader", readerEmail], ["writer", writerEmail]];
+  for (const [key, email] of pairs) {
+    if (TOK[key]) continue;
+    const r = await post("/api/auth/register", { email, password: PW });
+    const rt = r.json?.token ?? r.json?.Token;
+    if ((r.status === 201 || r.status === 200) && rt) { TOK[key] = rt; continue; }
+    const l = await post("/api/auth/login", { email, password: PW });
+    const lt = l.json?.token ?? l.json?.Token;
+    if (l.status === 200 && lt) TOK[key] = lt;
+  }
+  ok("secure-bootstrap", !!TOK.owner && !!TOK.m1reader && !!TOK.writer, Object.keys(TOK).join(","));
+}
+await ensureSecure();
+function upHeaders() { return TOK.owner ? { "authorization": "Bearer " + TOK.owner } : { "x-user": "owner" }; }
 const backend = await get("/api/backend");
 const PG = (backend.json?.mode === "postgres");
 console.log("  backend=" + (backend.json?.mode || "?") + " pg=" + PG);
@@ -332,7 +361,7 @@ const form = new FormData();
 form.append("file", new Blob(["quasar background reading for ledger"], { type: "text/plain" }), "ledger.txt");
 form.append("scope", "meeting");
 form.append("meetingId", mid);
-const upR = await fetch(API + "/api/boards/" + bid + "/sources/upload", { method: "POST", headers: { "x-user": "owner" }, body: form });
+const upR = await fetch(API + "/api/boards/" + bid + "/sources/upload", { method: "POST", headers: upHeaders(), body: form });
 const upText = await upR.text();
 let upJson = null; try { upJson = upText ? JSON.parse(upText) : null; } catch { upJson = null; }
 ok("setup-source-upload", upR.status === 201, upR.status + " " + upText.slice(0, 200));
@@ -377,7 +406,7 @@ const mid2 = await makeMeeting(bid2, "other brief");
 const form2 = new FormData();
 form2.append("file", new Blob(["other board secret text"], { type: "text/plain" }), "secret.txt");
 form2.append("scope", "board");
-const up2 = await fetch(API + "/api/boards/" + bid2 + "/sources/upload", { method: "POST", headers: { "x-user": "owner" }, body: form2 });
+const up2 = await fetch(API + "/api/boards/" + bid2 + "/sources/upload", { method: "POST", headers: upHeaders(), body: form2 });
 const up2j = JSON.parse(await up2.text());
 const otherSrc = up2j.id ?? up2j.Id;
 await post("/api/sources/" + otherSrc + "/approve", {});
@@ -456,7 +485,7 @@ for (const [nm, rr] of [["detail", await get("/api/records/" + snapDid)], ["list
   ok("no-raw-snapshots-" + nm, !hasSnapshotKey(rr.json), JSON.stringify(rr.json).slice(0, 200));
 }
 // M1-only reader: no referenced M2-board content, no raw bytes anywhere
-const m1r = await post("/api/boards/" + bid + "/grants", { userKey: "m1reader", meetingId: mid, access: "read" });
+const m1r = await post("/api/boards/" + bid + "/grants", { userKey: readerEmail, meetingId: mid, access: "read" });
 ok("m1reader-grant", m1r.status === 201 || m1r.status === 200, String(m1r.status));
 const ropts = { user: "m1reader" };
 const mRev = await get("/api/records/" + snapDid + "/review", ropts);
@@ -566,7 +595,7 @@ await post("/api/meetings/" + permMid + "/messages", { sender: "lead", content: 
 const permDraft = await post("/api/meetings/" + permMid + "/record/draft", [{ id: "g1", text: "perm item one" }, { id: "g2", text: "perm item two" }]);
 const permDid = camel(permDraft.json, "id");
 ok("perm-setup-201", permDraft.status === 201, String(permDraft.status));
-const cg = await post("/api/boards/" + permBoard + "/grants", { userKey: "writer", meetingId: permMid, access: "contribute" });
+const cg = await post("/api/boards/" + permBoard + "/grants", { userKey: writerEmail, meetingId: permMid, access: "contribute" });
 ok("contrib-grant-added", cg.status === 201 || cg.status === 200, String(cg.status));
 const wopts = { user: "writer" };
 const wDraft = await post("/api/meetings/" + permMid + "/record/draft", [{ id: "w1", text: "writer draft" }], wopts);
@@ -700,8 +729,8 @@ const fx3 = rev3f.json?.lineageEffects ?? rev3f.json?.LineageEffects ?? [];
 const fxE = (Array.isArray(fx3) ? fx3 : []).find((x) => (x.id ?? x.Id) === "E");
 const fxP = (Array.isArray(fx3) ? fx3 : []).find((x) => (x.id ?? x.Id) === "X");
 ok("lineagefx-present", !!fxE && !!fxP, JSON.stringify(fx3).slice(0, 300));
-ok("lineagefx-E-added", !!fxE && (fxE.status ?? fxE.Status) === "added", JSON.stringify(fxE).slice(0, 200));
-ok("lineagefx-P-inherited", !!fxP && (fxP.status ?? fxP.Status) === "inherited", JSON.stringify(fxP).slice(0, 200));
+ok("lineagefx-E-added", !!fxE && (fxE.status ?? fxE.Status) === "added", String(JSON.stringify(fxE)).slice(0, 200));
+ok("lineagefx-P-inherited", !!fxP && (fxP.status ?? fxP.Status) === "inherited", String(JSON.stringify(fxP)).slice(0, 200));
 // ---------- S7 superseded terminal guards + token rotation ----------
 const staleAll = await post("/api/records/" + adid + "/approve-all", { version: ag4.version, hash: ag4.hash, reviewToken: "rotated:" + ag4.reviewToken, watermark: ag4.watermark });
 ok("superseded-stale-token-409", staleAll.status === 409, String(staleAll.status));

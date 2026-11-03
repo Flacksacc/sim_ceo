@@ -139,6 +139,31 @@ public static class SourceGovernance
   // head row at all. Existing head rows are never touched: a retained pin
   // (including one that points at a moved-away source) stays exactly as it
   // is, and CurrentForFamily resolves it fail-closed by family+identity.
+  // Server-owned legacy version alias: migrate-version events record the
+  // ORIGINAL version a renumbered duplicate carried before canonicalization.
+  // Currency (head winner, eligibility lineage) is decided by original
+  // version, then creation order: an old duplicate parked above the actual
+  // newer version never outranks it. No schema change: the alias is derived
+  // from persisted, backed-up history events.
+  public static int OriginalVersionOf(InMemoryStore s, SourceDoc d)
+  {
+    try
+    {
+      var best = d.Version;
+      var found = false;
+      foreach (var e in s.SourceEvents.Values.Where(x => x.SourceId == d.Id && string.Equals(x.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)).ToList())
+      {
+        var det = e.Detail ?? "";
+        var arrow = det.IndexOf("->", StringComparison.Ordinal);
+        if (arrow <= 1) continue;
+        var from = det.Substring(0, arrow).Trim().TrimStart('v', 'V');
+        if (int.TryParse(from, out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
+      }
+      return found ? best : d.Version;
+    }
+    catch { return d.Version; }
+  }
+
   public static void EnsureMissingHeads(InMemoryStore s)
   {
     var fams = s.Sources.Values
@@ -148,13 +173,20 @@ public static class SourceGovernance
     foreach (var g in fams)
     {
       if (s.SourceHeads.Values.Any(h => h.BoardId == g.Key.BoardId && h.FamilyKey == g.Key.FamilyKey)) continue;
-      var maxV = g.Max(x => x.Version);
-      var tops = g.Where(x => x.Version == maxV).OrderBy(x => x.CreatedAt).ThenBy(x => x.Id).ToList();
-      // Uniqueness is enforced by migration/validation before this runs; if
-      // duplicates somehow remain, fail closed with no head.
-      if (tops.Count != 1) continue;
-      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = maxV, HeadSourceId = tops[0].Id, UpdatedAt = DateTime.UtcNow };
+      // Winner by ORIGINAL version (alias), then earliest creation: an old
+      // duplicate renumbered above the actual newer version never wins.
+      var ordered = g.Select(x => new { row = x, orig = OriginalVersionOf(s, x) })
+        .OrderByDescending(x => x.orig).ThenBy(x => x.row.CreatedAt).ThenBy(x => x.row.Id).ToList();
+      var win = ordered.First();
+      var head = new SourceFamilyHead { BoardId = g.Key.BoardId, FamilyKey = g.Key.FamilyKey, HeadVersion = win.row.Version, HeadSourceId = win.row.Id, HighWater = g.Max(x => x.Version), UpdatedAt = DateTime.UtcNow };
       s.SourceHeads[head.Id] = head;
+    }
+    // Maintain monotonic high-water on existing heads.
+    foreach (var h in s.SourceHeads.Values.ToList())
+    {
+      var liveMax = s.Sources.Values.Where(x => x.BoardId == h.BoardId && x.FamilyKey == h.FamilyKey).Select(x => (int?)x.Version).Max() ?? 0;
+      var want = Math.Max(Math.Max(h.HeadVersion, liveMax), h.HighWater);
+      if (want != h.HighWater) { h.HighWater = want; h.UpdatedAt = DateTime.UtcNow; }
     }
     try { s.SourceHeads.Flush(); } catch { }
   }
@@ -186,27 +218,11 @@ public static class SourceGovernance
           // family. The earliest row (CreatedAt, Id) keeps its version;
           // later duplicates move above the live max, preserving every
           // document/content/identity/history row. Dependent section and
-          // event versions follow; the original version is recorded.
-          foreach (var g in s.Sources.Values.ToList().GroupBy(x => (x.BoardId, x.FamilyKey)).ToList())
-          {
-            var ordered = g.OrderBy(x => x.Version).ThenBy(x => x.CreatedAt).ThenBy(x => x.Id).ToList();
-            var seen = new HashSet<int>();
-            var maxV = ordered.Count == 0 ? 0 : ordered.Max(x => x.Version);
-            foreach (var d in ordered)
-            {
-              if (seen.Add(d.Version)) continue;
-              maxV++;
-              var oldV = d.Version;
-              d.Version = maxV;
-              foreach (var sec in s.SourceSections.Values.Where(x => x.SourceId == d.Id).ToList())
-                sec.SourceVersion = maxV;
-              foreach (var e in s.SourceEvents.Values.Where(x => x.SourceId == d.Id && x.Version == oldV).ToList())
-                e.Version = maxV;
-              var pin = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == d.BoardId && h.FamilyKey == d.FamilyKey && h.HeadSourceId == d.Id && h.HeadVersion == oldV);
-              if (pin is not null) pin.HeadVersion = maxV;
-              RecordEvent(s, d, "migrate-version", "v" + oldV + "->v" + maxV);
-            }
-          }
+          // event versions follow; the original version is recorded as a
+          // migrate-version event (the server-owned original-version alias).
+          // Currency is decided by that alias, so a parked duplicate never
+          // outranks the actual newer version it once collided with.
+          ResolveCollisions(s);
           // 3. Re-pin sections/events to their canonical owner; drop
           // corrupt duplicate section ordinals (regenerable via reindex).
           var byId = s.Sources.Values.ToDictionary(x => x.Id);
@@ -258,6 +274,35 @@ public static class SourceGovernance
     }
   }
 
+  // Shared collision resolver: also used by legacy-restore migration so a
+  // genuine predecessor backup with old inline-v1 duplicates canonicalizes
+  // through the same deterministic path as a live predecessor database.
+  public static void ResolveCollisions(InMemoryStore s)
+  {
+    foreach (var g in s.Sources.Values.ToList().GroupBy(x => (x.BoardId, x.FamilyKey)).ToList())
+    {
+      var ordered = g.OrderBy(x => x.Version).ThenBy(x => x.CreatedAt).ThenBy(x => x.Id).ToList();
+      var seen = new HashSet<int>();
+      var maxV = ordered.Count == 0 ? 0 : ordered.Max(x => x.Version);
+      foreach (var d in ordered)
+      {
+        if (seen.Add(d.Version)) continue;
+        maxV++;
+        var oldV = d.Version;
+        d.Version = maxV;
+        foreach (var sec in s.SourceSections.Values.Where(x => x.SourceId == d.Id).ToList())
+          sec.SourceVersion = maxV;
+        foreach (var e in s.SourceEvents.Values.Where(x => x.SourceId == d.Id && x.Version == oldV).ToList())
+          e.Version = maxV;
+        var pin = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == d.BoardId && h.FamilyKey == d.FamilyKey && h.HeadSourceId == d.Id && h.HeadVersion == oldV);
+        if (pin is not null) pin.HeadVersion = maxV;
+        var hw = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == d.BoardId && h.FamilyKey == d.FamilyKey);
+        if (hw is not null && maxV > hw.HighWater) hw.HighWater = maxV;
+        RecordEvent(s, d, "migrate-version", "v" + oldV + "->v" + maxV);
+      }
+    }
+  }
+
   // Serialized startup/bootstrap migration. Runs after the backend is wired
   // and before the API serves: deterministic, idempotent, and fatal-safe —
   // no consumer can observe an unmigrated graph.
@@ -276,14 +321,39 @@ public static class SourceGovernance
   // only accepts empty keys for a uniformly legacy graph); completed-
   // without-sections metadata is failed-closed until reindex; established
   // heads cover families the snapshot left headless.
+  static bool IsPlaceholderHash(string? h)
+  {
+    var c = (h ?? "").Trim().ToLowerInvariant();
+    if (c.Length != 64) return true;
+    return !System.Text.RegularExpressions.Regex.IsMatch(c, "^[0-9a-f]{64}$");
+  }
+
   public static void MigrateRestoredSources(InMemoryStore s)
   {
     foreach (var d in s.Sources.Values.ToList()) EnsureMigrated(s, d);
+    // Legacy placeholder repair: predecessor rows whose hash is not a real
+    // content hash adopt the restored bytes (validation only admits these
+    // inside uniformly legacy graphs, and those carry no sections to repin).
+    foreach (var d in s.Sources.Values.ToList())
+    {
+      if (d.Original is not null && d.Original.Length > 0 && IsPlaceholderHash(d.ContentHash))
+      {
+        try
+        {
+          using var sha = System.Security.Cryptography.SHA256.Create();
+          d.ContentHash = Convert.ToHexString(sha.ComputeHash(d.Original)).ToLowerInvariant();
+        }
+        catch { }
+      }
+    }
     foreach (var d in s.Sources.Values.ToList())
     {
       if (string.IsNullOrWhiteSpace(d.FamilyKey))
         d.FamilyKey = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
     }
+    // Same deterministic collision path as live startup: predecessor inline
+    // duplicates canonicalize and renumber here instead of being rejected.
+    ResolveCollisions(s);
     foreach (var sec in s.SourceSections.Values.ToList())
     {
       if (s.Sources.TryGetValue(sec.SourceId, out var owner) && owner is not null
@@ -332,7 +402,16 @@ public static class SourceGovernance
       || restored.leads is null || restored.grants is null || restored.invites is null
       || restored.images is null)
     { error = "snapshot is missing required collections."; return false; }
+    foreach (var b in restored.boards)
+    { if (b is null) { error = "snapshot board is null."; return false; } }
     var boardIds = new HashSet<Guid>(restored.boards.Where(b => b is not null).Select(b => b.Id));
+    // Uniformly-legacy predecessor graphs (empty keys, no sections/heads/
+    // events) defer key + collision validation to the controlled restore
+    // migration, which canonicalizes and resolves collisions deterministically.
+    bool legacyKeys = restored.sources.All(d => d is null || string.IsNullOrWhiteSpace(d.FamilyKey))
+      && (restored.sections is null || restored.sections.All(x => x is null))
+      && (restored.heads is null || restored.heads.All(x => x is null))
+      && (restored.events is null || restored.events.All(x => x is null));
     var meetingBoard = new Dictionary<Guid, Guid>();
     foreach (var m in restored.meetings)
     {
@@ -377,14 +456,16 @@ public static class SourceGovernance
       if (string.IsNullOrWhiteSpace(d.FamilyKey))
       {
         // Empty key: only legitimate as a uniformly empty legacy graph,
-        // canonicalized inside the restore unit. Verified below.
+        // canonicalized (+collisions resolved) inside the restore unit.
+        if (!legacyKeys)
+        { error = "snapshot source has an empty family outside a legacy graph."; return false; }
         canonical[d.Id] = canon;
       }
       else if (!string.Equals(d.FamilyKey, canon, StringComparison.Ordinal))
       { error = "snapshot source family is forged: '" + d.FamilyKey + "' is not the canonical identity for this board/scope/meeting/origin/file."; return false; }
       else canonical[d.Id] = d.FamilyKey;
       var fv = d.BoardId.ToString("N") + "|" + canonical[d.Id] + "|v" + d.Version;
-      if (!familyVersions.Add(fv)) { error = "snapshot sources contain an ambiguous family/version collision; resolve by uploading a new version instead."; return false; }
+      if (!legacyKeys && !familyVersions.Add(fv)) { error = "snapshot sources contain an ambiguous family/version collision; resolve by uploading a new version instead."; return false; }
     }
     var legacyShape = restored.sources.All(d => d is null || string.IsNullOrWhiteSpace(d.FamilyKey))
       && (restored.sections is null || restored.sections.All(x => x is null))
@@ -398,11 +479,28 @@ public static class SourceGovernance
     }
     var byId = restored.sources.Where(d => d is not null).ToDictionary(d => d.Id);
     var famMax = new Dictionary<string, int>(StringComparer.Ordinal);
+    var famVersions = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
     foreach (var d in byId.Values)
     {
       var fk = canonical[d.Id];
       var key = d.BoardId.ToString("N") + "|" + fk;
       famMax[key] = famMax.TryGetValue(key, out var m) ? Math.Max(m, d.Version) : d.Version;
+      if (!famVersions.TryGetValue(key, out var vs)) { vs = new HashSet<int>(); famVersions[key] = vs; }
+      vs.Add(d.Version);
+    }
+    // No silent partial-family removal: surviving non-legacy families must
+    // hold dense versions 1..max. A gap means versions were deleted outside
+    // the supported whole-family removal or exclusion; reject instead of
+    // recycling numbers.
+    if (!legacyKeys)
+    {
+      foreach (var kv in famVersions)
+      {
+        var max = famMax[kv.Key];
+        for (var v = 1; v <= max; v++)
+          if (!kv.Value.Contains(v))
+          { error = "snapshot family skips version v" + v + "; partial-family removal is not supported (exclude or remove the whole family instead)."; return false; }
+      }
     }
     if (restored.sections is not null)
     {
@@ -426,7 +524,17 @@ public static class SourceGovernance
         if (sec.SourceVersion != owner.Version) { error = "snapshot section pins the wrong source version."; return false; }
         if (!string.Equals(sec.ContentHash ?? "", owner.ContentHash ?? "", StringComparison.Ordinal))
         { error = "snapshot section pins the wrong content hash."; return false; }
-        if (sec.IndexGeneration != owner.IndexGeneration) { error = "snapshot section pins the wrong index generation."; return false; }
+        var ownerFailed = string.Equals(owner.IndexState ?? "", "failed", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(owner.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase);
+      // Failed/running sources keep their last good sections under the older
+      // generation; the source is ineligible until a successful reindex
+      // rebuilds matching sections, so the relaxed pin cannot launder evidence.
+      if (ownerFailed)
+      {
+        if (sec.IndexGeneration < 0 || sec.IndexGeneration > owner.IndexGeneration)
+        { error = "snapshot section pins an index generation newer than its failed source."; return false; }
+      }
+      else if (sec.IndexGeneration != owner.IndexGeneration) { error = "snapshot section pins the wrong index generation."; return false; }
         if (sec.Ordinal < 1) { error = "snapshot section has an illegal ordinal."; return false; }
         var ok = sec.SourceId.ToString("N") + "#" + sec.Ordinal;
         if (!ordinals.Add(ok)) { error = "snapshot sections contain a duplicate ordinal."; return false; }
@@ -448,6 +556,7 @@ public static class SourceGovernance
         if (!boardIds.Contains(h.BoardId)) { error = "snapshot head references an unknown board."; return false; }
         if (string.IsNullOrWhiteSpace(h.FamilyKey)) { error = "snapshot head has an empty family."; return false; }
         if (h.HeadVersion < 0) { error = "snapshot head has an illegal version."; return false; }
+      if (h.HighWater < 0) { error = "snapshot head has an illegal high-water."; return false; }
         var hk = h.BoardId.ToString("N") + "|" + h.FamilyKey;
         if (!headKeys.Add(hk)) { error = "snapshot heads contain two heads for one family."; return false; }
         var liveHere = byId.Values.Any(x => x.BoardId == h.BoardId && canonical[x.Id] == h.FamilyKey);
@@ -472,6 +581,19 @@ public static class SourceGovernance
         }
         else if (liveHere)
         { error = "snapshot head has an ambiguous empty identity while its family still holds sources; resolve by uploading a new version instead."; return false; }
+        // Persisted allocation high-water must cover the family maximum and
+        // the head pin: a lowered high-water would silently recycle a retired
+        // version number for new content.
+        if (byId.Values.Any(x => x.BoardId == h.BoardId && canonical[x.Id] == h.FamilyKey))
+        {
+          var fmax = byId.Values.Where(x => x.BoardId == h.BoardId && canonical[x.Id] == h.FamilyKey).Max(x => x.Version);
+          // HighWater 0 means unmaintained (heads promoted before water tracking);
+          // MigrateRestoredSources recomputes it after replacement, so only a
+          // present-but-insufficient water rejects. ReserveVersion also floors on
+          // live rows, so no version is ever recycled through a zero water.
+          if (h.HighWater != 0 && (h.HighWater < fmax || h.HighWater < h.HeadVersion))
+          { error = "snapshot head high-water does not cover its family; versions would be recycled."; return false; }
+        }
       }
     }
     // No-fallback on removal: a non-legacy family that still holds
@@ -494,7 +616,12 @@ public static class SourceGovernance
         }
       foreach (var d in byId.Values)
       {
-        if (!string.Equals((d.ReviewState ?? "").Trim(), "approved", StringComparison.OrdinalIgnoreCase)) continue;
+        // Effective review state: legacy "" + Approved=true counts as approved
+        // so a headless-approved revival cannot slip through the sentinel.
+        var effReview = string.IsNullOrWhiteSpace(d.ReviewState)
+          ? (d.Approved ? "approved" : "pending")
+          : d.ReviewState.Trim();
+        if (!string.Equals(effReview, "approved", StringComparison.OrdinalIgnoreCase)) continue;
         var key = d.BoardId.ToString("N") + "|" + canonical[d.Id];
         if (!headed.Contains(key))
         { error = "snapshot leaves an approved family headless after removing its current version; exclude the current version instead of deleting it."; return false; }
@@ -521,18 +648,41 @@ public static class SourceGovernance
         }
         else if (!string.Equals(e.FamilyKey ?? "", ownerFam, StringComparison.Ordinal))
         { error = "snapshot event belongs to another family than its source."; return false; }
-        var fmax = famMax.TryGetValue(owner.BoardId.ToString("N") + "|" + ownerFam, out var mv) ? mv : owner.Version;
-        if (e.Version < 1 || e.Version > fmax)
-        { error = "snapshot event pins a version outside its source family history."; return false; }
+        var famKey = owner.BoardId.ToString("N") + "|" + ownerFam;
+        if (!famVersions.TryGetValue(famKey, out var fset) || !fset.Contains(e.Version))
+        { error = "snapshot event pins a version with no matching source in its family."; return false; }
       }
     }
     foreach (var kv in restored.blobs)
     {
-      if (!Guid.TryParse(kv.Key, out _))
+      if (!Guid.TryParse(kv.Key, out var blobId))
       { error = "snapshot blob key is not a source id."; return false; }
+      if (!byId.TryGetValue(blobId, out var bowner) || bowner is null)
+      { error = "snapshot blob references an unknown source."; return false; }
       if (string.IsNullOrWhiteSpace(kv.Value)) continue;
-      try { Convert.FromBase64String(kv.Value); }
+      byte[] raw;
+      try { raw = Convert.FromBase64String(kv.Value); }
       catch (FormatException) { error = "snapshot blob is not valid base64."; return false; }
+      // Original bytes must hash to the owning source's server-computed hash:
+      // swapped payloads would otherwise reindex under a false identity.
+      string hex;
+      try
+      {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        hex = Convert.ToHexString(sha.ComputeHash(raw)).ToLowerInvariant();
+      }
+      catch { error = "snapshot blob cannot be hashed."; return false; }
+      var claimed = (bowner.ContentHash ?? "").Trim().ToLowerInvariant();
+      var isRealHash = claimed.Length == 64 && System.Text.RegularExpressions.Regex.IsMatch(claimed, "^[0-9a-f]{64}$");
+      if (isRealHash)
+      {
+        if (!string.Equals(hex, claimed, StringComparison.Ordinal))
+        { error = "snapshot blob bytes do not match the owning source content hash."; return false; }
+      }
+      else if (!legacyKeys)
+      { error = "snapshot source carries a placeholder content hash outside a legacy graph; re-upload instead."; return false; }
+      // Non-hash placeholders inside a uniformly legacy graph are repaired
+      // at restore: the real bytes are adopted and hashed (see MigrateRestoredSources).
     }
     return true;
   }
@@ -1000,7 +1150,7 @@ public static class SourceGovernance
       .Where(x => x.BoardId == boardId && x.FamilyKey == familyKey)
       .Select(x => (int?)x.Version).Max() ?? 0;
     var head = s.SourceHeads.Values.FirstOrDefault(h => h.BoardId == boardId && h.FamilyKey == familyKey);
-    var high = head is null ? 0 : head.HeadVersion;
+    var high = head is null ? 0 : Math.Max(head.HeadVersion, head.HighWater);
     return Math.Max(live, high) + 1;
   }
 
@@ -1026,7 +1176,7 @@ public static class SourceGovernance
     return (b.BlockedTypes ?? "") + "|" + SourceGovernance.PolicyModeOf(b);
   }
 
-  public static bool TryBeginIndex(InMemoryStore s, Guid id, out IndexReservation? reservation, out string error)
+  public static bool TryBeginIndex(InMemoryStore s, HttpRequest req, Guid id, string need, out IndexReservation? reservation, out string error)
   {
     lock (s.SetupLock)
     {
@@ -1039,10 +1189,26 @@ public static class SourceGovernance
         var wasEligible = IsEligible(s, d, meeting);
         var policyKey = PolicyRevisionKey(s, d.BoardId);
         IndexReservation? made = null;
+        string? gateErr = null;
         Atomic.Run(() =>
         {
           if (!s.Sources.TryGetValue(id, out var cur) || cur is null)
             throw new InvalidOperationException("source vanished during index reservation");
+          // Fresh caller + board/scope/policy validation inside the backend
+          // unit: a revocation or policy change between the entry check and
+          // this reservation must fail closed with zero mutation.
+          if (PeopleOps.Check(s, req, cur.BoardId, cur.Scope == "meeting" ? cur.MeetingId : null, need) is { } deniedBi)
+          {
+            gateErr = deniedBi is Microsoft.AspNetCore.Http.HttpResults.JsonHttpResult<object> deniedJson && deniedJson.StatusCode == 401
+              ? "Authentication required."
+              : "Access revoked or not granted for this scope.";
+            return;
+          }
+          if (!string.Equals(PolicyRevisionKey(s, cur.BoardId), policyKey, StringComparison.Ordinal))
+          {
+            gateErr = "Source policy changed before index reservation; retry with current policy.";
+            return;
+          }
           var jobId = Guid.NewGuid();
           cur.IndexState = "running";
           cur.IndexGeneration = cur.IndexGeneration <= 0 ? 1 : cur.IndexGeneration + 1;
@@ -1054,6 +1220,7 @@ public static class SourceGovernance
             cur.FamilyKey ?? "", cur.BoardId, cur.Scope ?? "board", cur.MeetingId, policyKey,
             cur.IndexGeneration, wasEligible);
         });
+        if (gateErr is not null) { error = gateErr; return false; }
         reservation = made;
         return true;
       }
@@ -1069,111 +1236,125 @@ public static class SourceGovernance
   // extraction simply stands. Returns stale=true on any mismatch; the
   // caller must report a conflict and change nothing further.
   public static (bool ok, bool stale, bool eligibilityLost, string? error, int status) FinishIndex(
-    InMemoryStore s, IndexReservation res, bool isReindex)
+    InMemoryStore s, HttpRequest req, IndexReservation res, bool isReindex, string need)
   {
     lock (s.SetupLock)
     {
       lock (s.MessageLock)
       {
-        if (res.Epoch != s.SourceEpoch)
-          return (false, true, false, "Index epoch changed during indexing (restore replaced state); reindex required.", 409);
-        if (!s.ActiveIndexJobs.TryGetValue(res.SourceId, out var active)
-          || active.JobId != res.JobId || active.Epoch != res.Epoch || active.Generation != res.Generation)
-          return (false, true, false, "A newer index attempt superseded this one; stale completion discarded.", 409);
-        if (!s.Sources.TryGetValue(res.SourceId, out var d) || d is null)
-          return (false, true, false, "Source is gone; stale index completion discarded.", 409);
-        EnsureMigrated(s, d);
-        if (d.Version != res.Version
-          || !string.Equals(d.ContentHash ?? "", res.ContentHash ?? "", StringComparison.Ordinal)
-          || !string.Equals(d.FamilyKey ?? "", res.FamilyKey ?? "", StringComparison.Ordinal)
-          || d.BoardId != res.BoardId
-          || !string.Equals(d.Scope ?? "", res.Scope ?? "", StringComparison.OrdinalIgnoreCase)
-          || d.MeetingId != res.MeetingId
-          || !string.Equals(PolicyRevisionKey(s, d.BoardId), res.PolicyKey, StringComparison.Ordinal))
-          return (false, true, false, "Source identity or policy changed during indexing; stale completion discarded.", 409);
-        if (!string.Equals(d.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
-          || d.IndexGeneration != res.Generation)
-          return (false, true, false, "A newer index attempt superseded this one; stale completion discarded.", 409);
+        // Every fetch, authorization, policy, and revision check runs INSIDE
+        // the actual backend transaction against freshly fetched rows: the
+        // pre-gate captured source object never sources the mutation, so an
+        // intervening tracker-clear cannot detach the write target.
         string? failure = null;
+        bool stale = false;
+        string? staleErr = null;
         var eventName = isReindex ? "reindex" : "index";
-        try
+        Atomic.Run(() =>
         {
-          Atomic.Run(() =>
+          if (!s.Sources.TryGetValue(res.SourceId, out var cur) || cur is null)
+          { stale = true; staleErr = "Source is gone; stale index completion discarded."; return; }
+          EnsureMigrated(s, cur);
+          if (PeopleOps.Check(s, req, cur.BoardId, cur.Scope == "meeting" ? cur.MeetingId : null, need) is { } deniedFi)
+          { stale = true; staleErr = "Access revoked or not granted for this scope."; return; }
+          if (res.Epoch != s.SourceEpoch)
+          { stale = true; staleErr = "Index epoch changed during indexing (restore replaced state); reindex required."; return; }
+          if (!s.ActiveIndexJobs.TryGetValue(res.SourceId, out var active)
+            || active.JobId != res.JobId || active.Epoch != res.Epoch || active.Generation != res.Generation)
+          { stale = true; staleErr = "A newer index attempt superseded this one; stale completion discarded."; return; }
+          if (cur.Version != res.Version
+            || !string.Equals(cur.ContentHash ?? "", res.ContentHash ?? "", StringComparison.Ordinal)
+            || !string.Equals(cur.FamilyKey ?? "", res.FamilyKey ?? "", StringComparison.Ordinal)
+            || cur.BoardId != res.BoardId
+            || !string.Equals(cur.Scope ?? "", res.Scope ?? "", StringComparison.OrdinalIgnoreCase)
+            || cur.MeetingId != res.MeetingId
+            || !string.Equals(PolicyRevisionKey(s, cur.BoardId), res.PolicyKey, StringComparison.Ordinal))
+          { stale = true; staleErr = "Source identity or policy changed during indexing; stale completion discarded."; return; }
+          if (!string.Equals(cur.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
+            || cur.IndexGeneration != res.Generation)
+          { stale = true; staleErr = "A newer index attempt superseded this one; stale completion discarded."; return; }
+          string? ferr = null;
+          try
           {
             // Fail closed on explicit extraction failure: raw Original bytes must
             // not stand in for extractor output. Textual uploads extract locally;
             // anything else requires a successful extractor result first.
-            var md = Extraction.MarkdownOf(d.ExtractionJson);
+            var md = Extraction.MarkdownOf(cur.ExtractionJson);
             string extStatus = "";
             try
             {
-              using var ej = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.ExtractionJson) ? "{}" : d.ExtractionJson);
+              using var ej = JsonDocument.Parse(string.IsNullOrWhiteSpace(cur.ExtractionJson) ? "{}" : cur.ExtractionJson);
               if (ej.RootElement.TryGetProperty("status", out var st) && st.ValueKind == JsonValueKind.String)
                 extStatus = (st.GetString() ?? "").Trim().ToLowerInvariant();
             }
             catch (JsonException) { }
             if (string.IsNullOrWhiteSpace(md) && (extStatus == "failed" || extStatus == "unreachable"))
             {
-              d.IndexState = "failed";
-              d.IndexError = "extraction " + extStatus + "; raw bytes are not indexed without extractor output";
-              d.IndexCompletedAt = DateTime.UtcNow;
+              cur.IndexState = "failed";
+              cur.IndexError = "extraction " + extStatus + "; raw bytes are not indexed without extractor output";
+              cur.IndexCompletedAt = DateTime.UtcNow;
               s.Sources.Flush();
-              RecordEvent(s, d, eventName + "-failed", d.IndexError);
+              RecordEvent(s, cur, eventName + "-failed", cur.IndexError);
               return;
             }
-            var text = ReadableTextFor(d);
+            var text = ReadableTextFor(cur);
             if (string.IsNullOrWhiteSpace(text))
             {
-              d.IndexState = "failed";
-              d.IndexError = string.IsNullOrWhiteSpace(Extraction.MarkdownOf(d.ExtractionJson)) ? "no extractable text; extraction failed or binary without extractor output" : "empty text";
-              d.IndexCompletedAt = DateTime.UtcNow;
+              cur.IndexState = "failed";
+              cur.IndexError = string.IsNullOrWhiteSpace(Extraction.MarkdownOf(cur.ExtractionJson)) ? "no extractable text; extraction failed or binary without extractor output" : "empty text";
+              cur.IndexCompletedAt = DateTime.UtcNow;
               s.Sources.Flush();
-              RecordEvent(s, d, eventName + "-failed", d.IndexError);
+              RecordEvent(s, cur, eventName + "-failed", cur.IndexError);
               return;
             }
             var built = BuildSections(text);
             if (built.Count == 0)
             {
-              d.IndexState = "failed"; d.IndexError = "no sections built"; d.IndexCompletedAt = DateTime.UtcNow;
+              cur.IndexState = "failed"; cur.IndexError = "no sections built"; cur.IndexCompletedAt = DateTime.UtcNow;
               s.Sources.Flush();
-              RecordEvent(s, d, eventName + "-failed", d.IndexError);
+              RecordEvent(s, cur, eventName + "-failed", cur.IndexError);
               return;
             }
-            foreach (var old in s.SourceSections.Values.Where(x => x.SourceId == d.Id).ToList())
+            foreach (var old in s.SourceSections.Values.Where(x => x.SourceId == cur.Id).ToList())
               s.SourceSections.TryRemove(old.Id, out _);
             int ord = 1;
             foreach (var b in built)
             {
               var sec = new SourceSection
               {
-                BoardId = d.BoardId, SourceId = d.Id, FamilyKey = d.FamilyKey,
-                SourceVersion = d.Version, ContentHash = d.ContentHash,
+                BoardId = cur.BoardId, SourceId = cur.Id, FamilyKey = cur.FamilyKey,
+                SourceVersion = cur.Version, ContentHash = cur.ContentHash,
                 Ordinal = ord++, Heading = b.Heading, Location = b.Location,
                 Text = b.Text, IndexGeneration = res.Generation, CreatedAt = DateTime.UtcNow,
               };
               s.SourceSections[sec.Id] = sec;
             }
-            d.IndexState = "completed"; d.IndexError = ""; d.IndexCompletedAt = DateTime.UtcNow;
+            cur.IndexState = "completed"; cur.IndexError = ""; cur.IndexCompletedAt = DateTime.UtcNow;
             s.Sources.Flush(); s.SourceSections.Flush();
-            RecordEvent(s, d, eventName, "gen" + res.Generation + " sections" + built.Count);
-          });
-        }
-        catch (Exception ex)
-        {
-          failure = ex.Message;
-        }
+            RecordEvent(s, cur, eventName, "gen" + res.Generation + " sections" + built.Count);
+          }
+          catch (Exception ex)
+          {
+            ferr = ex.Message;
+          }
+          if (ferr is not null) { failure = ferr; return; }
+        });
         if (failure is not null)
           return (false, false, false, failure, 500);
+        if (stale)
+          return (false, true, false, staleErr, 409);
         // Retire the completed reservation only if it is still current.
-        if (s.ActiveIndexJobs.TryGetValue(res.SourceId, out var cur)
-          && cur.JobId == res.JobId && cur.Epoch == res.Epoch)
+        if (s.ActiveIndexJobs.TryGetValue(res.SourceId, out var curJob)
+          && curJob.JobId == res.JobId && curJob.Epoch == res.Epoch)
           s.ActiveIndexJobs.TryRemove(res.SourceId, out _);
-        Guid? fmeeting = d.Scope == "meeting" ? d.MeetingId : null;
-        var nowEligible = IsEligible(s, d, fmeeting);
+        if (!s.Sources.TryGetValue(res.SourceId, out var done) || done is null)
+          return (false, true, false, "Source is gone; stale index completion discarded.", 409);
+        Guid? fmeeting = done.Scope == "meeting" ? done.MeetingId : null;
+        var nowEligible = IsEligible(s, done, fmeeting);
         var lost = res.WasEligible && !nowEligible;
         // The Begin reservation already paused affected meetings when the
         // source was eligible; only report here, never restore old state.
-        RecordAudit(s, d.BoardId, "source.index", eventName + " " + d.FileName + " v" + d.Version + " gen" + res.Generation);
+        RecordAudit(s, done.BoardId, "source.index", eventName + " " + done.FileName + " v" + done.Version + " gen" + res.Generation);
         return (true, false, lost, null, 200);
       }
     }
@@ -1193,8 +1374,18 @@ public static class SourceGovernance
           && string.Equals(cur.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
           && cur.IndexGeneration == res.Generation)
         {
-          cur.ExtractionJson = extractionJson;
-          try { s.Sources.Flush(); } catch { }
+          try
+          {
+            Atomic.Run(() =>
+            {
+              if (!s.Sources.TryGetValue(res.SourceId, out var stamped) || stamped is null) return;
+              if (!string.Equals(stamped.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)
+                || stamped.IndexGeneration != res.Generation) return;
+              stamped.ExtractionJson = extractionJson;
+              s.Sources.Flush();
+            });
+          }
+          catch { }
         }
       }
     }
@@ -1337,7 +1528,7 @@ public static class SourceGovernance
   // destination (meetingId null) accepts board-scoped sources only:
   // meeting-only sources can never land in a board-wide direction, even
   // though they are eligible inside their own meeting.
-  public static List<EvidenceRef> ResolveEvidence(InMemoryStore s, IEnumerable<EvidenceRef> refs, Guid boardId, Guid? meetingId)
+  public static List<EvidenceRef> ResolveEvidence(InMemoryStore s, HttpRequest req, IEnumerable<EvidenceRef> refs, Guid boardId, Guid? meetingId)
   {
     var ok = new List<EvidenceRef>();
     foreach (var r in refs)
@@ -1349,7 +1540,12 @@ public static class SourceGovernance
       if (doc.BoardId != boardId) continue;
       if (!meetingId.HasValue && doc.Scope != "board") continue;
       if (!IsEligible(s, doc, meetingId)) continue;
-      if (r.Version.HasValue && r.Version.Value != doc.Version) continue; // stale version pin
+      // Current referenced-resource authorization BEFORE any title/text.
+      if (!PeopleOps.Can(s, req, doc.BoardId, doc.MeetingId, "read")) continue;
+      // Version pins match the current version OR the server-owned legacy
+      // alias (migrate-version history): renumbered duplicates still resolve
+      // their original citations; anything else is a stale pin.
+      if (r.Version.HasValue && r.Version.Value != doc.Version && r.Version.Value != OriginalVersionOf(s, doc)) continue; // stale version pin
       // Caller-supplied excerpts are untrusted quotations, not evidence (P2 #10):
       // an eligible identity never authenticates the quoted text. Keep the
       // caller text only when it matches persisted sections; otherwise resolve

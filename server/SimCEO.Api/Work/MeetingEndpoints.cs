@@ -209,7 +209,7 @@ public static class MeetingEndpoints
       var epochBefore = s.SourceEpoch;
       List<string> EligibleFingerprint() => SourceGovernance.EligibleFingerprint(s, m.BoardId, id);
       var fpBefore = EligibleFingerprint();
-      var evidenceBefore = SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
+      var evidenceBefore = SourceGovernance.ResolveEvidence(s, req, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
       string text;
       try
       {
@@ -235,7 +235,7 @@ public static class MeetingEndpoints
             return Results.Conflict("Source evidence changed during briefing; draft discarded.");
           if (!EligibleFingerprint().SequenceEqual(fpBefore))
             return Results.Conflict("Source evidence changed during briefing; draft discarded.");
-            var resolved = SourceGovernance.ResolveEvidence(s, evidenceBefore, m.BoardId, id);
+            var resolved = SourceGovernance.ResolveEvidence(s, req, evidenceBefore, m.BoardId, id);
           var note = new Note
           {
             BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
@@ -287,7 +287,7 @@ public static class MeetingEndpoints
         BoardId = bid, MeetingId = meetingId, Kind = "direction", Scope = scope,
         Title = scope == "board" ? "Adopted board-wide" : "Adopted for meeting",
         Body = text, Provisional = false,
-        EvidenceJson = EvidenceRef.ToJsonList(SourceGovernance.ResolveEvidence(s, EvidenceRef.ParseList(body, "evidence"), bid, meetingId == Guid.Empty ? null : meetingId)),
+        EvidenceJson = EvidenceRef.ToJsonList(SourceGovernance.ResolveEvidence(s, req, EvidenceRef.ParseList(body, "evidence"), bid, meetingId == Guid.Empty ? null : meetingId)),
       };
       s.Notes[note.Id] = note;
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });

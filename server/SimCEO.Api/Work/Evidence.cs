@@ -72,6 +72,11 @@ public sealed record EvidenceRef(
   public static EvidenceRef ForRecord(RecordDraft d) =>
     new("record", d.Id.ToString(), d.Version, null, "record v" + d.Version, null);
 
+  // Exact owner provenance: the approving record+version that last set this
+  // item, never the unapproved head that merely inherits its text.
+  public static EvidenceRef ForRecordItem(string recordId, int version, string itemId, string? excerpt = null) =>
+    new("record", recordId, version, null, "record v" + version + " [" + itemId + "]", excerpt);
+
   public static EvidenceRef ForNote(Note n) =>
     new(n.Kind == "direction" ? "direction" : "note", n.Id.ToString(),
       null, null, n.Title, n.Body.Length > 240 ? n.Body.Substring(0, 240) : n.Body);

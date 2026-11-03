@@ -317,12 +317,17 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"ReviewToken\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"HistoryJson\" text NOT NULL DEFAULT '[]'");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Drafts\" ADD COLUMN IF NOT EXISTS \"EvidenceSnapshotJson\" text NOT NULL DEFAULT '[]'");
-      // Compatibility-only initialization for legacy rows: fill blank
-      // columns with deterministic/stable values. Never touch Decided or a
-      // non-blank Status, so previously finalized or discarded reviews stay
-      // terminal with only their original selections.
+      // Compatibility-only initialization for RECOGNIZED legacy rows only
+      // (blank review token AND pre-review revision): fill blank columns with
+      // deterministic/stable values. Never touch Decided or a non-blank
+      // Status, so previously finalized or discarded reviews stay terminal
+      // with only their original selections. Malformed CURRENT rows (which
+      // always carry a token and revision) are preserved untouched so the
+      // strict validator fails closed on them instead of being papered over.
       foreach (var d in db.Drafts.ToList())
       {
+        var isRecognizedLegacy = string.IsNullOrWhiteSpace(d.ReviewToken) && d.ReviewRevision < 1;
+        if (!isRecognizedLegacy) continue;
         if (string.IsNullOrWhiteSpace(d.ReviewToken)) { d.ReviewToken = SimCEO.Api.Work.Hashing.HashOf("legacy-review:" + d.Id.ToString("N") + ":" + d.Version + ":" + (d.Hash ?? "")); }
         if (d.ReviewRevision < 1) { d.ReviewRevision = 1; }
         if (string.IsNullOrWhiteSpace(d.ApprovedJson)) { d.ApprovedJson = "[]"; }
@@ -353,7 +358,8 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexError\" text NOT NULL DEFAULT ''");
       db.Database.ExecuteSqlRaw("ALTER TABLE \"Sources\" ADD COLUMN IF NOT EXISTS \"IndexCompletedAt\" timestamp with time zone NULL");
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceSections\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"SourceVersion\" integer NOT NULL DEFAULT 1, \"ContentHash\" text NOT NULL DEFAULT '', \"Ordinal\" integer NOT NULL DEFAULT 1, \"Heading\" text NOT NULL DEFAULT '', \"Location\" text NOT NULL DEFAULT '', \"Text\" text NOT NULL DEFAULT '', \"IndexGeneration\" integer NOT NULL DEFAULT 1, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
-      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceHeads\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"HeadVersion\" integer NOT NULL DEFAULT 0, \"HeadSourceId\" uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', \"HighWater\" integer NOT NULL DEFAULT 0, \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"SourceHeads\" ADD COLUMN IF NOT EXISTS \"HighWater\" integer NOT NULL DEFAULT 0");
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");

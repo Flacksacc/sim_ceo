@@ -161,11 +161,19 @@ public static class AuthEndpoints
     app.MapPost("/api/auth/logout", (InMemoryStore s, HttpRequest req) =>
     {
       string tok = "";
-      if (req.Headers.TryGetValue("Authorization", out var auth)
-          && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+      // Session removal shares the publication serialization boundary: it runs
+      // under SetupLock so an in-flight run/briefing/transcribe/finalize gate
+      // either observes the live session (and commits first) or observes the
+      // removal (and refuses). Logout can no longer complete between another
+      // request's authority check and its commit.
+      lock (s.SetupLock)
       {
-        tok = auth.ToString()["Bearer ".Length..].Trim();
-        s.Sessions.TryRemove(tok, out _);
+        if (req.Headers.TryGetValue("Authorization", out var auth)
+          && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+          tok = auth.ToString()["Bearer ".Length..].Trim();
+          s.Sessions.TryRemove(tok, out _);
+        }
       }
       try { if (!string.IsNullOrEmpty(tok)) SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(tok); } catch { }
       return Results.Ok(new { loggedOut = true });

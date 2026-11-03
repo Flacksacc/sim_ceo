@@ -170,6 +170,9 @@ public static class WizardGuide
             }
           }
           if (!s.WizardDrafts.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound("wizard draft");
+          // Renewed session/ownership authorization after the model await: a
+          // logout or ownership change during generation must not commit.
+          if (!TryWizardUser(s, req, fresh, out _, out var deniedIv3)) return deniedIv3;
           string? freshJob = null;
           try
           {

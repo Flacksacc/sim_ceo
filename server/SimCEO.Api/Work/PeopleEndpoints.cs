@@ -304,13 +304,18 @@ public static class SecurityOps
         s.WizardDrafts.Flush();
         foreach (var inv in s.Invites.Values.Where(i => i.State == "accepted" && i.MeetingId != null).ToList())
         {
-          var user = !string.IsNullOrWhiteSpace(inv.UserKey) ? inv.UserKey : inv.Email;
-          if (string.IsNullOrWhiteSpace(user)) continue;
+          // Only live-bound accepts (UserKey stamped by the accept flow in
+          // this store) may reconstruct access. Predecessor/unknown-provenance
+          // accepts without a bound identity are owner-review items, never
+          // automatic grants or memberships.
+          if (string.IsNullOrWhiteSpace(inv.UserKey)) { reviewed++; continue; }
+          var user = inv.UserKey;
           // Non-destructive: validate current parent; respect explicit leave/revocation.
           if (!s.Meetings.TryGetValue(inv.MeetingId.Value, out var __pm) || __pm.BoardId != inv.BoardId) { reviewed++; continue; }
           var __mem = s.Memberships.Values.FirstOrDefault(mm => mm.BoardId == inv.BoardId && mm.MeetingId == inv.MeetingId.Value
             && string.Equals(mm.UserKey, user, StringComparison.OrdinalIgnoreCase));
           if (__mem is not null && !__mem.Active) continue; // left/revoked: never resurrect
+          if (PeopleOps.WasExplicitlyLeft(s, inv.BoardId, inv.MeetingId.Value, user)) continue;
           var hasScoped = s.Grants.Values.Any(g => g.BoardId == inv.BoardId && g.MeetingId == inv.MeetingId
             && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
           if (!hasScoped)
@@ -389,8 +394,79 @@ public static class PeopleEndpoints
     _ => "contribute",
   };
 
+  private static object CapabilityView(InMemoryStore s, HttpRequest req, Guid bid, Guid? meetingId)
+  {
+    var user = PeopleOps.UserOf(s, req);
+    // Raw scope access first; "open" demo boards grant full local capability,
+    // secure boards require a session (enforced by Can/Check callers).
+    var rawBoard = PeopleOps.AccessFor(s, bid, null, user);
+    var board = rawBoard == "open" ? "manage" : rawBoard;
+    string? meeting = null;
+    if (meetingId.HasValue)
+    {
+      var rawMeeting = PeopleOps.AccessFor(s, bid, meetingId, user);
+      meeting = rawMeeting == "open" ? "manage" : rawMeeting;
+    }
+    var allowed = PeopleOps.GuestMeetingIds(s, user, bid);
+    var guest = !PeopleOps.Can(s, req, bid, null, "read") && allowed.Count > 0;
+    bool admin = false;
+    try { admin = PeopleOps.IsInstallationAdmin(s, user); } catch { }
+    return new { board, meeting, meetings = allowed, guest, admin };
+  }
+
   public static void MapPeople(this WebApplication app)
   {
+    // Server-derived selected-scope capabilities: the UI gates EVERY tab and
+    // action on these values, never on a board-DTO heuristic. Board access is
+    // board-wide; meeting access is the effective scope for the selected
+    // meeting (board-wide grants satisfy meeting scope by AccessFor).
+    app.MapGet("/api/boards/{bid:guid}/capabilities", (InMemoryStore s, HttpRequest req, Guid bid, Guid? meetingId) =>
+    {
+      if (!s.Boards.ContainsKey(bid)) return Results.NotFound("board");
+      if (PeopleOps.BadToken(s, req) is { } badCap) return badCap;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = PeopleOps.UserOf(s, req);
+      if (!PeopleOps.Can(s, req, bid, null, "read") && PeopleOps.GuestMeetingIds(s, user, bid).Count == 0)
+        return PeopleOps.Denied();
+      if (meetingId.HasValue && (!s.Meetings.TryGetValue(meetingId.Value, out var cm) || cm.BoardId != bid))
+        return Results.NotFound("meeting");
+      return Results.Ok(CapabilityView(s, req, bid, meetingId));
+    });
+
+    // Effective (activated) board settings for guests and owners alike.
+    // Activated blanks are preserved verbatim and never fall back to draft
+    // text; dataUse/policy come from the activated snapshot when present.
+    // Guests receive board-owned lead identity only (no global fallback) and
+    // only their own meeting ids; board readers see all meeting ids.
+    app.MapGet("/api/boards/{bid:guid}/guest-settings", (InMemoryStore s, HttpRequest req, Guid bid) =>
+    {
+      if (!s.Boards.TryGetValue(bid, out var b)) return Results.NotFound("board");
+      if (PeopleOps.BadToken(s, req) is { } badGs) return badGs;
+      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _))
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var user = PeopleOps.UserOf(s, req);
+      var allowed = PeopleOps.GuestMeetingIds(s, user, bid);
+      var reader = PeopleOps.Can(s, req, bid, null, "read");
+      if (!reader && allowed.Count == 0) return PeopleOps.Denied();
+      var eff = LeadSetup.EffectiveView(s, b);
+      var leadOwned = LeadSetup.ResolveLeadForStrict(s, bid);
+      var meetingIds = reader
+        ? s.Meetings.Values.Where(m => m.BoardId == bid).Select(m => m.Id).ToList()
+        : allowed;
+      return Results.Ok(new
+      {
+        id = b.Id,
+        name = eff.name,
+        mission = eff.mission,
+        stage = eff.stage,
+        discussionPolicy = eff.policy,
+        dataUse = eff.dataUse,
+        lead = leadOwned is null ? null : new { name = leadOwned.Name, roleLabel = leadOwned.RoleLabel },
+        meetingIds,
+      });
+    });
+
     app.MapGet("/api/boards/{bid:guid}/invites", (InMemoryStore s, HttpRequest req, Guid bid) =>
       PeopleOps.Check(s, req, bid, null, "manage") ?? Results.Ok(s.Invites.Values.Where(i => i.BoardId == bid).OrderByDescending(i => i.CreatedAt)));
 
@@ -491,6 +567,21 @@ public static class PeopleEndpoints
           {
             if (!s.Invites.TryGetValue(id, out var curA) || curA.State != "pending")
               throw new InvalidOperationException("Invite is not pending.");
+            // Re-resolve the CURRENT session identity inside the durable unit:
+            // a logout or revocation between the preliminary checks and commit
+            // must fail closed, never bind a stale identity.
+            string inUser;
+            if (PeopleOps.IsSecure(s))
+            {
+              if (!AuthOps.TrySession(s, req, out var inSess))
+                throw new UnauthorizedAccessException("Session ended before commit.");
+              inUser = inSess;
+              if (!string.Equals(inUser, user, StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException("Identity changed before commit.");
+            }
+            else inUser = AuthOps.TrySession(s, req, out var eIn) ? eIn : PeopleOps.UserOf(s, req);
+            if (string.IsNullOrWhiteSpace(inUser)) throw new InvalidOperationException("No identity to bind.");
+            user = inUser;
             curA.State = "accepted";
             curA.UserKey = user;
             s.Invites[id] = curA;
@@ -520,6 +611,7 @@ public static class PeopleEndpoints
           });
         }
         catch (InvalidOperationException iox) when (iox.Message == "Invite is not pending.") { return Results.Conflict(iox.Message); }
+          catch (UnauthorizedAccessException) { return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
         catch (Exception ex) { return Results.Json(new { error = "Invite acceptance could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (acceptMid.HasValue) PeopleOps.BumpMeeting(s, acceptMid.Value); } catch { }
         s.Audit.Add(new AuditEvent { BoardId = acceptBid, Action = "invite.accept", Detail = JsonSerializer.Serialize(new { user, meeting = acceptMid }) });
@@ -804,9 +896,11 @@ public static class PeopleEndpoints
               if (!s.Boards.TryGetValue(bid, out var __b2) || !string.Equals(__b2.OwnerKey, __me2, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("Only the installation admin or board owner can repair access.");
             }
             if (!s.Boards.TryGetValue(bid, out var __board2)) throw new InvalidOperationException("Board is gone.");
+            var needsReview = new List<object>();
             foreach (var inv in s.Invites.Values.Where(i => i.BoardId == bid && i.State == "accepted" && i.MeetingId != null).ToList())
             {
-              var u = !string.IsNullOrWhiteSpace(inv.UserKey) ? inv.UserKey : inv.Email;
+              if (string.IsNullOrWhiteSpace(inv.UserKey)) { needsReview.Add(new { user = inv.Email ?? "", note = "accepted invite without bound identity; owner review, never automatic grant" }); continue; }
+              var u = inv.UserKey;
               if (string.IsNullOrWhiteSpace(u)) continue;
               // Respect explicit leave/revoke and current meeting parent: an old accepted invite
               // must NOT silently reissue a revoked grant. Only a genuinely NEW explicit invitation
@@ -814,17 +908,18 @@ public static class PeopleEndpoints
               if (!s.Meetings.TryGetValue(inv.MeetingId.Value, out var __pm) || __pm.BoardId != bid) continue;
               { var __ex = s.Memberships.Values.FirstOrDefault(x => x.BoardId == bid && x.MeetingId == inv.MeetingId.Value && string.Equals(x.UserKey, u, StringComparison.OrdinalIgnoreCase)); if (__ex is not null && !__ex.Active) continue; }
               if (PeopleOps.WasExplicitlyLeft(s, bid, inv.MeetingId.Value, u)) continue;
-              var widened = s.Grants.Values.Where(g => g.BoardId == bid && g.MeetingId == null
+              // Independent board-wide grants are NEVER deleted: the current
+              // accept flow binds meeting-scoped grants only, so a coexisting
+              // board grant is either independently issued (preserve) or of
+              // unknown provenance (owner review, never automatic deletion).
+              var coexisting = s.Grants.Values.Where(g => g.BoardId == bid && g.MeetingId == null
                 && string.Equals(g.UserKey, u, StringComparison.OrdinalIgnoreCase)).ToList();
-              foreach (var w in widened)
-              {
-                s.Grants.TryRemove(w.Id, out _);
-                repaired.Add(new { user = u, removedBoardGrant = w.Id });
-                revokedLive.Add(u);
-              }
-              // No reissue: repair never grants access. A NEW explicit invitation + accept binds access;
-              // repair only narrows widened board grants and never resurrects revoked/leave state.
+              foreach (var w in coexisting)
+                needsReview.Add(new { user = u, boardGrant = w.Id, access = w.Access, note = "accepted meeting invite coexists with board-wide grant; owner review, not automatic removal" });
+              // No reissue: repair never grants access and never resurrects
+              // revoked/leave state.
             }
+            if (needsReview.Count > 0) repaired.Add(new { needsReview });
             PeopleOps.MarkEnforced(s, bid);
           });
         }

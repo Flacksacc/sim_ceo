@@ -16,6 +16,17 @@ public static class SimCEOEndpoints
   // Captured BEFORE model work and compared against a fresh ResolveLeadFor
   // immediately under the publication locks, so a same-version identity or
   // content swap discards the stale reply instead of publishing it.
+  static string DiscussionDirFingerprint(SimCEO.Api.Data.InMemoryStore s, Guid boardId, Guid meetingId)
+    {
+      try { return string.Join(",", s.Notes.Values.Where(n => n.BoardId == boardId && (n.MeetingId == meetingId || n.Scope == "board") && n.Kind == "direction").OrderBy(n => n.Id).Select(n => n.Id.ToString("N") + ":" + ((n.Body ?? "").Length).ToString())); }
+      catch { return ""; }
+    }
+  static string DiscussionEffFingerprint(SimCEO.Api.Data.InMemoryStore s, Guid boardId, Guid meetingId)
+    {
+      try { return string.Join("|", global::SimCEO.Api.RecordsOps.EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == boardId && x.MeetingId == meetingId)).OrderBy(v => v.Head.ToString()).Select(v => v.Head.ToString() + "=" + v.ConciseExport.Length.ToString())); }
+      catch { return ""; }
+    }
+
   private static string LeadIdentityFingerprint(LeadProfile? lead) =>
     lead is null ? "lead:none"
     : JsonSerializer.Serialize(new
@@ -122,6 +133,10 @@ public static class SimCEOEndpoints
       if (PeopleOps.Check(s, req, id, null, "manage") is { } deniedBoard) return deniedBoard;
       lock (s.SetupLock)
       {
+        // Fresh fetch + authority inside the durable unit: the pre-lock row
+        // must not source the mutation after an intervening failure.
+        if (!s.Boards.TryGetValue(id, out b)) return Results.NotFound();
+        if (PeopleOps.Check(s, req, id, null, "manage") is { } deniedBoardIn) return deniedBoardIn;
         if (body.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) b.Name = n.GetString() ?? "";
         if (body.TryGetProperty("mission", out var m) && m.ValueKind == JsonValueKind.String) b.Mission = m.GetString() ?? "";
         if (body.TryGetProperty("stage", out var st) && st.ValueKind == JsonValueKind.String) b.Stage = st.GetString() ?? "";
@@ -352,12 +367,28 @@ public static class SimCEOEndpoints
       // concurrent creations can never reserve and store the same version.
       SourceDoc? inlineDoc = null;
       string? inlineDup = null;
+      string? inlineDenied = null;
+      int inlineDeniedStatus = 403;
       lock (s.SetupLock)
       {
         lock (s.MessageLock)
         {
           Atomic.Run(() =>
           {
+            // Fresh board/scope/caller/policy validation inside the backend
+            // unit: revocation, meeting moves, or wiki-only switches between
+            // the entry check and insertion fail closed with zero write.
+            if (!s.Boards.TryGetValue(bid, out var curBoard) || curBoard is null)
+            { inlineDenied = "Board not found."; inlineDeniedStatus = 404; return; }
+            if (PeopleOps.Check(s, req, bid, effMeeting, "contribute") is { } deniedIc)
+            { inlineDenied = "Access revoked or not granted for this scope."; return; }
+            if (SourceGovernance.PolicyModeOf(curBoard) == "wikiOnly")
+            { inlineDenied = "Board policy is wiki-only; uploads are disabled. Add a Wiki connector resource instead."; inlineDeniedStatus = 415; return; }
+            if (!SourceGovernance.PolicyAllows(curBoard, new SourceDoc { FileName = fname, Origin = "upload" }))
+            { inlineDenied = "Source type is blocked on this board."; inlineDeniedStatus = 415; return; }
+            if (effScope == "meeting" && (!effMeeting.HasValue
+              || !s.Meetings.TryGetValue(effMeeting.Value, out var curMtg) || curMtg.BoardId != bid))
+            { inlineDenied = "Meeting does not belong to this board."; inlineDeniedStatus = 409; return; }
             var dupe = s.Sources.Values.FirstOrDefault(x => x.BoardId == bid && x.FamilyKey == familyKey && x.ContentHash == d.ContentHash);
             if (dupe is not null) { inlineDup = $"Identical content already stored as {dupe.Id} (v{dupe.Version})."; return; }
             d.Version = SourceGovernance.ReserveVersion(s, bid, familyKey);
@@ -368,12 +399,13 @@ public static class SimCEOEndpoints
           });
         }
       }
+      if (inlineDenied is not null) return Results.Json(new { error = inlineDenied }, statusCode: inlineDeniedStatus);
       if (inlineDoc is null) return Results.Conflict(inlineDup ?? "Identical content already stored.");
-      if (!SourceGovernance.TryBeginIndex(s, inlineDoc.Id, out var inlineRes, out var inlineBeginErr) || inlineRes is null)
+      if (!SourceGovernance.TryBeginIndex(s, req, inlineDoc.Id, "contribute", out var inlineRes, out var inlineBeginErr) || inlineRes is null)
         return Results.Json(new { error = inlineBeginErr }, statusCode: 500);
       var inlineExt = await Extraction.ExtractAsync(inlineRaw, fname);
       SourceGovernance.StampExtraction(s, inlineRes, Extraction.ToJson(inlineExt));
-      var (inlineOk, inlineStale, _, inlineErr, inlineStatus) = SourceGovernance.FinishIndex(s, inlineRes, false);
+      var (inlineOk, inlineStale, _, inlineErr, inlineStatus) = SourceGovernance.FinishIndex(s, req, inlineRes, false, "contribute");
       if (!inlineOk)
         return Results.Json(new { error = inlineErr, stale = inlineStale }, statusCode: inlineStatus);
       if (!s.Sources.TryGetValue(inlineDoc.Id, out var created) || created is null) return Results.NotFound();
@@ -553,6 +585,8 @@ public static class SimCEOEndpoints
       // so any in-flight publication generated before it must be discarded
       // even if meeting generation numbers happen to coincide.
       var epochBefore = s.SourceEpoch;
+      var dirBefore = DiscussionDirFingerprint(s, m.BoardId, id);
+      var effBefore = DiscussionEffFingerprint(s, m.BoardId, id);
       var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
       // Lane B: capture which candidates were explicitly invited; non-invited must stay Approved at commit.
       var invitedIds = new HashSet<Guid>();
@@ -766,9 +800,13 @@ public static class SimCEOEndpoints
               { laneBGate = LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
               // Re-authorize AFTER the model await: a caller revoked or expired during
               // generation must not publish (Auth8 publication boundary).
-              { var __tok2 = ""; try { var __ah2 = req.Headers["Authorization"].ToString(); if (__ah2.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok2 = __ah2["Bearer ".Length..].Trim(); } catch { } string __em2 = ""; bool __sessOk2 = false; try { if (!string.IsNullOrEmpty(__tok2) && s.Sessions.TryGetValue(__tok2, out var __ss2) && __ss2.ExpiresAt > System.DateTime.UtcNow) { __sessOk2 = true; __em2 = __ss2.Email; } } catch { } if (PeopleOps.IsSecure(s) && !__sessOk2) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have2 = PeopleOps.AccessFor(s, cur.BoardId, id, __em2); bool __ok2 = PeopleOps.IsSecure(s) ? (__have2 is "manage" or "contribute" or "discuss") : (__have2 == "open" || __have2 is "manage" or "contribute" or "discuss"); if (!__ok2) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } }
+              { var __tok2 = ""; try { var __ah2 = req.Headers["Authorization"].ToString(); if (__ah2.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok2 = __ah2["Bearer ".Length..].Trim(); } catch { } string __em2 = ""; bool __sessOk2 = false; try { if (!string.IsNullOrEmpty(__tok2) && s.Sessions.TryGetValue(__tok2, out var __ss2) && __ss2.ExpiresAt > System.DateTime.UtcNow) { __sessOk2 = true; __em2 = __ss2.Email; } } catch { } if (string.IsNullOrEmpty(__em2)) { try { __em2 = PeopleOps.UserOf(s, req); } catch { } } if (PeopleOps.IsSecure(s) && !__sessOk2) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have2 = PeopleOps.AccessFor(s, cur.BoardId, id, __em2); bool __ok2 = PeopleOps.IsSecure(s) ? (__have2 is "manage" or "contribute" or "discuss") : (__have2 == "open" || __have2 is "manage" or "contribute" or "discuss"); if (!__ok2) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } }
               if (s.SourceEpoch != epochBefore)
                 { laneBGate = LaneBFail("source evidence changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
+              if (!string.Equals(DiscussionDirFingerprint(s, cur.BoardId, id), dirBefore, StringComparison.Ordinal))
+                { laneBGate = LaneBFail("adopted directions changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
+              if (!string.Equals(DiscussionEffFingerprint(s, cur.BoardId, id), effBefore, StringComparison.Ordinal))
+                { laneBGate = LaneBFail("approved record context changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
             var curLead = LeadSetup.ResolveLeadFor(s, cur.BoardId);
             var curLeadVersion = curLead?.Version ?? 0;
             if (curLeadVersion != leadVersion
@@ -848,8 +886,8 @@ public static class SimCEOEndpoints
         }
       }
       s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
-      await hub.Clients.Group($"meeting:{id:N}".ToLowerInvariant()).SendAsync("run-complete",
-        new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) });
+      await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, id, "run-complete",
+        new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) }, "read");
       outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";
       outcome.Body = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = m.DeliveredRevision, rounds = rounds.Count, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, leadSeq = leadFloor, cap = effectiveCap, status = "completed" });
       s.Notes[outcome.Id] = outcome;

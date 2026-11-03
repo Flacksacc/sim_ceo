@@ -103,8 +103,33 @@ async function phase0() {
   const adv = await makeAdvisor(bid, "Keeper");
   ok("p0-advisor-ready", !adv.error, adv.error || "");
   const mid = await makeMeeting(bid, "p0 brief");
-  const br = await post("/api/meetings/" + mid + "/briefings", { topic: "qa topic", evidence: [{ kind: "source", ref: "s1", title: "T", excerpt: "E" }] });
-  ok("briefing-evidence-stored", br.status === 201 && JSON.stringify(br.json).includes("s1"), br.status + " " + br.text.slice(0, 200));
+  // Briefings resolve caller-supplied evidence server-side against CURRENT
+  // eligible sources; arbitrary refs are never trusted. Upload + approve a
+  // real source, then prove (a) the eligible ref resolves with canonical
+  // section text (forged quotations replaced) and (b) the bogus ref drops.
+  const srcText = "Unity ledger alpha: the board approved five dollars for tooling.\nSecond line for section shape.";
+  const sform = new FormData();
+  sform.append("file", new Blob([srcText], { type: "text/plain" }), "ledger.txt");
+  const upCtl = new AbortController();
+  const upT = setTimeout(() => upCtl.abort(), 60000);
+  let upStatus = 0, upJson = null, upText = "";
+  try {
+    const ur = await fetch(API + "/api/boards/" + bid + "/sources/upload", { method: "POST", signal: upCtl.signal, headers: { "x-user": "owner" }, body: sform });
+    upStatus = ur.status; upText = await ur.text();
+    try { upJson = upText ? JSON.parse(upText) : null; } catch { upJson = null; }
+  } finally { clearTimeout(upT); }
+  const srcId = upJson?.id ?? upJson?.Id ?? "";
+  ok("p0-source-upload-201", upStatus === 201 && !!srcId, upStatus + " " + upText.slice(0, 200));
+  const ap = await post("/api/sources/" + srcId + "/approve", {});
+  ok("p0-source-approve-200", ap.status === 200, ap.status + " " + ap.text.slice(0, 200));
+  // Approving evidence pauses affected active meetings by design; resume before briefing.
+  const rs = await post("/api/meetings/" + mid + "/resume", {});
+  ok("p0-meeting-resume-200", rs.status === 200, rs.status + " " + rs.text.slice(0, 200));
+  const br = await post("/api/meetings/" + mid + "/briefings", { topic: "qa topic", evidence: [{ kind: "source", ref: srcId, title: "T", excerpt: "forged quotation never in the file" }] });
+  const brBody = JSON.stringify(br.json);
+  ok("briefing-evidence-resolved", br.status === 201 && brBody.includes(srcId) && brBody.includes("Unity ledger alpha") && !brBody.includes("forged quotation never in the file"), br.status + " " + br.text.slice(0, 300));
+  const brBad = await post("/api/meetings/" + mid + "/briefings", { topic: "qa topic", evidence: [{ kind: "source", ref: "s1", title: "T", excerpt: "E" }] });
+  ok("briefing-unresolvable-dropped", brBad.status === 201 && !JSON.stringify(brBad.json).includes("s1"), brBad.status + " " + brBad.text.slice(0, 200));
   const exact = "Adopt $5.00 now [brackets] (keep!)";
   const dr = await post("/api/boards/" + bid + "/directions", { text: exact, scope: "meeting", meetingId: mid, evidence: [{ kind: "note", ref: "n1" }] });
   ok("direction-created", dr.status === 201, dr.status + " " + dr.text.slice(0, 160));
@@ -422,6 +447,11 @@ async function phase2() {
 async function phase3() {
   console.log("phase3: discussion + records");
   const bid = await makeBoard(run + "-p3");
+  // Run policy is board-governed (server-authoritative effective policy; the
+  // per-request policy field is not trusted for caps). Configure focused so
+  // the cap assertions exercise the board's configured 5-reply cap.
+  const polPatch = await patch("/api/boards/" + bid, { discussionPolicy: "focused" });
+  ok("p3-policy-focused-200", polPatch.status === 200, String(polPatch.status));
   await post("/api/boards/" + bid + "/lead", { name: "QA Lead", roleLabel: "Lead" });
   const roles = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"];
   for (const r of roles) {

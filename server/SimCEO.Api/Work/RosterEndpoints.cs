@@ -818,7 +818,14 @@ public static class RosterEndpoints
       string profile = body.TryGetProperty("profileJson", out var pj) ? pj.GetRawText() : "{}";
       if (body.TryGetProperty("rosterId", out var ri) && ri.GetGuid() is Guid rid
           && s.Roster.TryGetValue(rid, out var entry))
+      {
+        // Authorize the referenced private roster source BEFORE reading its
+        // profile or dispatching to the provider; strangers are denied here
+        // without consuming any metered call.
+        if (entry.Archived) return Results.NotFound();
+        if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, entry)) return PeopleOps.Denied();
         profile = entry.ProfileJson;
+      }
       var boardInfo = body.TryGetProperty("boardInfo", out var bi) ? (bi.GetString() ?? "") : "";
       string answer;
       try
@@ -1076,6 +1083,11 @@ public static class RosterEndpoints
         var admin = PeopleOps.AdminEmail(s);
         if (!string.IsNullOrWhiteSpace(admin) && string.Equals(admin, iu, StringComparison.OrdinalIgnoreCase)) ok = true;
         if (!ok && img.RosterEntryId.HasValue && s.Roster.TryGetValue(img.RosterEntryId.Value, out var re) && string.Equals(re.OwnerKey, iu, StringComparison.OrdinalIgnoreCase)) ok = true;
+        // Ordinary board readers/managers: the same roster-read boundary that
+        // permits listing this image's metadata also permits its exact bytes.
+        // Meeting guests remain confined to the accepted selected-portrait
+        // path below (CanReadRoster excludes meeting-scoped discuss grants).
+        if (!ok && img.RosterEntryId.HasValue && s.Roster.TryGetValue(img.RosterEntryId.Value, out var re2) && CanReadRoster(s, req, re2)) ok = true;
         if (!ok)
         {
           // Meeting guests: only the accepted, selected portrait of an approved

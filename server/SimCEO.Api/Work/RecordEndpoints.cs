@@ -35,15 +35,28 @@ public static partial class RecordsOps
       if (el.TryGetProperty("refs", out var refs))
       {
         if (refs.ValueKind != JsonValueKind.Array) { error = "Draft item '" + id + "' refs must be an array."; return false; }
+        var seenRefs = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var r in refs.EnumerateArray())
         {
           if (r.ValueKind != JsonValueKind.Object) { error = "Draft item '" + id + "' ref must be an object."; return false; }
-          if (EvidenceRef.Parse(r) is null) { error = "Draft item '" + id + "' carries an invalid evidence ref."; return false; }
+          var parsedRef = EvidenceRef.Parse(r);
+          if (parsedRef is null) { error = "Draft item '" + id + "' carries an invalid evidence ref."; return false; }
           foreach (var meta in new[] { "url", "title", "excerpt" })
           {
             if (r.TryGetProperty(meta, out var mv) && mv.ValueKind != JsonValueKind.String && mv.ValueKind != JsonValueKind.Null)
             { error = "Draft item '" + id + "' ref field '" + meta + "' must be a string."; return false; }
           }
+          // Ambiguous duplicate targets (same kind+ref, different requested
+          // versions) are rejected before publication: snapshot identity and
+          // resolution must never depend on ref order.
+          var rkey = parsedRef.Kind.ToLowerInvariant() + "\u0001" + parsedRef.Ref;
+          var rver = parsedRef.Version?.ToString();
+          if (seenRefs.TryGetValue(rkey, out var prior))
+          {
+            if (!string.Equals(prior, rver, StringComparison.Ordinal))
+            { error = "Draft item '" + id + "' has ambiguous duplicate evidence refs for '" + parsedRef.Kind + ":" + parsedRef.Ref + "' with different versions; pin one version."; return false; }
+          }
+          else seenRefs[rkey] = rver;
         }
       }
       idx++;
@@ -53,8 +66,15 @@ public static partial class RecordsOps
 
   public static string BuildExport(string itemsJson, string approvedJson, bool detailed)
   {
-    using var items = JsonDocument.Parse(string.IsNullOrWhiteSpace(itemsJson) ? "[]" : itemsJson);
-    using var approved = JsonDocument.Parse(string.IsNullOrWhiteSpace(approvedJson) ? "[]" : approvedJson);
+    JsonDocument items; JsonDocument approved;
+    try
+    {
+      items = JsonDocument.Parse(string.IsNullOrWhiteSpace(itemsJson) ? "[]" : itemsJson);
+      approved = JsonDocument.Parse(string.IsNullOrWhiteSpace(approvedJson) ? "[]" : approvedJson);
+    }
+    catch (JsonException) { return ""; }
+    using (items) using (approved)
+    {
     var ok = new HashSet<string>(approved.RootElement.EnumerateArray().Select(e => e.GetString() ?? ""), StringComparer.Ordinal);
     var sb = new StringBuilder();
     foreach (var el in items.RootElement.EnumerateArray())
@@ -79,6 +99,7 @@ public static partial class RecordsOps
       }
     }
     return sb.ToString();
+    }
   }
 
   public static List<string> ParseIdList(string json)
@@ -113,6 +134,16 @@ public static partial class RecordsOps
     }
     if (ids.Distinct(StringComparer.Ordinal).Count() != ids.Count) { error = "duplicate entries."; return false; }
     return true;
+  }
+
+  public static bool IsReadableItems(string itemsJson)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(itemsJson) ? "[]" : itemsJson);
+      return doc.RootElement.ValueKind == JsonValueKind.Array;
+    }
+    catch (JsonException) { return false; }
   }
 
   public static string ToIdList(IEnumerable<string> ids)
@@ -255,9 +286,24 @@ public static partial class RecordsOps
     foreach (var name in new[] { "itemId", "oldText", "newText", "actor", "viewedHash", "viewedToken", "token", "at" })
       if (e.TryGetProperty(name, out var s) && s.ValueKind != JsonValueKind.String)
       { error = "Decision history field '" + name + "' must be a string."; return false; }
-    foreach (var name in new[] { "seq", "viewedVersion", "viewedWatermark", "revision" })
-      if (e.TryGetProperty(name, out var n) && n.ValueKind != JsonValueKind.Number)
-      { error = "Decision history field '" + name + "' must be a number."; return false; }
+    // Sequence numbers are integral and start at 1; revisions/viewed counters
+    // must be integral (fractional or negative counters are never written by
+    // the builders, so their presence proves foreign or corrupt state).
+    if (e.TryGetProperty("seq", out var sq))
+    {
+      if (sq.ValueKind != JsonValueKind.Number || !sq.TryGetInt32(out var si) || si < 1)
+      { error = "Decision history field 'seq' must be a positive integer."; return false; }
+    }
+    foreach (var name in new[] { "viewedVersion", "viewedWatermark", "revision" })
+    {
+      if (e.TryGetProperty(name, out var n))
+      {
+        if (n.ValueKind != JsonValueKind.Number || !n.TryGetInt64(out var ni))
+        { error = "Decision history field '" + name + "' must be an integer."; return false; }
+        if (ni < 0)
+        { error = "Decision history field '" + name + "' must not be negative."; return false; }
+      }
+    }
     return true;
   }
 
@@ -275,7 +321,7 @@ public static partial class RecordsOps
   // invalid outside the boot-time compatibility initializer; malformed
   // arrays AND structurally invalid entries reject with a controlled 4xx.
   // Reads stay lenient and never reset this state.
-  public static bool StrictStateCheck(RecordDraft d, out string error)
+  public static bool StrictStateCheck(InMemoryStore s, RecordDraft d, out string error)
   {
     error = "";
     if (string.IsNullOrWhiteSpace(d.ItemsJson)) { error = "Draft items are blank; explicit repair required."; return false; }
@@ -293,7 +339,14 @@ public static partial class RecordsOps
     if (string.IsNullOrWhiteSpace(d.HistoryJson)) { error = "Decision history is blank; explicit repair required."; return false; }
     if (!StrictHistoryEntries(d.HistoryJson, out var herr)) { error = herr; return false; }
     if (string.IsNullOrWhiteSpace(d.SupersedesJson)) { error = "Supersedes state is blank; explicit repair required."; return false; }
-    if (!StrictSupersedesEntries(d.SupersedesJson, out var serr)) { error = serr; return false; }
+    if (!StrictSupersedesEntries(d.SupersedesJson, d.Id, out var serr)) { error = serr; return false; }
+    try
+    {
+      var closure = ClosureIds(s, d);
+      closure.Remove(d.Id.ToString());
+      if (closure.Contains(d.Id.ToString())) { error = "Supersedes chain is cyclic; explicit repair required."; return false; }
+    }
+    catch { error = "Supersedes chain unreadable; explicit repair required."; return false; }
     if (string.IsNullOrWhiteSpace(d.EvidenceSnapshotJson)) { error = "Evidence snapshot state is blank; explicit repair required."; return false; }
     if (!StrictSnapshotEntries(d.EvidenceSnapshotJson, out var eerr)) { error = eerr; return false; }
     if (string.IsNullOrWhiteSpace(d.ReviewToken)) { error = "Review state uninitialized; explicit repair required."; return false; }
@@ -307,24 +360,38 @@ public static partial class RecordsOps
     {
       using var h = JsonDocument.Parse(historyJson);
       if (h.RootElement.ValueKind != JsonValueKind.Array) { error = "Decision history is malformed; explicit repair required."; return false; }
+      var lastSeq = 0;
       foreach (var e in h.RootElement.EnumerateArray())
+      {
         if (!TryParseHistoryEntry(e, out var eerr)) { error = eerr; return false; }
+        if (e.TryGetProperty("seq", out var sq) && sq.ValueKind == JsonValueKind.Number && sq.TryGetInt32(out var si))
+        {
+          if (si != lastSeq + 1) { error = "Decision history sequence must ascend without gaps; explicit repair required."; return false; }
+          lastSeq = si;
+        }
+      }
     }
     catch (JsonException) { error = "Decision history is malformed; explicit repair required."; return false; }
     return true;
   }
 
-  public static bool StrictSupersedesEntries(string supersedesJson, out string error)
+  public static bool StrictSupersedesEntries(string supersedesJson, Guid selfId, out string error)
   {
     error = "";
     try
     {
       using var s = JsonDocument.Parse(supersedesJson);
       if (s.RootElement.ValueKind != JsonValueKind.Array) { error = "Supersedes state is malformed; explicit repair required."; return false; }
+      var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       foreach (var e in s.RootElement.EnumerateArray())
       {
-        if (e.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(e.GetString()) || !Guid.TryParse(e.GetString(), out _))
+        if (e.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(e.GetString()) || !Guid.TryParse(e.GetString(), out var g))
         { error = "Supersedes entries must be record ids; explicit repair required."; return false; }
+        var key = g.ToString();
+        if (string.Equals(key, selfId.ToString(), StringComparison.OrdinalIgnoreCase))
+        { error = "Supersedes chain must not reference its own record; explicit repair required."; return false; }
+        if (!seen.Add(key))
+        { error = "Supersedes entries must not repeat a record; explicit repair required."; return false; }
       }
     }
     catch (JsonException) { error = "Supersedes state is malformed; explicit repair required."; return false; }
@@ -391,20 +458,44 @@ public static partial class RecordsOps
     return seen;
   }
 
-  public sealed record EffectiveView(RecordDraft Head, List<string> ChainIds, List<string> EffectiveIds, string ConciseExport, Dictionary<string, string> EffectiveTexts);
+  public sealed record EffectiveOwner(string RecordId, int Version);
+  public sealed record EffectiveView(RecordDraft Head, List<string> ChainIds, List<string> EffectiveIds, string ConciseExport, Dictionary<string, string> EffectiveTexts, Dictionary<string, EffectiveOwner> EffectiveOwners, List<string> CoveredIds);
+
+  static bool HasApprovals(RecordDraft d)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(d.ApprovedJson) ? "[]" : d.ApprovedJson);
+      return doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0;
+    }
+    catch (JsonException) { return false; }
+  }
+
+  static bool IsTerminal(RecordDraft d) =>
+    string.Equals(d.Status, "discarded", StringComparison.OrdinalIgnoreCase)
+    || string.Equals(d.Status, "superseded", StringComparison.OrdinalIgnoreCase);
 
   public static List<EffectiveView> EffectiveChains(IEnumerable<RecordDraft> all)
   {
     var byId = new Dictionary<string, RecordDraft>(StringComparer.OrdinalIgnoreCase);
     foreach (var d in all) byId[d.Id.ToString()] = d;
-    var covered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Authority coverage: only APPROVED successors retire an ancestor. Pending
+    // or discarded proposals retire nothing and never become authoritative.
+    var coveredByApproved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var d in byId.Values)
-      foreach (var s in SupersededIdSet(d)) covered.Add(s);
-    var heads = byId.Values.Where(d => !covered.Contains(d.Id.ToString())).OrderBy(d => d.Version).ToList();
-    if (heads.Count == 0) heads = byId.Values.OrderBy(d => d.Version).ToList();
+    {
+      if (!HasApprovals(d)) continue;
+      foreach (var s in SupersededIdSet(d)) coveredByApproved.Add(s);
+    }
+    // Authoritative heads: approved content, not terminal, not superseded by
+    // another approved draft. Pending/discarded drafts are never heads.
+    var heads = byId.Values
+      .Where(d => HasApprovals(d) && !IsTerminal(d) && !coveredByApproved.Contains(d.Id.ToString()))
+      .OrderBy(d => d.Version).ThenBy(d => d.CreatedAt).ToList();
     var views = new List<EffectiveView>();
     foreach (var head in heads)
     {
+      // Ancestor closure of the authority (approved lineage only for effect).
       var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { head.Id.ToString() };
       var q = new Queue<string>(SupersededIdSet(head));
       while (q.Count > 0)
@@ -412,13 +503,34 @@ public static partial class RecordsOps
         var id = q.Dequeue();
         if (!ids.Add(id)) continue;
         if (byId.TryGetValue(id, out var dd))
-          foreach (var p in SupersededIdSet(dd)) q.Enqueue(p);
+          foreach (var pp in SupersededIdSet(dd)) q.Enqueue(pp);
+      }
+      // Family membership: every draft in this board+meeting whose closure
+      // reaches the authority (pending/discarded descendants included), so a
+      // pending amendment still resolves its inherited approved context.
+      var covers = new HashSet<string>(ids, StringComparer.OrdinalIgnoreCase);
+      foreach (var d in byId.Values)
+      {
+        if (covers.Contains(d.Id.ToString())) continue;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var qq = new Queue<string>(SupersededIdSet(d));
+        var reaches = false;
+        while (qq.Count > 0 && !reaches)
+        {
+          var x = qq.Dequeue();
+          if (!seen.Add(x)) continue;
+          if (ids.Contains(x)) { reaches = true; break; }
+          if (byId.TryGetValue(x, out var dx))
+            foreach (var pp in SupersededIdSet(dx)) qq.Enqueue(pp);
+        }
+        if (reaches) covers.Add(d.Id.ToString());
       }
       var lineage = ids
         .Select(id => byId.TryGetValue(id, out var dd) ? dd : null)
         .Where(d => d is not null)
         .OrderBy(d => d!.Version).ThenBy(d => d!.CreatedAt).ToList();
       var eff = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+      var owners = new Dictionary<string, EffectiveOwner>(StringComparer.Ordinal);
       foreach (var d in lineage)
       {
         if (d is null) continue;
@@ -426,22 +538,92 @@ public static partial class RecordsOps
         if (merr != "") continue;
         if (!TryStrictIdList(d.ApprovedJson, out var ap, out _)) continue;
         foreach (var id2 in ap)
-          if (map.TryGetValue(id2, out var el)) eff[id2] = el.Clone();
+        {
+          if (map.TryGetValue(id2, out var el))
+          {
+            eff[id2] = el.Clone();
+            // Owner provenance: the exact approving record+version that last
+            // set this item. New-ID-only amendments inherit old owners and add
+            // their own; nothing is text-only.
+            owners[id2] = new EffectiveOwner(d.Id.ToString(), d.Version);
+          }
+        }
       }
       var eids = eff.Keys.OrderBy(x => x, StringComparer.Ordinal).ToList();
       var sb = new StringBuilder();
       var texts = new Dictionary<string, string>(StringComparer.Ordinal);
       foreach (var id2 in eids)
       {
-        var t = ItemText(eff[id2]);
-        texts[id2] = t;
-        sb.AppendLine("- [" + id2 + "] " + t);
+        var tx = ItemText(eff[id2]);
+        texts[id2] = tx;
+        sb.AppendLine("- [" + id2 + "] " + tx);
       }
       views.Add(new EffectiveView(head,
         lineage.Where(d => d is not null).Select(d => d!.Id.ToString()).ToList(),
-        eids, sb.ToString(), texts));
+        eids, sb.ToString(), texts, owners,
+        covers.OrderBy(x => x, StringComparer.Ordinal).ToList()));
     }
     return views;
+  }
+
+  static HashSet<string> ClosureOf(Dictionary<string, RecordDraft> byId, RecordDraft root)
+  {
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { root.Id.ToString() };
+    var q = new Queue<string>(SupersededIdSet(root));
+    while (q.Count > 0)
+    {
+      var id = q.Dequeue();
+      if (!seen.Add(id)) continue;
+      if (byId.TryGetValue(id, out var dd))
+        foreach (var p in SupersededIdSet(dd)) q.Enqueue(p);
+    }
+    return seen;
+  }
+
+  // Approval-time authority: the FIRST legitimate approved successor wins
+  // WITHIN its lineage family. Approving draft D is rejected with 409 only when
+  // another same-scope approved draft competes for the SAME authority: either
+  // it shares supersedes ancestry with D (sibling/descendant, not an ancestor)
+  // or it already owns one of Ds item ids. Independent roots with disjoint items
+  // are separate lineages and never block each other; ambiguous same-item claims
+  // across families stay rejected until rebased or discarded.
+  public static bool CheckApprovalAuthority(InMemoryStore s, RecordDraft d, out string error)
+  {
+    error = "";
+    var byId = new Dictionary<string, RecordDraft>(StringComparer.OrdinalIgnoreCase);
+    foreach (var x in s.Drafts.Values)
+      if (x.BoardId == d.BoardId && x.MeetingId == d.MeetingId) byId[x.Id.ToString()] = x;
+    var mine = ClosureOf(byId, d);
+    var myItems = new HashSet<string>(ItemMap(d.ItemsJson, out _).Keys, StringComparer.Ordinal);
+    foreach (var other in byId.Values)
+    {
+      if (other.Id == d.Id) continue;
+      if (!HasApprovals(other)) continue;
+      if (mine.Contains(other.Id.ToString())) continue; // proper ancestor: normal continuation
+      var otherClosure = ClosureOf(byId, other);
+      var sharesAncestry = mine.Any(id => otherClosure.Contains(id)) || otherClosure.Any(id => mine.Contains(id));
+      if (!sharesAncestry && !myItems.Overlaps(ParseIdList(other.ApprovedJson))) continue; // independent lineage
+      error = "Another approved review already carries this lineage forward; continue on the authoritative head instead of approving a competing branch.";
+      return false;
+    }
+    return true;
+  }
+  // At most ONE open (undecided) successor per authoritative lineage. A
+  // discarded unapproved proposal retires nothing and allows a new proposal.
+  public static bool CheckSingleOpenSuccessor(InMemoryStore s, RecordDraft old, out string error)
+  {
+    error = "";
+    foreach (var d in s.Drafts.Values)
+    {
+      if (d.Id == old.Id) continue;
+      if (d.BoardId != old.BoardId || d.MeetingId != old.MeetingId) continue;
+      if (!SupersededIdSet(d).Contains(old.Id.ToString())) continue;
+      if (d.Decided) continue;
+      if (HasApprovals(d)) continue; // decided-content handled by approval authority
+      error = "This review already has an open successor; continue on it instead of branching again.";
+      return false;
+    }
+    return true;
   }
 
   public static bool ValidateSupersedesChain(InMemoryStore s, RecordDraft old, string[] extra, out string error)
@@ -456,6 +638,14 @@ public static partial class RecordsOps
       if (!s.Drafts.TryGetValue(g, out var target) || target is null) { error = "Superseded record not found."; return false; }
       if (target.BoardId != old.BoardId || target.MeetingId != old.MeetingId) { error = "Supersedes target belongs to another board or meeting."; return false; }
       if (ParseIdList(target.ApprovedJson).Count == 0) { error = "Supersedes target has no approved items."; return false; }
+      foreach (var other in extra.Concat(new[] { old.Id.ToString() }))
+      {
+        if (!Guid.TryParse(other, out var og) || og == g) continue;
+        if (!s.Drafts.TryGetValue(og, out var ot) || ot is null) continue;
+        var shared = new HashSet<string>(ParseIdList(target.ApprovedJson), StringComparer.Ordinal);
+        shared.IntersectWith(ParseIdList(ot.ApprovedJson));
+        if (shared.Count > 0) { error = "Supersedes parents share approved item '" + string.Join(",", shared.OrderBy(x => x)) + "'; rebase onto one authoritative head instead of merging."; return false; }
+      }
       if (ClosureIds(s, target).Contains(old.Id.ToString())) { error = "Supersedes chain would cycle."; return false; }
     }
     return true;
@@ -492,7 +682,7 @@ public static partial class RecordsOps
   {
     var outList = new List<LineageEffect>();
     var chain = EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
-    var mine = chain.FirstOrDefault(v => v.ChainIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
+    var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
     if (mine is null) return outList;
     var byId = new Dictionary<string, RecordDraft>(StringComparer.OrdinalIgnoreCase);
     foreach (var x in s.Drafts.Values) byId[x.Id.ToString()] = x;
@@ -606,7 +796,10 @@ public static partial class RecordsOps
           var okState = doc.Approved && !doc.Excluded;
           var okScope = doc.Scope == "board" || doc.MeetingId == null || doc.MeetingId == d.MeetingId;
           var okVersion = !parsed.Version.HasValue || parsed.Version.Value == doc.Version;
-          if (okBoard && okState && okScope && okVersion)
+          // Current referenced-resource authorization BEFORE any title/text:
+          // a reader confined to another meeting must not receive this source.
+          var okAuth = okBoard && PeopleOps.Can(s, req, doc.BoardId, doc.MeetingId, "read");
+          if (okBoard && okState && okScope && okVersion && okAuth)
             cards.Add(new EvidenceCard(itemId, kind, rf, doc.Version, doc.FileName, Trunc(ReadableSourceText(s, doc), 600), true, true, false));
           else
             cards.Add(Unavailable(itemId, kind, rf, parsed.Version));
@@ -620,7 +813,8 @@ public static partial class RecordsOps
           var okBoard = note.BoardId == d.BoardId;
           var okState = !note.Provisional;
           var okScope = note.Scope == "board" || (note.Scope == "meeting" && note.MeetingId == d.MeetingId);
-          if (okKind && okBoard && okState && okScope)
+          var okNoteAuth = okBoard && PeopleOps.Can(s, req, note.BoardId, note.Scope == "meeting" ? (Guid?)note.MeetingId : d.MeetingId, "read");
+          if (okKind && okBoard && okState && okScope && okNoteAuth)
             cards.Add(new EvidenceCard(itemId, kind, rf, null, note.Title ?? "", Trunc(note.Body ?? "", 600), true, true, false));
           else
             cards.Add(Unavailable(itemId, kind, rf, parsed.Version));
@@ -632,7 +826,8 @@ public static partial class RecordsOps
           var okVersion = !parsed.Version.HasValue || parsed.Version.Value == rd.Version;
           var okState = ParseIdList(rd.ApprovedJson).Count > 0
             && !string.Equals(rd.Status, "superseded", StringComparison.OrdinalIgnoreCase);
-          if (okBoard && okAuth && okVersion && okState)
+          var okReadable = IsReadableItems(rd.ItemsJson);
+          if (okBoard && okAuth && okVersion && okState && okReadable)
           {
             var txt = BuildExport(rd.ItemsJson, rd.ApprovedJson, false);
             cards.Add(new EvidenceCard(itemId, kind, rf, rd.Version, "record v" + rd.Version, Trunc(txt, 600), true, true, false));
@@ -722,7 +917,7 @@ public static partial class RecordsOps
     }
     catch (JsonException) { error = "Evidence snapshot state is malformed; explicit repair required."; return false; }
     var idx = new Dictionary<string, int>(StringComparer.Ordinal);
-    for (var i = 0; i < snaps.Count; i++) idx[SnapshotKey(snaps[i].ItemId, snaps[i].Kind, snaps[i].Ref)] = i;
+    for (var i = 0; i < snaps.Count; i++) idx[SnapshotKeyV(snaps[i].ItemId, snaps[i].Kind, snaps[i].Ref, snaps[i].Version)] = i;
     var live = new Dictionary<string, EvidenceCard>(StringComparer.Ordinal);
     foreach (var c in authorized) live[SnapshotKey(c.ItemId, c.Kind, c.Ref)] = c;
     foreach (var id in newIds)
@@ -733,12 +928,20 @@ public static partial class RecordsOps
       {
         var parsed = EvidenceRef.Parse(r);
         if (parsed is null) continue;
-        var key = SnapshotKey(id, parsed.Kind, parsed.Ref);
+        var key = SnapshotKeyV(id, parsed.Kind, parsed.Ref, parsed.Version);
         if (idx.ContainsKey(key)) continue; // never overwrite an existing capture
         EvidenceSnapshot entry;
-        if (live.TryGetValue(key, out var card) && !card.Missing
-          && (!string.IsNullOrWhiteSpace(card.Title) || !string.IsNullOrWhiteSpace(card.Excerpt)))
-          entry = new EvidenceSnapshot(id, parsed.Kind, parsed.Ref, card.Version, true, card.Title, card.Excerpt, DateTime.UtcNow.ToString("o"), revision);
+        // Live lookup ignores the requested version pin: the persisted entry
+        // always carries the RESOLVED capture version, so readback compares
+        // resolved-against-resolved. A versioned request that does not match
+        // the current resolution captures unavailable (stale pin), never
+        // another versions bytes. Duplicate same-target different-version refs
+        // are rejected at validation, so one requested version owns this key.
+        var liveHit = live.TryGetValue(SnapshotKey(id, parsed.Kind, parsed.Ref), out var card) && !card.Missing
+          && (!string.IsNullOrWhiteSpace(card.Title) || !string.IsNullOrWhiteSpace(card.Excerpt));
+        var pinOk = parsed.Version is null || (card is not null && card.Version == parsed.Version);
+        if (liveHit && pinOk)
+          entry = new EvidenceSnapshot(id, parsed.Kind, parsed.Ref, card!.Version, true, card!.Title, card!.Excerpt, DateTime.UtcNow.ToString("o"), revision);
         else
           entry = new EvidenceSnapshot(id, parsed.Kind, parsed.Ref, parsed.Version, false, "", "", DateTime.UtcNow.ToString("o"), revision);
         idx[key] = snaps.Count; snaps.Add(entry);
@@ -753,6 +956,11 @@ public static partial class RecordsOps
     return itemId + "\u0001" + kind + "\u0001" + rf;
   }
 
+  public static string SnapshotKeyV(string itemId, string kind, string rf, int? version)
+  {
+    return itemId + "\u0001" + kind + "\u0001" + rf + "\u0001" + (version?.ToString() ?? "");
+  }
+
   public static bool TryParseSnapshotEntry(JsonElement e, out EvidenceSnapshot sn, out string error)
   {
     sn = new EvidenceSnapshot("", "", "", null, false, "", "", "", 0); error = "";
@@ -762,11 +970,13 @@ public static partial class RecordsOps
     var rf = e.TryGetProperty("ref", out var c) && c.ValueKind == JsonValueKind.String ? (c.GetString() ?? "") : "";
     if (string.IsNullOrWhiteSpace(itemId) || string.IsNullOrWhiteSpace(kind) || string.IsNullOrWhiteSpace(rf))
     { error = "Evidence snapshot entries must carry itemId, kind, and ref."; return false; }
+    if (!EvidenceRef.ValidKind(kind)) { error = "Evidence snapshot kind '" + kind + "' is not a known evidence kind."; return false; }
     int? ver = null;
     if (e.TryGetProperty("version", out var vv))
     {
       if (vv.ValueKind == JsonValueKind.Null) ver = null;
       else if (vv.ValueKind != JsonValueKind.Number || !vv.TryGetInt32(out var vi)) { error = "Evidence snapshot version must be an integer or null."; return false; }
+      else if (vi < 1) { error = "Evidence snapshot version must be a positive version or null."; return false; }
       else ver = vi;
     }
     var title = "";
@@ -818,7 +1028,7 @@ public static partial class RecordsOps
     foreach (var sn in snaps)
     {
       if (!approved.Contains(sn.ItemId)) continue;
-      snapKeys.Add(SnapshotKey(sn.ItemId, sn.Kind, sn.Ref));
+      snapKeys.Add(SnapshotKeyV(sn.ItemId, sn.Kind, sn.Ref, sn.Version));
       if (sn.Available && SnapshotAuthorize(s, req, d, sn))
       {
         var stillEligible = live.Any(c => !c.Missing && c.ItemId == sn.ItemId && c.Kind == sn.Kind && c.Ref == sn.Ref
@@ -842,7 +1052,7 @@ public static partial class RecordsOps
       {
         var parsed = EvidenceRef.Parse(r);
         if (parsed is null) continue;
-        if (!snapKeys.Contains(SnapshotKey(itemId, parsed.Kind, parsed.Ref)))
+        if (!snapKeys.Contains(SnapshotKeyV(itemId, parsed.Kind, parsed.Ref, parsed.Version)))
           result.Add(Unavailable(itemId, parsed.Kind, parsed.Ref, parsed.Version));
       }
     }
@@ -869,8 +1079,70 @@ public static partial class RecordsOps
     return true;
   }
 
+  // Guest projection: approved items/content only. Pending/discarded text,
+  // provisional notes, recent messages and the version graph are withheld;
+  // evidence is limited to approved item refs (authorized bytes or explicit
+  // unavailable cards). Shape stays 200 so authorized readers always render.
+  public static Dictionary<string, object?> GuestDraftView(InMemoryStore s, RecordDraft d)
+  {
+    // Approved-item content with exact owner provenance: approved text only,
+    // each item pinned to the record+version that approved it. Pending text
+    // never leaves the server for unauthorized readers.
+    var items = new List<object>();
+    try
+    {
+      var chain = EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
+      var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
+      if (mine is not null)
+        foreach (var id in mine.EffectiveIds)
+          items.Add(new
+          {
+            id,
+            text = mine.EffectiveTexts.TryGetValue(id, out var tx) ? tx : "",
+            approvedBy = mine.EffectiveOwners.TryGetValue(id, out var ow)
+              ? new { recordId = ow.RecordId, version = ow.Version } : null,
+          });
+    }
+    catch { }
+    return new Dictionary<string, object?>
+    {
+      ["id"] = d.Id, ["boardId"] = d.BoardId, ["meetingId"] = d.MeetingId,
+      ["version"] = d.Version, ["decided"] = d.Decided, ["status"] = d.Status,
+      ["approvedJson"] = d.ApprovedJson, ["approvedItems"] = items, ["createdAt"] = d.CreatedAt,
+    };
+  }
+
+  public static Dictionary<string, object?> GuestReviewPayload(InMemoryStore s, HttpRequest req, RecordDraft d, Meeting mtg)
+  {
+    var approved = ParseIdList(d.ApprovedJson);
+    var aset = new HashSet<string>(approved, StringComparer.Ordinal);
+    var cards = MergeEvidenceForRead(s, req, d).Where(c => aset.Contains(c.ItemId)).ToList();
+    var chain = EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
+    var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
+    return new Dictionary<string, object?>
+    {
+      ["draft"] = GuestDraftView(s, d),
+      ["approved"] = approved,
+      ["discarded"] = new List<string>(),
+      ["pending"] = new List<string>(),
+      ["notes"] = new List<object>(),
+      ["recentMessages"] = new List<object>(),
+      ["predecessors"] = new List<string>(),
+      ["successors"] = new List<string>(),
+      ["evidence"] = cards,
+      ["historyCount"] = HistoryCount(d.HistoryJson),
+      ["meetingWatermark"] = mtg.DeliveredRevision,
+      ["effectiveIds"] = mine is null ? new List<string>() : mine.EffectiveIds,
+      ["effectiveExport"] = mine is null ? "" : mine.ConciseExport,
+      ["lineageEffects"] = AmendmentEffects(s, d),
+    };
+  }
+
   public static Dictionary<string, object?> ReviewPayload(InMemoryStore s, HttpRequest req, RecordDraft d, Meeting mtg)
   {
+    // Authoritative persisted-state validity: every approval control in the
+    // UI gates on this server-computed flag, not on partial client checks.
+    var stateValid = StrictStateCheck(s, d, out var stateError);
     var approved = ParseIdList(d.ApprovedJson);
     var discarded = ParseIdList(d.DiscardedJson);
     var pending = PendingIds(d);
@@ -902,10 +1174,12 @@ public static partial class RecordsOps
     var cards = MergeEvidenceForRead(s, req, d);
     int histCount = HistoryCount(d.HistoryJson);
     var chain = EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
-    var mine = chain.FirstOrDefault(v => v.ChainIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
+    var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
     return new Dictionary<string, object?>
     {
       ["draft"] = SafeDraft(d),
+      ["stateValid"] = stateValid,
+      ["stateError"] = stateValid ? "" : stateError,
       ["approved"] = approved,
       ["discarded"] = discarded,
       ["pending"] = pending,
@@ -960,17 +1234,7 @@ public static partial class RecordsOps
       || (meetingId.HasValue && PeopleOps.Can(s, req, boardId, meetingId, "contribute"));
   }
 
-  private static Dictionary<string, object?> GuestDraft(RecordDraft d)
-  {
-    // Decided + approved items/content only: no pending text, no history,
-    // no snapshot bytes (SafeDraft already omits them), no supersession graph.
-    return new Dictionary<string, object?>
-    {
-      ["id"] = d.Id, ["boardId"] = d.BoardId, ["meetingId"] = d.MeetingId,
-      ["version"] = d.Version, ["decided"] = d.Decided, ["status"] = d.Status,
-      ["approvedJson"] = d.ApprovedJson, ["createdAt"] = d.CreatedAt,
-    };
-  }
+  private static Dictionary<string, object?> GuestDraft(InMemoryStore s, RecordDraft d) => RecordsOps.GuestDraftView(s, d);
 
   public static void MapRecords(this WebApplication app)
   {
@@ -982,7 +1246,7 @@ public static partial class RecordsOps
       if (!IsManager(s, req, m.BoardId, id))
       {
         rows = rows.Where(d => d.Decided && !string.IsNullOrWhiteSpace(d.ApprovedJson) && d.ApprovedJson.Trim() != "[]").ToList();
-        return Results.Ok(rows.Select(GuestDraft).ToList());
+        return Results.Ok(rows.Select(x => GuestDraft(s, x)).ToList());
       }
       return Results.Ok(rows.Select(RecordsOps.SafeDraft).ToList());
     });
@@ -992,11 +1256,7 @@ public static partial class RecordsOps
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
       if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedRD) return deniedRD;
       if (!IsManager(s, req, d.BoardId, d.MeetingId))
-      {
-        if (!d.Decided || string.IsNullOrWhiteSpace(d.ApprovedJson) || d.ApprovedJson.Trim() == "[]")
-          return PeopleOps.Denied();
-        return Results.Ok(GuestDraft(d));
-      }
+        return Results.Ok(RecordsOps.GuestDraftView(s, d));
       return Results.Ok(RecordsOps.SafeDraft(d));
     });
 
@@ -1006,8 +1266,6 @@ public static partial class RecordsOps
       if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedEv) return deniedEv;
       if (!IsManager(s, req, d.BoardId, d.MeetingId))
       {
-        if (!d.Decided || string.IsNullOrWhiteSpace(d.ApprovedJson) || d.ApprovedJson.Trim() == "[]")
-          return PeopleOps.Denied();
         var approvedOnly = new HashSet<string>(RecordsOps.ParseIdList(d.ApprovedJson), StringComparer.Ordinal);
         return Results.Ok(RecordsOps.MergeEvidenceForRead(s, req, d).Where(c => approvedOnly.Contains(c.ItemId)).ToList());
       }
@@ -1018,9 +1276,9 @@ public static partial class RecordsOps
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
       if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedRv) return deniedRv;
-      if (!IsManager(s, req, d.BoardId, d.MeetingId) && (!d.Decided || string.IsNullOrWhiteSpace(d.ApprovedJson) || d.ApprovedJson.Trim() == "[]"))
-        return PeopleOps.Denied();
       if (!s.Meetings.TryGetValue(d.MeetingId, out var mtg)) return Results.NotFound("meeting");
+      if (!IsManager(s, req, d.BoardId, d.MeetingId))
+        return Results.Ok(RecordsOps.GuestReviewPayload(s, req, d, mtg));
       return Results.Ok(RecordsOps.ReviewPayload(s, req, d, mtg));
     });
 
@@ -1028,10 +1286,8 @@ public static partial class RecordsOps
     {
       if (!s.Drafts.TryGetValue(draftId, out var d)) return Results.NotFound();
       if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "read") is { } deniedEf) return deniedEf;
-      if (!IsManager(s, req, d.BoardId, d.MeetingId) && (!d.Decided || string.IsNullOrWhiteSpace(d.ApprovedJson) || d.ApprovedJson.Trim() == "[]"))
-        return PeopleOps.Denied();
       var chain = RecordsOps.EffectiveChains(s.Drafts.Values.Where(x => x.BoardId == d.BoardId && x.MeetingId == d.MeetingId));
-      var mine = chain.FirstOrDefault(v => v.ChainIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
+      var mine = chain.FirstOrDefault(v => v.CoveredIds.Contains(d.Id.ToString(), StringComparer.OrdinalIgnoreCase));
       if (mine is null) return Results.NotFound("chain");
       return Results.Ok(new { head = mine.Head.Id, chain = mine.ChainIds, effectiveIds = mine.EffectiveIds, conciseExport = mine.ConciseExport, effectiveTexts = mine.EffectiveTexts });
     });
@@ -1051,7 +1307,7 @@ public static partial class RecordsOps
             if (PeopleOps.Check(s, req, d.BoardId, d.MeetingId, "contribute") is { } deniedAuto1) return deniedAuto1;
             if (IsSuperseded(d))
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (body.ValueKind != JsonValueKind.Object)
               return Results.Json(new { error = "Refresh review: send the current version, hash, review token and watermark together." }, statusCode: 400);
@@ -1079,13 +1335,29 @@ public static partial class RecordsOps
             var newTokenF = RecordsOps.NewReviewToken();
             if (!RecordsOps.TryBuildHistoryJson(d.HistoryJson, "refresh", "", "watermark " + viewedW, "watermark " + newWm, actor, viewedV, viewedH, viewedW, viewedT, d.ReviewRevision + 1, newTokenF, out var newHistoryF, out var herr))
               return Results.Json(new { error = herr }, statusCode: 422);
+            // Fallible response construction completes BEFORE any mutation:
+            // build the review payload from a staged copy, so a malformed
+            // referenced row fails closed with zero state change.
+            var staged = new RecordDraft
+            {
+              Id = d.Id, BoardId = d.BoardId, MeetingId = d.MeetingId, Version = d.Version,
+              Watermark = newWm, ItemsJson = d.ItemsJson, Hash = d.Hash,
+              ApprovedJson = d.ApprovedJson, DiscardedJson = d.DiscardedJson,
+              ReviewRevision = d.ReviewRevision + 1, ReviewToken = newTokenF,
+              HistoryJson = newHistoryF, SupersedesJson = d.SupersedesJson,
+              EvidenceSnapshotJson = d.EvidenceSnapshotJson,
+              Decided = d.Decided, Status = d.Status, CreatedAt = d.CreatedAt,
+            };
+            Dictionary<string, object?> payload;
+            try { payload = RecordsOps.ReviewPayload(s, req, staged, meeting); }
+            catch (Exception px) { return Results.Json(new { error = "Review payload failed before commit; no state changed (" + px.GetType().Name + ")." }, statusCode: 500); }
             d.Watermark = newWm;
             d.HistoryJson = newHistoryF;
             d.ReviewRevision++;
             d.ReviewToken = newTokenF;
             s.Drafts.Flush();
             pendingAudit = new AuditEvent { BoardId = d.BoardId, Action = "record.refresh", Detail = JsonSerializer.Serialize(new { draft = draftId, watermark = d.Watermark, revision = d.ReviewRevision }) };
-            return Results.Ok(RecordsOps.ReviewPayload(s, req, d, meeting));
+            return Results.Ok(payload);
           });
         }
         catch (Exception) { return CommitFailed(); }
@@ -1109,10 +1381,12 @@ public static partial class RecordsOps
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
             if (d.Decided)
               return Results.Json(new { error = "Review is already decided; refresh review." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, d, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
+            if (!RecordsOps.CheckApprovalAuthority(s, d, out var authErr))
+              return Results.Json(new { error = authErr }, statusCode: 409);
             string itemId = "";
             if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("itemId", out var iv) && iv.ValueKind == JsonValueKind.String)
               itemId = (iv.GetString() ?? "").Trim();
@@ -1173,10 +1447,12 @@ public static partial class RecordsOps
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
             if (d.Decided)
               return Results.Json(new { error = "Review is already decided; refresh review." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, d, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
+            if (!RecordsOps.CheckApprovalAuthority(s, d, out var authErrAll))
+              return Results.Json(new { error = authErrAll }, statusCode: 409);
             var map = RecordsOps.ItemMap(d.ItemsJson, out var mapErr);
             if (mapErr != "") return Results.Json(new { error = mapErr }, statusCode: 422);
             RecordsOps.TryStrictIdList(d.ApprovedJson, out var apList, out _);
@@ -1232,7 +1508,7 @@ public static partial class RecordsOps
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
             if (d.Decided)
               return Results.Json(new { error = "Review is already decided; refresh review." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, d, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
@@ -1310,7 +1586,7 @@ public static partial class RecordsOps
               return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
             if (d.Decided)
               return Results.Json(new { error = "Review is already decided; refresh review." }, statusCode: 409);
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, d, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
@@ -1361,15 +1637,20 @@ public static partial class RecordsOps
             if (!s.Drafts.TryGetValue(draftId, out var old) || old is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(old.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
             if (PeopleOps.Check(s, req, old.BoardId, old.MeetingId, "contribute") is { } deniedAuto6) return deniedAuto6;
+            if (!RecordsOps.ValidateSupersedesChain(s, old, extraSupersedes, out var verr))
+              return Results.Json(new { error = verr }, statusCode: 422);
             if (IsSuperseded(old))
               return Results.Json(new { error = "Review is superseded; branch from the current successor instead." }, statusCode: 409);
+            if (!RecordsOps.CheckSingleOpenSuccessor(s, old, out var openErr))
+              return Results.Json(new { error = openErr }, statusCode: 409);
             if (!amend && old.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
             if (amend && (!old.Decided || !string.Equals(old.Status, "approved", StringComparison.OrdinalIgnoreCase)))
               return Results.Conflict("Only a final approved record can be amended; revise the current open version instead.");
-            if (!RecordsOps.StrictStateCheck(old, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, old, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, old, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);
+
             if (!amend)
             {
               var decidedCount = RecordsOps.ParseIdList(old.ApprovedJson).Count + RecordsOps.ParseIdList(old.DiscardedJson).Count;
@@ -1378,8 +1659,7 @@ public static partial class RecordsOps
             }
             if (RecordsOps.HasApprovedSuccessor(s, old))
               return Results.Json(new { error = "An approved successor already carries this line forward; continue on the authoritative head instead." }, statusCode: 409);
-            if (!RecordsOps.ValidateSupersedesChain(s, old, extraSupersedes, out var verr))
-              return Results.Json(new { error = verr }, statusCode: 422);
+
             JsonElement itemsEl;
             string items;
             if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("items", out var it))
@@ -1464,7 +1744,7 @@ public static partial class RecordsOps
             if (IsSuperseded(d))
               return Results.Json(new { error = "Review is superseded by a newer version." }, statusCode: 409);
             if (d.Decided) return Results.Conflict("Draft already decided; revise the current version instead.");
-            if (!RecordsOps.StrictStateCheck(d, out var serr))
+            if (!RecordsOps.StrictStateCheck(s, d, out var serr))
               return Results.Json(new { error = serr }, statusCode: 422);
             if (!RecordsOps.CheckGuard(body, d, meeting, out var gs, out var ge))
               return Results.Json(new { error = ge }, statusCode: gs);

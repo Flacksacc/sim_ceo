@@ -366,6 +366,9 @@ async function fetchAuth<T>(u: string, init: RequestInit, wantJson = true): Prom
     }
   }
   if (!r.ok) throw new Error(`${r.status} ${text}`);
+  // HTTP 204 means deliberate no-content success (e.g. grant/invite delete);
+  // accept it explicitly. Other empty bodies still fail closed for JSON calls.
+  if (r.status === 204) return undefined as unknown as T;
   if (!wantJson) return undefined as unknown as T;
   if (!text) throw Object.assign(new Error("empty response discarded"), { stale: false });
   try { return JSON.parse(text) as T; } catch { throw new Error("malformed response discarded"); }
@@ -403,13 +406,24 @@ const put = <T,>(u: string, b: unknown): Promise<T> =>
   fetchAuth<T>(u, { method: "PUT", headers: { "Content-Type": "application/json", ...withUser() }, body: JSON.stringify(b ?? {}) });
 const del = <T,>(u: string): Promise<T> =>
   fetchAuth<T>(u, { method: "DELETE", headers: withUser() });
-const authedBlobUrl = async (u: string): Promise<string> => {
+// Blob identity follows the bytes: the originating epoch/token/user travel
+// with the object URL so every consumer (click, render) rechecks them
+// instead of trusting fetch-time identity.
+const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; token: string; user: string }> => {
   const myEpoch = epochNow();
   const myToken = currentToken();
   const myUser = currentUser();
   const ctrl = new AbortController();
   try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl; } catch {}
   const r = await fetch(u, { headers: withUser(), signal: ctrl.signal });
+  // Blob transport joins the central 401 transition: an expired or revoked
+  // session expires the app identity instead of failing silently.
+  if (r.status === 401) {
+    try {
+      const latest = currentToken();
+      if (latest === myToken) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } }));
+    } catch {}
+  }
   const buf = await r.arrayBuffer();
   if (epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser) throw Object.assign(new Error("stale blob discarded"), { stale: true });
   if (!r.ok) { let tx = ""; try { tx = new TextDecoder().decode(buf); } catch {} throw new Error(`${r.status} ${tx}`); }
@@ -417,14 +431,20 @@ const authedBlobUrl = async (u: string): Promise<string> => {
   const url = URL.createObjectURL(b);
   // Track for late revocation even if unmounted.
   try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = [...(((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs) ?? []), url]; setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 60000); } catch {}
-  return url;
+  return { url, epoch: myEpoch, token: myToken, user: myUser };
 };
+const blobStale = (b: { epoch: number; token: string; user: string }) =>
+  epochNow() !== b.epoch || currentToken() !== b.token
+  || (currentToken() ? currentUser() : (actAs || "owner")) !== (b.token ? b.user : (actAs || "owner"));
 const authedDownload = async (u: string, filename: string): Promise<void> => {
-  const url = await authedBlobUrl(u);
+  const b = await authedBlobUrl(u);
+  // Re-verify the originating identity AT click time: an account switch
+  // between fetch and click revokes the URL instead of downloading it.
+  if (blobStale(b)) { try { URL.revokeObjectURL(b.url); } catch {} throw Object.assign(new Error("stale download discarded (identity changed)"), { stale: true }); }
   try {
     const a = document.createElement("a");
-    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
-  } finally { setTimeout(() => URL.revokeObjectURL(url), 10000); }
+    a.href = b.url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  } finally { setTimeout(() => URL.revokeObjectURL(b.url), 10000); }
 };
 type Tab =
   | "boards"
@@ -875,8 +895,8 @@ function AuthPanel() {
     <div className="card">
       <h3>Accounts</h3>
       <p role="status">
-        {status.data ? (status.data.authRequired ? `Secure mode · admin ${status.data.admin || "(migrating)"} · ${status.data.accountCount} account(s)` : "Local demo (no accounts yet)") : "…"}
-        {meQ.data ? ` · ${meQ.data.user}${meQ.data.authenticated ? " · signed in" : " · demo identity"}` : ""}
+        {status.data ? (status.data.authRequired ? `Secure mode ï¿½ admin ${status.data.admin || "(migrating)"} ï¿½ ${status.data.accountCount} account(s)` : "Local demo (no accounts yet)") : "ï¿½"}
+        {meQ.data ? ` ï¿½ ${meQ.data.user}${meQ.data.authenticated ? " ï¿½ signed in" : " ï¿½ demo identity"}` : ""}
       </p>
       <div className="row">
         <label>Email <input aria-label="Account email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></label>
@@ -903,11 +923,12 @@ function AuthedImg({ id, alt, className }: { id: string; alt: string; className?
   const [url, setUrl] = useState("");
   useEffect(() => {
     let live = true;
+    let fresh = true;
     let obj = "";
-    authedBlobUrl(`/api/images/${id}`).then((u) => { if (live) { obj = u; setUrl(u); } }).catch(() => { if (live) setUrl(""); });
-    return () => { live = false; if (obj) URL.revokeObjectURL(obj); };
+    authedBlobUrl(`/api/images/${id}`).then((b) => { if (live && fresh && !blobStale(b)) { obj = b.url; setUrl(b.url); } }).catch(() => { if (live) setUrl(""); });
+    return () => { live = false; fresh = false; if (obj) URL.revokeObjectURL(obj); };
   }, [id]);
-  if (!url) return <span className="muted">loading portrait…</span>;
+  if (!url) return <span className="muted">loading portraitï¿½</span>;
   return <img src={url} alt={alt} className={className} />;
 }
 function InviteClaim() {
@@ -1043,25 +1064,35 @@ export default function App() {
     }
   }, [boardId]);
   const draftKey = `simceo-draft:${boardId}:${meetingId}:${(() => { try { return localStorage.getItem("simceo-user") ?? "anon"; } catch { return "anon"; } })()}`;
-  const [draft, setDraftState] = useState(() => { try { return localStorage.getItem(draftKey) ?? ""; } catch { return ""; } });
+  const readDraft = (k: string): string => {
+    try { return localStorage.getItem(k) ?? ""; } catch { return ""; }
+  };
+  const [draft, setDraftState] = useState(() => readDraft(draftKey));
+  // Last persisted/loaded snapshot. The save effect intentionally depends on
+  // [draft] only: on a key change (board/meeting/account switch, late board
+  // hydration after reload) the load effect below adopts the stored text for
+  // the new key, and no save runs with the previous key's stale closure, so a
+  // full reload under StrictMode can never clobber the stored draft with "".
+  const draftSavedRef = useRef<{ key: string; text: string } | null>(null);
   const setDraft = (v: string | ((prev: string) => string)) =>
     setDraftState((prev) =>
       typeof v === "function" ? (v as (prev: string) => string)(prev) : v,
     );
   useEffect(() => {
-    try {
-      setDraftState(localStorage.getItem(draftKey) ?? "");
-    } catch {
-      setDraftState("");
-    }
+    const stored = readDraft(draftKey);
+    draftSavedRef.current = { key: draftKey, text: stored };
+    setDraftState(stored);
   }, [draftKey]);
   useEffect(() => {
+    const last = draftSavedRef.current;
+    if (last !== null && last.key === draftKey && last.text === draft) return;
+    draftSavedRef.current = { key: draftKey, text: draft };
     try {
       localStorage.setItem(draftKey, draft);
     } catch {
       /* private-mode: keep draft in memory only */
     }
-  }, [draft, draftKey]);
+  }, [draft]);
   const [policy, setPolicy] = useState("balanced");
   const [presetKey, setPresetKey] = useState("strategy");
   type WizardSeat = { role: string; name: string };
@@ -1112,21 +1143,28 @@ export default function App() {
   const [sessExpiredFlag, setSessExpiredFlag] = useState(false);
   useEffect(() => { try { if (sessQ.data && sessQ.data.authenticated) setSessExpiredFlag(false); } catch {} }, [sessQ.data]);
   const sessExpired = sessExpiredFlag || (() => { try { return !!currentToken() && !!sessQ.data && !sessQ.data.authenticated; } catch { return false; } })();
+  // Protected queries and private rendering must not start before the session
+  // is verified: a stored token with no /auth/me answer yet gates everything.
+  const sessPending = (() => { try { return !!currentToken() && sessQ.data === undefined; } catch { return false; } })();
+  const sessGate = sessExpired || sessPending;
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
     try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
+    try { cancelActiveVoiceOp(true); } catch {}
+    try { recRef.current = null; } catch {}
     try {
-      qc.removeQueries({ queryKey: ["messages"] });
-      qc.removeQueries({ queryKey: ["delivery"] });
-      qc.removeQueries({ queryKey: ["meeting-detail"] });
-      qc.removeQueries({ queryKey: ["board-detail"] });
-      qc.removeQueries({ queryKey: ["meetings"] });
-      qc.removeQueries({ queryKey: ["records"] });
-      qc.removeQueries({ queryKey: ["record"] });
-      qc.removeQueries({ queryKey: ["setup"] });
-      qc.removeQueries({ queryKey: ["guest-settings"] });
-      qc.removeQueries({ queryKey: ["lead"] });
+      // Every private cache family: boards, meetings, messages, delivery,
+      // records, setup/lead, sources, notes, directions, roster/advisors,
+      // portraits, people, jobs/usage/audit/spending, review state, caps.
+      // Public presets/commands/invite-public are intentionally retained.
+      for (const k of ["messages", "delivery", "meeting-detail", "board-detail", "boards",
+        "meetings", "records", "record", "record-review", "setup", "guest-settings", "lead",
+        "sources", "notes", "directions", "roster", "roster-count", "roster-names", "roster-images",
+        "images", "advisors", "invites", "grants", "jobs", "usage", "audit", "spending",
+        "modelcalls", "status", "caps", "voice", "wizreview", "meeting-views", "briefings", "briefing"]) {
+        try { qc.removeQueries({ queryKey: [k] }); } catch {}
+      }
       qc.invalidateQueries({ queryKey: ["my-memberships"] });
       qc.invalidateQueries({ queryKey: ["sess"] });
     } catch {}
@@ -1164,7 +1202,7 @@ export default function App() {
   const boardDetail = useQuery({
     queryKey: ["board-detail", boardId],
     queryFn: () => get<Board>(`/api/boards/${boardId}`),
-    enabled: !!boardId,
+    enabled: !!boardId && !sessGate,
     retry: false,
   });
   // Bounded board list (newest 100) never establishes absence: only a 404
@@ -1176,7 +1214,27 @@ export default function App() {
     boardId === "" ||
     (boardDetail.isSuccess && (boardDetail.data as Board | undefined)?.id === boardId);
   const boardOk = boardValid;
-  const guestView = !!boardId && !!((boardDetail.data as unknown as { guest?: boolean } | undefined)?.guest);
+  // Server-derived selected-scope capabilities govern every tab and action.
+  // The legacy board-DTO guest flag never grants or hides by itself.
+  const caps = useQuery({
+    queryKey: ["caps", boardId, meetingId],
+    queryFn: () =>
+      get<{ board: string; meeting: string | null; meetings: string[]; guest: boolean; admin: boolean }>(
+        `/api/boards/${boardId}/capabilities${meetingId ? `?meetingId=${meetingId}` : ""}`,
+      ),
+    enabled: !!boardId && !sessGate,
+    retry: false,
+  });
+  const capBoard = (caps.data as { board?: string } | undefined)?.board ?? "none";
+  const capMeeting = (caps.data as { meeting?: string | null } | undefined)?.meeting ?? null;
+  const canManageBoard = capBoard === "manage";
+  const canWriteBoard = canManageBoard || capBoard === "contribute";
+  const canManageMeeting = canManageBoard || capMeeting === "manage";
+  // Mutations on meeting scope (chat/run/briefing/notes/records/voice/upload):
+  // board writers always qualify; otherwise the selected meeting grant must
+  // confer contribute or manage. Discuss/read-only never mutates.
+  const canActMeeting = canWriteBoard || capMeeting === "contribute" || capMeeting === "manage";
+  const isGuest = (caps.data as { guest?: boolean } | undefined)?.guest === true;
   const presets = useQuery({
     queryKey: ["presets"],
     queryFn: () => get<Preset[]>("/api/presets"),
@@ -1185,7 +1243,7 @@ export default function App() {
   const advisors = useQuery({
     queryKey: ["advisors", boardId],
     queryFn: () => get<AdvisorFull[]>(`/api/boards/${boardId}/advisors`),
-    enabled: !!boardId && boardOk,
+    enabled: !!boardId && boardOk && !sessGate,
   });
   const meetings = useQuery({
     queryKey: ["meetings", boardId, mq, mstate],
@@ -1193,12 +1251,12 @@ export default function App() {
       get<MeetingFull[]>(
         `/api/boards/${boardId}/meetings?${new URLSearchParams({ ...(mq ? { q: mq } : {}), ...(mstate ? { state: mstate } : {}) })}`,
       ),
-    enabled: !!boardId && boardOk,
+    enabled: !!boardId && boardOk && !sessGate,
   });
   const allMeetings = useQuery({
     queryKey: ["meetings", boardId, "all"],
     queryFn: () => get<MeetingFull[]>(`/api/boards/${boardId}/meetings`),
-    enabled: !!boardId && boardOk && !sessExpired,
+    enabled: !!boardId && boardOk && !sessGate && !sessGate,
   });
   // Selected-meeting authority is the scoped singular lookup, which also
   // verifies the parent board. Absence from capped lists never clears.
@@ -1206,7 +1264,7 @@ export default function App() {
     queryKey: ["meeting-detail", boardId, meetingId],
     queryFn: () =>
       get<MeetingFull>(`/api/boards/${boardId}/meetings/${meetingId}`),
-    enabled: !!boardId && !!meetingId && boardValid && !sessExpired,
+    enabled: !!boardId && !!meetingId && boardValid && !sessGate,
     retry: false,
   });
   // Bounded meeting windows (newest 200, filtered views) never establish
@@ -1234,7 +1292,7 @@ export default function App() {
   const messages = useQuery({
     queryKey: ["messages", meetingId],
     queryFn: () => get<Msg[]>(`/api/meetings/${meetingId}/messages?take=60`),
-    enabled: !!meetingId && meetingOk && !sessExpired,
+    enabled: !!meetingId && meetingOk && !sessGate,
     refetchInterval: 4000,
   });
   const hubRef = useRef<HubConnection | null>(null);
@@ -1654,12 +1712,12 @@ export default function App() {
   const sources = useQuery({
     queryKey: ["sources", boardId],
     queryFn: () => get<Source[]>(`/api/boards/${boardId}/sources`),
-    enabled: !!boardId && boardOk && tab === "sources",
+    enabled: !!boardId && boardOk && !sessGate && tab === "sources" && !sessGate,
   });
   const jobs = useQuery({
     queryKey: ["jobs"],
     queryFn: () => get<Job[]>("/api/activity/jobs"),
-    enabled: tab === "activity",
+    enabled: tab === "activity" && !sessGate,
   });
   const usage = useQuery({
     queryKey: ["usage", uday, ufrom, uto, boardId],
@@ -1667,24 +1725,24 @@ export default function App() {
       get<UsageRow[]>(
         `/api/usage?${new URLSearchParams({ ...(boardId ? { boardId } : {}), ...(uday ? { day: uday } : {}), ...(ufrom ? { from: ufrom } : {}), ...(uto ? { to: uto } : {}) })}`,
       ),
-    enabled: tab === "activity" && (!boardId || boardOk),
+    enabled: tab === "activity" && !sessGate && (!boardId || boardOk),
   });
   const lead = useQuery({
     queryKey: ["lead", boardId],
     queryFn: () => get<Lead>(`/api/boards/${boardId}/lead`),
     enabled:
-      !!boardId && (tab === "profile" || tab === "meet"),
+      !!boardId && (tab === "profile" || tab === "meet") && !sessGate,
     retry: false,
   });
   const setup = useQuery({
     queryKey: ["setup", boardId],
     queryFn: () => get<Setup>(`/api/boards/${boardId}/setup`),
-    enabled: !!boardId && boardOk && tab === "boards",
+    enabled: !!boardId && boardOk && !sessGate && tab === "boards" && !sessGate,
   });
   const guestSettings = useQuery({
     queryKey: ["guest-settings", boardId],
     queryFn: () => get<{ id: string; name: string; mission: string; stage: string; discussionPolicy: string; dataUse: string; lead: { name: string; roleLabel: string } | null; meetingIds: string[] }>(`/api/boards/${boardId}/guest-settings`),
-    enabled: !!boardId && boardOk && (tab === "boards" || tab === "meet"),
+    enabled: !!boardId && boardOk && !sessGate && (tab === "boards" || tab === "meet") && !sessGate,
     retry: false,
   });
   const [leadForm, setLeadForm] = useState({
@@ -1804,7 +1862,7 @@ export default function App() {
   const status = useQuery({
     queryKey: ["status", boardId],
     queryFn: () => get<BoardStatus>(`/api/boards/${boardId}/status`),
-    enabled: !!boardId && boardOk && tab === "boards",
+    enabled: !!boardId && boardOk && !sessGate && tab === "boards" && !sessGate,
   });
   const [wizId, setWizId] = useState(
     () => { try { const u = localStorage.getItem("simceo-user") ?? "anon"; return localStorage.getItem("simceo-wizard:"+(u||"anon")) ?? ""; } catch { return ""; } },
@@ -1935,7 +1993,7 @@ export default function App() {
         blockers: { field: string; step: number; message: string }[];
         fields: { field: string; step: number; status: string }[];
       }>(`/api/wizard/${wizId}/review`),
-    enabled: tab === "wizard" && !!wizId,
+    enabled: tab === "wizard" && !!wizId && !sessGate,
   });
   const guideInput = () => {
     if (wizard.step === 2)
@@ -2105,7 +2163,14 @@ export default function App() {
         `/api/wizard/${wizId}/create`,
         { ...(wizVersion != null ? { version: wizVersion } : {}) },
       ),
-    onSuccess: (r) => {
+    onMutate: () => ({ originWizId: wizId, origin: originIdentity(), originOwner: wizOwnerRef.current || currentUser() }),
+    onSuccess: (r, _v, ctx) => {
+      const o = ctx as { originWizId?: string; origin?: { epoch: number; token: string; user: string }; originOwner?: string } | undefined;
+      // Consume the completed wizard only under the originating identity:
+      // a late completion after an account switch must not seed caches,
+      // switch boards, or retire another account's draft pointer.
+      if (!o?.origin || originStale(o.origin)) return;
+      if (wizIdRef.current !== o.originWizId) return;
       // Seed the new board into the list + detail caches before the
       // invalidated list returns, so a delayed refresh never discards the
       // just-created selection as "absent".
@@ -2122,7 +2187,7 @@ export default function App() {
       // id, storage, fields and interview state so the next New board is a
       // fresh Step 1 that creates a DISTINCT board. Unfinished drafts survive
       // logo/ordinary navigation because this runs solely on success.
-      try { const ou = wizOwnerRef.current || currentUser() || "anon"; localStorage.removeItem("simceo-wizard:"+ou); localStorage.removeItem("simceo-wizard"); wizOwnerRef.current = ""; } catch { /* private-mode */ }
+      try { const ou = (o?.originOwner || o?.origin?.user || "anon"); if (ou === o?.origin?.user || ou === currentUser()) { localStorage.removeItem("simceo-wizard:"+ou); wizOwnerRef.current = ""; } localStorage.removeItem("simceo-wizard"); } catch { /* private-mode */ }
       setWizId("");
       setWizVersion(null);
       // Retire the save baseline with the completed draft: a late hydration
@@ -2169,7 +2234,7 @@ export default function App() {
       get<RosterRow[]>(
         `/api/roster?${new URLSearchParams({ accountId, ...(rq ? { q: rq } : {}), ...(rtype ? { type: rtype } : {}), ...(rtag ? { tag: rtag } : {}) })}`,
       ),
-    enabled: tab === "roster",
+    enabled: tab === "roster" && !sessGate,
   });
   const rosterRows = rosterList.data ?? [];
   const [selRoster, setSelRoster] = useState("");
@@ -2178,7 +2243,7 @@ export default function App() {
     queryKey: ["roster-images", selRoster],
     queryFn: () =>
       get<{ id: string; kind: string; provenance: string; review: string }[]>(`/api/roster/${selRoster}/images`),
-    enabled: !!selRoster,
+    enabled: !!selRoster && !sessGate,
   });
   const [createOpen, setCreateOpen] = useState(false);
   const closeCreate = () => setCreateOpen(false);
@@ -2206,6 +2271,7 @@ const rosterNames = useQuery({
     get<RosterRow[]>(
       `/api/roster?${new URLSearchParams({ accountId })}`,
     ),
+    enabled: !sessGate,
 });
 
 const rosterCount = useQuery({
@@ -2214,6 +2280,7 @@ const rosterCount = useQuery({
     get<{ total: number }>(
       `/api/roster/count?${new URLSearchParams({ accountId })}`,
     ),
+    enabled: !sessGate,
 });
 const tabCount = (k: Tab): number | null => {
   if (k === "boards") return boards.data ? boards.data.length : null;
@@ -2393,7 +2460,7 @@ const tabCount = (k: Tab): number | null => {
       get<{ id: string; kind: string; provenance: string }[]>(
         `/api/roster/${selAdvisor?.rosterEntryId}/images`,
       ),
-    enabled: tab === "advisors" && !!selAdvisor?.rosterEntryId,
+    enabled: tab === "advisors" && !!selAdvisor?.rosterEntryId && !sessGate,
   });
   const uploadImg = async (f: File | undefined) => {
     if (!f || !selAdvisor) return;
@@ -2517,7 +2584,7 @@ const tabCount = (k: Tab): number | null => {
         messages: number;
         lastSequence: number;
       }>(`/api/meetings/${meetingId}/delivery`),
-    enabled: !!meetingId && meetingOk && tab === "meet",
+    enabled: !!meetingId && meetingOk && tab === "meet" && !sessGate,
   });
   const [sq, setSq] = useState("");
   const [hits, setHits] = useState<
@@ -2542,7 +2609,7 @@ const tabCount = (k: Tab): number | null => {
   const notes = useQuery({
     queryKey: ["notes", meetingId],
     queryFn: () => get<Note[]>(`/api/meetings/${meetingId}/notes`),
-    enabled: !!meetingId && meetingOk && tab === "meet",
+    enabled: !!meetingId && meetingOk && tab === "meet" && !sessGate,
   });
   const [ntitle, setNtitle] = useState("");
   const [nbody, setNbody] = useState("");
@@ -2572,7 +2639,7 @@ const tabCount = (k: Tab): number | null => {
   const directions = useQuery({
     queryKey: ["directions", boardId],
     queryFn: () => get<Note[]>(`/api/boards/${boardId}/directions`),
-    enabled: !!boardId && boardOk && tab === "meet",
+    enabled: !!boardId && boardOk && !sessGate && tab === "meet" && !sessGate,
   });
   const [dtext, setDtext] = useState("");
   const [dscope, setDscope] = useState("meeting");
@@ -2593,32 +2660,34 @@ const tabCount = (k: Tab): number | null => {
   const fromDirection = useMutation({
     mutationFn: (noteId: string) =>
       post<RecordDraft>(`/api/meetings/${meetingId}/record/from-direction`, { noteId }),
-    onMutate: () => ({ originBoardId: boardId, originMeetingId: meetingId }),
+    onMutate: () => ({ originBoardId: boardId, originMeetingId: meetingId, originRecId: recId, origin: originIdentity() }),
     onSuccess: (r, _v, ctx) => {
-      const origin = ctx as { originBoardId?: string; originMeetingId?: string } | undefined;
+      const origin = ctx as { originBoardId?: string; originMeetingId?: string; originRecId?: string; origin?: { epoch: number; token: string; user: string } } | undefined;
       const keyMeeting = (r as RecordDraft)?.meetingId ?? origin?.originMeetingId ?? meetingId;
       const keyBoard = (r as RecordDraft)?.boardId ?? origin?.originBoardId ?? boardId;
-      // Seed the staged draft by its returned identity before the invalidated
-      // list returns, and only render it under the origin parents: the live
-      // selection ref (not captured promise values) decides, so switching
-      // meetings while the request is in flight never redirects or poisons
-      // another selection's cache. setRecId + setTab batch into one render, so
-      // the hash effect publishes records+newId once (push) with no split
-      // invalid-parent entry under a stale review.
+      // Never seed caches, select, or notify under a stale identity or
+      // selection: identity/epoch/token plus board/meeting/record must all
+      // still match, or the result is discarded silently.
+      const live = liveSelRef.current;
+      const og = origin?.origin;
+      if (!og || originStale(og)) return;
+      if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== (origin?.originRecId ?? "") || live.user !== og.user) return;
       qc.setQueryData<RecordDraft[] | undefined>(
         ["records", keyMeeting],
         (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
       );
       qc.setQueryData(["record", r.id], r);
-      const live = liveSelRef.current;
-      if (live.boardId === keyBoard && live.meetingId === keyMeeting) {
-        setRecId(r.id);
-        setTab("records");
-      }
+      setRecId(r.id);
+      setTab("records");
       refresh("records", "record");
       notify("Direction staged for review as draft " + r.id + ".");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e, _v, ctx) => {
+      const origin = ctx as { originBoardId?: string; originMeetingId?: string; originRecId?: string; origin?: { epoch: number; token: string; user: string } } | undefined;
+      const og = origin?.origin;
+      if (!og || originStale(og)) return;
+      noteReviewError(e, { boardId: origin?.originBoardId ?? "", meetingId: origin?.originMeetingId ?? "", recId: origin?.originRecId ?? "", user: og.user });
+    },
   });
   const [blocked, setBlocked] = useState("");
   const srcOp = (id: string, op: string, body?: unknown) => {
@@ -2700,14 +2769,26 @@ const tabCount = (k: Tab): number | null => {
   const recs = useQuery({
     queryKey: ["records", meetingId],
     queryFn: () => get<RecordDraft[]>(`/api/meetings/${meetingId}/records`),
-    enabled: !!meetingId && meetingOk && (tab === "records" || tab === "meet"),
+    enabled: !!meetingId && meetingOk && (tab === "records" || tab === "meet") && !sessGate,
   });
   const latestDraft = (recs.data ?? [])
     .slice()
     .sort((a, b) => b.version - a.version)[0];
   const [recId, setRecId] = useState(route0.rec);
-  const liveSelRef = useRef({ boardId, meetingId, recId, user: actAs || "owner" });
-  liveSelRef.current = { boardId, meetingId, recId, user: actAs || "owner" };
+  const liveSelRef = useRef({ boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") });
+  liveSelRef.current = { boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") };
+  // Immutable origin identity for async callbacks: the effective session
+  // identity when a session exists, else the demo act-as label. Epoch and
+  // token are captured so a later account switch or re-login invalidates
+  // stale callbacks even when the label coincides.
+  const originIdentity = () => ({
+    epoch: epochNow(),
+    token: currentToken(),
+    user: currentToken() ? currentUser() : (actAs || "owner"),
+  });
+  const originStale = (o: { epoch: number; token: string; user: string }) =>
+    epochNow() !== o.epoch || currentToken() !== o.token
+    || (currentToken() ? currentUser() : (actAs || "owner")) !== o.user;
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -2724,7 +2805,7 @@ const tabCount = (k: Tab): number | null => {
   const recDetail = useQuery({
     queryKey: ["record", recId],
     queryFn: () => get<RecordDraft>(`/api/records/${recId}`),
-    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records",
+    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records" && !sessGate,
     retry: false,
   });
   // Record authority is the singular detail lookup plus a parent check: the
@@ -2785,7 +2866,7 @@ const tabCount = (k: Tab): number | null => {
   const recReview = useQuery({
     queryKey: ["record-review", recId],
     queryFn: () => get<RecordReview>(`/api/records/${recId}/review`),
-    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records",
+    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records" && !sessGate,
     retry: false,
   });
   const [reviewError, setReviewError] = useState<{ key: string; message: string } | null>(null);
@@ -2872,19 +2953,19 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     post<unknown>(`/api/records/${d.id}/items/approve`, { ...guardOf(d), itemId })
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft(r);
         const st = (r as unknown as RecordDraft)?.status;
         notify(st === "approved" ? `Approved ${itemId}; review complete.` : `Approved ${itemId}.`);
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const itemRevise = (itemId: string) => {
@@ -2900,12 +2981,12 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     const originDraftId = d.id;
     post<unknown>(`/api/records/${d.id}/items/revise`, { ...guardOf(d), itemId, text })
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft(r);
         setItemTexts((old) => {
           const next = { ...old };
@@ -2916,8 +2997,8 @@ const tabCount = (k: Tab): number | null => {
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const itemDiscard = (itemId: string) => {
@@ -2928,18 +3009,18 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     post<unknown>(`/api/records/${d.id}/items/discard`, { ...guardOf(d), itemId })
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft(r);
         notify(`Discarded ${itemId}; approved items preserved.`);
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const approveAllFresh = () => {
@@ -2950,18 +3031,18 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     post<unknown>(`/api/records/${d.id}/approve-all`, guardOf(d))
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft(r);
         notify("Approved all pending items.");
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const approveRec = (all: boolean) => {
@@ -2982,7 +3063,7 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     const originDraftId = d.id;
     post<unknown>(`/api/meetings/${originMeetingId}/record/approve`, {
       draftId: originDraftId,
@@ -2994,7 +3075,7 @@ const tabCount = (k: Tab): number | null => {
     })
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft({ ...(d as RecordDraft), ...((r as unknown as { draft?: string })?.draft ? {} : {}) });
         const parsed = r as unknown as { approved?: string[]; draft?: string; status?: string; pending?: string[] } | undefined;
         const keyId = parsed?.draft ?? originDraftId;
@@ -3005,8 +3086,8 @@ const tabCount = (k: Tab): number | null => {
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const reviseRec = (amend: boolean) => {
@@ -3024,7 +3105,7 @@ const tabCount = (k: Tab): number | null => {
     const originMeetingId = meetingId;
     const originBoardId = boardId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     post<RecordDraft>(`/api/records/${d.id}/${amend ? "amend" : "revise"}`, {
       ...guardOf(d),
       items,
@@ -3033,7 +3114,7 @@ const tabCount = (k: Tab): number | null => {
         const keyMeeting = (r as RecordDraft)?.meetingId ?? originMeetingId;
         const keyBoard = (r as RecordDraft)?.boardId ?? originBoardId;
         const live = liveSelRef.current;
-        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         qc.setQueryData<RecordDraft[] | undefined>(
           ["records", keyMeeting],
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
@@ -3045,8 +3126,8 @@ const tabCount = (k: Tab): number | null => {
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };
   const discardRec = () => {
@@ -3056,17 +3137,17 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
-    const originUser = actAs || "owner";
+    const origin = originIdentity();
     return post<unknown>(`/api/records/${d.id}/discard`, guardOf(d))
       .then((r) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
         applyDraft(r);
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
-        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || (originStale(origin) || live.user !== origin.user)) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: origin.user });
       });
   };  const [draftItems, setDraftItems] = useState(
     '[{"id":"1","text":"","detail":"","status":"proposed","scope":"meeting"}]',
@@ -3076,42 +3157,44 @@ const tabCount = (k: Tab): number | null => {
     const originBoardId = boardId;
     const originMeetingId = meetingId;
     const originRecId = recId;
+    const origin = originIdentity();
     return post<RecordDraft>(
       `/api/meetings/${originMeetingId}/record/draft`,
       JSON.parse(draftItems),
     )
       .then((r) => {
-        // Seed the freshly drafted record by its returned identity before the
-        // invalidated list returns, and never render it under the wrong parent
-        // if the user switched while saving.
+        // Never seed caches, select, or render under a stale identity or
+        // selection: an account switch or navigation while saving discards.
         const keyMeeting = (r as RecordDraft)?.meetingId ?? originMeetingId;
         const keyBoard = (r as RecordDraft)?.boardId ?? originBoardId;
+        const live = liveSelRef.current;
+        if (originStale(origin)) return;
+        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || live.user !== origin.user) return;
         qc.setQueryData<RecordDraft[] | undefined>(
           ["records", keyMeeting],
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        const live = liveSelRef.current;
-        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || live.user !== (actAs || "owner")) return;
         setRecId(r.id);
         refresh("records", "record");
       })
       .catch((e) => {
         const live = liveSelRef.current;
-        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== (actAs || "owner")) return;
+        if (originStale(origin)) return;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== origin.user) return;
         const msg = String(e);
-        setReviewError({ key: `${originBoardId}:${originMeetingId}:${originRecId}:${actAs || "owner"}`, message: msg });
+        setReviewError({ key: `${originBoardId}:${originMeetingId}:${originRecId}:${origin.user}`, message: msg });
       });
   };
   const invites = useQuery({
     queryKey: ["invites", boardId],
     queryFn: () => get<Invite[]>(`/api/boards/${boardId}/invites`),
-    enabled: !!boardId && boardOk && tab === "people",
+    enabled: !!boardId && boardOk && !sessGate && tab === "people" && !sessGate,
   });
   const grants = useQuery({
     queryKey: ["grants", boardId],
     queryFn: () => get<Grant[]>(`/api/boards/${boardId}/grants`),
-    enabled: !!boardId && boardOk && tab === "people",
+    enabled: !!boardId && boardOk && !sessGate && tab === "people" && !sessGate,
   });
   const [iemail, setIemail] = useState("");
   const [irole, setIrole] = useState("contributor");
@@ -3149,7 +3232,7 @@ const tabCount = (k: Tab): number | null => {
       get<{ action: string; detail: string; createdAt: string }[]>(
         "/api/activity/audit",
       ),
-    enabled: tab === "activity",
+    enabled: tab === "activity" && !sessGate,
   });
   const modelCalls = useQuery({
     queryKey: ["modelcalls"],
@@ -3164,7 +3247,7 @@ const tabCount = (k: Tab): number | null => {
           ranSearch: boolean;
         }[]
       >("/api/models/calls"),
-    enabled: tab === "activity",
+    enabled: tab === "activity" && !sessGate,
   });
   const retryJob = (j: Job) =>
     post<Job>(`/api/jobs/${j.id}/retry`, {})
@@ -3173,7 +3256,7 @@ const tabCount = (k: Tab): number | null => {
   const spending = useQuery({
     queryKey: ["spending"],
     queryFn: () => get<Spending>("/api/spending"),
-    enabled: tab === "activity",
+    enabled: tab === "activity" && !sessGate,
   });
   const [capInput, setCapInput] = useState("");
   const [capMode, setCapMode] = useState("warn");
@@ -3200,6 +3283,7 @@ const tabCount = (k: Tab): number | null => {
 const modelStatus = useQuery({
   queryKey: ["model-status"],
   queryFn: () => get<ModelStatus>("/api/model/status"),
+  enabled: !sessGate,
 });
 const [modelKey, setModelKey] = useState("");
 const [modelChat, setModelChat] = useState("");
@@ -5591,7 +5675,7 @@ const testModel = useMutation({
                     roster v{a.rosterVersion} Â· {a.imageProvenance}{" "}
                   {(() => { const re = (rosterNames.data ?? []).find((r) => r.entry.id === a.rosterEntryId); return re && re.entry.version > a.rosterVersion ? (<span className="badge">{" "}roster updated â€” sync first{" "}</span>) : null; })()}
                   </span>{" "}
-                  {!a.approved && !guestView && (
+                  {!a.approved && canManageBoard && (
                     <button
                       onClick={() =>
                         post<unknown>(
@@ -5733,7 +5817,7 @@ const testModel = useMutation({
                     {" "}
                     <div className="meetctl">
                       {" "}
-                      {!guestView && (<button
+                      {canActMeeting && (<button
                         type="button"
                         className="primary"
                         onClick={() => createMeeting.mutate()}
@@ -5741,7 +5825,7 @@ const testModel = useMutation({
                         {" "}
                         Start meeting{" "}
                       </button>)}{" "}
-                    {!guestView && (<div className="card">{" "}
+                    {canActMeeting && (<div className="card">{" "}
                       Advisors for the next meeting (all when untouched){" "}
                       {(advisors.data ?? []).map((a) => (
                         <label key={a.id}>{" "}
@@ -5824,7 +5908,7 @@ const testModel = useMutation({
                           {" "}
                           <div>
                             {" "}
-                            {guestView && guestSettings.data && (<p role="status">Read-only guest settings: {guestSettings.data.name} &middot; {guestSettings.data.mission} &middot; {guestSettings.data.discussionPolicy}{guestSettings.data.lead ? ` \u00b7 Lead ${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : ""}</p>)}
+                            {isGuest && guestSettings.data && (<p role="status">Read-only guest settings: {guestSettings.data.name} &middot; {guestSettings.data.mission} &middot; {guestSettings.data.discussionPolicy}{guestSettings.data.lead ? ` \u00b7 Lead ${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : ""}</p>)}
                             <div className="eyebrow">Discussion</div>{" "}
                             <h2>{curMeeting?.title ?? "Meeting"}</h2>{" "}
                             {curMeeting?.brief && (
@@ -5833,7 +5917,7 @@ const testModel = useMutation({
                           </div>{" "}
                           <div className="meetctl">
                             {" "}
-                            {!guestView && (<button
+                            {canManageMeeting && (<button
                               type="button"
                               onClick={() => meetingCtl("pause")}
                               disabled={curMeeting?.state !== 1}
@@ -5846,7 +5930,7 @@ const testModel = useMutation({
                               {" "}
                               Pause{" "}
                             </button>)}{" "}
-                            {!guestView && (<button
+                            {canManageMeeting && (<button
                               type="button"
                               onClick={() => meetingCtl("resume")}
                               disabled={curMeeting?.state !== 3}
@@ -5859,7 +5943,7 @@ const testModel = useMutation({
                               {" "}
                               Resume{" "}
                             </button>)}{" "}
-                            {!guestView && (<button
+                            {canManageMeeting && (<button
                               type="button"
                               onClick={() => meetingCtl("end")}
                               disabled={
@@ -5910,7 +5994,7 @@ const testModel = useMutation({
                             )}{" "}
                           </p>
                         )}{" "}
-                        {!guestView && (<details className="setup">
+                        {canActMeeting && (<details className="setup">
                           {" "}
                           <summary>Meeting setup</summary>{" "}
                           <label>
@@ -6283,7 +6367,7 @@ const testModel = useMutation({
                                     {" "}
                                     Everyone{" "}
                                   </option>{" "}
-                                  {!guestView && (<option value="secretary">
+                                  {canActMeeting && (<option value="secretary">
                                     {" "}
                                     Secretary (direct){" "}</option>)}
                                 </select>{" "}
@@ -6455,7 +6539,7 @@ const testModel = useMutation({
                                 onChange={(e) => setBtopic(e.target.value)}
                               />{" "}
                             </label>{" "}
-                            {!guestView && (<button
+                            {canActMeeting && (<button
                               type="button"
                               onClick={() => askBriefing.mutate()}
                             >
@@ -6488,7 +6572,7 @@ const testModel = useMutation({
                                 onChange={(e) => setNbody(e.target.value)}
                               />{" "}
                             </label>{" "}
-                            {!guestView && (<button
+                            {canActMeeting && (<button
                               type="button"
                               onClick={() => addNote.mutate()}
                             >
@@ -6522,7 +6606,7 @@ const testModel = useMutation({
                                 ) : (
                                   <span> {n.body}</span>
                                 )}{" "}
-                                <button
+                                {canActMeeting && (<button
                                   type="button"
                                   className="btn ghost"
                                   disabled={!meetingId || fromDirection.isPending}
@@ -6531,7 +6615,7 @@ const testModel = useMutation({
                                 >
                                   {" "}
                                   Record this direction{" "}
-                                </button>{" "}
+                                </button>)}{" "}
                               </div>
                             ))}{" "}
                             {(directions.data ?? []).length === 0 && (
@@ -6564,15 +6648,15 @@ const testModel = useMutation({
                                 </option>{" "}
                               </select>{" "}
                             </label>{" "}
-                            <button
+                            {canActMeeting && (<button
                               type="button"
                               className="primary"
-                              disabled={!dtext.trim()}
+                              disabled={!dtext.trim() || adopt.isPending}
                               onClick={() => adopt.mutate()}
                             >
                               {" "}
                               Adopt exact text{" "}
-                            </button>{" "}
+                            </button>)}{" "}
                           </div>
                         )}{" "}
                         {meetTab === "decision" && (
@@ -6834,7 +6918,7 @@ const testModel = useMutation({
             <section aria-label="Resources and Inbox">
               {" "}
               <h2>Resources and Inbox</h2>{" "}
-                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={guestView} />
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} />
             </section>
           )}{" "}
           {tab === "records" && (
@@ -6862,7 +6946,7 @@ const testModel = useMutation({
                         onChange={(e) => setDraftItems(e.target.value)}
                       />{" "}
                     </label>{" "}
-                    {!guestView && (<button onClick={prepareDraft}>
+                    {canActMeeting && (<button onClick={prepareDraft}>
                       {" "}
                       Prepare draft from items{" "}
                     </button>)}{" "}
@@ -6884,9 +6968,17 @@ const testModel = useMutation({
                     const d: RecordDraft = recReview.data?.draft ?? recDetail.data!;
                     let items: { id?: string; text?: string; detail?: string; status?: string; scope?: string }[] = [];
                     let itemsValid = true;
+                    // Guest projection: no ItemsJson is shipped to unauthorized
+                    // readers; approved item content arrives as approvedItems
+                    // with exact owner provenance and renders read-only.
+                    const guestItems = (d as unknown as { approvedItems?: { id?: string; text?: string; approvedBy?: { recordId?: string; version?: number } }[] }).approvedItems;
                     const isStr = (v: unknown): v is string => typeof v === "string";
                     try {
-                      const parsed: unknown = JSON.parse(d.itemsJson);
+                      const rawItems = (d as unknown as { itemsJson?: string }).itemsJson;
+                      if (rawItems === undefined && Array.isArray(guestItems)) {
+                        items = guestItems.filter((g) => g && typeof g.id === "string" && typeof g.text === "string").map((g) => ({ id: g.id as string, text: g.text as string }));
+                      } else {
+                      const parsed: unknown = JSON.parse(rawItems ?? "");
                       if (!Array.isArray(parsed)) itemsValid = false;
                       else {
                         const seen = new Set<string>();
@@ -6922,6 +7014,7 @@ const testModel = useMutation({
                         }
                         if (itemsValid) items = parsed as { id?: string; text?: string; detail?: string; status?: string; scope?: string }[];
                       }
+                      }
                     } catch { itemsValid = false; }
                     let historyValid = true;
                     let history: { seq?: number; at?: string; actor?: string; action?: string; itemId?: string; oldText?: string; newText?: string; viewedVersion?: number; viewedHash?: string; viewedWatermark?: number; viewedToken?: string; revision?: number; token?: string }[] = [];
@@ -6945,7 +7038,12 @@ const testModel = useMutation({
                         if (historyValid) history = h as typeof history;
                       }
                     } catch { historyValid = false; history = []; }
-                    const stateValid = itemsValid && historyValid;
+                    // Authoritative persisted-state validity comes from the server
+                    // review payload; client checks only add to it. A false
+                    // server flag hides every approval control, including hidden ones.
+                    const serverValid = (recReview.data as { stateValid?: boolean } | undefined)?.stateValid !== false;
+                    const serverError = (recReview.data as { stateError?: string } | undefined)?.stateError ?? "";
+                    const stateValid = itemsValid && historyValid && serverValid;
                     const strList = (raw: string): string[] => {
                       try {
                         const a: unknown = JSON.parse(raw ?? "[]");
@@ -7001,9 +7099,11 @@ const testModel = useMutation({
                           )}
                         </p>
                       )}
-                      <button type="button" className="btn ghost" onClick={refreshReview}>
-                        Refresh review
-                      </button>
+                      {canActMeeting && (
+                        <button type="button" className="btn ghost" onClick={refreshReview}>
+                          Refresh review
+                        </button>
+                      )}
                       <p role="alert" className="error" hidden={!showReviewError}>
                         {showReviewError && reviewError ? reviewError.message : "No review errors."}
                       </p>
@@ -7031,7 +7131,7 @@ const testModel = useMutation({
                           </div>
                         ))}
                       </div>
-                      {!stateValid && <p role="alert">Review state is malformed; no approval controls are shown.</p>}
+                      {!stateValid && <p role="alert">Review state is malformed{serverError ? ": " + serverError : ""}; no approval controls are shown.</p>}
                       {stateValid && items.map((it) => {
                         const id = it.id ?? "";
                         const st = statusOf(id);
@@ -7063,7 +7163,7 @@ const testModel = useMutation({
                                 </span>
                               </div>
                             ))}
-                            {!guestView && canDecide && st === "pending" && (
+                            {canActMeeting && canDecide && st === "pending" && (
                               <div className="meetctl">
                                 <button type="button" onClick={() => itemApprove(id)}>
                                   Approve {id}
@@ -7086,7 +7186,7 @@ const testModel = useMutation({
                         );
                       })}
                       <div>
-                        {!guestView && canDecide && (
+                        {canActMeeting && canDecide && (
                           <>
                             <button type="button" onClick={approveAllFresh}>
                               Approve all ({pend.length} pending)
@@ -7173,7 +7273,7 @@ const testModel = useMutation({
                           })()}{" "}
                       </div>
                       <div>
-                        {!guestView && d.decided && d.status === "approved" && (
+                        {canActMeeting && d.decided && d.status === "approved" && (
                           <button type="button" onClick={() => reviseRec(true)}>
                             Amend (name superseded IDs)
                           </button>
@@ -7188,7 +7288,7 @@ const testModel = useMutation({
                             onChange={(e) => setRevText(e.target.value)}
                           />{" "}
                         </label>
-                        {!guestView && canDecide && (
+                        {canActMeeting && canDecide && (
                           <>
                             <button type="button" onClick={() => reviseRec(false)}>
                               Request revision (new version)
@@ -7196,7 +7296,7 @@ const testModel = useMutation({
                             <button type="button" onClick={discardRec}>Discard draft</button>{" "}
                           </>
                         )}
-                        {(guestView || !canDecide) && !(d.decided && d.status === "approved") && (
+                        {(!canActMeeting || !canDecide) && !(d.decided && d.status === "approved") && (
                           <p className="muted">No whole-draft actions available in this state.</p>
                         )}
                       </details>

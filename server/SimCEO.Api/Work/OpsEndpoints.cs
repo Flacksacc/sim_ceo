@@ -51,8 +51,8 @@ public static class OpsEndpoints
         active = b.ActiveConfig,
         dirty = !string.Equals(b.DraftJson, b.ActiveJson, StringComparison.Ordinal),
         name = !string.IsNullOrWhiteSpace(b.Name),
-        lead = LeadSetup.ResolveLeadFor(s, bid) is not null,
-        leadVersion = LeadSetup.ResolveLeadFor(s, bid)?.Version ?? 0,
+        lead = (LeadSetup.ResolveLeadForStrict(s, bid) ?? (LeadSetup.InheritsGlobalLead(s, b) ? LeadSetup.ResolveLead(s) : null)) is not null,
+        leadVersion = (LeadSetup.ResolveLeadForStrict(s, bid) ?? (LeadSetup.InheritsGlobalLead(s, b) ? LeadSetup.ResolveLead(s) : null))?.Version ?? 0,
         advisors = new { total = advisors.Count, approved = advisors.Count(a => a.Approved) },
         meetings = new
         {
@@ -61,7 +61,8 @@ public static class OpsEndpoints
         },
         sourcesPending = stCanContrib ? s.Sources.Values.Count(x => x.BoardId == bid && string.Equals(string.IsNullOrWhiteSpace(x.ReviewState) ? (x.Approved ? "approved" : "pending") : x.ReviewState, "pending", StringComparison.OrdinalIgnoreCase) && !x.Excluded) : 0,
         jobsFailed = stIsAdmin ? s.Jobs.Values.Count(j => j.State == "failed") : 0,
-        policy = b.DiscussionPolicy,
+        policy = LeadSetup.EffectiveView(s, b).policy,
+        dataUse = LeadSetup.EffectiveView(s, b).dataUse,
         retainAudio = b.RetainAudio,
         guest = stGuest,
       });
@@ -463,30 +464,33 @@ public static class OpsEndpoints
       // forged graphs are rejected with zero partial state.
       if (!SourceGovernance.ValidateRestoreGraph(restored, out var srcGraphErr))
         return Results.Json(new { error = "Backup graph rejected: " + srcGraphErr }, statusCode: 422);
-      // Fresh generation base: in-flight publications captured gen <= live max. Restored
-      // meetings restart strictly above it, so stale runs can never commit (no snapshot reuse).
-      var liveMaxGen = 0L;
-      try { liveMaxGen = s.Meetings.Values.Any() ? s.Meetings.Values.Max(m => m.Generation) : 0L; } catch { liveMaxGen = 0L; }
       var memMode = SimCEO.Api.Data.Pg.Backend is null;
-      var snapBoards = memMode ? s.Boards.Values.ToList() : new System.Collections.Generic.List<Domain.Board>();
-      var snapRoster = memMode ? s.Roster.Values.ToList() : new System.Collections.Generic.List<Domain.RosterEntry>();
-      var snapAdvisors = memMode ? s.Advisors.Values.ToList() : new System.Collections.Generic.List<Domain.BoardAdvisor>();
-      var snapMeetings = memMode ? s.Meetings.Values.ToList() : new System.Collections.Generic.List<Domain.Meeting>();
-      var snapNotes = memMode ? s.Notes.Values.ToList() : new System.Collections.Generic.List<Domain.Note>();
-      var snapDrafts = memMode ? s.Drafts.Values.ToList() : new System.Collections.Generic.List<Domain.RecordDraft>();
-      var snapSources = memMode ? s.Sources.Values.ToList() : new System.Collections.Generic.List<Domain.SourceDoc>();
-      var snapSections = memMode ? s.SourceSections.Values.ToList() : new System.Collections.Generic.List<Domain.SourceSection>();
-      var snapHeads = memMode ? s.SourceHeads.Values.ToList() : new System.Collections.Generic.List<Domain.SourceFamilyHead>();
-      var snapEvents = memMode ? s.SourceEvents.Values.ToList() : new System.Collections.Generic.List<Domain.SourceEvent>();
-      var snapLeads = memMode ? s.LeadProfiles.Values.ToList() : new System.Collections.Generic.List<Domain.LeadProfile>();
-      var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
-      var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
-      var snapMessages = memMode ? s.Messages.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()) : new System.Collections.Generic.Dictionary<Guid, System.Collections.Generic.List<Domain.Message>>();
       int restoredCount = 0;
       lock (s.SetupLock)
       {
         lock (s.MessageLock)
         {
+          // Invalidation base AND rollback snapshots are captured INSIDE the
+          // shared serialization boundary (never sampled before the lock): a
+          // concurrent commit between sampling and replacement can neither
+          // slip below the generation floor nor be erased by a failed-restore
+          // rollback.
+          var liveMaxGen = 0L;
+          try { liveMaxGen = s.Meetings.Values.Any() ? s.Meetings.Values.Max(m => m.Generation) : 0L; } catch { liveMaxGen = 0L; }
+          var snapBoards = memMode ? s.Boards.Values.ToList() : new System.Collections.Generic.List<Domain.Board>();
+          var snapRoster = memMode ? s.Roster.Values.ToList() : new System.Collections.Generic.List<Domain.RosterEntry>();
+          var snapAdvisors = memMode ? s.Advisors.Values.ToList() : new System.Collections.Generic.List<Domain.BoardAdvisor>();
+          var snapMeetings = memMode ? s.Meetings.Values.ToList() : new System.Collections.Generic.List<Domain.Meeting>();
+          var snapNotes = memMode ? s.Notes.Values.ToList() : new System.Collections.Generic.List<Domain.Note>();
+          var snapDrafts = memMode ? s.Drafts.Values.ToList() : new System.Collections.Generic.List<Domain.RecordDraft>();
+          var snapSources = memMode ? s.Sources.Values.ToList() : new System.Collections.Generic.List<Domain.SourceDoc>();
+          var snapSections = memMode ? s.SourceSections.Values.ToList() : new System.Collections.Generic.List<Domain.SourceSection>();
+          var snapHeads = memMode ? s.SourceHeads.Values.ToList() : new System.Collections.Generic.List<Domain.SourceFamilyHead>();
+          var snapEvents = memMode ? s.SourceEvents.Values.ToList() : new System.Collections.Generic.List<Domain.SourceEvent>();
+          var snapLeads = memMode ? s.LeadProfiles.Values.ToList() : new System.Collections.Generic.List<Domain.LeadProfile>();
+          var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
+          var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
+          var snapMessages = memMode ? s.Messages.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()) : new System.Collections.Generic.Dictionary<Guid, System.Collections.Generic.List<Domain.Message>>();
           try
           {
             restoredCount = Atomic.Run(() =>
@@ -519,13 +523,13 @@ public static class OpsEndpoints
               // completed-without-sections metadata is failed-closed until
               // reindex; established heads cover families the snapshot left
               // headless. All inside this same transaction.
-              SourceGovernance.MigrateRestoredSources(s);
               foreach (var kv in restored.blobs)
               {
                 if (Guid.TryParse(kv.Key, out var bid2))
                   if (s.Sources.TryGetValue(bid2, out var bdoc) && !string.IsNullOrEmpty(kv.Value))
                     try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
               }
+              SourceGovernance.MigrateRestoredSources(s);
               s.Sources.Flush();
               foreach (var img in restored.images)
               {
@@ -537,7 +541,7 @@ public static class OpsEndpoints
                   Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
                   Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
                   ContentType = img.contentType ?? "image/png", Data = data,
-                  CreatedAt = img.createdAt == default ? DateTime.UtcNow : DateTime.UtcNow,
+                  CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
                 };
               }
               foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
@@ -698,7 +702,9 @@ public static class OpsEndpoints
     foreach (var n in r.notes)
     {
       if (!bids.Contains(n.BoardId)) return Err("Backup graph: note references unknown board.");
-      if (!mids.Contains(n.MeetingId) || meetingBoard[n.MeetingId] != n.BoardId)
+      // Board-wide notes (e.g. adopted directions) legitimately carry an empty
+      // meeting id; only meeting-scoped notes must resolve to a same-board meeting.
+      if (n.MeetingId != Guid.Empty && (!mids.Contains(n.MeetingId) || meetingBoard[n.MeetingId] != n.BoardId))
         return Err("Backup graph: note references unknown or foreign meeting.");
     }
     foreach (var d in r.drafts)
@@ -707,7 +713,9 @@ public static class OpsEndpoints
       if (!mids.Contains(d.MeetingId) || meetingBoard[d.MeetingId] != d.BoardId)
         return Err("Backup graph: record references unknown or foreign meeting.");
     }
-    foreach (var l in r.leads) if (!bids.Contains(l.BoardId)) return Err("Backup graph: lead references unknown board.");
+    // Global leads legitimately carry an empty board id; only board-owned
+    // leads must resolve to an exported board.
+    foreach (var l in r.leads) if (l.BoardId != Guid.Empty && !bids.Contains(l.BoardId)) return Err("Backup graph: lead references unknown board.");
     foreach (var a in r.advisors)
     {
       if (!bids.Contains(a.BoardId)) return Err("Backup graph: advisor references unknown board.");
@@ -719,16 +727,8 @@ public static class OpsEndpoints
       if (im.rosterEntryId.HasValue && !rosterIds.Contains(im.rosterEntryId.Value))
         return Err("Backup graph: image references missing roster entry.");
     }
-    foreach (var kv in r.blobs)
-    {
-      if (!Guid.TryParse(kv.Key, out var bk)) return Err("Backup graph: blob key is not a GUID.");
-      if (!sourceIds.Contains(bk)) return Err("Backup graph: blob references unknown source.");
-      if (!string.IsNullOrEmpty(kv.Value))
-      {
-        try { Convert.FromBase64String(kv.Value); }
-        catch (FormatException) { return Err("Backup graph: blob is not valid base64."); }
-      }
-    }
+    // Blob linkage, encoding, and byte-identity are owned by the Phase 6 graph
+    // validator (422 with exact cause); the legacy structural pass defers them.
     foreach (var kv in r.messages)
     {
       if (!Guid.TryParse(kv.Key, out var mk)) return Err("Backup graph: message key is not a GUID.");
@@ -746,7 +746,19 @@ public static class OpsEndpoints
     }
     if (r.wizardDrafts is not null) foreach (var wz in r.wizardDrafts)
     {
+      if (wz is null) return Err("Backup graph: wizard draft is null.");
       if (wz.Id == Guid.Empty) return Err("Backup graph: wizard draft has no id.");
+    }
+    foreach (var im in r.images)
+    {
+      if (im is null) return Err("Backup graph: image entry is null.");
+      // Every binary is validated BEFORE any mutation: malformed image data
+      // must reject the snapshot instead of throwing mid-replacement.
+      if (!string.IsNullOrEmpty(im.data))
+      {
+        try { Convert.FromBase64String(im.data); }
+        catch (FormatException) { return Err("Backup graph: image data is not valid base64."); }
+      }
     }
     return null;
   }

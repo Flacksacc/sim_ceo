@@ -165,6 +165,11 @@ public sealed class SourceFamilyHead
   public string FamilyKey { get; set; } = "";
   public int HeadVersion { get; set; } = 0;
   public Guid HeadSourceId { get; set; } = Guid.Empty;
+  // Persisted allocation high-water: the highest version EVER allocated in this
+  // family. ReserveVersion never reuses a version at or below the high-water,
+  // so restoring an older backup cannot silently recycle a retired version
+  // number for new content. Monotonic per family; carried in backups.
+  public int HighWater { get; set; } = 0;
   public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
 public sealed class SourceEvent

@@ -397,29 +397,65 @@ async function suite(tag) {
   }
   // --- 8. destination auth: read-only denied writes; meeting-only grants ---
   // --- cannot move scope (narrow board authority), but can review in-scope.
+  // Meeting-scoped grants require secure accounts (Auth8): bootstrap dedicated
+  // identities; the first registration flips this fresh instance to secure.
   {
-    const bid = await newBoard(tag + "-perm");
-    const mid = await newMeeting(bid, "perm-m");
-    const up = await upload(bid, "perm.txt", "perm body " + crypto.randomUUID(), "board");
+    async function secReg(email) {
+      let r = await post("/api/auth/register", { email, password: "qa-only-pass-9" });
+      let tok = r.json?.token ?? r.json?.Token;
+      if (!tok) { const l = await post("/api/auth/login", { email, password: "qa-only-pass-9" }); tok = l.json?.token ?? l.json?.Token; }
+      return tok;
+    }
+    const adminEmail = "sgc-admin-" + tag + "-" + Date.now().toString(36) + "@qa.local";
+    const readerEmail = "sgc-reader-" + tag + "-" + Date.now().toString(36) + "@qa.local";
+    const meetEmail = "sgc-meet-" + tag + "-" + Date.now().toString(36) + "@qa.local";
+    const adminTok = await secReg(adminEmail);
+    const readerTok = await secReg(readerEmail);
+    const meetTok = await secReg(meetEmail);
+    ok(tag + "-perm-secure-bootstrap", !!adminTok && !!readerTok && !!meetTok, "tokens issued");
+    const AH = { "Authorization": "Bearer " + adminTok };
+    const RH = { "Authorization": "Bearer " + readerTok };
+    const MH = { "Authorization": "Bearer " + meetTok };
+    async function uploadAs(tok, boardId, filename, content, scope, meetingId) {
+      const fd = new FormData();
+      fd.append("file", new Blob([content], { type: "text/plain" }), filename);
+      if (scope) fd.append("scope", scope);
+      if (meetingId) fd.append("meetingId", meetingId);
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 20000);
+      try {
+        const r = await fetch(API + "/api/boards/" + boardId + "/sources/upload", { method: "POST", signal: ctl.signal, headers: { "Authorization": "Bearer " + tok }, body: fd });
+        const text = await r.text();
+        let json = null; try { json = text ? JSON.parse(text) : null; } catch { }
+        return { status: r.status, json, text };
+      } finally { clearTimeout(t); }
+    }
+    const bRes = await post("/api/boards", { name: tag + "-perm" }, { headers: AH });
+    const bid = bRes.json.id;
+    const mRes = await post("/api/boards/" + bid + "/meetings", { title: "perm-m" }, { headers: AH });
+    const mid = mRes.json.id;
+    const up = await uploadAs(adminTok, bid, "perm.txt", "perm body " + crypto.randomUUID(), "board");
     const id = sidOf(up);
-    const mu = await upload(bid, "permmeet.txt", "perm meeting body " + crypto.randomUUID(), "meeting", mid);
+    const mu = await uploadAs(adminTok, bid, "permmeet.txt", "perm meeting body " + crypto.randomUUID(), "meeting", mid);
     const mid2 = sidOf(mu);
-    const gr = await post("/api/boards/" + bid + "/grants", { userKey: "reader", access: "read" });
+    const gr = await post("/api/boards/" + bid + "/grants", { userKey: readerEmail, access: "read" }, { headers: AH });
     ok(tag + "-perm-grant-read", gr.status === 201, gr.status + " " + gr.text.slice(0, 200));
-    const gm = await post("/api/boards/" + bid + "/grants", { userKey: "meetaide", access: "contribute", meetingId: mid });
+    const gm = await post("/api/boards/" + bid + "/grants", { userKey: meetEmail, access: "contribute", meetingId: mid }, { headers: AH });
     ok(tag + "-perm-grant-meet", gm.status === 201, gm.status + " " + gm.text.slice(0, 200));
-    const denied = await post("/api/sources/" + id + "/approve", {}, { headers: { "x-user": "reader" } });
+    const denied = await post("/api/sources/" + id + "/approve", {}, { headers: RH });
     ok(tag + "-perm-read-deny-approve", denied.status === 403, denied.status + " " + denied.text.slice(0, 200));
-    const deniedPatch = await patch("/api/sources/" + id, { excluded: true }, { headers: { "x-user": "reader" } });
+    const deniedPatch = await patch("/api/sources/" + id, { excluded: true }, { headers: RH });
     ok(tag + "-perm-read-deny-patch", deniedPatch.status === 403, deniedPatch.status + " " + deniedPatch.text.slice(0, 200));
-    const readOk = await get("/api/boards/" + bid + "/recall?q=perm&take=8", { headers: { "x-user": "reader" } });
+    const readOk = await get("/api/boards/" + bid + "/recall?q=perm&take=8", { headers: RH });
     ok(tag + "-perm-read-recall-200", readOk.status === 200, readOk.status + "");
-    const meetMove = await patch("/api/sources/" + id, { scope: "meeting", meetingId: mid }, { headers: { "x-user": "meetaide" } });
-    ok(tag + "-perm-meet-deny-move", meetMove.status === 409, meetMove.status + " " + meetMove.text.slice(0, 200));
-    ok(tag + "-perm-meet-deny-actionable", (meetMove.text || "").toLowerCase().includes("upload"), (meetMove.text || "").slice(0, 200));
-    const meetAp = await post("/api/sources/" + mid2 + "/approve", {}, { headers: { "x-user": "meetaide" } });
+    const meetMove = await patch("/api/sources/" + id, { scope: "meeting", meetingId: mid }, { headers: MH });
+    ok(tag + "-perm-meet-deny-move", meetMove.status === 403, meetMove.status + " " + meetMove.text.slice(0, 200));
+    const adminMove = await patch("/api/sources/" + id, { scope: "meeting", meetingId: mid }, { headers: AH });
+    ok(tag + "-perm-board-deny-move-409", adminMove.status === 409, adminMove.status + " " + adminMove.text.slice(0, 200));
+    ok(tag + "-perm-meet-deny-actionable", (adminMove.text || "").toLowerCase().includes("upload"), (adminMove.text || "").slice(0, 200));
+    const meetAp = await post("/api/sources/" + mid2 + "/approve", {}, { headers: MH });
     ok(tag + "-perm-meet-approve-inscope", meetAp.status === 200, meetAp.status + " " + meetAp.text.slice(0, 200));
-    const still = await get("/api/sources/" + id + "/index");
+    const still = await get("/api/sources/" + id + "/index", { headers: AH });
     ok(tag + "-perm-board-untouched", still.status === 200, still.status + "");
   }
 }

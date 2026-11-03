@@ -143,12 +143,30 @@ public static class SourceEndpoints
       // the same family/version twice.
       SourceDoc? doc = null;
       string? dupMsg = null;
+      string? createDenied = null;
+      int createDeniedStatus = 403;
       lock (s.SetupLock)
       {
         lock (s.MessageLock)
         {
           Atomic.Run(() =>
           {
+            // Fresh board/scope/caller/policy validation inside the backend
+            // unit: a revocation, meeting move, or wiki-only switch between
+            // the entry check and insertion must fail closed with zero write.
+            if (!s.Boards.TryGetValue(bid, out var curBoard) || curBoard is null)
+            { createDenied = "Board not found."; createDeniedStatus = 404; return; }
+            if (PeopleOps.Check(s, req, bid, effMeeting, "contribute") is { } deniedCr)
+            { createDenied = "Access revoked or not granted for this scope."; return; }
+            if (SourceGovernance.PolicyModeOf(curBoard) == "wikiOnly")
+            { createDenied = "Board policy is wiki-only; uploads are disabled. Add a Wiki connector resource instead."; createDeniedStatus = 415; return; }
+            var blockedNow = (curBoard.BlockedTypes ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+              .Any(b => string.Equals(b.Trim().TrimStart('.'), SourceGovernance.GetExtension(file.FileName), StringComparison.OrdinalIgnoreCase));
+            if (blockedNow)
+            { createDenied = "Source type is blocked on this board."; createDeniedStatus = 415; return; }
+            if (effScope == "meeting" && (!effMeeting.HasValue
+              || !s.Meetings.TryGetValue(effMeeting.Value, out var curMtg) || curMtg.BoardId != bid))
+            { createDenied = "Meeting does not belong to this board."; createDeniedStatus = 409; return; }
             // Dedup is family-scoped (same bytes in the same board/scope/meeting/
             // origin/file family): identical bytes under a different family are a
             // separate pending version, never an unrelated board-wide conflict.
@@ -173,16 +191,17 @@ public static class SourceEndpoints
           });
         }
       }
+      if (createDenied is not null) return Results.Json(new { error = createDenied }, statusCode: createDeniedStatus);
       if (doc is null) return Results.Conflict(dupMsg ?? "Identical content already stored.");
       // Reserve the index slot, then run actual extraction outside the
       // transaction under that reservation: textual formats decode locally,
       // binary formats go to the extractor. A failed extraction can never
       // become completed raw-byte evidence (fail closed at commit).
-      if (!SourceGovernance.TryBeginIndex(s, doc.Id, out var res, out var beginErr) || res is null)
+      if (!SourceGovernance.TryBeginIndex(s, req, doc.Id, "contribute", out var res, out var beginErr) || res is null)
         return Results.Json(new { error = beginErr }, statusCode: 500);
       var extr = await Extraction.ExtractAsync(bytes, file.FileName);
       SourceGovernance.StampExtraction(s, res, Extraction.ToJson(extr));
-      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, res, false);
+      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, false, "contribute");
       if (!ok)
         return Results.Json(new { error = finErr, stale }, statusCode: status);
       _ = lost;
@@ -317,7 +336,7 @@ public static class SourceEndpoints
       if (!s.Sources.TryGetValue(id, out var found)) return Results.NotFound();
       if (PeopleOps.BadToken(s, req) is { } badRe) return badRe;
       if (PeopleOps.Check(s, req, found.BoardId, found.MeetingId, "contribute") is { } deniedSrc8) return deniedSrc8;
-      if (!SourceGovernance.TryBeginIndex(s, id, out var res, out var beginErr) || res is null)
+      if (!SourceGovernance.TryBeginIndex(s, req, id, "contribute", out var res, out var beginErr) || res is null)
         return Results.Json(new { error = beginErr }, statusCode: 404);
       var reviewBefore = "";
       lock (s.SetupLock) { lock (s.MessageLock) {
@@ -335,7 +354,7 @@ public static class SourceEndpoints
         var ext = await Extraction.ExtractAsync(snap.Original, snap.FileName);
         SourceGovernance.StampExtraction(s, res, Extraction.ToJson(ext));
       }
-      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, res, true);
+      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, true, "contribute");
       if (!ok)
         return Results.Json(new { error = finErr, stale }, statusCode: status);
       if (!s.Sources.TryGetValue(id, out var doc) || doc is null) return Results.NotFound();
@@ -535,7 +554,7 @@ public static class SourceEndpoints
     {
       if (!s.Sources.TryGetValue(id, out var found)) return Results.NotFound();
       if (PeopleOps.Check(s, req, found.BoardId, found.MeetingId, "contribute") is { } deniedSrc11) return deniedSrc11;
-      if (!SourceGovernance.TryBeginIndex(s, id, out var res, out var beginErr) || res is null)
+      if (!SourceGovernance.TryBeginIndex(s, req, id, "contribute", out var res, out var beginErr) || res is null)
         return Results.Json(new { error = beginErr }, statusCode: 404);
       var reviewBefore = "";
       lock (s.SetupLock) { lock (s.MessageLock) {
@@ -550,7 +569,7 @@ public static class SourceEndpoints
         var ext = await Extraction.ExtractAsync(snap.Original, snap.FileName);
         SourceGovernance.StampExtraction(s, res, Extraction.ToJson(ext));
       }
-      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, res, true);
+      var (ok, stale, lost, finErr, status) = SourceGovernance.FinishIndex(s, req, res, true, "contribute");
       if (!ok)
         return Results.Json(new { error = finErr, stale }, statusCode: status);
       if (!s.Sources.TryGetValue(id, out var doc) || doc is null) return Results.NotFound();

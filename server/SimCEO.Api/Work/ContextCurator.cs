@@ -56,10 +56,17 @@ public static class ContextCurator
     var recent = Recent(s, m.Id, 12);
     foreach (var msg in recent)
       sb.AppendLine($"[{msg.Sequence}] {msg.Sender}{(msg.AdvisorName is null ? "" : "/" + msg.AdvisorName)}: {Truncate(msg.Content, 600)}");
+    var evidence = new List<EvidenceRef>();
     foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.MeetingId == m.Id))
       .Where(v => v.EffectiveIds.Count > 0).OrderByDescending(v => v.Head.Version).Take(3))
+    {
       sb.AppendLine($"APPROVED RECORD v{v.Head.Version}: {Truncate(v.ConciseExport, 1500)}");
-    var evidence = new List<EvidenceRef>();
+      foreach (var id2 in v.EffectiveIds)
+      {
+        if (v.EffectiveOwners.TryGetValue(id2, out var own) && v.EffectiveTexts.TryGetValue(id2, out var et))
+          evidence.Add(EvidenceRef.ForRecordItem(own.RecordId, own.Version, id2, Truncate(et, 200)));
+      }
+    }
     foreach (var n in s.Notes.Values
       .Where(n => n.BoardId == m.BoardId && n.Kind == "direction" && !n.Provisional
         && (n.Scope == "board" || n.MeetingId == m.Id))
@@ -165,9 +172,14 @@ public static class ContextCurator
     foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.BoardId == boardId)))
     {
       if (v.EffectiveIds.Count == 0) continue;
-      var text = v.ConciseExport;
-      if (!string.IsNullOrWhiteSpace(text))
-        hits.Add(new RecallHit("record", $"record v{v.Head.Version}", Truncate(text, 600), Score(text, words) + 2));
+      // One hit per effective item pinned to its exact approving owner:
+      // inherited text is never labeled with an unapproved head version.
+      foreach (var id2 in v.EffectiveIds)
+      {
+        if (!v.EffectiveTexts.TryGetValue(id2, out var et) || string.IsNullOrWhiteSpace(et)) continue;
+        if (!v.EffectiveOwners.TryGetValue(id2, out var own)) continue;
+        hits.Add(new RecallHit("record", own.RecordId + "#" + id2, Truncate($"[{id2}] record v{own.Version}: " + et, 600), Score(et, words) + 2));
+      }
     }
     foreach (var n in s.Notes.Values.Where(n => n.BoardId == boardId && n.Kind == "direction" && !n.Provisional))
       hits.Add(new RecallHit("direction", n.Id.ToString(), Truncate(n.Body, 400), Score(n.Body, words) + 2));

@@ -36,9 +36,10 @@ const post = <T,>(actAs: string, u: string, b?: unknown): Promise<T> =>
 const putPolicy = (actAs: string, bid: string, blockedTypes: string, mode: string) =>
   fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean }) {
-  const { boardId, meetingId, meetings, actAs, readOnly } = props;
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean }) {
+  const { boardId, meetingId, meetings, actAs, readOnly, canManage } = props;
   const canWrite = !readOnly;
+  const canManagePolicy = canManage === true;
   const [groups, setGroups] = useState<ReviewGroup[] | null>(null);
   const [policy, setPolicy] = useState<{ blockedTypes: string; mode: string } | null>(null);
   const [blocked, setBlocked] = useState("");
@@ -154,7 +155,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
       {loading && <p role="status">Loading sources…</p>}
       {!loading && conflict && <p role="alert">Request failed: {conflict}</p>}
       {notice && <p role="status">{notice}</p>}
-      {canWrite && (<div className="card">
+      {canManagePolicy && (<div className="card">
         <h3>Source policy</h3>
         <p>Mode applies to every entry path (upload, inline creation, retry, recall, discussion). Wiki-only denies ordinary uploads. Exclusions win. Board discussion-policy activation is separate.</p>
         <label>Mode <select aria-label="Policy mode" value={mode} onChange={(e) => setMode(e.target.value)}>
