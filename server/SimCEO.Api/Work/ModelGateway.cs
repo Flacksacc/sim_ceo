@@ -619,7 +619,7 @@ public sealed class ModelGateway
 
   public async Task<string> CompleteAsync(string model, string purpose, string prompt,
     int inputBudget, int outputBudget, CancellationToken ct = default, bool ownerOverride = false,
-    Guid? boardId = null, Guid? meetingId = null)
+    Guid? boardId = null, Guid? meetingId = null, bool truncatePrompt = true)
   {
     ThrowIfCapped(ownerOverride);
     EnsureAvailable();
@@ -638,7 +638,7 @@ public sealed class ModelGateway
         messages = new object[]
         {
           new { role = "developer", content = dev },
-          new { role = "user", content = Truncate(prompt, inputBudget * 4) },
+          new { role = "user", content = truncatePrompt ? Truncate(prompt, inputBudget * 4) : (prompt.Length <= inputBudget * 4 ? prompt : throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.")) },
         },
         max_completion_tokens = Math.Clamp(ensured, 16, 16000),
         reasoning_effort = effort,

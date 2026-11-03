@@ -130,6 +130,28 @@ async function phase0() {
   ok("briefing-evidence-resolved", br.status === 201 && brBody.includes(srcId) && brBody.includes("Unity ledger alpha") && !brBody.includes("forged quotation never in the file"), br.status + " " + br.text.slice(0, 300));
   const brBad = await post("/api/meetings/" + mid + "/briefings", { topic: "qa topic", evidence: [{ kind: "source", ref: "s1", title: "T", excerpt: "E" }] });
   ok("briefing-unresolvable-dropped", brBad.status === 201 && !JSON.stringify(brBad.json).includes("s1"), brBad.status + " " + brBad.text.slice(0, 200));
+  await post("/api/meetings/" + mid + "/resume", {});
+  const fd0 = new FormData(); fd0.append("file", new Blob(["Real grounding text for briefing. Budget figures 10 to 20."], { type: "text/plain" }), "realbrief.txt"); fd0.append("scope", "board");
+  const up0raw = await fetch(API + "/api/boards/" + bid + "/sources/upload", { method: "POST", headers: { "x-user": "owner" }, body: fd0 });
+  const up0t = await up0raw.text(); let up0j = null; try { up0j = JSON.parse(up0t); } catch { }
+  const realSid = up0j.id || up0j.Id;
+  await post("/api/sources/" + realSid + "/approve", {});
+  await post("/api/meetings/" + mid + "/resume", {});
+  const secs0 = await get("/api/sources/" + realSid + "/sections");
+  const sec0 = (secs0.json.sections || secs0.json.Sections || [])[0];
+  const sec0Id = sec0.id || sec0.Id; const sec0Text = sec0.text || sec0.Text || "";
+  const brSec = await post("/api/meetings/" + mid + "/briefings", { topic: "qa topic SECRETARY-BRIEFING", evidence: [{ kind: "source", ref: realSid, excerpt: sec0Text.slice(0, 60) }] });
+  ok("briefing-evidence-stored", brSec.status === 201 && JSON.stringify(brSec.json).includes(realSid), br.status + " " + br.text.slice(0, 300));
+  ok("briefing-evidence-canonical", brSec.status === 201 && JSON.stringify(brSec.json).includes(sec0Id) && !JSON.stringify(br.json).includes("s1"), JSON.stringify(br.json).slice(0,500));
+  const brForged = await post("/api/meetings/" + mid + "/briefings", { topic: "forged SECRETARY-BRIEFING", evidence: [{ kind: "source", ref: realSid, excerpt: "forged quote xyz not in sections" }] });
+  ok("briefing-forged-canonicalized", brForged.status === 201 && !JSON.stringify(brForged.json).includes("forged quote xyz"), brForged.status + " " + brForged.text.slice(0,300));
+  const otherBid = await makeBoard(run + "-p0-other");
+  await post("/api/boards/" + otherBid + "/lead", { name: "QA Lead" });
+  const otherAdv = await makeAdvisor(otherBid, "Keeper2");
+  const otherMid = await makeMeeting(otherBid, "other brief");
+  await post("/api/meetings/" + otherMid + "/resume", {});
+  const brWrong = await post("/api/meetings/" + otherMid + "/briefings", { topic: "wrong scope SECRETARY-BRIEFING", evidence: [{ kind: "source", ref: realSid }] });
+  ok("briefing-wrong-scope-dropped", brWrong.status === 201 && !JSON.stringify(brWrong.json).includes(realSid), brWrong.status + " " + brWrong.text.slice(0,300));
   const exact = "Adopt $5.00 now [brackets] (keep!)";
   const dr = await post("/api/boards/" + bid + "/directions", { text: exact, scope: "meeting", meetingId: mid, evidence: [{ kind: "note", ref: "n1" }] });
   ok("direction-created", dr.status === 201, dr.status + " " + dr.text.slice(0, 160));
@@ -437,11 +459,21 @@ async function phase2() {
   const stale = await post("/api/boards/" + wbid + "/lead", { version: 0, name: "Stale", roleLabel: "x" });
   ok("lead-stale-409", stale.status === 409, stale.status + " " + stale.text.slice(0, 120));
   const bare = await makeBoard(run + "-bare");
-  const sec0 = await post("/api/meetings/" + (await makeMeeting(bare, "bare")) + "/secretary", { request: "hi" });
+  const sec0 = await post("/api/meetings/" + (await makeMeeting(bare, "bare")) + "/secretary", { input: "hi", clientNonce: "11111111-1111-1111-1111-111111111111" });
   ok("secretary-bare-409", sec0.status === 409, String(sec0.status));
   const midS = await makeMeeting(wbid, "ready");
-  const sec1 = await post("/api/meetings/" + midS + "/secretary", { request: "qa status" });
-  ok("secretary-ready-200", sec1.status === 200 && sec1.json?.provisional === true, sec1.status + " " + sec1.text.slice(0, 200));
+  await post("/api/meetings/" + midS + "/resume", {});
+  const { randomUUID: _ru } = await import("node:crypto");
+  const sNonce = _ru();
+  const sec1 = await post("/api/meetings/" + midS + "/secretary", { input: "qa status SECRETARY-NOTE", clientNonce: sNonce });
+  ok("secretary-ready-200", sec1.status === 200 && sec1.json?.note && (sec1.json.note.provisional ?? sec1.json.note.Provisional) === true, sec1.status + " " + sec1.text.slice(0, 300));
+  ok("secretary-ready-request", !!sec1.json?.requestId && !!sec1.json?.status, sec1.text.slice(0,200));
+  const secReplay = await post("/api/meetings/" + midS + "/secretary", { input: "qa status SECRETARY-NOTE", clientNonce: sNonce });
+  ok("secretary-ready-replay", secReplay.status === 200 && secReplay.json?.replay === true && String(secReplay.json.note.id || secReplay.json.note.Id) === String(sec1.json.note.id || sec1.json.note.Id), secReplay.status + " " + secReplay.text.slice(0,300));
+  const secConflict = await post("/api/meetings/" + midS + "/secretary", { input: "different", clientNonce: sNonce });
+  ok("secretary-ready-conflict", secConflict.status === 409, String(secConflict.status));
+  const msgsS = await get("/api/meetings/" + midS + "/messages?take=100");
+  ok("secretary-ready-owner-once", (msgsS.json || []).filter((m) => (m.sender || m.Sender) === "lead").length === 1, JSON.stringify((msgsS.json||[]).length));
 }
 // ---------- phase 3 ----------
 async function phase3() {

@@ -84,6 +84,8 @@ if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
         Environment.Exit(1);
       }
       Console.WriteLine("POSTGRES: connected.");
+      var recovered = SimCEO.Api.Work.SecretaryRecovery.RecoverInterrupted(pgStore);
+      Console.WriteLine($"POSTGRES: secretary recovery marked {recovered} interrupted request(s).");
     }
     catch (Exception ex)
     {

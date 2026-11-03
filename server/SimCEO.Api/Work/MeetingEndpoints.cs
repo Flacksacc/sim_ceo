@@ -169,24 +169,45 @@ public static class MeetingEndpoints
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "read") is { } deniedNotes) return deniedNotes;
-      var notes = s.Notes.Values.Where(n => n.MeetingId == id);
-      if (!string.IsNullOrWhiteSpace(kind)) notes = notes.Where(n => n.Kind == kind);
-      return Results.Ok(notes.OrderByDescending(n => n.CreatedAt).Take(100));
+      if (!PeopleOps.Can(s, req, m.BoardId, id, "read")) return PeopleOps.Denied();
+      var notes = s.Notes.Values.Where(n => n.MeetingId == id && n.BoardId == m.BoardId);
+      if (!string.IsNullOrWhiteSpace(kind))
+      {
+        var k = kind.Trim();
+        notes = notes.Where(n => n.Kind == k);
+      }
+      else
+      {
+        notes = notes.Where(n => !SecretaryContext.IsOperationalNote(n) && n.NoteStatus == "current");
+      }
+      return Results.Ok(notes.OrderByDescending(n => n.CreatedAt).Take(100).ToList());
     });
 
     app.MapPost("/api/meetings/{id:guid}/notes", (InMemoryStore s, HttpRequest req, Guid id, Note input) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedNotePost) return deniedNotePost;
-      input.Id = Guid.NewGuid();
-      input.BoardId = m.BoardId;
-      input.MeetingId = id;
-      if (input.Kind is not ("note" or "briefing")) input.Kind = "note";
-      input.Scope = "meeting";
-      input.Provisional = true;
-      input.CreatedAt = DateTime.UtcNow;
-      s.Notes[input.Id] = input;
-      return Results.Created($"/api/notes/{input.Id}", input);
+      var title = (input.Title ?? "").Trim();
+      var bodyIn = (input.Body ?? "").Trim();
+      if (string.IsNullOrWhiteSpace(bodyIn)) return Results.BadRequest("body is required.");
+      if (bodyIn.Length > 12000) return Results.BadRequest("body too long.");
+      var kind = (input.Kind ?? "note").Trim().ToLowerInvariant();
+      if (kind is not ("note" or "briefing")) kind = "note";
+      Note created;
+      lock (s.SetupLock) { lock (s.MessageLock) {
+        created = Atomic.Run(() =>
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur) || cur.BoardId != m.BoardId) throw new InvalidOperationException("meeting moved");
+          var note = new Note { BoardId = cur.BoardId, MeetingId = id, Kind = kind, Title = string.IsNullOrWhiteSpace(title) ? (kind == "briefing" ? "Briefing" : "Working note") : title, Body = bodyIn, Scope = "meeting", Provisional = true, EvidenceJson = "[]", RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
+          note.RootId = note.Id;
+          s.Notes[note.Id] = note;
+          var h = new NoteHistory { BoardId = cur.BoardId, MeetingId = id, NoteId = note.Id, RootId = note.RootId, Revision = 1, Title = note.Title, Body = note.Body, EvidenceJson = note.EvidenceJson, Action = "created", CreatedAt = DateTime.UtcNow };
+          s.NoteHistories[h.Id] = h;
+          s.Notes.Flush(); s.NoteHistories.Flush();
+          return note;
+        });
+      } }
+      return Results.Created($"/api/notes/{created.Id}", created);
     });
 
     app.MapPost("/api/meetings/{id:guid}/briefings", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -195,55 +216,85 @@ public static class MeetingEndpoints
       if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedBr) return deniedBr;
       if (PeopleOps.Guard(gw, req) is { } cappedBr) return cappedBr;
       var topic = body.TryGetProperty("topic", out var t) ? (t.GetString() ?? "") : "";
+      if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("input", out var iv2) && iv2.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(iv2.GetString())) topic = iv2.GetString() ?? topic;
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
+      var callerRaw = EvidenceRef.ParseList(body, "evidence");
+      SecretarySnapshot snapBefore;
+      List<EvidenceRef> deliveredB = new();
+      List<string> omittedB = new();
+      string promptBText;
+      List<EvidenceRef> callerCanonPre;
+      try
+      {
+        lock (s.SetupLock) { lock (s.MessageLock) {
+          snapBefore = SecretaryContext.CaptureSnapshot(s, m);
+          callerCanonPre = SecretaryContext.CanonicalizeCaller(s, m.BoardId, id, callerRaw);
+          const string bhead = "You are the board secretary. Return a provisional briefing as JSON with kind briefing, title and body. Ground only in the packet; state limitations when evidence is missing.\n";
+          string btail = "\nBRIEFING TOPIC: " + topic.Trim() + "\n";
+          int bbudget = 32000 - bhead.Length - btail.Length - 1000;
+          if (bbudget < 4000) throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
+          var tmpB = new List<EvidenceRef>(); var omB = new List<string>();
+          string packetB = SecretaryContext.BuildPacket(s, m, topic.Trim(), callerCanonPre, tmpB, bbudget, omB);
+          string bfooter = omB.Count > 0 ? "\nOMITTED FROM PACKET (not cited as evidence): " + string.Join("; ", omB.Take(20)) + "\n" : "";
+          string fullB = bhead + packetB + bfooter + btail;
+          if (fullB.Length > 32000) throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
+          foreach (var d in tmpB.ToList())
+          {
+            if (string.IsNullOrWhiteSpace(d.Excerpt) || !fullB.Contains(d.Excerpt!, StringComparison.Ordinal))
+            {
+              bool isCallerB = callerCanonPre.Any(c => c.Kind == d.Kind && c.Ref == d.Ref && (c.SectionId ?? "") == (d.SectionId ?? ""));
+              if (isCallerB) throw new ProviderException(502, "Secretary caller evidence exceeds prompt budget.");
+              tmpB.Remove(d);
+            }
+          }
+          deliveredB = tmpB; omittedB = omB; promptBText = fullB;
+        } }
+      }
+      catch (ProviderException pexB) { return PeopleOps.ProviderError(pexB); }
       if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
         return Results.Conflict("Meeting is not active; resume to request a briefing.");
-      // Capture generation + eligible-input fingerprint BEFORE the provider
-      // await: a policy change, exclusion, revocation, or index-generation
-      // change during generation must discard the stale draft instead of
-      // publishing it (P1 #3/#4). The fingerprint pins the exact eligible
-      // set with per-source version, index generation, content hash, and
-      // section-graph shape, so a same-bytes/version reindex that swaps
-      // text still discards the in-flight draft.
-      var genBefore = m.Generation;
-      var epochBefore = s.SourceEpoch;
-      List<string> EligibleFingerprint() => SourceGovernance.EligibleFingerprint(s, m.BoardId, id);
-      var fpBefore = EligibleFingerprint();
-      var evidenceBefore = SourceGovernance.ResolveEvidence(s, req, EvidenceRef.ParseList(body, "evidence"), m.BoardId, id);
       string text;
       try
       {
-        text = await gw.CompleteAsync(ModelPolicy.SparkFor(s, m.BoardId), "briefing",
-        "Provisional briefing on " + topic + " from saved board context only.", ContextBudget.BidTokens, 2048,
-        ownerOverride: PeopleOps.IsOwner(req), boardId: m.BoardId, meetingId: id);
+        text = await gw.CompleteAsync(ModelPolicy.SparkFor(s, m.BoardId), "secretary",
+        promptBText, SecretaryDirect.InputTokens, 2048,
+        ownerOverride: PeopleOps.IsOwner(req), boardId: m.BoardId, meetingId: id, truncatePrompt: false);
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
-      // Re-authorize AFTER the model await: the caller may have been revoked during generation.
+      SecretaryOutcome bout;
+      try { bout = SecretaryOutcomeParser.Parse(text); }
+      catch (ProviderException pex) { return PeopleOps.ProviderError(pex); }
+      if (bout.Kind != "secretary-briefing") return Results.Json(new { error = "Briefing model returned non-briefing outcome." }, statusCode: 502);
+      // Re-authorize AFTER the model await: the caller may have been revoked or expired during generation.
       if (PeopleOps.BadToken(s, req) is { } badBr2) return badBr2;
       if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedBr2) return deniedBr2;
-      if (!s.Meetings.TryGetValue(id, out m)) return Results.NotFound("meeting");
-      // Publication boundary: recheck state, generation, and the eligible
-      // input fingerprint under the governance locks before storing.
       lock (s.SetupLock)
       {
         lock (s.MessageLock)
         {
-          if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
-            return Results.Conflict("Meeting state changed during briefing; draft discarded.");
-          if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
-          if (cur.Generation != genBefore || s.SourceEpoch != epochBefore)
-            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
-          if (!EligibleFingerprint().SequenceEqual(fpBefore))
-            return Results.Conflict("Source evidence changed during briefing; draft discarded.");
-            var resolved = SourceGovernance.ResolveEvidence(s, req, evidenceBefore, m.BoardId, id);
-          var note = new Note
+          return Atomic.Run<IResult>(() =>
           {
-            BoardId = m.BoardId, MeetingId = id, Kind = "briefing",
-            Title = topic, Body = text, Scope = "meeting", Provisional = true,
-            EvidenceJson = EvidenceRef.ToJsonList(resolved),
-          };
-          s.Notes[note.Id] = note;
-          return Results.Created($"/api/notes/{note.Id}", note);
+            if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+              return Results.Conflict("Meeting state changed during briefing; draft discarded.");
+            var nowSnap = SecretaryContext.CaptureSnapshot(s, cur);
+            if (!SecretaryContext.SnapshotEquals(snapBefore, nowSnap))
+              return Results.Json(new { error = SecretaryContext.SnapshotMismatchReason(snapBefore, nowSnap) }, statusCode: 409);
+            if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
+            var bodyText = bout.Body;
+            if (deliveredB.Count == 0) bodyText = bodyText + " [Limitation: No eligible approved sources, adopted directions, or approved records were available for this meeting.]";
+            var note = new Note
+            {
+              BoardId = cur.BoardId, MeetingId = id, Kind = "secretary-briefing",
+              Title = string.IsNullOrWhiteSpace(bout.Title) ? topic.Trim() : bout.Title, Body = bodyText, Scope = "meeting", Provisional = true,
+              EvidenceJson = EvidenceRef.ToJsonList(deliveredB), RootId = Guid.Empty, Revision = 1, NoteStatus = "current", CreatedAt = DateTime.UtcNow,
+            };
+            note.RootId = note.Id;
+            s.Notes[note.Id] = note;
+            var hb = new NoteHistory { BoardId = cur.BoardId, MeetingId = id, NoteId = note.Id, RootId = note.RootId, Revision = 1, Title = note.Title, Body = note.Body, EvidenceJson = note.EvidenceJson, Action = "created", CreatedAt = DateTime.UtcNow };
+            s.NoteHistories[hb.Id] = hb;
+            s.Notes.Flush(); s.NoteHistories.Flush();
+            return Results.Created($"/api/notes/{note.Id}", note);
+          });
         }
       }
     });
@@ -288,7 +339,9 @@ public static class MeetingEndpoints
         Title = scope == "board" ? "Adopted board-wide" : "Adopted for meeting",
         Body = text, Provisional = false,
         EvidenceJson = EvidenceRef.ToJsonList(SourceGovernance.ResolveEvidence(s, req, EvidenceRef.ParseList(body, "evidence"), bid, meetingId == Guid.Empty ? null : meetingId)),
+        RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current",
       };
+      note.RootId = note.Id;
       s.Notes[note.Id] = note;
       s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });
       return Results.Created($"/api/notes/{note.Id}", note);

@@ -233,11 +233,49 @@ public sealed class Note
   public string Body { get; set; } = "";
   public string Scope { get; set; } = "";
   public bool Provisional { get; set; }
+    public Guid RootId { get; set; } = Guid.Empty;
+    public int Revision { get; set; } = 1;
+    public Guid? PredecessorId { get; set; }
+    public string NoteStatus { get; set; } = "current";
   public string EvidenceJson { get; set; } = "[]";
   public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
-public sealed class Grant
+public sealed class SecretaryRequest
+  {
+    [Key] public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid BoardId { get; set; }
+    public Guid MeetingId { get; set; }
+    public string ClientNonce { get; set; } = "";
+    public string InputHash { get; set; } = "";
+    public string InputText { get; set; } = "";
+    public string Status { get; set; } = "pending";
+    public string Question { get; set; } = "";
+    public string Answer { get; set; } = "";
+    public Guid? NoteId { get; set; }
+    public long Generation { get; set; }
+    public string LeadFingerprint { get; set; } = "";
+    public string EvidenceFingerprintJson { get; set; } = "[]"; public string SnapshotJson { get; set; } = "{}"; public string Phase { get; set; } = "initial"; public string SubmissionHash { get; set; } = ""; public string CallerRefsJson { get; set; } = "[]"; public string RecentHash { get; set; } = ""; public string EvidenceTextHash { get; set; } = ""; public string DossierHash { get; set; } = "";public string DeliveredRefsJson { get; set; } = "[]"; public string DeliveredPromptHash { get; set; } = ""; public Guid AttemptId { get; set; } = Guid.Empty; public Guid AnswerAttemptId { get; set; } = Guid.Empty;
+    public string Error { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? CompletedAt { get; set; }
+  }
+
+  public sealed class NoteHistory
+  {
+    [Key] public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid BoardId { get; set; } public Guid MeetingId { get; set; } public Guid NoteId { get; set; }
+    public Guid RootId { get; set; }
+    public int Revision { get; set; } = 1;
+    public string Title { get; set; } = "";
+    public string Body { get; set; } = "";
+    public string EvidenceJson { get; set; } = "[]";
+    public string Action { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+  }
+
+  public sealed class Grant
 {
   [Key] public Guid Id { get; set; } = Guid.NewGuid();
   public Guid BoardId { get; set; }
