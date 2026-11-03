@@ -12,7 +12,7 @@ function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
 function gateWait(text) { const w = sleepMsOf(text); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
 function logPrompt(path, text) {
   try {
-    promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length });
+    promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length, full: (text || "").slice(0, 200000) });
     if (promptLog.length > 500) promptLog.splice(0, promptLog.length - 500);
   } catch { }
 }

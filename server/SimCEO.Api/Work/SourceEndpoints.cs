@@ -445,7 +445,11 @@ public static class SourceEndpoints
             if (wantScope == "meeting" && !targetMeeting.HasValue)
               return Results.BadRequest("meetingId is required for meeting scope.");
             if (wantScope != doc.Scope || targetMeeting != doc.MeetingId)
+            {
+              if (string.Equals((doc.Origin ?? "").Trim(), "wiki", System.StringComparison.OrdinalIgnoreCase))
+                return Results.Json(new { error = "Wiki connector scope is authoritative; move the resource via its Wiki resource (scope/meeting), not generic source scope editing." }, statusCode: 409);
               return Results.Json(new { error = "Scope changes are not performed by edit; upload a new version in the destination board/meeting scope instead. This version keeps its scope, review, and history." }, statusCode: 409);
+            }
           }
           else if (hasMeetingId && !doc.MeetingId.HasValue)
           {

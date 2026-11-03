@@ -360,6 +360,38 @@ public static class OpsEndpoints
       if (!s.Sources.TryGetValue(sourceId, out var doc)) return Results.NotFound("source");
       // Authorize the referenced source: caller must read its actual scope.
       if (PeopleOps.Check(s, req, doc.BoardId, doc.MeetingId, "read") is { } deniedDoc) return deniedDoc;
+      // Setup-use purpose gate for Wiki connectors (F9): missing resources,
+      // disabled/setup-off/failed/stale/pending/removed-page sources, and
+      // unauthorized scopes all reject WITHOUT adding a checkpoint. Only a
+      // healthy authorized setup-use positive control passes.
+      if (string.Equals((doc.Origin ?? "").Trim(), "wiki", System.StringComparison.OrdinalIgnoreCase))
+      {
+        static (bool ok, string error) WikiSetupAllowed(InMemoryStore s, HttpRequest req, SourceDoc d, out WikiResource? wrOut)
+        {
+          wrOut = null;
+          if (!d.ResourceId.HasValue || !s.WikiResources.TryGetValue(d.ResourceId.Value, out var wr)) return (false, "Wiki connector for this source is missing; reconfigure the connector before wizard extraction.");
+          wrOut = wr;
+          if (!wr.SetupUse) return (false, "This Wiki connector is not enabled for setup use; enable setup-use on the resource before wizard extraction.");
+          if (!wr.Enabled || !string.Equals(wr.LastStatus ?? "", "succeeded", StringComparison.OrdinalIgnoreCase)
+            || wr.ConfigRevision != wr.LastSuccessRevision || wr.LastSuccessRevision <= 0)
+            return (false, "Wiki connector evidence is not currently healthy; sync successfully before wizard extraction.");
+          HashSet<string> members;
+          try
+          {
+            var list = JsonSerializer.Deserialize<List<string>>(string.IsNullOrWhiteSpace(wr.SuccessPagesJson) ? "[]" : wr.SuccessPagesJson);
+            members = new HashSet<string>(list ?? new(), StringComparer.Ordinal);
+          }
+          catch { return (false, "Wiki connector evidence is not currently healthy; sync successfully before wizard extraction."); }
+          if (!members.Contains(d.FamilyKey ?? "")) return (false, "Wiki page is not in the current successful sync; sync successfully before wizard extraction.");
+          if (!SourceGovernance.IsEligible(s, d, d.Scope == "meeting" ? d.MeetingId : null))
+            return (false, "Wiki source is not eligible (pending, excluded, unindexed, or removed); approve and sync before wizard extraction.");
+          if (!WikiAuth.CanReadResource(s, req, wr.BoardId, wr.Scope, wr.MeetingId))
+            return (false, "Access revoked or not granted for this scope.");
+          return (true, "");
+        }
+        var (setupOk, setupErr) = WikiSetupAllowed(s, req, doc, out _);
+        if (!setupOk) return Results.Json(new { error = setupErr }, statusCode: 409);
+      }
       List<object> log;
       try
       {
@@ -402,25 +434,30 @@ public static class OpsEndpoints
       }
       else if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can export backups." }, statusCode: 403);
+      // Deterministic canonical ordering: every collection is sorted by
+      // identity (dictionaries by key) so backups hash stably and restores
+      // round-trip byte-identically (modulo the fresh export timestamp).
       var snapshot = new
       {
         version = 2,
         at = DateTime.UtcNow,
-        boards = s.Boards.Values.ToList(),
-        roster = s.Roster.Values.ToList(),
-        advisors = s.Advisors.Values.ToList(),
-        meetings = s.Meetings.Values.ToList(),
-        messages = s.Messages.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
-        notes = s.Notes.Values.ToList(),
-        drafts = s.Drafts.Values.ToList(),
-        sources = s.Sources.Values.ToList(), sections = s.SourceSections.Values.ToList(), heads = s.SourceHeads.Values.ToList(), events = s.SourceEvents.Values.ToList(),
-        blobs = s.Sources.Values.ToDictionary(
+        boards = s.Boards.Values.OrderBy(x => x.Id).ToList(),
+        roster = s.Roster.Values.OrderBy(x => x.Id).ToList(),
+        advisors = s.Advisors.Values.OrderBy(x => x.Id).ToList(),
+        meetings = s.Meetings.Values.OrderBy(x => x.Id).ToList(),
+        messages = s.Messages.OrderBy(kv => kv.Key).ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
+        notes = s.Notes.Values.OrderBy(x => x.Id).ToList(),
+        drafts = s.Drafts.Values.OrderBy(x => x.Id).ToList(),
+        sources = s.Sources.Values.OrderBy(x => x.Id).ToList(), sections = s.SourceSections.Values.OrderBy(x => x.Id).ToList(), heads = s.SourceHeads.Values.OrderBy(x => x.Id).ToList(), events = s.SourceEvents.Values.OrderBy(x => x.Id).ToList(),
+        wikiResources = WikiBackup.Export(s),
+        deletedWikiResourceIds = WikiBackup.DeletedWikiResourceIds(s),
+        blobs = s.Sources.Values.OrderBy(x => x.Id).ToDictionary(
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
-        leads = s.LeadProfiles.Values.ToList(),
-          wizardDrafts = s.WizardDrafts.Values.ToList(),
-        grants = s.Grants.Values.ToList(),
-        invites = s.Invites.Values.ToList(),
-        images = s.Images.Values.Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
+        leads = s.LeadProfiles.Values.OrderBy(x => x.Id).ToList(),
+          wizardDrafts = s.WizardDrafts.Values.OrderBy(x => x.Id).ToList(),
+        grants = s.Grants.Values.OrderBy(x => x.Id).ToList(),
+        invites = s.Invites.Values.OrderBy(x => x.Id).ToList(),
+        images = s.Images.Values.OrderBy(i => i.Id).Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
       };
       var json = JsonSerializer.Serialize(snapshot);
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)), bytes = json.Length });
@@ -464,6 +501,20 @@ public static class OpsEndpoints
       // forged graphs are rejected with zero partial state.
       if (!SourceGovernance.ValidateRestoreGraph(restored, out var srcGraphErr))
         return Results.Json(new { error = "Backup graph rejected: " + srcGraphErr }, statusCode: 422);
+      // Typed Wiki graph prevalidation BEFORE any clear: strict required IDs,
+      // exact scopes, snapshot meeting parents, strict rule JSON, preserved
+      // history, and source/section graph validation. Secrets, dangling,
+      // cross-board, and malformed graphs reject without partial writes.
+      // Absent wikiResources validates as empty (backward compatible).
+      List<WikiBackupRecord>? wikiValidated = null;
+      try
+      {
+        using var vdoc = JsonDocument.Parse(snapshot);
+        var (recs, werr) = WikiBackup.Validate(vdoc.RootElement, s);
+        if (werr is not null) return Results.BadRequest(werr);
+        wikiValidated = recs;
+      }
+      catch (JsonException) { return Results.BadRequest("Snapshot wikiResources are malformed."); }
       var memMode = SimCEO.Api.Data.Pg.Backend is null;
       int restoredCount = 0;
       lock (s.SetupLock)
@@ -491,6 +542,8 @@ public static class OpsEndpoints
           var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
           var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
           var snapMessages = memMode ? s.Messages.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()) : new System.Collections.Generic.Dictionary<Guid, System.Collections.Generic.List<Domain.Message>>();
+          var snapWikiRes = memMode ? s.WikiResources.Values.ToList() : new System.Collections.Generic.List<Domain.WikiResource>();
+          var snapWikiSec = memMode ? s.WikiSecrets.Values.ToList() : new System.Collections.Generic.List<Domain.WikiResourceSecret>();
           try
           {
             restoredCount = Atomic.Run(() =>
@@ -498,6 +551,7 @@ public static class OpsEndpoints
               s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
               s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
               s.LeadProfiles.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
+              s.WikiResources.Clear(); s.WikiSecrets.Clear();
               foreach (var b in restored.boards) s.Boards[b.Id] = b;
               foreach (var r in restored.roster) s.Roster[r.Id] = r;
               foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
@@ -516,6 +570,33 @@ public static class OpsEndpoints
               if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss;
               if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh;
               if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
+            // Typed Wiki restore: exact validated export round-trips resource IDs,
+            // history, URLs, rules, scope, and schedule; credentials are absent
+            // and every resource is DISABLED with blocked cached sources.
+            // Validated BEFORE clear; applied atomically inside the same boundary.
+            // No grants/invites/ACL are restored here by design (see ACL note below).
+            if (wikiValidated is not null)
+              foreach (var w in wikiValidated)
+              {
+                var r = new Domain.WikiResource
+                {
+                  Id = w.Id, BoardId = w.BoardId, Scope = w.Scope, MeetingId = w.MeetingId,
+                  BaseUrl = w.BaseUrl, Description = w.Description ?? "", AllowedUse = w.AllowedUse ?? "",
+                  SetupUse = w.SetupUse, ManualOnly = w.ManualOnly,
+                  AllowlistJson = w.AllowlistJson, ExclusionsJson = w.ExclusionsJson,
+                  RequiredTagsJson = w.RequiredTagsJson, Locale = w.Locale ?? "",
+                  ConfigRevision = w.ConfigRevision, AttemptGeneration = 1, AttemptStatus = "idle",
+                  SyncIntervalMinutes = w.SyncIntervalMinutes, CreatedAt = w.CreatedAt,
+                  Enabled = false, LastStatus = "disabled",
+                  LastError = "Restored from backup; reconfigure the credential and re-enable.",
+                  LastCompletedAt = null, LastSuccessAt = null,
+                  HasCredential = false, SuccessPagesJson = "[]", LastSuccessRevision = 0,
+                  NextSyncAt = null, UpdatedAt = DateTime.UtcNow,
+                };
+                if (!s.Boards.TryGetValue(r.BoardId, out _)) throw new InvalidOperationException("validated invariant violated: wiki board missing.");
+                if (r.Scope == "meeting" && (!r.MeetingId.HasValue || !s.Meetings.TryGetValue(r.MeetingId.Value, out var wmt) || wmt.BoardId != r.BoardId)) throw new InvalidOperationException("validated invariant violated: wiki meeting missing.");
+                s.WikiResources[r.Id] = r;
+              }
               // Deliberate legacy migration: pre-phase-6 snapshots carry
               // Approved=true with no ReviewState field. The "" sentinel promotes
               // those to "approved" without touching explicit decisions (rejected
@@ -575,6 +656,8 @@ public static class OpsEndpoints
                 s.SourceSections.Clear(); foreach (var ss in snapSections) s.SourceSections[ss.Id] = ss;
                 s.SourceHeads.Clear(); foreach (var hh in snapHeads) s.SourceHeads[hh.Id] = hh;
                 s.SourceEvents.Clear(); foreach (var ee in snapEvents) s.SourceEvents[ee.Id] = ee;
+                s.WikiResources.Clear(); foreach (var wr in snapWikiRes) s.WikiResources[wr.Id] = wr;
+                s.WikiSecrets.Clear(); foreach (var ws in snapWikiSec) s.WikiSecrets[ws.Id] = ws;
                 s.LeadProfiles.Clear(); foreach (var l in snapLeads) s.LeadProfiles[l.Id] = l;
                 s.Images.Clear(); foreach (var im in snapImages) s.Images[im.Id] = im;
                 s.WizardDrafts.Clear(); foreach (var w in snapWiz) s.WizardDrafts[w.Id] = w;

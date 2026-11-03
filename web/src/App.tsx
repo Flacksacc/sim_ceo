@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr"; import SourcesGovernance from "./sources-governance";
 import { convertRecordedBlobToWav } from "./voiceCodec";
+import WikiResources from "./wiki-resources";
 type Board = { id: string; name: string; mission: string };
 type Meeting = { id: string; title: string; state: number };
 type Msg = {
@@ -446,6 +447,10 @@ const authedDownload = async (u: string, filename: string): Promise<void> => {
     a.href = b.url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
   } finally { setTimeout(() => URL.revokeObjectURL(b.url), 10000); }
 };
+// Shared applied transport (demo identity + Bearer + auth epoch) passed to
+// the Wiki connector UI; every Wiki call carries the same applied identity
+// as the rest of the app (no window-global substitute).
+const wikiApi = { get, post, patch, del, put, upload };
 type Tab =
   | "boards"
   | "wizard"
@@ -6918,6 +6923,7 @@ const testModel = useMutation({
             <section aria-label="Resources and Inbox">
               {" "}
               <h2>Resources and Inbox</h2>{" "}
+              <WikiResources boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} api={wikiApi} onChanged={() => { try { qc.invalidateQueries(); } catch {} }} />
                 <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} />
             </section>
           )}{" "}

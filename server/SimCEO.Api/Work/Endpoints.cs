@@ -928,6 +928,7 @@ public static class SimCEOEndpoints
     app.MapMeetingExtras();
     app.MapRecords();
     app.MapSourcesX();
+    app.MapWiki();
     app.MapPeople();
     app.MapAuth();
     app.MapOps();

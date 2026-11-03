@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type GovSource = {
   id: string; boardId: string; fileName: string; contentHash: string; version: number;
@@ -58,11 +58,23 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
   // change event instead of being swallowed as "no change".
   const [fileKey, setFileKey] = useState(0);
   // (move-target meeting resolves after its state declaration below)
+  // Stale-closure guards: an obsolete refresh for another board (or an older
+  // overlapping refresh) must never displace current-board state.
+  const boardRef = useRef(boardId);
+  boardRef.current = boardId;
+  const seqRef = useRef(0);
+  function notifyWikiChanged() {
+    try { window.dispatchEvent(new CustomEvent("wiki-changed", { detail: { boardId: boardRef.current } })); } catch {}
+  }
   async function refresh() {
+    const myBoard = boardId;
+    if (boardRef.current !== myBoard) return;
     if (!boardId) return;
+    const seq = ++seqRef.current;
     setLoading(true); setConflict("");
     try {
       const g = await get<ReviewGroup[]>(actAs, "/api/boards/" + boardId + "/sources/review");
+      if (boardRef.current !== myBoard || seq !== seqRef.current) return;
       setGroups(g);
       if (canWrite) {
         try {
@@ -70,12 +82,13 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
             get<{ blockedTypes: string; mode: string }>(actAs, "/api/boards/" + boardId + "/source-policy"),
             get<unknown>(actAs, "/api/boards/" + boardId + "/context"),
           ]);
+          if (boardRef.current !== myBoard || seq !== seqRef.current) return;
           setPolicy(p); setBlocked(p.blockedTypes ?? ""); setMode(p.mode ?? "allowAll"); setCtx(c);
-        } catch (e) { setConflict(String(e)); }
+        } catch (e) { if (boardRef.current === myBoard && seq === seqRef.current) setConflict(String(e)); }
       }
     } catch (e) {
-      setConflict(String(e));
-    } finally { setLoading(false); }
+      if (boardRef.current === myBoard && seq === seqRef.current) setConflict(String(e));
+    } finally { if (boardRef.current === myBoard && seq === seqRef.current) setLoading(false); }
   }
   useEffect(() => { refresh(); }, [boardId]);
 
@@ -94,16 +107,19 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
   }
   async function act(id: string, op: string) {
     setConflict(""); setNotice("");
+    const opBoard = boardId;
     try {
       await post(actAs, "/api/sources/" + id + "/" + op, {});
+      if (boardRef.current !== opBoard) return;
       if (op === "approve" || op === "reject" || op === "exclude" || op === "restore") setNotice("Meeting evidence re-evaluated; affected active meetings paused.");
-      await refresh();
-    } catch (e) { setConflict(String(e)); }
+      await refresh(); notifyWikiChanged();
+    } catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
   }
   async function savePolicy() {
     setConflict(""); setNotice("");
-    try { await putPolicy(actAs, boardId, blocked, mode); setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); }
-    catch (e) { setConflict(String(e)); }
+    const opBoard = boardId;
+    try { await putPolicy(actAs, boardId, blocked, mode); if (boardRef.current !== opBoard) return; setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); notifyWikiChanged(); }
+    catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
   }
   const [uploadMeetingId, setUploadMeetingId] = useState("");
   const effUploadMeeting = uploadScope === "meeting" ? (uploadMeetingId || meetingId || "") : "";
@@ -122,9 +138,10 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
       if (uploadScope === "meeting" && effUploadMeeting) fd.append("meetingId", effUploadMeeting);
       const res = await fetch("/api/boards/" + boardId + "/sources/upload", { method: "POST", headers: authHeaders(actAs), body: fd });
       if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 400));
+      if (boardRef.current !== boardId) return;
       setNotice("Uploaded as pending; explicit approval required before it becomes evidence.");
-      await refresh();
-    } catch (e) { setConflict(String(e)); }
+      await refresh(); notifyWikiChanged();
+    } catch (e) { if (boardRef.current === boardId) setConflict(String(e)); }
   }
   async function loadHist(id: string) {
     try { const h = await get<HistEvent[]>(actAs, "/api/sources/" + id + "/history"); setHist((m) => ({ ...m, [id]: h })); }

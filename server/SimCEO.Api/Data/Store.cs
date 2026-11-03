@@ -11,6 +11,8 @@ public sealed class InMemoryStore
   public MessageTable Messages { get; } = new();
   public Table<Domain.RecordDraft> Drafts { get; } = new();
   public Table<Domain.SourceDoc> Sources { get; } = new(); public Table<Domain.SourceSection> SourceSections { get; } = new(); public Table<Domain.SourceFamilyHead> SourceHeads { get; } = new(); public Table<Domain.SourceEvent> SourceEvents { get; } = new();
+  public Table<Domain.WikiResource> WikiResources { get; } = new();
+  public Table<Domain.WikiResourceSecret> WikiSecrets { get; } = new();
   public Table<Domain.WizardDraft> WizardDrafts { get; } = new();
   public Table<Domain.VoiceTurn> VoiceTurns { get; } = new();
   public Table<Domain.LeadProfile> LeadProfiles { get; } = new();
@@ -25,7 +27,7 @@ public sealed class InMemoryStore
   public ConcurrentDictionary<string, Session> Sessions { get; } = new();
   public ConcurrentDictionary<string, List<DateTime>> AuthFails { get; } = new();
   public object AuthLock { get; } = new();
-  public Domain.SpendCap Spend { get; } = new();
+  public Domain.SpendCap Spend { get; set; } = new();
   public object SpendLock { get; } = new();
   public string ModelApiKeyOverride { get; set; } = string.Empty;
   public string ModelChatOverride { get; set; } = string.Empty;
