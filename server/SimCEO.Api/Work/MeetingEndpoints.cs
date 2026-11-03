@@ -21,15 +21,24 @@ public static class MeetingEndpoints
       if (audio is null || audio.Length == 0) return Results.BadRequest("No audio.");
       if (audio.Length > 10 * 1024 * 1024) return Results.BadRequest("Audio exceeds 10 MB.");
       using var ms = new MemoryStream();
-      await audio.CopyToAsync(ms);
+      await audio.CopyToAsync(ms, req.HttpContext.RequestAborted);
+      var bytes = ms.ToArray();
+      if (req.HttpContext.RequestAborted.IsCancellationRequested) return Results.StatusCode(499);
+      if (!VoiceAudio.TryValidate(bytes, audio.ContentType, audio.FileName,
+          out var verr, out _, out var normType, out var normName))
+        return Results.BadRequest(verr);
       string transcript;
       try
       {
-        (transcript, _) = await gw.TranscribeAsync(ms.ToArray(), audio.ContentType ?? "audio/webm",
-          string.IsNullOrWhiteSpace(audio.FileName) ? "mic.webm" : audio.FileName,
+        (transcript, _) = await gw.TranscribeAsync(bytes, normType,
+          normName,
+          req.HttpContext.RequestAborted,
           ownerOverride: PeopleOps.IsOwner(req), boardId: m.BoardId, meetingId: id);
       }
+      catch (OperationCanceledException) { return Results.StatusCode(499); }
+      catch (VoiceAudioException vex) { return Results.BadRequest(vex.Message); }
       catch (Exception ex) when (ex is CapExceededException or ProviderException) { return PeopleOps.ModelError(ex); }
+      if (req.HttpContext.RequestAborted.IsCancellationRequested) return Results.StatusCode(499);
       if (string.IsNullOrWhiteSpace(transcript))
         return Results.Json(new { error = "No speech recognized; nothing posted." }, statusCode: 422);
       var turn = new VoiceTurn
