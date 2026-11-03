@@ -193,4 +193,113 @@ if ($Action -eq "start") {
     }
   }
   Write-Host "stopped (volumes preserved; old stack untouched)"
-} else { throw "unknown -Action $Action (start|status|stop)" }
+} elseif ($Action -eq "update") {
+  # EXISTING-stack-only refresh (rapid redeploy of the live human stack).
+  # Narrow contract: the live $Project app + db MUST already exist and match
+  # this request (compose labels, service names, loopback host port); the DB
+  # service is NEVER altered (no down, no down -v, no volume create/remove,
+  # no db rebuild, no db recreate). Downtime is minimal by design: preserve
+  # a rollback image ref -> build the new app image while the OLD app stays
+  # up -> take fresh backups (fail closed) -> recreate ONLY app with
+  # --no-deps --no-build under the sealed approved env -> health + /ready.
+  # No secrets or response bodies are printed at any step.
+  if ([string]::IsNullOrWhiteSpace($EnvFile)) { throw "update requires explicit -EnvFile <approved private app .env>; refusing to auto-discover env for an existing human stack." }
+  if (-not (Test-Path $EnvFile)) { throw ("update: approved env file not found: " + $EnvFile) }
+  Initialize-PrivateEnv $true
+  Invoke-Compose -argv @("config", "-q")
+  Write-Host "compose render ok (quiet; no secrets printed)"
+  $appIds = @(docker ps -q --filter "label=com.docker.compose.project=$Project" --filter "label=com.docker.compose.service=app" 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($LASTEXITCODE -ne 0) { throw ("update: app lookup failed (exit " + $LASTEXITCODE + ")") }
+  if ($appIds.Count -ne 1) { throw ("update: need exactly 1 live app container for project " + $Project + " (found " + $appIds.Count + "); refusing (missing or ambiguous holder).") }
+  $dbIds = @(docker ps -q --filter "label=com.docker.compose.project=$Project" --filter "label=com.docker.compose.service=db" 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($LASTEXITCODE -ne 0) { throw ("update: db lookup failed (exit " + $LASTEXITCODE + ")") }
+  if ($dbIds.Count -ne 1) { throw ("update: need exactly 1 live db container for project " + $Project + " (found " + $dbIds.Count + "); refusing.") }
+  $appId = $appIds[0].Trim()
+  $dbId = $dbIds[0].Trim()
+  $appProj = ((docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' $appId 2>$null) | Out-String).Trim()
+  if ($appProj -ne $Project) { throw ("update: live app project label mismatch (want " + $Project + "); refusing.") }
+  $appSvc = ((docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' $appId 2>$null) | Out-String).Trim()
+  if ($appSvc -ne "app") { throw "update: live app service label mismatch; refusing." }
+  $dbSvc = ((docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' $dbId 2>$null) | Out-String).Trim()
+  if ($dbSvc -ne "db") { throw "update: live db service label mismatch; refusing." }
+  $appRunning = ((docker inspect -f '{{.State.Running}}' $appId 2>$null) | Out-String).Trim()
+  if ($appRunning -ne "True") { throw "update: live app container is not running; refusing (fresh boot is owned by start)." }
+  $portMap = ((docker port $appId 5080 2>$null) | Out-String)
+  $pmPorts = @()
+  foreach ($mm in ([regex]::Matches($portMap, '127\.0\.0\.1:(\d+)'))) { $pmPorts += $mm.Groups[1].Value }
+  if ($pmPorts -notcontains "$AppPort") { throw ("update: live app publishes [" + $portMap.Trim() + "], request is 127.0.0.1:" + $AppPort + "; refusing (wrong holder/project/port).") }
+  $dbHealth = ((docker inspect -f '{{.State.Health.Status}}' $dbId 2>$null) | Out-String).Trim()
+  if ($dbHealth -ne "healthy") { throw ("update: db health is '" + $dbHealth + "' (need 'healthy'); refusing.") }
+  $dbMountsRaw = ((docker inspect -f '{{json .Mounts}}' $dbId 2>$null) | Out-String)
+  if ([string]::IsNullOrWhiteSpace($dbMountsRaw)) { throw "update: cannot inspect db mounts; refusing." }
+  $appMountsRaw = ((docker inspect -f '{{json .Mounts}}' $appId 2>$null) | Out-String)
+  if ([string]::IsNullOrWhiteSpace($appMountsRaw)) { throw "update: cannot inspect app mounts; refusing." }
+  $volNames = @((@($dbMountsRaw | ConvertFrom-Json) + @($appMountsRaw | ConvertFrom-Json) | Where-Object { $_.Type -eq "volume" } | Select-Object -ExpandProperty Source) | Sort-Object -Unique)
+  if ($volNames.Count -eq 0) { throw "update: no volume mounts on live containers; refusing." }
+  foreach ($vn in $volNames) {
+    & docker volume inspect $vn 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw ("update: live volume missing: " + $vn + "; refusing (volumes are never recreated here).") }
+  }
+  Write-Host ("update preflight ok: live app+db match project " + $Project + " on 127.0.0.1:" + $AppPort + "; db healthy; volumes preserved (" + ($volNames -join ", ") + ")")
+  $curImage = ((docker inspect -f '{{.Config.Image}}' $appId 2>$null) | Out-String).Trim()
+  if ([string]::IsNullOrWhiteSpace($curImage)) { throw "update: cannot resolve live app image; refusing." }
+  $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+  $shortId = [Guid]::NewGuid().ToString("N").Substring(0, 8)
+  $rollbackTag = ("simceo-essentials-app:rollback-" + $stamp + "-" + $shortId)
+  & docker tag $curImage $rollbackTag | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "update: rollback tag failed; refusing to build." }
+  Write-Host ("rollback ref preserved: " + $rollbackTag + " (from " + $curImage + ")")
+  Invoke-Compose -argv @("build", "app")
+  Write-Host "new app image built (old app still serving; nothing recreated yet)"
+  $stillUp = ((docker inspect -f '{{.State.Running}}' $appId 2>$null) | Out-String).Trim()
+  if ($stillUp -ne "True") { throw ("update: old app stopped during build; aborting before swap. Rollback ref kept: " + $rollbackTag) }
+  $backupDir = Join-Path $repo (".tmp/update-" + $stamp + "-UTC-" + $shortId)
+  if (Test-Path $backupDir) { throw ("update: backup dir already exists; never overwriting: " + $backupDir) }
+  & git -C $repo check-ignore -q $backupDir
+  if ($LASTEXITCODE -ne 0) { throw ("update: backup dir is NOT Git-ignored; refusing private data write: " + $backupDir) }
+  $null = New-Item -ItemType Directory -Path $backupDir -Force
+  $dumpFile = Join-Path $backupDir "pg-full.dump.sql"
+  & git -C $repo check-ignore -q $dumpFile
+  if ($LASTEXITCODE -ne 0) { throw ("update: dump path is NOT Git-ignored; refusing: " + $dumpFile) }
+  $pw = [Environment]::GetEnvironmentVariable("POSTGRES_PASSWORD")
+  $dumpText = & docker exec -e ("PGPASSWORD=" + $pw) $dbId pg_dumpall -U simceo -c 2>$null
+  $dumpCode = $LASTEXITCODE
+  $pw = $null
+  if ($dumpCode -ne 0) { throw ("update: full PG dump failed (exit " + $dumpCode + "); aborting before swap. Rollback ref kept: " + $rollbackTag + "; partial evidence left under " + $backupDir) }
+  $dumpJoined = (@($dumpText) | Out-String)
+  if ($dumpJoined -notmatch "PostgreSQL database cluster dump") { throw ("update: PG dump looks incomplete (marker missing); aborting before swap. Rollback ref kept: " + $rollbackTag + "; partial evidence left under " + $backupDir) }
+  $noBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($dumpFile, $dumpJoined, $noBom)
+  $dumpText = $null; $dumpJoined = $null
+  $dumpInfo = Get-Item $dumpFile
+  if ($dumpInfo.Length -lt 1024) { throw ("update: PG dump too small (" + $dumpInfo.Length + " bytes); aborting before swap. Rollback ref kept: " + $rollbackTag + "; partial evidence left under " + $backupDir) }
+  $dumpSha = (Get-FileHash -LiteralPath $dumpFile -Algorithm SHA256).Hash.ToLowerInvariant()
+  $appdataDst = Join-Path $backupDir "appdata"
+  & docker cp ($appId + ":/app/data") $appdataDst 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw ("update: appdata copy failed (exit " + $LASTEXITCODE + "); aborting before swap. Rollback ref kept: " + $rollbackTag + "; PG dump kept at " + $dumpFile) }
+  $appdataFiles = @(Get-ChildItem -LiteralPath $appdataDst -Recurse -File -ErrorAction Stop)
+  $appdataBytes = ($appdataFiles | Measure-Object -Property Length -Sum).Sum
+  if ($null -eq $appdataBytes) { $appdataBytes = 0 }
+  $manifest = [ordered]@{
+    tool = "essentials-persist.ps1 update (Muse-authored rapid redeploy; existing stack only)"
+    atUtc = [DateTime]::UtcNow.ToString("o")
+    project = $Project
+    appPort = $AppPort
+    liveAppImage = $curImage
+    rollbackTag = $rollbackTag
+    liveVolumes = @($volNames)
+    dbHealth = $dbHealth
+    pgDump = [ordered]@{ file = "pg-full.dump.sql"; bytes = $dumpInfo.Length; sha256 = $dumpSha; note = "full cluster dump incl roles/globals (pg_dumpall -c); read-only against live db; contents never printed" }
+    appdata = [ordered]@{ dir = "appdata"; files = $appdataFiles.Count; bytes = $appdataBytes; note = "read-only docker cp from live app container; contents never printed" }
+    backupDirLeaf = (Split-Path -Leaf $backupDir)
+  }
+  [System.IO.File]::WriteAllText((Join-Path $backupDir "manifest.json"), (ConvertTo-Json -InputObject $manifest -Depth 6), $noBom)
+  Write-Host ("backups fresh: pg dump " + $dumpInfo.Length + " bytes sha256 " + $dumpSha.Substring(0, 12) + "... + appdata " + $appdataFiles.Count + " files (" + $appdataBytes + " bytes) under " + (Split-Path -Leaf $backupDir))
+  Invoke-Compose -argv @("up", "-d", "--no-deps", "--no-build", "app")
+  Write-Host "app recreated (db untouched; volumes preserved)"
+  $rollbackCmd = ("docker tag " + $rollbackTag + " simceo-essentials-app:1.0.0; then with the same approved env loaded: docker compose --project-name " + $Project + " -f " + $compose + " up -d --no-deps --no-build app")
+  if (-not (Wait-AppHealthy 180)) { throw ("update FAILED after app recreate: app never healthy. Backups kept at " + $backupDir + ". Rollback: " + $rollbackCmd + ". DB was never altered; volumes preserved.") }
+  Write-Host "app container healthy"
+  if (-not (Wait-Ready ("http://localhost:" + $AppPort + "/ready") 120)) { throw ("update FAILED after app recreate: readiness need ready=true store=postgres. Backups kept at " + $backupDir + ". Rollback: " + $rollbackCmd + ". DB was never altered; volumes preserved.") }
+  Write-Host ("persistent stack UPDATED: :" + $AppPort + "/health + /ready (postgres store); backups under " + (Split-Path -Leaf $backupDir) + "; rollback ref " + $rollbackTag)
+} else { throw "unknown -Action $Action (start|status|stop|update)" }

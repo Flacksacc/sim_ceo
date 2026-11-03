@@ -113,3 +113,50 @@ and is only one preflight input). Cutover/start require separate verification; i
 Do NOT overwrite the older checkpoint
 `.tmp/dev-app-preservation-20261103-141739-UTC-backup.json`, and leave the
 current MAIN `tmp.txt` (c924892, unknown origin) untouched.
+
+## Existing-stack update (rapid redeploy, primary-only run)
+
+`-Action update` refreshes ONLY the app container of an already-live
+`simceo-essentials` stack (human app on `127.0.0.1:5173`, db
+`simceo-essentials-db-1`). It never boots a new stack and never touches the
+db service or any volume: `start` still refuses a busy port, and `update`
+refuses anything but the exact live match, then fails closed before any swap
+when backups are not fresh and complete.
+
+Exact human invocation (the approved private MAIN `.env` is explicitly
+provided by primary; the helper repo root is derived from the helper file
+location, never hardcoded):
+
+```powershell
+powershell -File qa/essentials-backend/essentials-persist.ps1 -Action update -Project simceo-essentials -AppPort 5173 -EnvFile C:/Users/War/scrach/sim_ceo/.env
+```
+
+What update does, in order (minimal downtime; the old app serves until swap):
+
+1. Sealed approved env first (existing key guard: inherited coding-profile
+   keys cleared, allowlisted file values win, compose env source sealed).
+2. Existing-only preflight: exactly one live app and one live db container
+   with matching `com.docker.compose.project` / `service` labels, the live
+   app publishing exactly `127.0.0.1:<AppPort>`, the db container `healthy`,
+   and every live volume mount inspected to exist. Anything else aborts.
+3. Preserves a rollback image ref
+   (`simceo-essentials-app:rollback-<UTC>-<id>`) from the running app image.
+4. Builds the new app image while the old app stays up (verified still
+   running after build; nothing recreated yet).
+5. Takes fresh backups into a NEW gitignored private
+   `<helper-root>/.tmp/update-<UTC>-<id>/` dir: a full cluster `pg_dumpall
+   -c` dump (includes roles/globals, read-only against the live db) plus a
+   read-only `docker cp` of `/app/data`, with a nonsecret `manifest.json`
+   (sizes, SHA256, image refs only). Any backup failure aborts before swap.
+6. Recreates ONLY app (`up -d --no-deps --no-build app`, db untouched), then
+   requires container `healthy` plus `/ready` returning
+   `{ready:true, store:postgres}`.
+
+What update never does: `down` (with or without `-v`), volume
+create/remove, db build/recreate, secret or response-body printing, or
+overwriting an existing backup dir. On post-swap failure it throws an
+explicit rollback (`docker tag <rollback> simceo-essentials-app:1.0.0` then
+`up -d --no-deps --no-build app` with the same approved env loaded) and
+leaves all backups in place; the db never needs restore because it is never
+written (a `psql` restore from the kept dump stays a primary-only explicit
+decision, not part of update).
