@@ -4,19 +4,26 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import App from './App';
 import './styles.css';
 
-function identityKey(): string {
+// Full session identity compared in memory (complete token + user + demo
+// profile). The opaque mount key below never carries token material.
+function readIdentity(): string {
   try {
     const t = localStorage.getItem("simceo-token") ?? "";
     const u = localStorage.getItem("simceo-user") ?? "";
     const fb = localStorage.getItem("simceo-fb-user-v2") ?? "";
-    return t ? ("token:" + t.slice(0, 12) + ":" + u) : ("anon:" + fb);
+    return t ? ("token:" + t + ":" + u) : ("anon:" + fb);
   } catch { return "anon"; }
 }
 function makeClient(): QueryClient {
   return new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 5000 } } });
 }
 let qc = makeClient();
-let appKey = identityKey();
+// Opaque mount generation only: never derived from token bytes, so rotating
+// to a new token with the same prefix still remounts. Identity equality uses
+// readIdentity() above, not this key.
+let currentIdentity = readIdentity();
+let mountSeq = 0;
+let appKey = "app-" + mountSeq;
 let root: Root | null = null;
 try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = 0; } catch {}
 function epochNow(): number { try { return (window as unknown as { __simceoEpoch?: number }).__simceoEpoch ?? 0; } catch { return 0; } }
@@ -35,9 +42,12 @@ function mount(): void {
 }
 try {
   window.addEventListener("simceo-auth-change", () => {
-    const next = identityKey();
-    if (next === appKey) return;
-    appKey = next;
+    let next = "";
+    try { next = readIdentity(); } catch { next = "anon"; }
+    if (next === currentIdentity) return;
+    currentIdentity = next;
+    mountSeq++;
+    appKey = "app-" + mountSeq;
     try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = ((window as unknown as { __simceoEpoch?: number }).__simceoEpoch ?? 0) + 1; } catch {}
     try { qc.cancelQueries(); } catch {}
     try { qc.clear(); } catch {}
@@ -47,7 +57,7 @@ try {
   });
   window.addEventListener("storage", (e) => {
     // key === null covers localStorage.clear() (cross-tab sign-out): identity re-read decides.
-    if (e.key === null || e.key === "simceo-token" || e.key === "simceo-user") {
+    if (e.key === null || e.key === "simceo-token" || e.key === "simceo-user" || e.key === "simceo-fb-user-v2") {
       window.dispatchEvent(new Event("simceo-auth-change"));
     }
   });

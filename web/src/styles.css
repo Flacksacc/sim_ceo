@@ -147,7 +147,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .badge.warn { background: transparent; color: var(--danger); border-color: var(--danger); }
 .badge.stance { margin-inline-start: 0; }
 label { display: block; margin-block: 10px; font-size: 0.92rem; }
-label input, label select, label textarea,
+label input:not([type="checkbox"]):not([type="radio"]), label select, label textarea,
 .field input, .field select, .field textarea,
 .meet-left input, .meet-left select {
   display: block; margin-top: 5px; padding: 9px 12px;
@@ -559,3 +559,12 @@ section[aria-label] > h2{margin-bottom:4px;}
 
 .portrait-review { display: flex; gap: 12px; align-items: flex-start; margin-block: 8px; }
 .portrait-thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); flex: none; }
+
+/* Compact inline checkbox/radio rows: text-input rules above must not stretch
+   option controls. Label rows stay clickable/keyboard-focusable with low
+   vertical waste in light/dark, desktop/mobile. */
+label.checkline { display: flex; align-items: flex-start; gap: 10px; margin-block: 6px; padding: 6px 8px; margin-inline: -8px; border-radius: 8px; cursor: pointer; }
+label.checkline:hover { background: var(--panel-2); }
+label.checkline:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+label.checkline input[type="checkbox"], label.checkline input[type="radio"] { display: inline-block; flex: none; width: 18px; height: 18px; min-width: 18px; min-height: 18px; margin: 2px 0 0; padding: 0; accent-color: var(--accent); }
+label input[type="checkbox"], label input[type="radio"] { display: inline-block; width: auto; min-width: 0; min-height: 0; margin-top: 0; accent-color: var(--accent); }
