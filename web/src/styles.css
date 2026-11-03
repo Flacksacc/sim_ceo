@@ -571,3 +571,13 @@ label input[type="checkbox"], label input[type="radio"] { display: inline-block;
 
 /* Profile/wizard multiline fields: roomy textareas for background, familiar topics, simpler explanation, communication preferences. */
 label textarea { display: block; width: 100%; min-height: 76px; resize: vertical; }
+
+/* Account-default profile paragraph fields: full-width, vertical resize only. */
+textarea.profile-area {
+  width: 100%;
+  max-width: 100%;
+  min-width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  line-height: 1.45;
+}

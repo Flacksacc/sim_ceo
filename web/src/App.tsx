@@ -1289,7 +1289,7 @@ export default function App() {
       // portraits, people, jobs/usage/audit/spending, review state, caps.
       // Public presets/commands/invite-public are intentionally retained.
       for (const k of ["messages", "delivery", "meeting-detail", "board-detail", "boards",
-        "meetings", "records", "record", "record-review", "setup", "guest-settings", "lead",
+        "meetings", "records", "record", "record-review", "setup", "guest-settings", "lead", "profile",
         "sources", "notes", "notes-history", "directions", "roster", "roster-count", "roster-names", "roster-images",
         "images", "advisors", "invites", "grants", "jobs", "usage", "audit", "spending",
         "modelcalls", "status", "model-status", "caps", "voice", "wizreview", "meeting-views", "briefings", "briefing", "me"]) {
@@ -1946,6 +1946,12 @@ export default function App() {
     enabled: !!boardId && boardOk && !sessGate && (tab === "boards" || tab === "meet" || tab === "settings"),
     retry: false,
   });
+  const profile = useQuery({
+    queryKey: ["profile"],
+    queryFn: () => get<Lead>("/api/profile"),
+    enabled: !sessGate && (tab === "profile" || tab === "meet"),
+    retry: false,
+  });
   const [leadForm, setLeadForm] = useState({
     name: "",
     roleLabel: "Board Lead",
@@ -1954,56 +1960,120 @@ export default function App() {
     simplerTopics: "",
     commPrefs: DEFAULT_COMM_PREFS,
   });
-  const [leadLoaded, setLeadLoaded] = useState("");
-  const [leadBoard, setLeadBoard] = useState("");
+  const [profileLoaded, setProfileLoaded] = useState("");
+  const [profileBase, setProfileBase] = useState({ id: "", version: 0 });
+  const [saveMsg, setSaveMsg] = useState("");
+  const [saveErr, setSaveErr] = useState("");
+  const profileEditRev = useRef(0);
+  const profileSnap = useRef("");
+  const profileHeld = useRef<null | { rev: number; epoch: number; token: string; user: string }>(null);
+  const profileWho = useRef("");
+  const bumpProfileEdit = (next: { name: string; roleLabel: string; background: string; familiarTopics: string; simplerTopics: string; commPrefs: string }) => {
+    profileEditRev.current += 1;
+    setLeadForm(next);
+  };
+  const profileSnapNow = JSON.stringify(leadForm);
+  const profileDirty = profileSnap.current !== "" && profileSnapNow !== profileSnap.current;
   useEffect(() => {
-    if (!boardId) return;
-    // P2 #9: track board identity independently from fetched lead identity, so
-    // switching boards always clears the form synchronously, even when both
-    // boards have no saved lead (leadLoaded === "" on both sides).
-    if (leadBoard !== boardId) {
-      setLeadBoard(boardId);
-      setLeadLoaded("");
-      setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS });
+    const whoNow = String(epochNow()) + "|" + currentToken() + "|" + canonicalUser();
+    if (profileWho.current !== whoNow) {
+      profileWho.current = whoNow;
+      profileHeld.current = null;
+      profileEditRev.current = 0;
+      const fresh = { name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS };
+      setLeadForm(fresh);
+      profileSnap.current = JSON.stringify(fresh);
+      setProfileLoaded("");
+      setProfileBase({ id: "", version: 0 });
+      setSaveMsg("");
+      setSaveErr("");
       return;
     }
-    const key = lead.data ? boardId + ":" + lead.data.id + ":" + String(lead.data.version) : "";
-    if (!lead.data) {
-      if (leadLoaded !== "") {
-        setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS });
-        setLeadLoaded("");
+    if (sessGate) return;
+    if (saveLead.isPending || profileHeld.current) return;
+    const key = profile.data ? profile.data.id + ":" + String(profile.data.version) : "";
+    if (!profile.data) {
+      if ((profile.isSuccess || isNotFound(profile.error)) && profileLoaded !== "" && !profileDirty) {
+        const fresh = { name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS };
+        setLeadForm(fresh);
+        profileSnap.current = JSON.stringify(fresh);
+        setProfileLoaded("");
+        setProfileBase({ id: "", version: 0 });
       }
       return;
     }
-    // Ignore a stale arrival from another board during refetch: the payload must
-    // belong to the current board or the global fallback. Same-board background
-    // refetch still cannot clobber unsaved edits unless the fetched
-    // identity/version actually changed (key check below).
-    const dataBoard: string = lead.data.boardId || "";
-    if (dataBoard !== "" && dataBoard !== boardId && dataBoard !== "00000000-0000-0000-0000-000000000000") return;
-    if (key !== leadLoaded) {
-      setLeadForm({
-        name: lead.data.name,
-        roleLabel: lead.data.roleLabel,
-        background: lead.data.background,
-        familiarTopics: lead.data.familiarTopics,
-        simplerTopics: lead.data.simplerTopics,
-        commPrefs: lead.data.commPrefs,
-      });
-      setLeadLoaded(key);
+    if (key !== profileLoaded) {
+      setProfileBase({ id: profile.data.id, version: profile.data.version });
+      setProfileLoaded(key);
+      if (!profileDirty) {
+        const adopted = {
+          name: profile.data.name ?? "",
+          roleLabel: profile.data.roleLabel || "Board Lead",
+          background: profile.data.background ?? "",
+          familiarTopics: profile.data.familiarTopics ?? "",
+          simplerTopics: profile.data.simplerTopics ?? "",
+          commPrefs: profile.data.commPrefs ?? "",
+        };
+        setLeadForm(adopted);
+        profileSnap.current = JSON.stringify(adopted);
+      }
     }
-  }, [lead.data, boardId, leadLoaded, leadBoard]);
+  }, [profile.data, profile.isSuccess, profile.error, profileLoaded, profileDirty, sessGate]);
   const saveLead = useMutation({
     mutationFn: () =>
-      post<Lead>(`/api/boards/${boardId}/lead`, {
+      post<Lead>("/api/profile", {
         ...leadForm,
-        version: lead.data?.version ?? 0,
+        version: profileBase.version,
       }),
-    onSuccess: () => {
-      refresh("lead", "setup");
+    onMutate: () => {
+      setSaveMsg("");
+      setSaveErr("");
+      profileHeld.current = { rev: profileEditRev.current, epoch: epochNow(), token: currentToken(), user: canonicalUser() };
     },
-    onError: (e) => alert(`Save rejected (refresh and re-apply): ${String(e)}`),
+    onSuccess: (r) => {
+      const held = profileHeld.current;
+      profileHeld.current = null;
+      if (held && (epochNow() !== held.epoch || currentToken() !== held.token || canonicalUser() !== held.user)) {
+        setSaveErr("Account changed during save; the response was discarded. Review and save again.");
+        return;
+      }
+      const rr = r as Lead | undefined;
+      if (!rr || !rr.id) return;
+      try { qc.setQueryData(["profile"], rr); } catch { /* keep server truth on next refetch */ }
+      const nkey = rr.id + ":" + String(rr.version);
+      setProfileBase({ id: rr.id, version: rr.version });
+      setProfileLoaded(nkey);
+      if (held && profileEditRev.current !== held.rev) {
+        setSaveMsg("Saved version " + String(rr.version) + " as your account default. Your newer typing was kept; save again to apply it.");
+      } else {
+        const adopted = {
+          name: rr.name ?? "",
+          roleLabel: rr.roleLabel || "Board Lead",
+          background: rr.background ?? "",
+          familiarTopics: rr.familiarTopics ?? "",
+          simplerTopics: rr.simplerTopics ?? "",
+          commPrefs: rr.commPrefs ?? "",
+        };
+        setLeadForm(adopted);
+        profileSnap.current = JSON.stringify(adopted);
+        setSaveMsg("Profile saved as your account default for all boards. Version " + String(rr.version) + ".");
+      }
+      refresh("profile", "lead", "setup");
+    },
+    onError: (e) => {
+      profileHeld.current = null;
+      setSaveMsg("");
+      if (e instanceof Error && e.message.startsWith("409")) {
+        setSaveErr("Another save landed first. Your text is kept; the latest saved version loads behind your edits. Re-apply your change and save again.");
+        refresh("profile");
+      } else if (e instanceof Error && (e as { stale?: boolean }).stale) {
+        setSaveErr("Account changed; the save was discarded. Review and save again.");
+      } else {
+        setSaveErr("Save rejected (your text is kept): " + String(e));
+      }
+    },
   });
+
   const [boardForm, setBoardForm] = useState({
     name: "",
     mission: "",
@@ -6534,22 +6604,21 @@ const testModel = useMutation({
                 </div>{" "}
               </div>{" "}
 
-              <p>
-                One lead profile per board — this is who you are in that board's meetings.
+                            <p>
+                Your account default — shared by all your boards unless a board saves its own override.
               </p>
               <>
                 {" "}
                 <p role="status">
                   {" "}
-                  {lead.data
-                    ? `Saved version ${lead.data.version} · updated ${lead.data.updatedAt}`
+                  {profile.data
+                    ? `Saved version ${profile.data.version} · updated ${profile.data.updatedAt}`
                     : "No saved profile yet — saving creates version 1."}{" "}
                 </p>{" "}
                 <p>
                   {" "}
-                  Saving here takes effect immediately for future meeting
-                  context. Other setup fields stay draft until activation in
-                  Settings.{" "}
+                  Saving here updates your account default immediately for future meeting
+                  context on all your boards. Boards with their own saved profile keep that profile.{" "}
                 </p>{" "}
                 <label>
                   {" "}
@@ -6557,18 +6626,17 @@ const testModel = useMutation({
                   <input
                     value={leadForm.name}
                     onChange={(e) =>
-                      setLeadForm({ ...leadForm, name: e.target.value })
+                      bumpProfileEdit({ ...leadForm, name: e.target.value })
                     }
                   />{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "name") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
-                  Role label for this board{" "}
+                  Role label{" "}
                   <select
                     value={leadForm.roleLabel}
                     onChange={(e) =>
-                      setLeadForm({ ...leadForm, roleLabel: e.target.value })
+                      bumpProfileEdit({ ...leadForm, roleLabel: e.target.value })
                     }
                   >
                     {" "}
@@ -6586,82 +6654,82 @@ const testModel = useMutation({
                       </option>
                     ))}{" "}
                   </select>{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "roleLabel") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Background{" "}
                   <textarea
                     rows={3}
+                    className="profile-area"
                     value={leadForm.background}
                     onChange={(e) =>
-                      setLeadForm({ ...leadForm, background: e.target.value })
+                      bumpProfileEdit({ ...leadForm, background: e.target.value })
                     }
                   ></textarea>{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "background") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects already familiar{" "}
                   <textarea
                     rows={3}
+                    className="profile-area"
                     value={leadForm.familiarTopics}
                     onChange={(e) =>
-                      setLeadForm({
+                      bumpProfileEdit({
                         ...leadForm,
                         familiarTopics: e.target.value,
                       })
                     }
                   ></textarea>{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "familiarTopics") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects needing simpler explanation{" "}
                   <textarea
                     rows={3}
+                    className="profile-area"
                     value={leadForm.simplerTopics}
                     onChange={(e) =>
-                      setLeadForm({
+                      bumpProfileEdit({
                         ...leadForm,
                         simplerTopics: e.target.value,
                       })
                     }
                   ></textarea>{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "simplerTopics") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Communication preferences{" "}
                   <textarea
                     rows={4}
+                    className="profile-area"
                     value={leadForm.commPrefs}
                     onChange={(e) =>
-                      setLeadForm({ ...leadForm, commPrefs: e.target.value })
+                      bumpProfileEdit({ ...leadForm, commPrefs: e.target.value })
                     }
                   ></textarea>{" "}
-                    <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "commPrefs") || "not saved yet"}{" "}</div>
                 </label>{" "}
-                {!boardId ? (
-                  <p role="status">
-                    {" "}
-                    Select a board to save your lead profile for that board.{" "}
-                    <button type="button" onClick={() => setTab("boards")}>
-                      {" "}
-                      Select board{" "}
-                    </button>{" "}
-                  </p>
-                ) : (
+                <div className="meetctl">
+                  {" "}
                   <button
                     onClick={() => saveLead.mutate()}
-                    disabled={!canManageBoard || !leadForm.name.trim() || saveLead.isPending}
+                    disabled={!leadForm.name.trim() || saveLead.isPending || sessGate}
                   >
                     {" "}
-                    Save profile{" "}
-                  </button>
+                    {saveLead.isPending ? "Saving..." : "Save profile"}{" "}
+                  </button>{" "}
+                </div>{" "}
+                {profileDirty && !saveLead.isPending && (
+                  <p role="status">Unsaved changes.</p>
                 )}{" "}
+                {!leadForm.name.trim() && (
+                  <p role="status">Enter your name to enable saving.</p>
+                )}{" "}
+                {saveLead.isPending && <p role="status">Saving...</p>}{" "}
+                {saveMsg && <p role="status">{saveMsg}</p>}{" "}
+                {saveErr && <p role="alert">{saveErr}</p>}{" "}
               </>
-            </section>
+</section>
           )}{" "}
           {tab === "settings" && (
             <section aria-label="Settings">
