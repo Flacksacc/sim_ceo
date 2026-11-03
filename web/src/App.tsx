@@ -1208,6 +1208,7 @@ export default function App() {
   const [policy, setPolicy] = useState("balanced");
   const [presetKey, setPresetKey] = useState("strategy");
   type WizardSeat = { role: string; name: string };
+  const DEFAULT_COMM_PREFS = "Be clear and direct. Explain unfamiliar terms, use practical examples, and finish with actionable next steps.";
   const [wizard, setWizard] = useState({
     name: "",
     mission: "",
@@ -1220,7 +1221,7 @@ export default function App() {
       background: "",
       familiarTopics: "",
       simplerTopics: "",
-      commPrefs: "",
+      commPrefs: DEFAULT_COMM_PREFS,
     },
   });
   const [seatRole, setSeatRole] = useState("");
@@ -1951,7 +1952,7 @@ export default function App() {
     background: "",
     familiarTopics: "",
     simplerTopics: "",
-    commPrefs: "",
+    commPrefs: DEFAULT_COMM_PREFS,
   });
   const [leadLoaded, setLeadLoaded] = useState("");
   const [leadBoard, setLeadBoard] = useState("");
@@ -1963,13 +1964,13 @@ export default function App() {
     if (leadBoard !== boardId) {
       setLeadBoard(boardId);
       setLeadLoaded("");
-      setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: "" });
+      setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS });
       return;
     }
     const key = lead.data ? boardId + ":" + lead.data.id + ":" + String(lead.data.version) : "";
     if (!lead.data) {
       if (leadLoaded !== "") {
-        setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: "" });
+        setLeadForm({ name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS });
         setLeadLoaded("");
       }
       return;
@@ -2410,7 +2411,7 @@ export default function App() {
           background: "",
           familiarTopics: "",
           simplerTopics: "",
-          commPrefs: "",
+          commPrefs: DEFAULT_COMM_PREFS,
         },
       });
       setSeatRole("");
@@ -6130,7 +6131,8 @@ const testModel = useMutation({
                   <label>
                     {" "}
                     Background{" "}
-                    <input
+                    <textarea
+                      rows={3}
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.background}
                       onChange={(e) =>
@@ -6140,12 +6142,13 @@ const testModel = useMutation({
                         })
                       }
                       placeholder="What should advisors know about you?"
-                    />{" "}
+                    ></textarea>{" "}
                   </label>{" "}
                   <label>
                     {" "}
                     Subjects already familiar{" "}
-                    <input
+                    <textarea
+                      rows={3}
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.familiarTopics}
                       onChange={(e) =>
@@ -6157,12 +6160,13 @@ const testModel = useMutation({
                           },
                         })
                       }
-                    />{" "}
+                    ></textarea>{" "}
                   </label>{" "}
                   <label>
                     {" "}
                     Subjects needing simpler explanation{" "}
-                    <input
+                    <textarea
+                      rows={3}
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.simplerTopics}
                       onChange={(e) =>
@@ -6174,12 +6178,13 @@ const testModel = useMutation({
                           },
                         })
                       }
-                    />{" "}
+                    ></textarea>{" "}
                   </label>{" "}
                   <label>
                     {" "}
                     Communication preferences{" "}
-                    <input
+                    <textarea
+                      rows={4}
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.commPrefs}
                       onChange={(e) =>
@@ -6189,7 +6194,7 @@ const testModel = useMutation({
                         })
                       }
                       placeholder="e.g. Blunt and brief"
-                    />{" "}
+                    ></textarea>{" "}
                   </label>{" "}
                   <div className="meetctl">
                     {" "}
@@ -6586,18 +6591,20 @@ const testModel = useMutation({
                 <label>
                   {" "}
                   Background{" "}
-                  <input
+                  <textarea
+                    rows={3}
                     value={leadForm.background}
                     onChange={(e) =>
                       setLeadForm({ ...leadForm, background: e.target.value })
                     }
-                  />{" "}
+                  ></textarea>{" "}
                     <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "background") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects already familiar{" "}
-                  <input
+                  <textarea
+                    rows={3}
                     value={leadForm.familiarTopics}
                     onChange={(e) =>
                       setLeadForm({
@@ -6605,13 +6612,14 @@ const testModel = useMutation({
                         familiarTopics: e.target.value,
                       })
                     }
-                  />{" "}
+                  ></textarea>{" "}
                     <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "familiarTopics") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects needing simpler explanation{" "}
-                  <input
+                  <textarea
+                    rows={3}
                     value={leadForm.simplerTopics}
                     onChange={(e) =>
                       setLeadForm({
@@ -6619,18 +6627,19 @@ const testModel = useMutation({
                         simplerTopics: e.target.value,
                       })
                     }
-                  />{" "}
+                  ></textarea>{" "}
                     <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "simplerTopics") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 <label>
                   {" "}
                   Communication preferences{" "}
-                  <input
+                  <textarea
+                    rows={4}
                     value={leadForm.commPrefs}
                     onChange={(e) =>
                       setLeadForm({ ...leadForm, commPrefs: e.target.value })
                     }
-                  />{" "}
+                  ></textarea>{" "}
                     <div className="muted">{" "}Provenance: {provText(lead.data?.provenanceJson, "commPrefs") || "not saved yet"}{" "}</div>
                 </label>{" "}
                 {!boardId ? (
@@ -7077,8 +7086,9 @@ const testModel = useMutation({
                         onClick={() => createMeeting.mutate()}
                       >
                         {" "}
-                        Start meeting{" "}
+                        New meeting{" "}
                       </button>)}{" "}
+                    {canManageBoard && (<div className="muted">Starts a new separate conversation.</div>)}{" "}
                     {canManageBoard && (<div className="card">{" "}
                       Advisors for the next meeting (all when untouched){" "}
                       {(advisors.data ?? []).map((a) => (
@@ -7244,8 +7254,9 @@ const testModel = useMutation({
                               {" "}
                               {runDiscussion.isPending
                                 ? "Advisors drafting…"
-                                : "Run discussion"}{" "}
+                                : "Request advisor responses"}{" "}
                             </button>{" "}
+                            <div className="muted">Asks the advisors in the current meeting to respond.</div>{" "}
                           </div>{" "}
                         </div>{" "}
                         {delivery.data && curMeeting && (

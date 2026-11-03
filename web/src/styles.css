@@ -568,3 +568,6 @@ label.checkline:hover { background: var(--panel-2); }
 label.checkline:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
 label.checkline input[type="checkbox"], label.checkline input[type="radio"] { display: inline-block; flex: none; width: 18px; height: 18px; min-width: 18px; min-height: 18px; margin: 2px 0 0; padding: 0; accent-color: var(--accent); }
 label input[type="checkbox"], label input[type="radio"] { display: inline-block; width: auto; min-width: 0; min-height: 0; margin-top: 0; accent-color: var(--accent); }
+
+/* Profile/wizard multiline fields: roomy textareas for background, familiar topics, simpler explanation, communication preferences. */
+label textarea { display: block; width: 100%; min-height: 76px; resize: vertical; }
