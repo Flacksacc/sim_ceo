@@ -110,6 +110,16 @@ The first update-helper invocation failed closed before any app swap because the
 
 This deployment also includes the accepted shared-profile **backend API**, but the default-profile editor is still under repair and is not claimed delivered. The new character research/editor, broad missing-advisor recovery, roster-only chat, and complete meeting layout/behavior remain unaccepted. Keep the full advisor completion notice pending until their integrated review and runtime checks pass.
 
+### Meeting progress and subsequent acceptance checks
+
+The latest user feedback requires normal board Send to save the question and request replies, with visible progress until completion or an actionable failure. Retrying replies must not duplicate the saved question. Progress must reflect actual work: a timer is not evidence that drafting began. Meeting portraits must show every board member plus Secretary, with per-member activity; Decisions and Evidence belong inside Meeting settings. Muse has separate Send, activity backend, portrait component, and central integration assignments. None of those meeting changes is deployed at this checkpoint.
+
+Primary independently reran the final Muse-authored read-only live roster browser script: **19 PASS / 0 failures**, including all five names, all five canonical attachments, selected advisor details, desktop/mobile overflow, no page errors, and no API mutations. Source: `qa/roster-live-readonly.mjs`, Muse commits `8f35f47` and `fa151c5`. Primary inspected the desktop screenshot as well.
+
+Broader recovery candidate `c3c5dee` passed primary build, 89 HTTP/selftest checks, and 14 native PostgreSQL checks including restart. It remains **rejected**: dedicated `.tmp/roster-recovery-final-review.txt` reproduced historical ownership fallback, incomplete plan hashing, scoped shared-target recovery, replay with existing deterministic targets, and misleading recovered-placeholder completeness defects. All findings were returned to Muse; passing existing suites does not close those omissions.
+
+Character editor candidate `794ec72` also remains **rejected**. Dedicated `.tmp/character-ui-final-review.txt` found saved-paragraph overwrite on research, stale entry/auth continuations, disabled cancellation, polling that cannot adopt completion, unreliable proof reconciliation, and inability to remove every source URL. Muse is repairing the source and meaningful browser coverage. Shared Profile editor fixes build successfully but still require corrected conflict/reload/offline tests and independent closure. These results do not establish complete advisor readiness.
+
 ## Navigation + secure UI completion (Muse lane, unaccepted)
 
 Scope: entire-app navigation (hash routes, normalization, board/meeting/record scope, wrong-parent, unknown/missing/archived/deleted/denied, public invite join, recovery, back/forward) and secure UI (fail-closed private queries/rendering, canonical Bearer-first applied identity + auth epoch, server-derived role caps for every tab/action, server stateValid-gated record approval, identity-aware transport/downloads/refresh/exports, held-response and A-B-A invalidation).
