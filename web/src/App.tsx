@@ -512,11 +512,13 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
 };
 const blobStale = (b: { epoch: number; token: string; user: string }) =>
   epochNow() !== b.epoch || currentToken() !== b.token || canonicalUser() !== b.user;
-const authedDownload = async (u: string, filename: string): Promise<void> => {
+const authedDownload = async (u: string, filename: string, isLive?: () => boolean): Promise<void> => {
   const b = await authedBlobUrl(u);
   // Re-verify the originating identity AT click time: an account switch
   // between fetch and click revokes the URL instead of downloading it.
   if (blobStale(b)) { try { URL.revokeObjectURL(b.url); } catch {} throw Object.assign(new Error("stale download discarded (identity changed)"), { stale: true }); }
+  // Optional narrow view/visit predicate (record export): re-checked after the fetch and BEFORE the download click side effect; revokes instead of clicking.
+  if (isLive) { let ok = false; try { ok = !!isLive(); } catch { ok = false; } if (!ok) { try { URL.revokeObjectURL(b.url); } catch {} throw Object.assign(new Error("stale download discarded (view changed)"), { stale: true }); } }
   try {
     const a = document.createElement("a");
     a.href = b.url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
@@ -2829,7 +2831,8 @@ const tabCount = (k: Tab): number | null => {
   const noteVisitRef = useRef(0);
   const noteDraftRev = useRef(0);
   const briefVisitRef = useRef(0);
-  useEffect(() => { noteVisitRef.current++; try { noteDraftRev.current++; } catch { /* noop */ } }, [boardId, meetingId, meetTab, tab]);
+  // Actual view visits: leaving the takeaways/manual-note/briefing/history view (selection, tab, or sub-tab change) retires in-flight briefing and history callbacks via their visit revisions. Close bumps secHistRef directly; leave and return bump it here so a late loadHistory never populates a new visit.
+  useEffect(() => { noteVisitRef.current++; try { briefVisitRef.current++; } catch { /* noop */ } try { secHistRef.current++; } catch { /* noop */ } try { noteDraftRev.current++; } catch { /* noop */ } }, [boardId, meetingId, meetTab, tab]);
   const addNote = useMutation({
     mutationFn: () =>
       post<Note>(`/api/meetings/${meetingId}/notes`, {
@@ -2858,7 +2861,7 @@ const tabCount = (k: Tab): number | null => {
       if (!o || !o.origin || originStale(o.origin) || o.visit !== briefVisitRef.current) return;
       if (!o.opId || secPendingRef.current?.id !== o.opId) return;
       if (btopic === (pack as any)?.submitted) setBtopic("");
-      try { const omB = parseOmittedManifest((pack as any)?.r?.omitted ?? (pack as any)?.omitted); if (omB !== null) { setSecOmitted(omB); secOmittedReq.current = ""; } } catch { }
+      try { const omB = parseOmittedManifest((pack as any)?.r?.omitted ?? (pack as any)?.omitted) ?? parseOmittedRow((pack as any)?.r ?? (pack as any)); if (omB !== null) { setSecOmitted(omB); secOmittedReq.current = ""; } } catch { }
       refresh("notes");
       notify("Briefing prepared from grounded packet.");
     },
@@ -2890,11 +2893,12 @@ const tabCount = (k: Tab): number | null => {
         scope: dscope,
         meetingId,
       }),
-    onMutate: () => captureRecOrigin(),
+    onMutate: () => ({ ...captureRecOrigin(), submitted: dtext }),
     onSuccess: (_r, _v, ctx) => {
-      const o = ctx as { boardId: string; meetingId: string; recId: string; visit: number; epoch: number; token: string; user: string } | undefined;
+      const o = ctx as { boardId: string; meetingId: string; recId: string; visit: number; epoch: number; token: string; user: string; submitted?: string } | undefined;
       if (!o || !recOriginLive(o)) return;
-      setDtext("");
+      // Clear only the submitted revision: newer typed text survives a held success.
+      if (dtext === o.submitted) setDtext("");
       refresh("directions");
       notify("Direction adopted with the exact shown text.");
     },
@@ -3031,7 +3035,8 @@ const tabCount = (k: Tab): number | null => {
   // Record-visit generation: incremented on every record selection so a
   // same-record A-B-A return cannot validate a stale first-visit callback.
   const recVisitRef = useRef(0);
-  useEffect(() => { recVisitRef.current++; }, [recId]);
+  // Record view visits: leaving or (re)entering the Records tab retires held record callbacks even when the record ID is unchanged (A-away-A). Operation-owned settlement still protects newer operations.
+  useEffect(() => { recVisitRef.current++; }, [recId, tab]);
   const liveSelRef = useRef({ boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") });
   liveSelRef.current = { boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") };
   // Immutable origin identity for async callbacks: the effective session
@@ -3195,7 +3200,9 @@ const tabCount = (k: Tab): number | null => {
     if (!recOk || !recDetail.data || !canActMeeting) return;
     const d = recDetail.data;
     const origin = captureRecOrigin();
-    authedDownload(`/api/records/${d.id}/export?format=${format}`, `record-${d.id}-${format}.json`)
+    // Local visit/identity guard BEFORE the download side effect: a stale selection, record switch, or A-B-A return never starts the fetch, and the predicate is re-checked after the fetch before the click.
+    if (!recOriginLive(origin)) return;
+    authedDownload(`/api/records/${d.id}/export?format=${format}`, `record-${d.id}-${format}.json`, () => recOriginLive(origin))
       .then(() => {
         if (!recOriginLive(origin)) return;
         notify(`Exported ${format} record v${d.version}.`);
@@ -3281,9 +3288,12 @@ const tabCount = (k: Tab): number | null => {
         const live = liveSelRef.current;
         if (!recOriginLive(origin)) return;
         applyDraft(r);
+        // Delete only the submitted revision: newer typing in the same box survives a held success. Pure updater (StrictMode-safe).
+        const reviseKey = `${originDraftId}:${itemId}`;
         setItemTexts((old) => {
+          if ((old[reviseKey] ?? "").trim() !== text) return old;
           const next = { ...old };
-          delete next[`${originDraftId}:${itemId}`];
+          delete next[reviseKey];
           return next;
         });
         notify(`Revised ${itemId}; approved text untouched.`);
@@ -4175,11 +4185,12 @@ const testModel = useMutation({
   // same origin/intent; it never substitutes [] and never erases a manifest.
   const parseOmittedManifest = (v: unknown): string[] | null => {
     try {
-      if (Array.isArray(v)) return (v as unknown[]).filter((x): x is string => typeof x === "string");
+      // Strict known-manifest rule: a non-string element poisons the whole payload to UNKNOWN (null). [1] must never become known-empty [].
+      if (Array.isArray(v)) { for (const x of v) if (typeof x !== "string") return null; return v as string[]; }
       if (typeof v === "string" && v) {
         try {
           const p = JSON.parse(v);
-          if (Array.isArray(p)) return (p as unknown[]).filter((x): x is string => typeof x === "string");
+          if (Array.isArray(p)) { for (const x of p) if (typeof x !== "string") return null; return p as string[]; }
         } catch { /* invalid => unknown */ }
         return null;
       }
@@ -4208,7 +4219,8 @@ const testModel = useMutation({
         if (originStale(snap.oOrigin)) return;
         const live = liveSelRef.current;
         if (live.boardId !== snap.oB || live.meetingId !== snap.oM || secIdentity() !== snap.oU || snap.oEp !== secEpoch.current) return;
-        const om = parseOmittedManifest((body as any)?.omitted);
+        // Single request GET carries the row shape: omittedJson fallback included.
+        const om = parseOmittedRow(body);
         if (om === null) return;
         setSecOmitted(om); secOmittedReq.current = reqId;
       }).catch(() => {});
@@ -4223,7 +4235,7 @@ const testModel = useMutation({
   const adoptOmittedResponse = (resp: any, reqId: string) => {
     // Replay/answer responses already carry the persisted truth: adopt known
     // manifests, preserve the display when the manifest is UNKNOWN.
-    const om = parseOmittedManifest((resp as any)?.omitted);
+    const om = parseOmittedManifest((resp as any)?.omitted) ?? parseOmittedRow(resp);
     if (om !== null) { setSecOmitted(om); secOmittedReq.current = reqId || ""; }
   };
   // Epoch/reset guard: data-query resolution (e.g. /auth/me settling) must
@@ -4255,6 +4267,8 @@ const testModel = useMutation({
     const dver0 = secDraftVer.current;
     const aver0 = secAnsVer.current;
     const tok0 = currentToken();
+    // Pre-hydration answer snapshot for StrictMode-pure replacement below: the revision guards prove no typing interleaves after this point, so decisions use this value instead of mutating refs inside a state updater.
+    let preHydAns = secAnswer;
     // Synchronous immutable-envelope restore: runs before any user input can
     // interleave. A saved answer envelope (requestId + accepted answer) is
     // restored into the inputs so a reload never loses the recovery payload.
@@ -4266,7 +4280,7 @@ const testModel = useMutation({
       if (!secComposerTouched.current) {
         const aenv0 = readEnvelope(secAnsEnvelopeKey(u, boardId, meetingId));
         if (aenv0 && aenv0.boardId === boardId && aenv0.meetingId === meetingId && aenv0.identity === u && aenv0.requestId && aenv0.answer) {
-          setSecQuestion(aenv0.question || ""); setSecRequestId(aenv0.requestId); setSecAnswer(aenv0.answer);
+          setSecQuestion(aenv0.question || ""); setSecRequestId(aenv0.requestId); setSecAnswer(aenv0.answer); preHydAns = aenv0.answer;
           secAnsOwnerReq.current = aenv0.requestId; secAnsOwnerHyd.current = true;
         }
       }
@@ -4328,19 +4342,16 @@ const testModel = useMutation({
         }
         if (["needs-clarification", "interrupted", "discarded", "failed", "answering"].includes(ast)) {
           setSecQuestion(aq); setSecRequestId(arid);
-          try { adoptOmittedRow(arow, arid, { oB: boardId, oM: meetingId, oU: u, oEp, oOrigin: originIdentity() }); } catch { }
-          if (aans) setSecAnswer((cur: string) => {
-            // Replace older hydration-owned text; genuine typing is preserved
-            // and never relabeled to the new request.
-            if (cur === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== arid)) { secAnsOwnerReq.current = arid; secAnsOwnerHyd.current = true; return aans; }
-            return cur;
-          });
-          else { secAnsOwnerReq.current = arid; secAnsOwnerHyd.current = true; }
+          // StrictMode-pure replacement: decide from the guarded pre-hydration snapshot, never by mutating refs inside a state updater. Older hydration-owned text is replaced; genuine typing is preserved and never relabeled.
+          if (aans && (preHydAns === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== arid))) { secAnsOwnerReq.current = arid; secAnsOwnerHyd.current = true; setSecAnswer(aans); }
+          else if (!aans) { secAnsOwnerReq.current = arid; secAnsOwnerHyd.current = true; }
           try {
             const env: SecEnvelope = { identity: u, boardId, meetingId, requestId: arid, nonce: arow.clientNonce || arow.ClientNonce || aenv?.nonce || "", input: arow.inputText || arow.InputText || aenv?.input || "", evidence: [], phase: "continuation", question: aq, answer: aans, epoch: oEp, submittedRev: secDraftVer.current };
             localStorage.setItem(secAnsEnvelopeKey(u, boardId, meetingId), JSON.stringify(env));
             secEnvelopeRev.current++;
           } catch { }
+          // Omitted-manifest adoption runs AFTER the envelope write above so the persisted-GET snapshot is not self-staled by our own bump.
+          try { adoptOmittedRow(arow, arid, { oB: boardId, oM: meetingId, oU: u, oEp, oOrigin: originIdentity() }); } catch { }
           if (ast === "needs-clarification") {
             // An accepted answer whose generation failed stays retryable:
             // surface the durable error instead of silently clearing it.
@@ -4354,12 +4365,14 @@ const testModel = useMutation({
       } else if (!arowSuperseded && aenv && aenv.requestId && !initFail && !aenvShadowed) {
         if (hid !== secHydRef.current || envRev0 !== secEnvelopeRev.current || secComposerTouched.current || secDraftVer.current !== dver0 || secAnsVer.current !== aver0 || currentToken() !== tok0) return;
         setSecQuestion(aenv.question || ""); setSecRequestId(aenv.requestId);
-        if (aenv.answer) setSecAnswer((cur: string) => { if (cur === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== aenv.requestId)) { secAnsOwnerReq.current = aenv.requestId; secAnsOwnerHyd.current = true; return aenv.answer; } return cur; });
-        else { secAnsOwnerReq.current = aenv.requestId; secAnsOwnerHyd.current = true; }
+        // StrictMode-pure replacement: decide from the guarded pre-hydration snapshot (same rule as above).
+        if (aenv.answer && (preHydAns === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== aenv.requestId))) { secAnsOwnerReq.current = aenv.requestId; secAnsOwnerHyd.current = true; setSecAnswer(aenv.answer); }
+        else if (!aenv.answer) { secAnsOwnerReq.current = aenv.requestId; secAnsOwnerHyd.current = true; }
         try {
           const __omE = parseOmittedManifest((aenv as any)?.omitted);
           if (__omE !== null) { setSecOmitted(__omE); secOmittedReq.current = aenv.requestId; }
-          else { setSecOmitted([]); secOmittedReq.current = ""; }
+          // UNKNOWN envelope manifest preserves a known same-request display but never attributes another request manifest to this one.
+          else if ((secOmittedReq.current || "") !== (aenv.requestId || "")) { setSecOmitted([]); secOmittedReq.current = ""; }
         } catch { }
         setSecError("Saved answer has no matching server request; retry may report not found. Clear saved retry to start over.");
         return;
@@ -4377,10 +4390,10 @@ const testModel = useMutation({
         setSecQuestion(q); setSecRequestId(rid);
         // Durable-only recovery: hydrate accepted server answer bytes so retry is enabled without typing. Older hydration-owned text is replaced with
           // the new request's bytes; genuine typing is preserved and never relabeled.
-        if (tAns) setSecAnswer((cur: string) => { if (cur === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== rid)) { secAnsOwnerReq.current = rid; secAnsOwnerHyd.current = true; return tAns; } return cur; });
-        else { secAnsOwnerReq.current = rid; secAnsOwnerHyd.current = true; }
+        // StrictMode-pure replacement: decide from the guarded pre-hydration snapshot (same rule as above). Older hydration-owned text is replaced with the new request bytes; genuine typing is preserved.
+        if (tAns && (preHydAns === "" || (secAnsOwnerHyd.current && secAnsOwnerReq.current !== rid))) { secAnsOwnerReq.current = rid; secAnsOwnerHyd.current = true; setSecAnswer(tAns); }
+        else if (!tAns) { secAnsOwnerReq.current = rid; secAnsOwnerHyd.current = true; }
           if (!tAns && (!aenv || String(aenv.requestId || "") !== String(rid))) { setSecAnswer(""); secAnsOwnerReq.current = rid; secAnsOwnerHyd.current = true; }
-          try { adoptOmittedRow(target, rid, { oB: boardId, oM: meetingId, oU: u, oEp, oOrigin: originIdentity() }); } catch { }
         setSecError("");
         try {
           const env: SecEnvelope = { identity: u, boardId, meetingId, requestId: rid, nonce: target.clientNonce || target.ClientNonce || "", input: target.inputText || target.InputText || "", evidence: [], phase: "continuation", question: q, answer: target.answer || target.Answer || "", epoch: oEp, submittedRev: secDraftVer.current };
@@ -4388,6 +4401,8 @@ const testModel = useMutation({
           secEnvelopeRev.current++;
           if (env.answer) localStorage.setItem(secAnsEnvelopeKey(u, boardId, meetingId), JSON.stringify(env));
         } catch { }
+          // Omitted-manifest adoption runs AFTER the envelope write above so the persisted-GET snapshot is not self-staled by our own bump.
+          try { adoptOmittedRow(target, rid, { oB: boardId, oM: meetingId, oU: u, oEp, oOrigin: originIdentity() }); } catch { }
         if (!clar && recov) setSecError("Secretary continuation is recoverable after reload. Review the question and retry the same answer.");
         return;
       }
@@ -4456,7 +4471,16 @@ const testModel = useMutation({
     submitBusyRef.current = true;
     submitOpRef.current = submitOp;
     const direct = audience === "secretary" || secHasPrefix(draft);
-    if (direct) askSecretary.mutate();
+    if (direct) {
+      // Freeze the full attempt intent BEFORE queuing: a paused (offline) dispatch must never read a newer meeting, draft, or identity at resume time.
+      const uAsk = secIdentity();
+      askSecretary.mutate({
+        opId: "init-" + (++opSeq.current),
+        boardId, meetingId, user: uAsk, epoch: secEpoch.current, origin: originIdentity(),
+        draft, submitVer: secDraftVer.current, prevReq: secRequestId, submitOp,
+        nonce: (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : String(Date.now()) + "-" + String(Math.floor(Math.random() * 1000000)),
+      });
+    }
     else send.mutate();
   };
   const runSummary = (r: { published: Msg[]; yielded: { advisor: string; reason: string }[]; overflow: { omitted: string[]; cap: number; policy: string } | null }) => {
@@ -4464,35 +4488,50 @@ const testModel = useMutation({
     return "Published " + (r.published ?? []).length + "; yielded " + (r.yielded ?? []).length + "." + (oc ? " Overflow omits " + oc + " (cap " + (r.overflow ? r.overflow.cap : 0) + ")." : "");
   };
   const runDiscussion = useMutation({
-    mutationFn: () =>
-      post<{ published: Msg[]; yielded: { advisor: string; reason: string }[]; abstained: string[]; overflow: { omitted: string[]; cap: number; policy: string } | null }>(`/api/meetings/${meetingId}/run`, {
-        policy,
-        prompt: draft || "Continue the discussion.",
+    mutationFn: (v: any) => {
+      // Queued-attempt validation: a paused dispatch posts exactly the click-time snapshot, never a newer meeting, prompt, or identity.
+      if (!v || v.meetingId !== meetingId || originStale(v.origin)) throw Object.assign(new Error("Discussion run retired before dispatch."), { stale: true });
+      return post<{ published: Msg[]; yielded: { advisor: string; reason: string }[]; abstained: string[]; overflow: { omitted: string[]; cap: number; policy: string } | null }>(`/api/meetings/${v.meetingId}/run`, {
+        policy: v.policy,
+        prompt: v.prompt,
         evidenceSupported: false,
-        ...(lead.data ? { leadVersion: lead.data.version } : {}),
-      }),
-    onSuccess: (r) => {
+        ...(v.leadVersion != null ? { leadVersion: v.leadVersion } : {}),
+      });
+    },
+    onMutate: (v: any) => ({ meetingId: v.meetingId, origin: v.origin }),
+    onSuccess: (r, _v, ctx) => {
+      // Retire held completions after a view/identity change: never refresh or notify a stale meeting context.
+      const o = ctx as any;
+      if (!o || o.meetingId !== meetingId || originStale(o.origin)) return;
       refresh("messages");
       notify(runSummary(r));
     },
-    onError: (e) => alert(String(e)),
+    onError: (e, _v, ctx) => {
+      const o = ctx as any;
+      if (!o || o.meetingId !== meetingId || originStale(o.origin)) return;
+      alert(String(e));
+    },
   });
   const askSecretary = useMutation({
-    mutationFn: () => {
-      const originBoardId = boardId;
-      const originMeetingId = meetingId;
-      const originUser = secIdentity();
-      const originEpoch = secEpoch.current;
-      const raw = draft || "";
-      const submitVer = secDraftVer.current;
-      const nonce = (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : String(Date.now()) + "-" + String(Math.floor(Math.random() * 1000000));
-      const prevReqAsk = secRequestId; const envRevAsk = secEnvelopeRev.current; const originAsk = originIdentity();
+    mutationFn: (v: any) => {
+      // Queued-attempt validation (offline pause, held dispatch): navigation, Clear, or a newer attempt retires this one BEFORE any storage write or POST.
+      if (!v || secPendingRef.current?.id !== v.opId) throw Object.assign(new Error("Secretary submission retired before dispatch."), { stale: true });
+      if (v.boardId !== boardId || v.meetingId !== meetingId || secIdentity() !== v.user || secEpoch.current !== v.epoch || originStale(v.origin)) throw Object.assign(new Error("Secretary submission retired before dispatch."), { stale: true });
+      // Frozen click-time intent (never resume-time refs).
+      const originBoardId = v.boardId;
+      const originMeetingId = v.meetingId;
+      const originUser = v.user;
+      const originEpoch = v.epoch;
+      const raw = v.draft || "";
+      const submitVer = v.submitVer;
+      const nonce = v.nonce;
+      const prevReqAsk = v.prevReq; const envRevAsk = secEnvelopeRev.current; const originAsk = v.origin;
       const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: "", nonce, input: raw, evidence: [], phase: "initial", question: "", answer: "", epoch: originEpoch, submittedRev: submitVer };
       try { localStorage.setItem(secEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env)); } catch { }
       try { localStorage.setItem(secSubmitKey(originUser, originBoardId, originMeetingId), JSON.stringify({ nonce, input: raw })); } catch { }
-      return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: raw, clientNonce: nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce, submittedDraft: raw, submitVer, prevReq: prevReqAsk, envRevCap: envRevAsk, origin: originAsk, opId: secPendingRef.current?.id ?? null }));
+      return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: raw, clientNonce: nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce, submittedDraft: raw, submitVer, prevReq: prevReqAsk, envRevCap: envRevAsk, origin: originAsk, opId: v.opId }));
     },
-    onMutate: () => { const opId = "init-" + (++opSeq.current); secPendingRef.current = { kind: "secretary-initial", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u0 = secIdentity(); try { localStorage.removeItem(secAnsEnvelopeKey(u0, boardId, meetingId)); } catch { } setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); setSecQuestion(""); setSecRequestId(""); setSecError(""); try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } try { secHistRef.current++; } catch { /* noop */ } return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current, opId, origin: originIdentity(), submitOp: submitOpRef.current, envRev: secEnvelopeRev.current, hydRev: secHydRef.current }; },
+    onMutate: (v: any) => { const opId = v.opId; secPendingRef.current = { kind: "secretary-initial", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u0 = v.user; try { localStorage.removeItem(secAnsEnvelopeKey(u0, v.boardId, v.meetingId)); } catch { } setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); setSecQuestion(""); setSecRequestId(""); setSecError(""); try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } try { secHistRef.current++; } catch { /* noop */ } return { originBoardId: v.boardId, originMeetingId: v.meetingId, originUser: v.user, originEpoch: v.epoch, opId, origin: v.origin, submitOp: v.submitOp, envRev: secEnvelopeRev.current, hydRev: secHydRef.current }; },
     onSuccess: (pack: any, _v: unknown, ctx: unknown) => {
       const r = (pack as any)?.r ?? pack;
       const originMeetingId = (pack as any)?.originMeetingId ?? meetingId;
@@ -4520,7 +4559,10 @@ const testModel = useMutation({
       if (r && r.status === "needs-clarification") {
         setSecQuestion(r.question ?? ""); setSecRequestId(r.requestId ?? ""); setSecError(""); setSecAnswer(""); try { secAnsOwnerReq.current = (r as any).requestId ?? ""; } catch { } try { secAnsOwnerHyd.current = true; } catch { } try { adoptOmittedResponse(r, (r as any).requestId ?? ""); } catch { } notify("Secretary needs one clarification.");
         try {
-          const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: (r as any).requestId ?? "", nonce: (pack as any)?.nonce ?? "", input: submittedDraft, evidence: [], phase: "continuation", question: (r as any).question ?? "", answer: "", epoch: originEpoch, submittedRev: submittedVer, omitted: (Array.isArray((r as any)?.omitted) ? (r as any).omitted : []) };
+          // Persist only a KNOWN omitted manifest; UNKNOWN stays absent, never fabricated [].
+          const __omAsk = parseOmittedManifest((r as any)?.omitted) ?? parseOmittedRow(r);
+          const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: (r as any).requestId ?? "", nonce: (pack as any)?.nonce ?? "", input: submittedDraft, evidence: [], phase: "continuation", question: (r as any).question ?? "", answer: "", epoch: originEpoch, submittedRev: submittedVer };
+          if (__omAsk !== null) env.omitted = __omAsk;
           localStorage.setItem(secEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env));
         } catch { }
       }
@@ -4546,15 +4588,18 @@ const testModel = useMutation({
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; if (o && o.submitOp && submitOpRef.current === o.submitOp) { try { submitBusyRef.current = false; } catch { /* noop */ } try { submitOpRef.current = null; } catch { /* noop */ } } },
   });
   const retrySecretary = useMutation({
-    mutationFn: () => {
-      const u = secIdentity();
-      const env = readEnvelope(secEnvelopeKey(u, boardId, meetingId));
-      if (!env || env.boardId !== boardId || env.meetingId !== meetingId || env.identity !== u) throw new Error("No saved secretary submission for this meeting and identity.");
-      const originBoardId = env.boardId; const originMeetingId = env.meetingId; const originUser = env.identity; const originEpoch = secEpoch.current; const originCap = originIdentity();
+    mutationFn: (v: any) => {
+      // Queued-attempt validation: navigation, Clear, or a newer attempt retires this one BEFORE any POST of the frozen envelope.
+      if (!v || secPendingRef.current?.id !== v.opId) throw Object.assign(new Error("Secretary retry retired before dispatch."), { stale: true });
+      if (v.boardId !== boardId || v.meetingId !== meetingId || secIdentity() !== v.user || secEpoch.current !== v.epoch || originStale(v.origin)) throw Object.assign(new Error("Secretary retry retired before dispatch."), { stale: true });
+      // Frozen click-time envelope (never resume-time storage reads).
+      const env = v.env;
+      if (!env || env.boardId !== v.boardId || env.meetingId !== v.meetingId || env.identity !== v.user) throw new Error("No saved secretary submission for this meeting and identity.");
+      const originBoardId = env.boardId; const originMeetingId = env.meetingId; const originUser = env.identity; const originEpoch = v.epoch; const originCap = v.origin;
       const envRev = secEnvelopeRev.current;
-      return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: env.input, clientNonce: env.nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce: env.nonce, submittedDraft: env.input, submitVer: env.submittedRev, retried: true, envRev, origin: originCap, opId: secPendingRef.current?.id ?? null }));
+      return post<any>(`/api/meetings/${originMeetingId}/secretary`, { input: env.input, clientNonce: env.nonce }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, nonce: env.nonce, submittedDraft: env.input, submitVer: env.submittedRev, retried: true, envRev, origin: originCap, opId: v.opId }));
     },
-    onMutate: () => { const opId = "retry-" + (++opSeq.current); secPendingRef.current = { kind: "secretary-retry", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current, opId, origin: originIdentity(), envRev: secEnvelopeRev.current, hydRev: secHydRef.current }; },
+    onMutate: (v: any) => { const opId = v.opId; secPendingRef.current = { kind: "secretary-retry", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } return { originBoardId: v.boardId, originMeetingId: v.meetingId, originUser: v.user, originEpoch: v.epoch, opId, origin: v.origin, envRev: secEnvelopeRev.current, hydRev: secHydRef.current }; },
     onSuccess: (pack: any, _v: unknown, ctx: unknown) => {
       const r = (pack as any)?.r ?? pack;
       const originBoardId = (pack as any)?.originBoardId ?? boardId;
@@ -4573,7 +4618,10 @@ const testModel = useMutation({
       if (r && (r as any).requestId) {
         try {
           if ((r as any).status === "needs-clarification") {
-            const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: (r as any).requestId ?? "", nonce: (pack as any)?.nonce ?? "", input: submittedDraft, evidence: [], phase: "continuation", question: (r as any).question ?? "", answer: "", epoch: originEpoch, submittedRev: submittedVer, omitted: (Array.isArray((r as any)?.omitted) ? (r as any).omitted : []) };
+            // Persist only a KNOWN omitted manifest; UNKNOWN stays absent, never fabricated [].
+            const __omRetry = parseOmittedManifest((r as any)?.omitted) ?? parseOmittedRow(r);
+            const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: (r as any).requestId ?? "", nonce: (pack as any)?.nonce ?? "", input: submittedDraft, evidence: [], phase: "continuation", question: (r as any).question ?? "", answer: "", epoch: originEpoch, submittedRev: submittedVer };
+            if (__omRetry !== null) env.omitted = __omRetry;
             localStorage.setItem(secEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env));
           } else localStorage.removeItem(secPendingKey(originUser, originBoardId, originMeetingId));
         } catch { }
@@ -4598,45 +4646,54 @@ const testModel = useMutation({
     },
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
+  // Click-time frozen answer intent: resolves saved-vs-live from the VISIBLE editor and hydration ownership at click, never response-time refs. A queued (paused) dispatch validates and posts exactly this snapshot.
+  const buildAnswerVars = () => {
+    const u = secIdentity();
+    const saved = readEnvelope(secAnsEnvelopeKey(u, boardId, meetingId));
+    const sameReq = !!saved && !!saved.requestId && !!saved.answer && saved.boardId === boardId && saved.meetingId === meetingId && saved.identity === u && String(saved.requestId) === String(secRequestId) && String(secRequestId) !== "";
+    const reuseSaved = sameReq && (secAnsOwnerHyd.current || secAnswer === (saved as SecEnvelope).answer);
+    return {
+      opId: "ans-" + secRequestId + "-" + (++opSeq.current),
+      boardId, meetingId, user: u, epoch: secEpoch.current, origin: originIdentity(),
+      req: reuseSaved ? (saved as SecEnvelope).requestId : secRequestId,
+      answer: reuseSaved ? (saved as SecEnvelope).answer : secAnswer,
+      question: reuseSaved ? ((saved as SecEnvelope).question || secQuestion) : secQuestion,
+      savedNonce: saved?.nonce ?? "",
+      usedSaved: reuseSaved,
+      ansVer: secAnsVer.current,
+      ansOwner: secAnsOwnerReq.current,
+    };
+  };
   const answerSecretary = useMutation({
-    mutationFn: () => {
-      try { secHydRef.current++; } catch { }
-      const originBoardId = boardId;
-      const originMeetingId = meetingId;
-      const originUser = secIdentity();
-      const originEpoch = secEpoch.current;
-      const originCap = originIdentity();
+    mutationFn: (v: any) => {
+      // Queued-attempt validation (offline pause, held dispatch): navigation, Clear, or a newer attempt retires this one BEFORE any storage write or POST. The single per-attempt revision still lives in onMutate; freshness gates stay intact.
+      if (!v || secPendingRef.current?.id !== v.opId) throw Object.assign(new Error("Secretary answer retired before dispatch."), { stale: true });
+      if (v.boardId !== boardId || v.meetingId !== meetingId || secIdentity() !== v.user || secEpoch.current !== v.epoch || originStale(v.origin)) throw Object.assign(new Error("Secretary answer retired before dispatch."), { stale: true });
+      // Frozen click-time intent (never resume-time or response-time refs).
+      const originBoardId = v.boardId;
+      const originMeetingId = v.meetingId;
+      const originUser = v.user;
+      const originEpoch = v.epoch;
+      const originCap = v.origin;
+      const ansVerCap = v.ansVer;
+      const ansOwnerCap = v.ansOwner;
       let envRev = secEnvelopeRev.current;
-      // Immutable answer retry: a saved answer envelope (written at first
-      // attempt and rehydrated after reload) is the recovery payload. Live
-      // typing must never overwrite it: after reload the input is empty and
-      // any new text would be rejected server-side as conflicting, losing
-      // the accepted answer. Only a first attempt with no saved envelope
-      // persists the live answer.
-      const saved = readEnvelope(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId));
-      let originReq = secRequestId;
-      let submittedAnswer = secAnswer;
-      let originQ = secQuestion;
-      let usedSaved = false;
-      // Exact-current-request binding: an old saved answer envelope for a different request MUST NOT redirect a new clarification.
-      // Only reuse the saved envelope when its requestId matches the currently displayed request.
-      if (saved && saved.boardId === originBoardId && saved.meetingId === originMeetingId && saved.identity === originUser && saved.requestId && saved.answer && String(saved.requestId) === String(secRequestId) && String(secRequestId) !== "") {
-        originReq = saved.requestId; submittedAnswer = saved.answer; originQ = saved.question || originQ; usedSaved = true;
-      } else {
+      // First-attempt persistence uses the frozen click-time payload: the builder already resolved saved-vs-live from the visible editor, so the editor always matches the submitted bytes for the same request.
+      if (!v.usedSaved) {
         try {
-          const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: originReq, nonce: saved?.nonce ?? "", input: "", evidence: [], phase: "continuation", question: originQ, answer: submittedAnswer, epoch: originEpoch, submittedRev: secDraftVer.current };
+          const env: SecEnvelope = { identity: originUser, boardId: originBoardId, meetingId: originMeetingId, requestId: v.req, nonce: v.savedNonce ?? "", input: "", evidence: [], phase: "continuation", question: v.question, answer: v.answer, epoch: originEpoch, submittedRev: secDraftVer.current };
           localStorage.setItem(secAnsEnvelopeKey(originUser, originBoardId, originMeetingId), JSON.stringify(env));
-          // Generation was already advanced in onMutate before dispatch, so
-          // this attempt's own success gate compares its post-increment own
-          // revision and a first answer is never discarded as stale.
+          // onMutate already advanced the single per-attempt revision before dispatch.
+          // The success gate compares that immutable revision, so a first answer is
+          // never discarded as stale.
           envRev = secEnvelopeRev.current;
         } catch { }
       }
-      if (!originReq) throw new Error("No secretary request to answer.");
-      if (!submittedAnswer.trim()) throw new Error("Answer is required.");
-      return post<any>(`/api/meetings/${originMeetingId}/secretary/answer`, { requestId: originReq, answer: submittedAnswer }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, originReq, submittedAnswer, envRev, usedSaved, origin: originCap, opId: secPendingRef.current?.id ?? null, ansVerCap: secAnsVer.current, ansOwnerCap: secAnsOwnerReq.current }));
+      if (!v.req) throw new Error("No secretary request to answer.");
+      if (!(v.answer || "").trim()) throw new Error("Answer is required.");
+      return post<any>(`/api/meetings/${originMeetingId}/secretary/answer`, { requestId: v.req, answer: v.answer }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, originReq: v.req, submittedAnswer: v.answer, envRev, usedSaved: v.usedSaved, origin: originCap, opId: v.opId, ansVerCap, ansOwnerCap }));
     },
-    onMutate: () => { const opId = "ans-" + secRequestId + "-" + (++opSeq.current); secPendingRef.current = { kind: "secretary-answer", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } return { originBoardId: boardId, originMeetingId: meetingId, originUser: secIdentity(), originEpoch: secEpoch.current, originReq: secRequestId, opId, origin: originIdentity(), envRev: secEnvelopeRev.current, hydRev: secHydRef.current, ansVer: secAnsVer.current, ansOwner: secAnsOwnerReq.current }; },
+    onMutate: (v: any) => { const opId = v.opId; secPendingRef.current = { kind: "secretary-answer", id: opId }; try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } return { originBoardId: v.boardId, originMeetingId: v.meetingId, originUser: v.user, originEpoch: v.epoch, originReq: v.req, opId, origin: v.origin, envRev: secEnvelopeRev.current, hydRev: secHydRef.current, ansVer: v.ansVer, ansOwner: v.ansOwner }; },
     onSuccess: (pack: any, _v: unknown, ctx: unknown) => {
       const r = (pack as any)?.r ?? pack;
       const originBoardId = (pack as any)?.originBoardId ?? boardId;
@@ -7068,7 +7125,7 @@ const testModel = useMutation({
                             (<button
                               type="button"
                               className="primary"
-                              onClick={() => runDiscussion.mutate()}
+                              onClick={() => runDiscussion.mutate({ meetingId, prompt: draft || "Continue the discussion.", policy, leadVersion: lead.data ? lead.data.version : null, origin: originIdentity() })}
                               disabled={
                                 runDiscussion.isPending ||
                                 !canDiscussMeeting ||
@@ -7680,10 +7737,10 @@ const testModel = useMutation({
                                 <div>{secQuestion}</div>
                                 {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {secOmitted.join("; ")}</div>)}
                                 <label>Answer<input value={secAnswer} onChange={(e) => { try { secComposerTouched.current = true; } catch { } try { secAnsVer.current++; } catch { /* noop */ } try { secAnsOwnerReq.current = secRequestId; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecAnswer(e.target.value); }} /></label>{" "}
-                                <button type="button" onClick={() => { if (!answerSecretary.isPending) answerSecretary.mutate(); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>{answerSecretary.isPending ? "Sending..." : "Send answer"}</button>{" "}
+                                <button type="button" onClick={() => { if (!answerSecretary.isPending) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>{answerSecretary.isPending ? "Sending..." : "Send answer"}</button>{" "}
                               </div>
                             )}{" "}
-                            {secError && (<div className="card" role="alert"><b>Secretary error</b><div>{secError}</div>{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) retrySecretary.mutate(); }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
+                            {secError && (<div className="card" role="alert"><b>Secretary error</b><div>{secError}</div>{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) { const uRet = secIdentity(); retrySecretary.mutate({ opId: "retry-" + (++opSeq.current), boardId, meetingId, user: uRet, epoch: secEpoch.current, origin: originIdentity(), env: readEnvelope(secEnvelopeKey(uRet, boardId, meetingId)) }); } }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
                             {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {secOmitted.join("; ")}</div>)}
                             <h3>Secretary provisional notes</h3>{" "}
                             {(notes.data ?? [])
