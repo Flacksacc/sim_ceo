@@ -248,7 +248,7 @@ public static class SourceGovernance
     {
       lock (s.MessageLock)
       {
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           foreach (var d in s.Sources.Values.ToList()) EnsureMigrated(s, d);
           // 1. Canonical family identity for every non-wiki row. Legacy rows may
@@ -907,7 +907,7 @@ public static class SourceGovernance
 
   public static void RecordAudit(InMemoryStore s, Guid boardId, string action, string detail)
   {
-    try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = action, Detail = detail ?? "" }); } catch { }
+    try { Atomic.Audit(s, new AuditEvent { BoardId = boardId, Action = action, Detail = detail ?? "" }); } catch { }
   }
   // Serialized review gate. The caller/context is re-authorized INSIDE the
   // boundary against the freshly fetched rows, and the SAME freshly fetched
@@ -970,7 +970,7 @@ public static class SourceGovernance
         string? failure = null;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (!s.Sources.TryGetValue(id, out var d) || d is null)
               throw new InvalidOperationException("source vanished during approval");
@@ -1044,7 +1044,7 @@ public static class SourceGovernance
         string? failure = null;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (!s.Sources.TryGetValue(id, out var d) || d is null)
               throw new InvalidOperationException("source vanished during rejection");
@@ -1085,7 +1085,7 @@ public static class SourceGovernance
         string? failure = null;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (!s.Sources.TryGetValue(id, out var d) || d is null)
               throw new InvalidOperationException("source vanished during exclusion change");
@@ -1120,7 +1120,7 @@ public static class SourceGovernance
     {
       lock (s.MessageLock)
       {
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           mutation();
           InvalidateLocked(s, boardId);
@@ -1142,11 +1142,11 @@ public static class SourceGovernance
     {
       lock (s.MessageLock)
       {
-        changed = Atomic.Run(mutation);
+        changed = Atomic.Run(s, mutation);
         if (changed) InvalidateLocked(s, boardId);
       }
     }
-    if (changed) try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
+    if (changed) try { Atomic.Audit(s, new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
     return changed;
   }
 
@@ -1159,7 +1159,7 @@ public static class SourceGovernance
     {
       InvalidateLocked(s, boardId);
     }
-    try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
+    try { Atomic.Audit(s, new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
   }
 
   // Bounded detached index staging for Wiki sync: builds exactly the sections
@@ -1232,7 +1232,7 @@ public static class SourceGovernance
     {
       lock (s.MessageLock)
       {
-        Atomic.Run(() => InvalidateLocked(s, boardId));
+        Atomic.Run(s, () => InvalidateLocked(s, boardId));
       }
     }
     RecordAudit(s, boardId, "source.invalidate", reason ?? "");
@@ -1374,7 +1374,7 @@ public static class SourceGovernance
         var policyKey = PolicyRevisionKey(s, d.BoardId);
         IndexReservation? made = null;
         string? gateErr = null;
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           if (!s.Sources.TryGetValue(id, out var cur) || cur is null)
             throw new InvalidOperationException("source vanished during index reservation");
@@ -1442,7 +1442,7 @@ public static class SourceGovernance
         bool stale = false;
         string? staleErr = null;
         var eventName = isReindex ? "reindex" : "index";
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           if (!s.Sources.TryGetValue(res.SourceId, out var cur) || cur is null)
           { stale = true; staleErr = "Source is gone; stale index completion discarded."; return; }
@@ -1568,7 +1568,7 @@ public static class SourceGovernance
         {
           try
           {
-            Atomic.Run(() =>
+            Atomic.Run(s, () =>
             {
               if (!s.Sources.TryGetValue(res.SourceId, out var stamped) || stamped is null) return;
               if (!string.Equals(stamped.IndexState ?? "", "running", StringComparison.OrdinalIgnoreCase)

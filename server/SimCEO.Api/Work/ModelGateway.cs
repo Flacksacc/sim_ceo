@@ -192,6 +192,18 @@ public sealed class ModelGateway
       Status = status, ProviderCallId = providerCallId, CostBasis = costBasis, Cost = cost,
       BoardId = b, MeetingId = m, At = at, Note = note,
     };
+    // Ledger-scoped atomicity: PG mode commits both rows in one backend
+    // transaction; memory mode has no backend transaction, so capture just the
+    // two installation ledgers and restore them on failure. Ledgers are
+    // deliberately EXCLUDED from domain-unit snapshots (Ops billing boundary):
+    // a failing domain unit must never erase a concurrently finalized pair.
+    List<Domain.UsageRow>? usageSnap = null;
+    List<ModelCall>? callsSnap = null;
+    if (SimCEO.Api.Data.Pg.Backend is null)
+    {
+      usageSnap = _store.Usage.CaptureLive();
+      callsSnap = _store.ModelCalls.CaptureLive();
+    }
     try
     {
       Atomic.Run(() =>
@@ -202,6 +214,15 @@ public sealed class ModelGateway
     }
     catch (Exception ex)
     {
+      if (usageSnap is not null)
+      {
+        try
+        {
+          _store.Usage.RestoreLive(usageSnap);
+          if (callsSnap is not null) _store.ModelCalls.RestoreLive(callsSnap);
+        }
+        catch (Exception rex) { throw new AggregateException("usage ledger append failed and ledger rollback is uncertain", ex, rex); }
+      }
       throw new UsageStorageException("usage ledger append failed; provider result not recorded", ex);
     }
   }

@@ -131,43 +131,59 @@ public static class LeadSetup
   public static (LeadProfile? saved, string? error, int status) SaveLead(
     InMemoryStore s, Guid boardId, LeadProfile input)
   {
-    Board? board = null;
-    if (boardId != Guid.Empty && !s.Boards.TryGetValue(boardId, out board))
+    if (boardId != Guid.Empty && !s.Boards.TryGetValue(boardId, out _))
       return (null, "board not found", 404);
     if (string.IsNullOrWhiteSpace(input.Name))
       return (null, "Lead name is required.", 400);
-    lock (s.SetupLock)
+    var wantVersion = input.Version;
+    var wantName = (input.Name ?? "").Trim();
+    var wantRole = string.IsNullOrWhiteSpace(input.RoleLabel) ? "Board Lead" : input.RoleLabel.Trim();
+    LeadProfile? savedOut = null;
+    try
     {
-      var currentVersion = s.LeadProfiles.Values
-        .Where(l => l.BoardId == boardId)
-        .Select(l => (int?)l.Version).Max() ?? 0;
-      if (currentVersion != 0 && input.Version != currentVersion)
-        return (null, "Stale lead profile; refresh and re-apply your edit.", 409);
-      var saved = new LeadProfile
+      Atomic.Run(s, () =>
       {
-        Id = Guid.NewGuid(),
-        BoardId = boardId,
-        Version = currentVersion + 1,
-        Name = input.Name.Trim(),
-        RoleLabel = string.IsNullOrWhiteSpace(input.RoleLabel) ? "Board Lead" : input.RoleLabel.Trim(),
-        Background = input.Background,
-        FamiliarTopics = input.FamiliarTopics,
-        SimplerTopics = input.SimplerTopics,
-        CommPrefs = input.CommPrefs,
-        UpdatedAt = DateTime.UtcNow,
-      };
-      saved.ProvenanceJson = JsonSerializer.Serialize(new Dictionary<string, object> { ["name"] = new { source = "owner", at = saved.UpdatedAt }, ["roleLabel"] = new { source = "owner", at = saved.UpdatedAt }, ["background"] = new { source = "owner", at = saved.UpdatedAt }, ["familiarTopics"] = new { source = "owner", at = saved.UpdatedAt }, ["simplerTopics"] = new { source = "owner", at = saved.UpdatedAt }, ["commPrefs"] = new { source = "owner", at = saved.UpdatedAt } });
-      s.LeadProfiles[saved.Id] = saved;
-      if (board is not null) board.LeadProfileVersion = saved.Version;
-      s.Boards.Flush();
-      s.LeadProfiles.Flush();
-      s.Audit.Add(new AuditEvent
-      {
-        BoardId = boardId, Action = "lead.save",
-        Detail = JsonSerializer.Serialize(new { version = saved.Version }),
+        // Fresh fetch + version guard inside the unit: a concurrent save between
+        // the route check and this commit cannot silently overwrite.
+        Board? freshBoard = null;
+        if (boardId != Guid.Empty && !s.Boards.TryGetValue(boardId, out freshBoard))
+          throw new InvalidOperationException("gone");
+        var currentVersion = s.LeadProfiles.Values
+          .Where(l => l.BoardId == boardId)
+          .Select(l => (int?)l.Version).Max() ?? 0;
+        if (currentVersion != 0 && wantVersion != currentVersion)
+          throw new InvalidOperationException("stale");
+        var saved = new LeadProfile
+        {
+          Id = Guid.NewGuid(),
+          BoardId = boardId,
+          Version = currentVersion + 1,
+          Name = wantName,
+          RoleLabel = wantRole,
+          Background = input.Background,
+          FamiliarTopics = input.FamiliarTopics,
+          SimplerTopics = input.SimplerTopics,
+          CommPrefs = input.CommPrefs,
+          UpdatedAt = DateTime.UtcNow,
+        };
+        saved.ProvenanceJson = JsonSerializer.Serialize(new Dictionary<string, object> { ["name"] = new { source = "owner", at = saved.UpdatedAt }, ["roleLabel"] = new { source = "owner", at = saved.UpdatedAt }, ["background"] = new { source = "owner", at = saved.UpdatedAt }, ["familiarTopics"] = new { source = "owner", at = saved.UpdatedAt }, ["simplerTopics"] = new { source = "owner", at = saved.UpdatedAt }, ["commPrefs"] = new { source = "owner", at = saved.UpdatedAt } });
+        s.LeadProfiles[saved.Id] = saved;
+        if (freshBoard is not null) { freshBoard.LeadProfileVersion = saved.Version; s.Boards[freshBoard.Id] = freshBoard; }
+        Atomic.Audit(s, new AuditEvent
+        {
+          BoardId = boardId, Action = "lead.save",
+          Detail = JsonSerializer.Serialize(new { version = saved.Version }),
+        });
+        savedOut = saved;
       });
-      return (saved, null, 200);
     }
+    catch (InvalidOperationException iox) when (iox.Message == "stale")
+    {
+      return (null, "Stale lead profile; refresh and re-apply your edit.", 409);
+    }
+    catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (Exception ex) { return (null, "Lead save failed; no state changed: " + ex.Message, 500); }
+    return (savedOut, null, 200);
   }
 
   public static (Board? board, string? error, int status) Activate(
@@ -175,33 +191,63 @@ public static class LeadSetup
   {
     if (!s.Boards.TryGetValue(boardId, out var board))
       return (null, "board not found", 404);
-    lock (s.SetupLock)
+    var wantHash = expectedHash;
+    Board? activatedOut = null;
+    try
     {
-      if (string.IsNullOrWhiteSpace(board.Name))
-        return (null, "Board name is required before activation.", 409);
-      // Activation requires the board's OWN lead, except admin/legacy boards
-      // which may inherit the installation-global profile.
-      var hasLead = (ResolveLeadForStrict(s, boardId) ?? (InheritsGlobalLead(s, board) ? ResolveLead(s) : null)) is not null;
-      if (!hasLead)
-        return (null, "Reviewed board-lead profile is required before activation.", 409);
-      var approved = s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed && a.Approved
-        && RosterOps.ApprovalGate(s, a) is null);
-      if (approved < 1)
-        return (null, "At least one eligible approved advisor is required before activation.", 409);
-      if (string.IsNullOrWhiteSpace(expectedHash))
-        return (null, "Reviewed draft hash is required; refresh review and activate the exact draft.", 400);
-      var canonical = CanonicalDraftJson(s, board);
-      if (!string.Equals(Hashing.HashOf(canonical), expectedHash, StringComparison.OrdinalIgnoreCase))
-        return (null, "Setup draft changed; refresh review.", 409);
-      board.ActiveJson = canonical;
-      board.ActiveConfig = true;
-      s.Boards.Flush();
-      s.Audit.Add(new AuditEvent
+      Atomic.Run(s, () =>
       {
-        BoardId = boardId, Action = "setup.activate",
-        Detail = JsonSerializer.Serialize(new { leadVersion = board.LeadProfileVersion, approved }),
+        // Fresh fetch + full activation guard inside the unit: name, own lead,
+        // eligible advisor, and exact reviewed hash are rechecked against
+        // current rows so a concurrent edit cannot activate a stale draft.
+        if (!s.Boards.TryGetValue(boardId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+        if (string.IsNullOrWhiteSpace(cur.Name))
+          throw new InvalidOperationException("noname");
+        var hasLead = (ResolveLeadForStrict(s, boardId) ?? (InheritsGlobalLead(s, cur) ? ResolveLead(s) : null)) is not null;
+        if (!hasLead)
+          throw new InvalidOperationException("nolead");
+        var approved = s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed && a.Approved
+          && RosterOps.ApprovalGate(s, a) is null);
+        if (approved < 1)
+          throw new InvalidOperationException("noadvisor");
+        if (string.IsNullOrWhiteSpace(wantHash))
+          throw new InvalidOperationException("nohash");
+        var canonical = CanonicalDraftJson(s, cur);
+        if (!string.Equals(Hashing.HashOf(canonical), wantHash, StringComparison.OrdinalIgnoreCase))
+          throw new InvalidOperationException("changed");
+        cur.ActiveJson = canonical;
+        cur.ActiveConfig = true;
+        s.Boards[cur.Id] = cur;
+        Atomic.Audit(s, new AuditEvent
+        {
+          BoardId = boardId, Action = "setup.activate",
+          Detail = JsonSerializer.Serialize(new { leadVersion = cur.LeadProfileVersion, approved }),
+        });
+        activatedOut = cur;
       });
-      return (board, null, 200);
     }
+    catch (InvalidOperationException iox) when (iox.Message == "noname")
+    {
+      return (null, "Board name is required before activation.", 409);
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "nolead")
+    {
+      return (null, "Reviewed board-lead profile is required before activation.", 409);
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "noadvisor")
+    {
+      return (null, "At least one eligible approved advisor is required before activation.", 409);
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "nohash")
+    {
+      return (null, "Reviewed draft hash is required; refresh review and activate the exact draft.", 400);
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "changed")
+    {
+      return (null, "Setup draft changed; refresh review.", 409);
+    }
+    catch (InvalidOperationException) { return (null, "board not found", 404); }
+    catch (Exception ex) { return (null, "Activation failed; no state changed: " + ex.Message, 500); }
+    return (activatedOut, null, 200);
   }
 }

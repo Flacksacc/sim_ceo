@@ -59,14 +59,14 @@ public static class ModelSettingsEndpoints
         if (body.TryGetProperty("apiKey", out var k) && k.ValueKind == JsonValueKind.String)
         {
           s.ModelApiKeyOverride = (k.GetString() ?? string.Empty).Trim();
-          s.Audit.Add(new AuditEvent { Action = "model.key-set", Detail = "override " + (string.IsNullOrWhiteSpace(s.ModelApiKeyOverride) ? "cleared" : "updated") });
+          Atomic.Audit(s, new AuditEvent { Action = "model.key-set", Detail = "override " + (string.IsNullOrWhiteSpace(s.ModelApiKeyOverride) ? "cleared" : "updated") });
         }
         if (body.TryGetProperty("chatModel", out var m) && m.ValueKind == JsonValueKind.String)
         {
           var v = (m.GetString() ?? string.Empty).Trim();
           if (v.Length > 0 && !allowed.Contains(v)) return Results.BadRequest("Unknown chat model.");
           s.ModelChatOverride = v;
-          s.Audit.Add(new AuditEvent { Action = "model.chat-set", Detail = string.IsNullOrWhiteSpace(v) ? "default" : v });
+          Atomic.Audit(s, new AuditEvent { Action = "model.chat-set", Detail = string.IsNullOrWhiteSpace(v) ? "default" : v });
         }
         s.ModelLastTestAt = null;
         s.ModelLastTestOk = false;
@@ -110,7 +110,7 @@ public static class ModelSettingsEndpoints
           s.ModelLastTestError = err;
           s.ModelLastTestModel = model;
         }
-        s.Audit.Add(new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + kind + ")" });
+        Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "fail: " + model + " (" + kind + ")" });
         return Results.Ok(new { ok = false, model, error = err });
       }
       sw.Stop();
@@ -121,7 +121,7 @@ public static class ModelSettingsEndpoints
         s.ModelLastTestError = string.Empty;
         s.ModelLastTestModel = model;
       }
-      s.Audit.Add(new AuditEvent { Action = "model.test", Detail = "ok: " + model });
+      Atomic.Audit(s, new AuditEvent { Action = "model.test", Detail = "ok: " + model });
       return Results.Ok(new { ok = true, model, latencyMs = sw.ElapsedMilliseconds });
     });
   }

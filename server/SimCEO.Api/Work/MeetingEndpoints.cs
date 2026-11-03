@@ -18,6 +18,7 @@ public static class MeetingEndpoints
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "discuss") is { } deniedTr) return deniedTr;
       if (PeopleOps.Guard(gw, req) is { } capped) return capped;
+      var restoreBeforeTr = s.RestoreEpochId;
       if (audio is null || audio.Length == 0) return Results.BadRequest("No audio.");
       if (audio.Length > 10 * 1024 * 1024) return Results.BadRequest("Audio exceeds 10 MB.");
       using var ms = new MemoryStream();
@@ -56,7 +57,25 @@ public static class MeetingEndpoints
         BoardId = m.BoardId, MeetingId = id, CreatorKey = trUser, State = "draft",
         Transcript = transcript, AudioRetained = false,
       };
-      s.VoiceTurns[turn.Id] = turn;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Meetings.TryGetValue(id, out var curM) || curM is null) throw new InvalidOperationException("gone");
+          if (!AuthOps.TrySession(s, req, out var tu) && PeopleOps.IsSecure(s)) throw new UnauthorizedAccessException("revoked");
+          var tu2 = PeopleOps.IsSecure(s) ? tu! : PeopleOps.UserOf(s, req);
+          if (PeopleOps.Check(s, req, curM.BoardId, id, "discuss") is not null) throw new UnauthorizedAccessException("revoked");
+          if (s.RestoreEpochId != restoreBeforeTr) throw new InvalidOperationException("restored");
+          if (!string.Equals(tu2, trUser, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("session changed during transcription");
+          turn.BoardId = curM.BoardId;
+          turn.CreatorKey = tu2;
+          s.VoiceTurns[turn.Id] = turn;
+        });
+      }
+      catch (UnauthorizedAccessException) { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during transcription; retry."); }
+      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
+      catch (Exception ex) { return Results.Json(new { error = "Transcription store failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Created($"/api/voice/{turn.Id}", new { turn = turn.Id, transcript });
     }).DisableAntiforgery();
 
@@ -64,11 +83,13 @@ public static class MeetingEndpoints
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "contribute") is { } deniedPatch) return deniedPatch;
-      lock (s.MessageLock)
+      try
       {
-        // Recheck CURRENT authority against a fresh fetch inside the lock (TOCTOU).
-        if (!s.Meetings.TryGetValue(id, out var curP)) return Results.NotFound("meeting");
-        if (PeopleOps.Check(s, req, curP.BoardId, id, "contribute") is { } deniedPatch2) return deniedPatch2;
+        Atomic.Run(s, () =>
+        {
+        // Recheck CURRENT authority against a fresh fetch inside the unit (TOCTOU).
+        if (!s.Meetings.TryGetValue(id, out var curP)) throw new InvalidOperationException("Meeting is gone.");
+        if (PeopleOps.Check(s, req, curP.BoardId, id, "contribute") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
         if (body.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String)
         {
           var title = t.GetString() ?? "";
@@ -90,9 +111,14 @@ public static class MeetingEndpoints
           if (!string.IsNullOrWhiteSpace(curP.Brief) && curP.State == MeetingState.AwaitingBrief)
             curP.State = MeetingState.Active;
         }
-        s.Meetings.Flush();
-        return Results.Ok(curP);
+        s.Meetings[curP.Id] = curP;
+        });
       }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
+      catch (Exception ex) { return Results.Json(new { error = "Meeting update failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (!s.Meetings.TryGetValue(id, out var savedP) || savedP is null) return Results.NotFound("meeting");
+      return Results.Ok(savedP);
     });
 
     app.MapPost("/api/meetings/{id:guid}/close", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -100,32 +126,46 @@ public static class MeetingEndpoints
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedClose) return deniedClose;
       var withRecord = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("withRecord", out var w) && w.GetBoolean();
-      lock (s.MessageLock)
+      try
       {
-        if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
-        if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedClose2) return deniedClose2;
-        cur.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
-        cur.Generation++;
-        s.Meetings.Flush();
-        s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting.close", Detail = JsonSerializer.Serialize(new { meeting = id, withRecord }) });
-        return Results.Ok(cur);
+        Atomic.Run(s, () =>
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur)) throw new InvalidOperationException("Meeting is gone.");
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          cur.State = withRecord ? MeetingState.ClosedWithRecord : MeetingState.ClosedWithoutPublication;
+          cur.Generation++;
+          s.Meetings[cur.Id] = cur;
+          Atomic.Audit(s, new AuditEvent { BoardId = cur.BoardId, Action = "meeting.close", Detail = JsonSerializer.Serialize(new { meeting = id, withRecord }) });
+        });
       }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
+      catch (Exception ex) { return Results.Json(new { error = "Meeting close failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (!s.Meetings.TryGetValue(id, out var closed) || closed is null) return Results.NotFound("meeting");
+      return Results.Ok(closed);
     });
 
     app.MapPost("/api/meetings/{id:guid}/reopen", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
       if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedReopen) return deniedReopen;
-      lock (s.MessageLock)
+      try
       {
-        if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound("meeting");
-        if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedReopen2) return deniedReopen2;
-        cur.State = MeetingState.Active;
-        cur.Generation++;
-        s.Meetings.Flush();
-        s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting.reopen", Detail = JsonSerializer.Serialize(new { meeting = id }) });
-        return Results.Ok(cur);
+        Atomic.Run(s, () =>
+        {
+          if (!s.Meetings.TryGetValue(id, out var cur)) throw new InvalidOperationException("Meeting is gone.");
+          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          cur.State = MeetingState.Active;
+          cur.Generation++;
+          s.Meetings[cur.Id] = cur;
+          Atomic.Audit(s, new AuditEvent { BoardId = cur.BoardId, Action = "meeting.reopen", Detail = JsonSerializer.Serialize(new { meeting = id }) });
+        });
       }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound("meeting"); }
+      catch (Exception ex) { return Results.Json(new { error = "Meeting reopen failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (!s.Meetings.TryGetValue(id, out var reopened) || reopened is null) return Results.NotFound("meeting");
+      return Results.Ok(reopened);
     });
 
     app.MapGet("/api/meetings/{id:guid}/messages/search", (InMemoryStore s, HttpRequest req, Guid id, string q, int context = 3) =>
@@ -195,7 +235,7 @@ public static class MeetingEndpoints
       if (kind is not ("note" or "briefing")) kind = "note";
       Note created;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        created = Atomic.Run(() =>
+        created = Atomic.Run(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur) || cur.BoardId != m.BoardId) throw new InvalidOperationException("meeting moved");
           var note = new Note { BoardId = cur.BoardId, MeetingId = id, Kind = kind, Title = string.IsNullOrWhiteSpace(title) ? (kind == "briefing" ? "Briefing" : "Working note") : title, Body = bodyIn, Scope = "meeting", Provisional = true, EvidenceJson = "[]", RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current", CreatedAt = DateTime.UtcNow };
@@ -220,6 +260,7 @@ public static class MeetingEndpoints
       if (string.IsNullOrWhiteSpace(topic)) return Results.BadRequest("topic is required.");
       var callerRaw = EvidenceRef.ParseList(body, "evidence");
       SecretarySnapshot snapBefore;
+      var restoreBeforeB = s.RestoreEpochId;
       List<EvidenceRef> deliveredB = new();
       List<string> omittedB = new();
       string promptBText;
@@ -272,13 +313,15 @@ public static class MeetingEndpoints
       {
         lock (s.MessageLock)
         {
-          return Atomic.Run<IResult>(() =>
+          return Atomic.Run<IResult>(s, () =>
           {
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
               return Results.Conflict("Meeting state changed during briefing; draft discarded.");
             var nowSnap = SecretaryContext.CaptureSnapshot(s, cur);
             if (!SecretaryContext.SnapshotEquals(snapBefore, nowSnap))
               return Results.Json(new { error = SecretaryContext.SnapshotMismatchReason(snapBefore, nowSnap) }, statusCode: 409);
+            if (s.RestoreEpochId != restoreBeforeB)
+              return Results.Json(new { error = "Domain was restored during briefing; retry." }, statusCode: 409);
             if (PeopleOps.Check(s, req, cur.BoardId, id, "contribute") is { } deniedBrIn) return deniedBrIn;
             var bodyText = bout.Body;
             if (deliveredB.Count == 0) bodyText = bodyText + " [Limitation: No eligible approved sources, adopted directions, or approved records were available for this meeting.]";
@@ -342,9 +385,22 @@ public static class MeetingEndpoints
         RootId = Guid.Empty, Revision = 1, PredecessorId = null, NoteStatus = "current",
       };
       note.RootId = note.Id;
-      s.Notes[note.Id] = note;
-      s.Audit.Add(new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });
-      return Results.Created($"/api/notes/{note.Id}", note);
+      var newNote = note;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Boards.ContainsKey(bid)) throw new InvalidOperationException("Board is gone.");
+          if (PeopleOps.Check(s, req, bid, newNote.MeetingId == Guid.Empty ? null : newNote.MeetingId, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if (newNote.Scope == "meeting" && (!s.Meetings.TryGetValue(newNote.MeetingId, out var mm) || mm.BoardId != bid)) throw new InvalidOperationException("Meeting is gone.");
+          s.Notes[newNote.Id] = newNote;
+          Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "direction.adopt", Detail = JsonSerializer.Serialize(new { scope, meetingId, text }) });
+        });
+      }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Direction adoption failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created($"/api/notes/{newNote.Id}", newNote);
     });
   }
 }

@@ -120,13 +120,18 @@ public static class AuthEndpoints
       {
         lock (s.AuthLock)
         {
+          // MessageLock joins the root gate here (order Setup -> Auth -> Message;
+          // no path takes Auth under Message, so no inversion) so registration
+          // commits in one store-bound unit.
+          lock (s.MessageLock)
+          {
           if (s.Accounts.Values.Any(a => a.Email == email))
             return Results.Conflict("An account with that email already exists.");
           var salt = AuthOps.NewSalt();
           var acct = new Account { Email = email, Salt = salt, Hash = AuthOps.HashPassword(password, salt) };
           try
           {
-            Atomic.Run(() =>
+            Atomic.Run(s, () =>
             {
               s.Accounts[acct.Id] = acct;
               SecurityOps.EnsureFirstAdmin(s, email, acct.Id);
@@ -142,8 +147,9 @@ public static class AuthEndpoints
           };
           s.Sessions[session.Token] = session;
           try { if (s.Accounts.Values.Count == 1) SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { }
-          s.Audit.Add(new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
+          Atomic.Audit(s, new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
           return Results.Created("/api/auth/me", new { email, token = session.Token, expiresAt = session.ExpiresAt });
+          }
         }
       }
     });
@@ -175,17 +181,25 @@ public static class AuthEndpoints
       {
         lock (s.MessageLock)
         {
-          Atomic.Run(() =>
+          // Store-bound unit: session removal rolls back if the unit fails, and
+          // hub revocation runs only after the outermost commit (never for a
+          // rolled-back logout).
+          Atomic.Run(s, () =>
           {
             string? cur = null;
             if (req.Headers.TryGetValue("Authorization", out var auth)
               && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
               cur = auth.ToString()["Bearer ".Length..].Trim();
-            if (!string.IsNullOrEmpty(cur)) { tok = cur; s.Sessions.TryRemove(tok, out _); }
+            if (!string.IsNullOrEmpty(cur) && s.Sessions.TryRemove(cur, out var prior))
+            {
+              tok = cur;
+              if (prior is not null)
+                Atomic.Compensate(s, () => { s.Sessions[cur] = prior; });
+              Atomic.Defer(s, () => { try { SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(cur); } catch { } });
+            }
           });
         }
       }
-      try { if (!string.IsNullOrEmpty(tok)) SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(tok); } catch { }
       return Results.Ok(new { loggedOut = true });
     });
 

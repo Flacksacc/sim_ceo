@@ -74,7 +74,7 @@ public static class WizardGuide
       }
       catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException)
       {
-        s.Audit.Add(new AuditEvent { Action = "wizard.guide-fallback", Detail = ex.GetType().Name });
+        Atomic.Audit(s, new AuditEvent { Action = "wizard.guide-fallback", Detail = ex.GetType().Name });
       }
       return Results.Ok(LocalGuide(d, step));
     });
@@ -106,14 +106,28 @@ public static class WizardGuide
           analysis = "Starting the setup interview from the current draft.";
           var after0 = Blockers(d);
           var checkpoints0 = ReadCheckpoints(d);
-          d.Step = after0.Count == 0 ? 4 : after0.Min(b => b.step);
-          d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = checkpoints0, pendingQuestion = question, lastAnalysis = new { ok = true, at = DateTime.UtcNow, started = true } });
-          NormalizeInterview(d);
-          d.Version++;
-          d.UpdatedAt = DateTime.UtcNow;
-          s.WizardDrafts[d.Id] = d;
-          s.WizardDrafts.Flush();
-          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = d.Version, fields = FieldStates(d), blockers = after0, checkpoints = checkpoints0, turns, done = after0.Count == 0 });
+          var draftId0 = d.Id; var ver0 = d.Version;
+          try
+          {
+            Atomic.Run(s, () =>
+            {
+              if (!s.WizardDrafts.TryGetValue(draftId0, out var cur0) || cur0 is null) throw new InvalidOperationException("Draft is gone.");
+              if (!TryWizardUser(s, req, cur0, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (cur0.Version != ver0) throw new InvalidOperationException("stale");
+            cur0.Step = after0.Count == 0 ? 4 : after0.Min(b => b.step);
+            cur0.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = checkpoints0, pendingQuestion = question, lastAnalysis = new { ok = true, at = DateTime.UtcNow, started = true } });
+            NormalizeInterview(cur0);
+            cur0.Version++;
+            cur0.UpdatedAt = DateTime.UtcNow;
+            s.WizardDrafts[cur0.Id] = cur0;
+            });
+          }
+          catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+          catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
+          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
+          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          if (!s.WizardDrafts.TryGetValue(draftId0, out var saved0) || saved0 is null) return Results.NotFound("wizard draft");
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = saved0.Version, fields = FieldStates(saved0), blockers = Blockers(saved0), checkpoints = ReadCheckpoints(saved0), turns, done = Blockers(saved0).Count == 0 });
         }
         else
         {
@@ -122,13 +136,27 @@ public static class WizardGuide
           var jobId = Guid.NewGuid().ToString("N");
           var pendingAt = DateTime.UtcNow;
           var pendingCheckpoints = ReadCheckpoints(d);
-          d.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = pendingCheckpoints, pendingQuestion = currentQ, lastAnalysis = new { ok = false, status = "pending", jobId, at = pendingAt, turn = turns.Count } });
-          NormalizeInterview(d);
-          d.Version++;
-          d.UpdatedAt = DateTime.UtcNow;
-          s.WizardDrafts[d.Id] = d;
-          s.WizardDrafts.Flush();
-          var pendingVersion = d.Version;
+          var draftIdP = d.Id; var verP = d.Version;
+          try
+          {
+            Atomic.Run(s, () =>
+            {
+              if (!s.WizardDrafts.TryGetValue(draftIdP, out var curP) || curP is null) throw new InvalidOperationException("Draft is gone.");
+              if (!TryWizardUser(s, req, curP, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              if (curP.Version != verP) throw new InvalidOperationException("stale");
+              curP.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints = pendingCheckpoints, pendingQuestion = currentQ, lastAnalysis = new { ok = false, status = "pending", jobId, at = pendingAt, turn = turns.Count } });
+              NormalizeInterview(curP);
+              curP.Version++;
+              curP.UpdatedAt = DateTime.UtcNow;
+              s.WizardDrafts[curP.Id] = curP;
+            });
+          }
+          catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+          catch (InvalidOperationException iox) when (iox.Message == "stale") { return Results.Conflict("Stale wizard draft; refresh and re-apply your edit."); }
+          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
+          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          if (!s.WizardDrafts.TryGetValue(draftIdP, out var savedP) || savedP is null) return Results.NotFound("wizard draft");
+          var pendingVersion = savedP.Version;
           var gw = new ModelGateway(s);
           var gate = PeopleOps.Guard(gw, req);
           InterviewParsed? parsed = null;
@@ -149,7 +177,7 @@ public static class WizardGuide
                 var raw = await gw.CompleteAsync(ModelPolicy.SparkFor(s, null), "wizard-interview",
                   iPrompt, 2000, 2048, ownerOverride: PeopleOps.IsOwner(req));
                 parsed = ParseInterviewJson(raw);
-                if (parsed is null) s.Audit.Add(new AuditEvent { Action = "wizard.interview-unparsed", Detail = raw.Length > 500 ? raw.Substring(0, 500) : raw });
+                if (parsed is null) Atomic.Audit(s, new AuditEvent { Action = "wizard.interview-unparsed", Detail = raw.Length > 500 ? raw.Substring(0, 500) : raw });
               }
               if (parsed is null)
               {
@@ -166,7 +194,7 @@ public static class WizardGuide
               question = NextQuestion(d);
               extractOk = false;
               extractError = ex.GetType().Name;
-              s.Audit.Add(new AuditEvent { Action = "wizard.interview-fallback", Detail = ex.GetType().Name });
+              Atomic.Audit(s, new AuditEvent { Action = "wizard.interview-fallback", Detail = ex.GetType().Name });
             }
           }
           if (!s.WizardDrafts.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound("wizard draft");
@@ -181,24 +209,46 @@ public static class WizardGuide
               freshJob = jj.GetString();
           }
           catch (JsonException) { }
-          if (fresh.Version != pendingVersion || !string.Equals(freshJob, jobId, StringComparison.Ordinal))
-            return Results.Conflict("Draft changed during interview; retry with the latest version.");
-          var pendingUpdates = parsed?.updates ?? new Dictionary<string, string>();
-          foreach (var u in pendingUpdates)
-            if (ApplyFieldUpdate(fresh, u.Key, u.Value)) applied.Add(u.Key);
-          if (turns.Count > 0) turns[^1] = turns[^1] with { analysis = analysis };
-          var after = Blockers(fresh);
-          var checkpoints = ReadCheckpoints(fresh);
-          foreach (var st in before.Except(after.Select(b => b.step)).OrderBy(x => x))
-            checkpoints.Add(new InterviewCheckpoint(DateTime.UtcNow, "Step " + st + " ready: " + StepLabel(st)));
-          fresh.Step = after.Count == 0 ? 4 : after.Min(b => b.step);
-          fresh.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints, pendingQuestion = question, lastAnalysis = new { ok = extractOk, at = DateTime.UtcNow, error = extractError, jobId } });
-          NormalizeInterview(fresh);
-          fresh.Version++;
-          fresh.UpdatedAt = DateTime.UtcNow;
-          s.WizardDrafts[fresh.Id] = fresh;
-          s.WizardDrafts.Flush();
-          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = fresh.Version, fields = FieldStates(fresh), blockers = after, checkpoints, turns, done = after.Count == 0 });
+          var completionId = fresh.Id;
+          try
+          {
+            Atomic.Run(s, () =>
+            {
+              if (!s.WizardDrafts.TryGetValue(completionId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+              if (!TryWizardUser(s, req, cur, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+              string? curJob = null;
+              try
+              {
+                using var pj = JsonDocument.Parse(string.IsNullOrWhiteSpace(cur.InterviewJson) ? "{}" : cur.InterviewJson);
+                if (pj.RootElement.TryGetProperty("lastAnalysis", out var la) && la.ValueKind == JsonValueKind.Object && la.TryGetProperty("jobId", out var jj) && jj.ValueKind == JsonValueKind.String)
+                  curJob = jj.GetString();
+              }
+              catch (JsonException) { }
+              if (cur.Version != pendingVersion || !string.Equals(curJob, jobId, StringComparison.Ordinal))
+                throw new InvalidOperationException("changed");
+              var pendingUpdates = parsed?.updates ?? new Dictionary<string, string>();
+              foreach (var u in pendingUpdates)
+                if (ApplyFieldUpdate(cur, u.Key, u.Value)) applied.Add(u.Key);
+              if (turns.Count > 0) turns[^1] = turns[^1] with { analysis = analysis };
+              var after = Blockers(cur);
+              var checkpoints = ReadCheckpoints(cur);
+              foreach (var st in before.Except(after.Select(b => b.step)).OrderBy(x => x))
+                checkpoints.Add(new InterviewCheckpoint(DateTime.UtcNow, "Step " + st + " ready: " + StepLabel(st)));
+              cur.Step = after.Count == 0 ? 4 : after.Min(b => b.step);
+              cur.InterviewJson = JsonSerializer.Serialize(new { turns, checkpoints, pendingQuestion = question, lastAnalysis = new { ok = extractOk, at = DateTime.UtcNow, error = extractError, jobId } });
+              NormalizeInterview(cur);
+              cur.Version++;
+              cur.UpdatedAt = DateTime.UtcNow;
+              s.WizardDrafts[cur.Id] = cur;
+              Atomic.Audit(s, new AuditEvent { Action = "wizard.interview", Detail = JsonSerializer.Serialize(new { draft = completionId, turn = turns.Count }) });
+            });
+          }
+          catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+          catch (InvalidOperationException iox) when (iox.Message == "changed") { return Results.Conflict("Draft changed during interview; retry with the latest version."); }
+          catch (InvalidOperationException) { return Results.NotFound("wizard draft"); }
+          catch (Exception ex) { return Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
+          if (!s.WizardDrafts.TryGetValue(completionId, out var doneIv) || doneIv is null) return Results.NotFound("wizard draft");
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = doneIv.Version, fields = FieldStates(doneIv), blockers = Blockers(doneIv), checkpoints = ReadCheckpoints(doneIv), turns, done = Blockers(doneIv).Count == 0 });
         }
       }
       finally { sem.Release(); }
@@ -257,7 +307,7 @@ public static class WizardGuide
       Guid savedLeadId = Guid.Empty;
       try
       {
-        return Atomic.Run(() =>
+        return Atomic.Run(s, () =>
         {
           s.Boards[board.Id] = board;
           var (saved, leadError, _) = LeadSetup.SaveLead(s, board.Id, new LeadProfile
@@ -304,7 +354,7 @@ public static class WizardGuide
           s.Images.Flush();
           s.Advisors.Flush();
           s.LeadProfiles.Flush();
-          s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "wizard.create", Detail = JsonSerializer.Serialize(new { board = board.Id, advisors = created.Count }) });
+          Atomic.Audit(s, new AuditEvent { BoardId = board.Id, Action = "wizard.create", Detail = JsonSerializer.Serialize(new { board = board.Id, advisors = created.Count }) });
           return Results.Created("/api/boards/" + board.Id, new
           {
             board, advisors = created,
@@ -319,7 +369,7 @@ public static class WizardGuide
         foreach (var aid in createdAdvisors) s.Advisors.TryRemove(aid, out _);
         if (savedLeadId != Guid.Empty) s.LeadProfiles.TryRemove(savedLeadId, out _);
         s.Boards.TryRemove(board.Id, out _);
-        s.Audit.Add(new AuditEvent { Action = "wizard.create-rolled-back", Detail = ex.Message });
+        Atomic.Audit(s, new AuditEvent { Action = "wizard.create-rolled-back", Detail = ex.Message });
         return Results.Json(new { error = "Board creation failed and was rolled back." }, statusCode: 500);
       }
     }

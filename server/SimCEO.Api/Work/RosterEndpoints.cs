@@ -45,8 +45,8 @@ public static class RosterOps
         BoardRole = string.IsNullOrWhiteSpace(role) ? entry.Name : role.Trim(),
         CreatedAt = DateTime.UtcNow,
       };
-      Atomic.Run(() => { s.Advisors[copy.Id] = copy; s.Advisors.Flush(); });
-      s.Audit.Add(new AuditEvent
+      Atomic.Run(s, () => { s.Advisors[copy.Id] = copy; s.Advisors.Flush(); });
+      Atomic.Audit(s, new AuditEvent
       {
         BoardId = boardId, Action = "roster.copy",
         Detail = JsonSerializer.Serialize(new { rosterId, version = entry.Version, copy = copy.Id }),
@@ -388,22 +388,30 @@ public static class RosterEndpoints
         if (nameProvided && newName != entry.Name) profileChanged = true;
         if (descProvided && newDesc != entry.Description) profileChanged = true;
         if (profileProvided && newProfile != entry.ProfileJson) profileChanged = true;
-        RosterEntry applied = entry;
-        Atomic.Run(() =>
+        RosterEntry? applied = null;
+        try
         {
-          if (nameProvided) entry.Name = newName!;
-          if (descProvided) entry.Description = newDesc!;
-          if (profileProvided) entry.ProfileJson = newProfile!;
-          if (tagsProvided) entry.Tags = newTags!;
-          entry.Version += 1;
-          entry.UpdatedAt = DateTime.UtcNow;
-          if (profileChanged) RosterOps.InvalidateDossier(s, entry);
-          else RosterOps.UnapproveBoardCopies(s, id);
-          s.Roster[entry.Id] = entry;
-          s.Roster.Flush();
-          applied = entry;
-        });
-        s.Audit.Add(new AuditEvent { Action = "roster.edit", Detail = JsonSerializer.Serialize(new { entry = applied.Id, version = applied.Version }) });
+          Atomic.Run(s, () =>
+          {
+            if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
+            if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (nameProvided) cur.Name = newName!;
+            if (descProvided) cur.Description = newDesc!;
+            if (profileProvided) cur.ProfileJson = newProfile!;
+            if (tagsProvided) cur.Tags = newTags!;
+            cur.Version += 1;
+            cur.UpdatedAt = DateTime.UtcNow;
+            if (profileChanged) RosterOps.InvalidateDossier(s, cur);
+            else RosterOps.UnapproveBoardCopies(s, id);
+            s.Roster[cur.Id] = cur;
+            applied = cur;
+          });
+          Atomic.Audit(s, new AuditEvent { Action = "roster.edit", Detail = JsonSerializer.Serialize(new { entry = applied!.Id, version = applied!.Version }) });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Roster edit failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (applied is null) return Results.NotFound();
         return Results.Ok(applied);
       }
     });    app.MapPost("/api/roster/{id:guid}/archive", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -417,16 +425,24 @@ public static class RosterEndpoints
       {
         if (!s.Roster.TryGetValue(id, out var entry)) return Results.NotFound();
         if (!RosterOps.CanWriteRoster(s, req, entry)) return PeopleOps.Denied();
-        RosterEntry saved = entry;
-        Atomic.Run(() =>
+        RosterEntry? saved = null;
+        try
         {
-          entry.Archived = archived;
-          entry.UpdatedAt = DateTime.UtcNow;
-          RosterOps.UnapproveBoardCopies(s, id);
-          s.Roster[entry.Id] = entry;
-          s.Roster.Flush();
-          saved = entry;
-        });
+          Atomic.Run(s, () =>
+          {
+            if (!s.Roster.TryGetValue(id, out var cur) || cur is null) throw new InvalidOperationException("gone");
+            if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            cur.Archived = archived;
+            cur.UpdatedAt = DateTime.UtcNow;
+            RosterOps.UnapproveBoardCopies(s, id);
+            s.Roster[cur.Id] = cur;
+            saved = cur;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Roster archive failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (saved is null) return Results.NotFound();
         return Results.Ok(saved);
       }
     });
@@ -441,14 +457,14 @@ public static class RosterEndpoints
         if (!s.Advisors.TryGetValue(aid, out var a) || a.BoardId != bid || a.Removed) return Results.NotFound();
         if (!s.Roster.TryGetValue(a.RosterEntryId, out var entry)) return Results.NotFound("roster entry");
         var ver = entry.Version;
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           a.RosterVersion = ver;
           a.Approved = false;
           s.Advisors[a.Id] = a;
           s.Advisors.Flush();
         });
-        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "roster.sync", Detail = JsonSerializer.Serialize(new { advisor = aid, version = ver, reapproval = true }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "roster.sync", Detail = JsonSerializer.Serialize(new { advisor = aid, version = ver, reapproval = true }) });
         return Results.Ok(a);
       }
     });
@@ -471,8 +487,13 @@ public static class RosterEndpoints
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       if (body.TryGetProperty("tags", out var t)) entry.Tags = t.GetString() ?? "";
-      s.Roster[entry.Id] = entry;
-      return Results.Created($"/api/roster/{entry.Id}", entry);
+      var newEntry = entry;
+      try
+      {
+        Atomic.Run(s, () => { s.Roster[newEntry.Id] = newEntry; });
+      }
+      catch (Exception ex) { return Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created($"/api/roster/{newEntry.Id}", newEntry);
     });
 
     app.MapGet("/api/roster/{id:guid}/completeness", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -510,9 +531,17 @@ public static class RosterEndpoints
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       if (body.TryGetProperty("tags", out var qtg)) entry.Tags = qtg.GetString() ?? "";
-      s.Roster[entry.Id] = entry;
-      s.Audit.Add(new AuditEvent { Action = "roster.quick", Detail = JsonSerializer.Serialize(new { entry = entry.Id, name }) });
-      return Results.Created($"/api/roster/{entry.Id}", entry);
+      var quickEntry = entry;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          s.Roster[quickEntry.Id] = quickEntry;
+          Atomic.Audit(s, new AuditEvent { Action = "roster.quick", Detail = JsonSerializer.Serialize(new { entry = quickEntry.Id, name }) });
+        });
+      }
+      catch (Exception ex) { return Results.Json(new { error = "Roster creation failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created($"/api/roster/{quickEntry.Id}", quickEntry);
     });
 
     app.MapPost("/api/roster/ai-draft", async (InMemoryStore s, HttpRequest req, JsonElement body) =>
@@ -578,9 +607,17 @@ public static class RosterEndpoints
         EvidenceCount = dossier.Citations.Count(c => !string.IsNullOrWhiteSpace(c.Url) && !string.IsNullOrWhiteSpace(c.Excerpt)),
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
-      s.Roster[entry.Id] = entry;
-      s.Audit.Add(new AuditEvent { Action = "roster.ai-draft", Detail = JsonSerializer.Serialize(new { entry = entry.Id, name, role, searches = dossier.SearchCalls }) });
-      return Results.Created("/api/roster/" + entry.Id, new { entry, researched = dossier.RanSearch, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
+      var aiEntry = entry;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          s.Roster[aiEntry.Id] = aiEntry;
+          Atomic.Audit(s, new AuditEvent { Action = "roster.ai-draft", Detail = JsonSerializer.Serialize(new { entry = aiEntry.Id, name, role, searches = dossier.SearchCalls }) });
+        });
+      }
+      catch (Exception ex) { return Results.Json(new { error = "Roster draft failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = dossier.RanSearch, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
     });
 
     app.MapPost("/api/boards/{bid:guid}/advisors/{aid:guid}/chat", async (InMemoryStore s, HttpRequest req, Guid bid, Guid aid, JsonElement body) =>
@@ -671,19 +708,30 @@ public static class RosterEndpoints
         jobId = Guid.NewGuid().ToString("N");
         baseVersion = entry.Version;
         startSubject = entry.Name + " (" + entry.Type + ")";
-        Atomic.Run(() =>
+        try
         {
-          entry.ResearchRequested = true;
-          entry.ResearchedAt = null;
-          entry.EvidenceCount = 0;
-          entry.ResearchJson = "{}";
-          entry.ResearchJobId = jobId;
-          entry.ResearchBaseVersion = baseVersion;
-          entry.UpdatedAt = DateTime.UtcNow;
-          RosterOps.UnapproveBoardCopies(s, id);
-          s.Roster[entry.Id] = entry;
-          s.Roster.Flush();
-        });
+          Atomic.Run(s, () =>
+          {
+            if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
+            if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (cur.ResearchRequested && cur.ResearchedAt is null && !string.IsNullOrEmpty(cur.ResearchJobId) && RosterOps.IsLiveResearchJob(cur.ResearchJobId))
+              throw new InvalidOperationException("running");
+            cur.ResearchRequested = true;
+            cur.ResearchedAt = null;
+            cur.EvidenceCount = 0;
+            cur.ResearchJson = "{}";
+            cur.ResearchJobId = jobId;
+            cur.ResearchBaseVersion = cur.Version;
+            baseVersion = cur.Version;
+            cur.UpdatedAt = DateTime.UtcNow;
+            RosterOps.UnapproveBoardCopies(s, id);
+            s.Roster[cur.Id] = cur;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Conflict("Research is already running for this advisor; wait for it to finish."); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
         RosterOps.MarkLiveResearchJob(jobId);
       }
       try
@@ -723,7 +771,7 @@ public static class RosterEndpoints
       {
         lock (s.SetupLock)
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (s.Roster.TryGetValue(id, out var failed) && failed.ResearchJobId == jobId)
             {
@@ -757,15 +805,15 @@ public static class RosterEndpoints
         }
         if (cur.Version != baseVersion)
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
-            if (cur.ResearchJobId == jobId)
+            if (!s.Roster.TryGetValue(id, out var stale) || stale is null) return;
+            if (stale.ResearchJobId == jobId)
             {
-              cur.ResearchJobId = "";
-              cur.ResearchRequested = true;
-              cur.UpdatedAt = DateTime.UtcNow;
-              s.Roster[cur.Id] = cur;
-              s.Roster.Flush();
+              stale.ResearchJobId = "";
+              stale.ResearchRequested = true;
+              stale.UpdatedAt = DateTime.UtcNow;
+              s.Roster[stale.Id] = stale;
             }
           });
           RosterOps.ClearLiveResearchJob(jobId);
@@ -784,19 +832,30 @@ public static class RosterEndpoints
             ? "No completed grounded evidence: treat every claim above as unsupported, not verified research."
             : "Snippet-level claims need cross-checking against independent sources before approval.",
         };
-        Atomic.Run(() =>
+        try
         {
-          cur.ResearchJson = JsonSerializer.Serialize(built);
-          cur.ResearchedAt = DateTime.UtcNow;
-          cur.EvidenceCount = citedExcerpts.Count;
-          cur.ResearchJobId = "";
-          cur.ResearchRequested = true;
-          cur.Version += 1;
-          cur.UpdatedAt = DateTime.UtcNow;
-          RosterOps.UnapproveBoardCopies(s, id);
-          s.Roster[cur.Id] = cur;
-          s.Roster.Flush();
-        });
+          Atomic.Run(s, () =>
+          {
+            if (!s.Roster.TryGetValue(id, out var fresh) || fresh is null || fresh.Archived) throw new InvalidOperationException("gone");
+            if (fresh.ResearchJobId != jobId) throw new InvalidOperationException("superseded");
+          fresh.ResearchJson = JsonSerializer.Serialize(built);
+          fresh.ResearchedAt = DateTime.UtcNow;
+          fresh.EvidenceCount = citedExcerpts.Count;
+          fresh.ResearchJobId = "";
+          fresh.ResearchRequested = true;
+          fresh.Version += 1;
+          fresh.UpdatedAt = DateTime.UtcNow;
+            RosterOps.UnapproveBoardCopies(s, id);
+            s.Roster[fresh.Id] = fresh;
+          });
+        }
+        catch (InvalidOperationException iox) when (iox.Message == "superseded")
+        {
+          RosterOps.ClearLiveResearchJob(jobId);
+          return Results.Conflict("A newer research request superseded this run; use its result.");
+        }
+        catch (InvalidOperationException) { RosterOps.ClearLiveResearchJob(jobId); return Results.NotFound(); }
+        catch (Exception ex) { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Research completion failed; no state changed: " + ex.Message }, statusCode: 500); }
         dossier = built;
       }
       return Results.Ok(dossier);
@@ -873,9 +932,21 @@ public static class RosterEndpoints
         Review = "pending",
         Provenance = $"upload:{file.FileName}", ContentType = ct, Data = ms.ToArray(),
       };
-      s.Images[img.Id] = img;
-      RosterOps.UnapproveBoardCopies(s, id);
-      return Results.Created($"/api/images/{img.Id}", new { img.Id, img.Kind, img.Provenance });
+      var newImg = img;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
+          if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          s.Images[newImg.Id] = newImg;
+          RosterOps.UnapproveBoardCopies(s, id);
+        });
+      }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Image upload failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created($"/api/images/{newImg.Id}", new { newImg.Id, newImg.Kind, newImg.Provenance });
     }).DisableAntiforgery(); // token-less API: no cookie auth to forge against
 
     app.MapPost("/api/roster/{id:guid}/image/url", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -901,9 +972,21 @@ public static class RosterEndpoints
         Review = "pending",
           Provenance = $"url:{url} source:{source}", ContentType = ct, Data = bytes,
         };
-        s.Images[img.Id] = img;
-        RosterOps.UnapproveBoardCopies(s, id);
-        return Results.Created($"/api/images/{img.Id}", new { img.Id, img.Kind, img.Provenance });
+        var newImg2 = img;
+        try
+        {
+          Atomic.Run(s, () =>
+          {
+            if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
+            if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            s.Images[newImg2.Id] = newImg2;
+            RosterOps.UnapproveBoardCopies(s, id);
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Image fetch failed to store; no state changed: " + ex.Message }, statusCode: 500); }
+        return Results.Created($"/api/images/{newImg2.Id}", new { newImg2.Id, newImg2.Kind, newImg2.Provenance });
       }
     });
 
@@ -926,19 +1009,34 @@ public static class RosterEndpoints
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
       var created = new List<object>();
+      var genImgs = new List<AdvisorImage>();
       foreach (var bytes in images)
       {
-        var img = new AdvisorImage
+        genImgs.Add(new AdvisorImage
         {
           RosterEntryId = id, Kind = "generated",
-        Review = "pending",
+          Review = "pending",
           Provenance = $"generated:muse-image prompt:{prompt[..Math.Min(120, prompt.Length)]}",
           ContentType = "image/png", Data = bytes,
-        };
-        s.Images[img.Id] = img;
-        created.Add(new { img.Id, img.Kind, img.Provenance });
+        });
       }
-      if (created.Count > 0) RosterOps.UnapproveBoardCopies(s, id);
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
+          if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          foreach (var gi in genImgs)
+          {
+            s.Images[gi.Id] = gi;
+            created.Add(new { gi.Id, gi.Kind, gi.Provenance });
+          }
+          if (created.Count > 0) RosterOps.UnapproveBoardCopies(s, id);
+        });
+      }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Image generation store failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Ok(created);
     });
 
@@ -971,8 +1069,29 @@ public static class RosterEndpoints
         ? RosterOps.CanWriteRoster(s, req, delEntry)
         : (boardId != Guid.Empty && PeopleOps.Can(s, req, boardId, null, "manage"));
       if (!delAllowed) return PeopleOps.Denied();
-      s.Images.TryRemove(imgId, out _);
-      if (img.RosterEntryId.HasValue) RosterOps.UnapproveBoardCopies(s, img.RosterEntryId.Value);
+      var delImgId = imgId;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Images.TryGetValue(delImgId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+          RosterEntry? curEntry = cur.RosterEntryId.HasValue && s.Roster.TryGetValue(cur.RosterEntryId.Value, out var curRe) ? curRe : null;
+          Guid curBoard = Guid.Empty;
+          if (cur.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(cur.BoardAdvisorId.Value, out var curAdv))
+            curBoard = curAdv.BoardId;
+          else if (curEntry is not null)
+            curBoard = s.Advisors.Values.FirstOrDefault(a => a.RosterEntryId == curEntry.Id && !a.Removed)?.BoardId ?? Guid.Empty;
+          var allowedNow = curEntry is not null
+            ? RosterOps.CanWriteRoster(s, req, curEntry)
+            : (curBoard != Guid.Empty && PeopleOps.Can(s, req, curBoard, null, "manage"));
+          if (!allowedNow) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          s.Images.TryRemove(delImgId, out _);
+          if (cur.RosterEntryId.HasValue) RosterOps.UnapproveBoardCopies(s, cur.RosterEntryId.Value);
+        });
+      }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Image delete failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.NoContent();
     });
 
@@ -991,29 +1110,42 @@ public static class RosterEndpoints
         if (!PeopleOps.Can(s, req, adv.BoardId, null, "manage")) return PeopleOps.Denied();
         if (!img.RosterEntryId.HasValue || img.RosterEntryId.Value != adv.RosterEntryId)
           return Results.BadRequest("Image does not belong to this advisor roster entry.");
-        BoardAdvisor savedAdv = adv;
-        Atomic.Run(() =>
+        var selImgId = img.Id; var selAdvId = adv.Id;
+        BoardAdvisor? savedAdv = null;
+        try
         {
-          foreach (var other in s.Images.Values.Where(i => i.BoardAdvisorId == adv.Id && i.Id != img.Id).ToList())
+          Atomic.Run(s, () =>
           {
-            other.BoardAdvisorId = null;
-            s.Images[other.Id] = other;
-          }
+            if (!s.Images.TryGetValue(selImgId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+            if (!s.Advisors.TryGetValue(selAdvId, out var a2) || a2 is null || a2.Removed) throw new InvalidOperationException("gone");
+            if (!PeopleOps.Can(s, req, a2.BoardId, null, "manage")) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (!cur.RosterEntryId.HasValue || cur.RosterEntryId.Value != a2.RosterEntryId)
+              throw new InvalidOperationException("mismatch");
+            foreach (var other in s.Images.Values.Where(i => i.BoardAdvisorId == a2.Id && i.Id != cur.Id).ToList())
+            {
+              other.BoardAdvisorId = null;
+              s.Images[other.Id] = other;
+            }
           // Per-board selection only: record identity (link + provenance) and
           // require re-approval of this copy, but never mutate the shared
           // global Review. A pending/rejected image stays pending/rejected, so
           // approval remains blocked until an explicit review accept with the
           // full roster-write scope. Only explicit review accept changes Review.
-          img.BoardAdvisorId = adv.Id;
-          s.Images[img.Id] = img;
-          adv.Approved = false;
-          adv.ImageProvenance = img.Kind + ":" + img.Id.ToString();
-          s.Images.Flush();
-          s.Advisors[adv.Id] = adv;
-          s.Advisors.Flush();
-          savedAdv = adv;
-        });
-        s.Audit.Add(new AuditEvent { BoardId = savedAdv.BoardId, Action = "image.select", Detail = JsonSerializer.Serialize(new { imgId, advisor = advisorId }) });
+            cur.BoardAdvisorId = a2.Id;
+            s.Images[cur.Id] = cur;
+            a2.Approved = false;
+            a2.ImageProvenance = cur.Kind + ":" + cur.Id.ToString();
+            s.Images[cur.Id] = cur;
+            s.Advisors[a2.Id] = a2;
+            savedAdv = a2;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException iox) when (iox.Message == "mismatch") { return Results.BadRequest("Image does not belong to this advisor roster entry."); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Image select failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (savedAdv is null) return Results.NotFound();
+        Atomic.Audit(s, new AuditEvent { BoardId = savedAdv.BoardId, Action = "image.select", Detail = JsonSerializer.Serialize(new { imgId, advisor = advisorId }) });
         return Results.Ok(savedAdv);
       }
     });
@@ -1053,25 +1185,41 @@ public static class RosterEndpoints
           ? RosterOps.CanWriteRoster(s, req, revEntry)
           : (rbBoard.HasValue && PeopleOps.Can(s, req, rbBoard.Value, null, "manage"));
         if (!revAllowed) return PeopleOps.Denied();
-        AdvisorImage savedImg = imgr;
-        Atomic.Run(() =>
+        AdvisorImage? savedImg = null;
+        try
         {
-          imgr.Review = dec == "accept" ? "accepted" : "rejected";
-          s.Images[imgr.Id] = imgr;
-          if (revEntry is not null) RosterOps.UnapproveBoardCopies(s, revEntry.Id);
-          if (imgr.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(imgr.BoardAdvisorId.Value, out var revAdv))
+          Atomic.Run(s, () =>
           {
-            revAdv.Approved = false;
-            s.Advisors[revAdv.Id] = revAdv;
-          }
-          s.Advisors.Flush();
-          s.Images.Flush();
-          savedImg = imgr;
-        });
+            if (!s.Images.TryGetValue(imgId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+            if (body.TryGetProperty("decision", out var dv2) && (dv2.GetString() ?? "") is var decNow && decNow != "accept" && decNow != "retry") throw new InvalidOperationException("bad-decision");
+            RosterEntry? curEntry = cur.RosterEntryId.HasValue && s.Roster.TryGetValue(cur.RosterEntryId.Value, out var curRe) ? curRe : null;
+            Guid? curBoard = null;
+            if (cur.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(cur.BoardAdvisorId.Value, out var curAdv0)) curBoard = curAdv0.BoardId;
+            else if (curEntry is not null) curBoard = s.Advisors.Values.FirstOrDefault(a => a.RosterEntryId == curEntry.Id && !a.Removed)?.BoardId;
+            var allowedNow = curEntry is not null
+              ? RosterOps.CanWriteRoster(s, req, curEntry)
+              : (curBoard.HasValue && PeopleOps.Can(s, req, curBoard.Value, null, "manage"));
+            if (!allowedNow) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            cur.Review = dec == "accept" ? "accepted" : "rejected";
+            s.Images[cur.Id] = cur;
+            if (curEntry is not null) RosterOps.UnapproveBoardCopies(s, curEntry.Id);
+            if (cur.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(cur.BoardAdvisorId.Value, out var revAdv))
+            {
+              revAdv.Approved = false;
+              s.Advisors[revAdv.Id] = revAdv;
+            }
+            savedImg = cur;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException iox) when (iox.Message == "bad-decision") { return Results.BadRequest("decision must be accept or retry."); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Image review failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (savedImg is null) return Results.NotFound();
         Guid? rb = null;
         if (savedImg.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(savedImg.BoardAdvisorId.Value, out var rba)) rb = rba.BoardId;
         else if (savedImg.RosterEntryId.HasValue && s.Roster.TryGetValue(savedImg.RosterEntryId.Value, out var rre)) rb = s.Advisors.Values.FirstOrDefault(a => a.RosterEntryId == rre.Id && !a.Removed)?.BoardId;
-        s.Audit.Add(new AuditEvent { BoardId = rb, Action = "image.review", Detail = JsonSerializer.Serialize(new { imgId, decision = dec }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = rb, Action = "image.review", Detail = JsonSerializer.Serialize(new { imgId, decision = dec }) });
         return Results.Ok(savedImg);
       }
     });

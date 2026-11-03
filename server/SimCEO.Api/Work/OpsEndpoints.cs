@@ -23,14 +23,36 @@ public static class OpsEndpoints
         if (!AuthOps.TrySession(s, req, out var jr)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
         if (!PeopleOps.IsInstallationAdmin(s, jr)) return PeopleOps.Denied();
       }
-      if (!s.Jobs.TryGetValue(id, out var job)) return Results.NotFound();
-      if (job.State != "failed")
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          // Job identity + retryable state rechecked inside the unit: only a
+          // still-failed job transitions to pending, exactly once.
+          if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("revoked");
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var jrIn)) throw new UnauthorizedAccessException("revoked");
+            if (!PeopleOps.IsInstallationAdmin(s, jrIn)) throw new UnauthorizedAccessException("denied");
+          }
+          if (!s.Jobs.TryGetValue(id, out var cur) || cur is null) throw new InvalidOperationException("Job is gone.");
+          if (cur.State != "failed") throw new InvalidOperationException("not-failed");
+          cur.State = "pending";
+          cur.UpdatedAt = DateTime.UtcNow;
+          s.Jobs[cur.Id] = cur;
+          Atomic.Audit(s, new AuditEvent { Action = "job.retry", Detail = JsonSerializer.Serialize(new { id, cur.Kind, cur.IdempotencyKey }) });
+        });
+      }
+      catch (InvalidOperationException iox) when (iox.Message == "not-failed")
+      {
         return Results.Conflict("Only a failed step offers Retry; otherwise the last checkpoint stands.");
-      job.State = "pending";
-      job.UpdatedAt = DateTime.UtcNow;
-      s.Jobs.Flush();
-      s.Audit.Add(new AuditEvent { Action = "job.retry", Detail = JsonSerializer.Serialize(new { id, job.Kind, job.IdempotencyKey }) });
-      return Results.Ok(job);
+      }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Job retry failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (!s.Jobs.TryGetValue(id, out var done) || done is null) return Results.NotFound();
+      return Results.Ok(done);
     });
 
     app.MapGet("/api/boards/{bid:guid}/status", (InMemoryStore s, HttpRequest req, Guid bid) =>
@@ -323,7 +345,7 @@ public static class OpsEndpoints
       int imported;
       lock (s.SetupLock)
       {
-        imported = Atomic.Run(() =>
+        imported = Atomic.Run(s, () =>
         {
           s.Boards[board.Id] = board;
           foreach (var pe in plannedRoster) s.Roster[pe.Id] = pe;
@@ -342,7 +364,7 @@ public static class OpsEndpoints
           s.Roster.Flush();
           s.Advisors.Flush();
           s.LeadProfiles.Flush();
-          s.Audit.Add(new AuditEvent { BoardId = board.Id, Action = "setup.import", Detail = JsonSerializer.Serialize(new { advisors = copied, reReview = true }) });
+          Atomic.Audit(s, new AuditEvent { BoardId = board.Id, Action = "setup.import", Detail = JsonSerializer.Serialize(new { advisors = copied, reReview = true }) });
           return copied;
         });
       }
@@ -392,28 +414,51 @@ public static class OpsEndpoints
         var (setupOk, setupErr) = WikiSetupAllowed(s, req, doc, out _);
         if (!setupOk) return Results.Json(new { error = setupErr }, statusCode: 409);
       }
-      List<object> log;
+      // Checkpoint append shares one store-bound unit: the draft and source are
+      // freshly re-fetched and re-authorized inside; a revoked source or a
+      // concurrently replaced draft cannot receive the checkpoint.
+      List<object>? addedLog = null;
+      object? addedCheckpoint = null;
+      var docId = doc.Id; var docHash = doc.ContentHash; var docVer = doc.Version;
       try
       {
-        log = JsonSerializer.Deserialize<List<object>>(string.IsNullOrWhiteSpace(d.ProvenanceJson) ? "[]" : d.ProvenanceJson) ?? new();
+        Atomic.Run(s, () =>
+        {
+          if (!s.WizardDrafts.TryGetValue(id, out var cur) || cur is null) throw new InvalidOperationException("Draft is gone.");
+          if (!WizardGuide.TryWizardUser(s, req, cur, out _, out _)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if (!s.Sources.TryGetValue(docId, out var fresh) || fresh is null) throw new InvalidOperationException("Source is gone.");
+          if (PeopleOps.Check(s, req, fresh.BoardId, fresh.MeetingId, "read") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if (!string.Equals(fresh.ContentHash ?? "", docHash ?? "", StringComparison.Ordinal) || fresh.Version != docVer)
+            throw new InvalidOperationException("Source changed during extraction; retry.");
+          List<object> log;
+          try
+          {
+            log = JsonSerializer.Deserialize<List<object>>(string.IsNullOrWhiteSpace(cur.ProvenanceJson) ? "[]" : cur.ProvenanceJson) ?? new();
+          }
+          catch (JsonException) { log = new(); }
+          var checkpoint = new
+          {
+            sourceId,
+            fileName = fresh.FileName,
+            version = fresh.Version,
+            contentHash = fresh.ContentHash,
+            approved = fresh.Approved, reviewState = fresh.ReviewState, eligible = SourceGovernance.IsEligible(s, fresh, fresh.Scope == "meeting" ? fresh.MeetingId : null), indexState = fresh.IndexState,
+            extractedAt = DateTime.UtcNow,
+            chars = fresh.Original?.Length ?? 0,
+            extractor = "direct-read",
+          };
+          log.Add(checkpoint);
+          cur.ProvenanceJson = JsonSerializer.Serialize(log);
+          cur.UpdatedAt = DateTime.UtcNow;
+          s.WizardDrafts[cur.Id] = cur;
+          addedLog = log; addedCheckpoint = checkpoint;
+        });
       }
-      catch (JsonException) { log = new(); }
-      var checkpoint = new
-      {
-        sourceId,
-        fileName = doc.FileName,
-        version = doc.Version,
-        contentHash = doc.ContentHash,
-        approved = doc.Approved, reviewState = doc.ReviewState, eligible = SourceGovernance.IsEligible(s, doc, doc.Scope == "meeting" ? doc.MeetingId : null), indexState = doc.IndexState,
-        extractedAt = DateTime.UtcNow,
-        chars = doc.Original?.Length ?? 0,
-        extractor = "direct-read",
-      };
-      log.Add(checkpoint);
-      d.ProvenanceJson = JsonSerializer.Serialize(log);
-      d.UpdatedAt = DateTime.UtcNow;
-      s.WizardDrafts.Flush();
-      return Results.Ok(new { checkpoints = log.Count, latest = checkpoint });
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException iox) when (iox.Message == "Source changed during extraction; retry.") { return Results.Conflict(iox.Message); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Wizard extraction failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Ok(new { checkpoints = (addedLog ?? new List<object>()).Count, latest = addedCheckpoint });
     });
 
     app.MapGet("/api/wizard/{id:guid}/extract", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -517,7 +562,6 @@ public static class OpsEndpoints
         wikiValidated = recs;
       }
       catch (JsonException) { return Results.BadRequest("Snapshot wikiResources are malformed."); }
-      var memMode = SimCEO.Api.Data.Pg.Backend is null;
       int restoredCount = 0;
       lock (s.SetupLock)
       {
@@ -530,27 +574,11 @@ public static class OpsEndpoints
           // rollback.
           var liveMaxGen = 0L;
           try { liveMaxGen = s.Meetings.Values.Any() ? s.Meetings.Values.Max(m => m.Generation) : 0L; } catch { liveMaxGen = 0L; }
-          var snapBoards = memMode ? s.Boards.Values.ToList() : new System.Collections.Generic.List<Domain.Board>();
-          var snapRoster = memMode ? s.Roster.Values.ToList() : new System.Collections.Generic.List<Domain.RosterEntry>();
-          var snapAdvisors = memMode ? s.Advisors.Values.ToList() : new System.Collections.Generic.List<Domain.BoardAdvisor>();
-          var snapMeetings = memMode ? s.Meetings.Values.ToList() : new System.Collections.Generic.List<Domain.Meeting>();
-          var snapNotes = memMode ? s.Notes.Values.ToList() : new System.Collections.Generic.List<Domain.Note>();
-          var snapDrafts = memMode ? s.Drafts.Values.ToList() : new System.Collections.Generic.List<Domain.RecordDraft>();
-          var snapSources = memMode ? s.Sources.Values.ToList() : new System.Collections.Generic.List<Domain.SourceDoc>();
-          var snapSections = memMode ? s.SourceSections.Values.ToList() : new System.Collections.Generic.List<Domain.SourceSection>();
-          var snapHeads = memMode ? s.SourceHeads.Values.ToList() : new System.Collections.Generic.List<Domain.SourceFamilyHead>();
-          var snapEvents = memMode ? s.SourceEvents.Values.ToList() : new System.Collections.Generic.List<Domain.SourceEvent>();
-          var snapLeads = memMode ? s.LeadProfiles.Values.ToList() : new System.Collections.Generic.List<Domain.LeadProfile>();
-          var snapImages = memMode ? s.Images.Values.ToList() : new System.Collections.Generic.List<Domain.AdvisorImage>();
-          var snapWiz = memMode ? s.WizardDrafts.Values.ToList() : new System.Collections.Generic.List<Domain.WizardDraft>();
-          var snapMessages = memMode ? s.Messages.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()) : new System.Collections.Generic.Dictionary<Guid, System.Collections.Generic.List<Domain.Message>>();
-          var snapWikiRes = memMode ? s.WikiResources.Values.ToList() : new System.Collections.Generic.List<Domain.WikiResource>();
-          var snapWikiSec = memMode ? s.WikiSecrets.Values.ToList() : new System.Collections.Generic.List<Domain.WikiResourceSecret>();
-          var snapSecretary = memMode ? s.SecretaryRequests.Values.ToList() : new System.Collections.Generic.List<Domain.SecretaryRequest>();
-          var snapNoteHist = memMode ? s.NoteHistories.Values.ToList() : new System.Collections.Generic.List<Domain.NoteHistory>();
+          // Deep rollback snapshots are owned by the store-bound unit below
+          // (exact deep capture in memory mode; EF transaction in PG mode).
           try
           {
-            restoredCount = Atomic.Run(() =>
+            restoredCount = Atomic.Run(s, () =>
             {
               s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
               s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
@@ -643,41 +671,205 @@ public static class OpsEndpoints
             // replaced state. No generation reuse is observable afterwards.
             s.ActiveIndexJobs.Clear();
             s.SourceEpoch++;
-            s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restoredCount, aclPreserved = true }) });
+            // Fresh global restore identity + revision: every in-flight domain
+            // publisher holding the previous identity fails closed at commit.
+            s.RestoreEpochId = Guid.NewGuid();
+            s.RestoreEpochRev++;
+            Atomic.Audit(s, new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restoredCount, aclPreserved = true }) });
           }
           catch (Exception __ex)
           {
-            if (memMode)
-            {
-              // Real memory rollback: validation passed but a write failed; restore snapshots.
-              try
-              {
-                s.Boards.Clear(); foreach (var b in snapBoards) s.Boards[b.Id] = b;
-                s.Roster.Clear(); foreach (var r in snapRoster) s.Roster[r.Id] = r;
-                s.Advisors.Clear(); foreach (var a in snapAdvisors) s.Advisors[a.Id] = a;
-                s.Meetings.Clear(); foreach (var m in snapMeetings) s.Meetings[m.Id] = m;
-                s.Messages.Clear(); foreach (var kv in snapMessages) s.Messages[kv.Key] = MessageList.Detached(kv.Key, kv.Value);
-                s.Notes.Clear(); foreach (var n in snapNotes) s.Notes[n.Id] = n;
-                s.Drafts.Clear(); foreach (var d in snapDrafts) s.Drafts[d.Id] = d;
-                s.Sources.Clear(); foreach (var x in snapSources) s.Sources[x.Id] = x;
-                s.SourceSections.Clear(); foreach (var ss in snapSections) s.SourceSections[ss.Id] = ss;
-                s.SourceHeads.Clear(); foreach (var hh in snapHeads) s.SourceHeads[hh.Id] = hh;
-                s.SourceEvents.Clear(); foreach (var ee in snapEvents) s.SourceEvents[ee.Id] = ee;
-                s.WikiResources.Clear(); foreach (var wr in snapWikiRes) s.WikiResources[wr.Id] = wr;
-                s.WikiSecrets.Clear(); foreach (var ws in snapWikiSec) s.WikiSecrets[ws.Id] = ws;
-                s.SecretaryRequests.Clear(); foreach (var sr in snapSecretary) s.SecretaryRequests[sr.Id] = sr;
-                s.NoteHistories.Clear(); foreach (var hh in snapNoteHist) s.NoteHistories[hh.Id] = hh;
-                s.LeadProfiles.Clear(); foreach (var l in snapLeads) s.LeadProfiles[l.Id] = l;
-                s.Images.Clear(); foreach (var im in snapImages) s.Images[im.Id] = im;
-                s.WizardDrafts.Clear(); foreach (var w in snapWiz) s.WizardDrafts[w.Id] = w;
-              }
-              catch { }
-            }
+            // No manual restore here: the store-bound unit above already
+            // restored exact deep state (memory mode) or rolled back the PG
+            // transaction. A shallow re-fill would reintroduce shared row refs.
             return Results.Json(new { error = "Restore failed; prior domain state was restored: " + __ex.Message }, statusCode: 500);
           }
         }
       }
       return Results.Ok(new { restored = restoredCount, at = restored.at });
+    });
+
+    app.MapGet("/api/jobs/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } badJg) return badJg;
+      if (!s.Jobs.TryGetValue(id, out var job) || job is null) return Results.NotFound();
+      // Caller-scoped read: installation admin sees all; anyone else must hold
+      // read on the job target's board. Unresolvable payloads are admin-only.
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var ju)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        if (!PeopleOps.IsInstallationAdmin(s, ju))
+        {
+          Guid? jb = null;
+          try
+          {
+            using var jd = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(job.Payload) ? "{}" : job.Payload);
+            if (jd.RootElement.TryGetProperty("targetId", out var jt) && jt.ValueKind == JsonValueKind.String && Guid.TryParse(jt.GetString(), out var jg))
+            {
+              if (string.Equals(job.Kind, "index", System.StringComparison.OrdinalIgnoreCase) && s.Sources.TryGetValue(jg, out var js)) jb = js.BoardId;
+              else if (string.Equals(job.Kind, "wiki-sync", System.StringComparison.OrdinalIgnoreCase) && s.WikiResources.TryGetValue(jg, out var jw)) jb = jw.BoardId;
+            }
+          }
+          catch (JsonException) { }
+          if (!jb.HasValue || !s.Boards.ContainsKey(jb.Value)) return PeopleOps.Denied();
+          if (!PeopleOps.Can(s, req, jb.Value, null, "read")) return PeopleOps.Denied();
+        }
+      }
+      else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
+      return Results.Ok(job);
+    });
+
+    app.MapPost("/api/jobs/{id:guid}/execute", async (InMemoryStore s, Work.WikiSyncService sync, HttpRequest req, Guid id) =>
+    {
+      if (PeopleOps.BadToken(s, req) is { } badJx) return badJx;
+      // Claim: exactly one executor wins. Revalidates session/authority inside
+      // the unit, captures the restore epoch + attempt, transitions to running.
+      Guid claimBoard = Guid.Empty;
+      Guid claimTarget = Guid.Empty;
+      string claimKind = "";
+      int claimAttempt = 0;
+      Guid claimEpoch = Guid.Empty;
+      Work.JobWorker.JobTarget? claimT = null;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("revoked");
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var jx)) throw new UnauthorizedAccessException("revoked");
+            if (!PeopleOps.IsInstallationAdmin(s, jx))
+            {
+              if (!s.Jobs.TryGetValue(id, out var pre) || pre is null) throw new InvalidOperationException("gone");
+              throw new UnauthorizedAccessException("denied");
+            }
+          }
+          else if (!PeopleOps.IsOwner(req)) throw new UnauthorizedAccessException("denied");
+          if (!s.Jobs.TryGetValue(id, out var cur) || cur is null) throw new InvalidOperationException("gone");
+          if (cur.State == "running") throw new InvalidOperationException("running");
+          if (cur.State is not ("pending" or "failed" or "interrupted")) throw new InvalidOperationException("terminal");
+          Work.JobWorker.JobTarget? tt = null;
+          try
+          {
+            using var jd = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(cur.Payload) ? "{}" : cur.Payload);
+            if (jd.RootElement.TryGetProperty("kind", out var kk) && kk.ValueKind == JsonValueKind.String
+              && jd.RootElement.TryGetProperty("targetId", out var tv) && tv.ValueKind == JsonValueKind.String && Guid.TryParse(tv.GetString(), out var tg))
+              tt = new Work.JobWorker.JobTarget((kk.GetString() ?? "").Trim().ToLowerInvariant(), tg);
+          }
+          catch (JsonException) { }
+          if (tt is null || !Work.JobWorker.KnownKinds.Contains(tt.Kind)) throw new InvalidOperationException("badkind");
+          if (tt.Kind == "index")
+          {
+            if (!s.Sources.TryGetValue(tt.TargetId, out var ds) || ds is null) throw new InvalidOperationException("gone-target");
+            if (PeopleOps.Check(s, req, ds.BoardId, ds.MeetingId, "contribute") is not null) throw new UnauthorizedAccessException("denied-scope");
+            claimBoard = ds.BoardId;
+          }
+          else
+          {
+            if (!s.WikiResources.TryGetValue(tt.TargetId, out var dw) || dw is null) throw new InvalidOperationException("gone-target");
+            if (!Work.WikiAuth.CanManageResource(s, req, dw.BoardId, (dw.Scope ?? "board") == "meeting" ? "meeting" : "board", dw.MeetingId)) throw new UnauthorizedAccessException("denied-scope");
+            claimBoard = dw.BoardId;
+          }
+          cur.State = "running";
+          cur.Attempts += 1;
+          cur.Error = "";
+          cur.UpdatedAt = DateTime.UtcNow;
+          s.Jobs[cur.Id] = cur;
+          claimTarget = tt.TargetId; claimKind = tt.Kind; claimAttempt = cur.Attempts;
+          claimEpoch = s.RestoreEpochId; claimT = tt;
+        });
+      }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Json(new { error = "Job is already running; wait for its attempt." }, statusCode: 409); }
+      catch (InvalidOperationException iox) when (iox.Message == "terminal") { return Results.Json(new { error = "Only pending, failed, or interrupted jobs execute." }, statusCode: 409); }
+      catch (InvalidOperationException iox) when (iox.Message == "badkind") { return Results.Json(new { error = "Unknown job kind." }, statusCode: 422); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Job claim failed; no state changed: " + ex.Message }, statusCode: 500); }
+      if (claimT is null) return Results.NotFound();
+      // Domain work runs OUTSIDE every lock/gate (async provider/extractor/network
+      // stays outside the unit). Only the claim above and the commit below are units.
+      bool wok = false;
+      string werr = "";
+      object? wdetail = null;
+      try
+      {
+        if (claimKind == "index")
+        {
+          if (!SourceGovernance.TryBeginIndex(s, req, claimTarget, "contribute", out var res, out _) || res is null)
+            throw new InvalidOperationException("index reservation refused");
+          SourceDoc? snapDoc = null;
+          lock (s.SetupLock) { lock (s.MessageLock) { if (s.Sources.TryGetValue(claimTarget, out var sd)) snapDoc = sd; } }
+          if (snapDoc is null || snapDoc.Original is null) throw new InvalidOperationException("source bytes unavailable");
+          var ext = await Work.Extraction.ExtractAsync(snapDoc.Original, snapDoc.FileName ?? "source");
+          wdetail = new { jobId = res.JobId };
+          Atomic.Run(s, () =>
+          {
+            if (s.RestoreEpochId != claimEpoch) throw new InvalidOperationException("restored");
+            Work.SourceGovernance.StampExtraction(s, req, res, Work.Extraction.ToJson(ext), "contribute");
+            var (fok, fstale, flost, ferr, fstatus) = Work.SourceGovernance.FinishIndex(s, req, res, true, "contribute");
+            _ = flost;
+            if (!fok) throw new InvalidOperationException("finish:" + ferr + ":" + fstatus);
+            wdetail = new { jobId = res.JobId };
+          });
+          wok = true;
+        }
+        else
+        {
+          string callerX = "";
+          string? callerTok = null;
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var sx)) throw new UnauthorizedAccessException("revoked");
+            callerX = sx;
+            try
+            {
+              var ahX = req.Headers["Authorization"].ToString() ?? "";
+              if (ahX.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) callerTok = ahX["Bearer ".Length..].Trim();
+            }
+            catch { }
+            if (string.IsNullOrWhiteSpace(callerTok)) throw new UnauthorizedAccessException("revoked");
+          }
+          else callerX = PeopleOps.UserOf(s, req);
+          var (sok, serr, sstatus) = await sync.SyncAsync(claimTarget, "job:" + id.ToString("N"), callerX, false, default, callerTok);
+          if (!sok) throw new InvalidOperationException("wikisync:" + serr + ":" + sstatus);
+          wok = true;
+        }
+      }
+      catch (UnauthorizedAccessException) { werr = "Access revoked during execution."; }
+      catch (InvalidOperationException iex) { werr = iex.Message; }
+      catch (Exception ex) { werr = ex.GetType().Name + ": " + ex.Message; }
+      // Commit: fresh fetch + attempt match + epoch pin; records terminal state.
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          if (!s.Jobs.TryGetValue(id, out var fin) || fin is null) throw new InvalidOperationException("gone");
+          if (fin.State != "running" || fin.Attempts != claimAttempt) throw new InvalidOperationException("superseded");
+          if (s.RestoreEpochId != claimEpoch)
+          {
+            fin.State = "failed"; fin.Error = "Domain was restored during execution; safe to retry."; fin.UpdatedAt = DateTime.UtcNow;
+            s.Jobs[fin.Id] = fin;
+            Atomic.Audit(s, new AuditEvent { BoardId = claimBoard == Guid.Empty ? null : claimBoard, Action = "job.restored-discard", Detail = System.Text.Json.JsonSerializer.Serialize(new { job = id }) });
+            return;
+          }
+          if (!wok)
+          {
+            fin.State = "failed"; fin.Error = werr; fin.UpdatedAt = DateTime.UtcNow;
+            s.Jobs[fin.Id] = fin;
+            Atomic.Audit(s, new AuditEvent { BoardId = claimBoard == Guid.Empty ? null : claimBoard, Action = "job.failed", Detail = System.Text.Json.JsonSerializer.Serialize(new { job = id, error = werr }) });
+            return;
+          }
+          fin.State = "succeeded"; fin.Error = ""; fin.UpdatedAt = DateTime.UtcNow;
+          s.Jobs[fin.Id] = fin;
+          Atomic.Audit(s, new AuditEvent { BoardId = claimBoard == Guid.Empty ? null : claimBoard, Action = "job.succeeded", Detail = System.Text.Json.JsonSerializer.Serialize(new { job = id }) });
+        });
+      }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { return Results.Json(new { error = "Job completion failed: " + ex.Message }, statusCode: 500); }
+      if (!s.Jobs.TryGetValue(id, out var done) || done is null) return Results.NotFound();
+      if (done.State == "succeeded") return Results.Ok(new { job = done, detail = wdetail });
+      return Results.Json(new { error = done.Error, job = done }, statusCode: 502);
     });
 
     app.MapGet("/api/commands", () => Results.Ok(CommandMap.All));
@@ -741,7 +933,7 @@ public static class OpsEndpoints
         if (body.TryGetProperty("mode", out var m) && m.GetString() is { } mode
             && (mode == "warn" || mode == "block"))
           s.Spend.Mode = mode;
-        s.Audit.Add(new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { s.Spend.MonthlyCapUsd, s.Spend.Mode }) });
+        Atomic.Audit(s, new AuditEvent { Action = "spending.set", Detail = JsonSerializer.Serialize(new { s.Spend.MonthlyCapUsd, s.Spend.Mode }) });
         return Results.Ok(new { s.Spend.MonthlyCapUsd, s.Spend.Mode });
       }
     });

@@ -346,6 +346,60 @@ app.MapGet("/api/backend", (InMemoryStore s) => Results.Ok(new
   mode = Pg.Backend is null ? "memory" : "postgres",
   error = s.PgError,
 }));
+// Redacted installation diagnostics: counts, epochs and availability only.
+// No keys, tokens, session material, connection strings, provider content,
+// private drafts, or roster internals are ever exposed here.
+app.MapGet("/api/admin/diag", (InMemoryStore s, HttpRequest req) =>
+{
+  if (PeopleOps.BadToken(s, req) is { } badDiag) return badDiag;
+  try
+  {
+    if (PeopleOps.IsSecure(s))
+    {
+      if (!AuthOps.TrySession(s, req, out var du)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      var adm = PeopleOps.AdminEmail(s);
+      if (string.IsNullOrWhiteSpace(adm) || !string.Equals(adm, du, StringComparison.OrdinalIgnoreCase)) return PeopleOps.Denied();
+    }
+    else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
+  }
+  catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+  bool backendOk = true;
+  string backendNote = "memory";
+  if (Pg.Backend is not null)
+  {
+    try { Pg.Backend.All<SecurityState>(); backendNote = "postgres"; }
+    catch (Exception ex) { backendOk = false; backendNote = "unavailable:" + ex.GetType().Name; }
+  }
+  try
+  {
+    return Results.Ok(new
+    {
+      backendOk,
+      backend = backendNote,
+      restoreEpochRev = s.RestoreEpochRev,
+      sourceEpoch = s.SourceEpoch,
+      hasRestoreIdentity = s.RestoreEpochId != Guid.Empty,
+      counts = new
+      {
+        boards = s.Boards.Values.Count(),
+        meetings = s.Meetings.Values.Count(),
+        drafts = s.Drafts.Values.Count(),
+        sources = s.Sources.Values.Count(),
+        notes = s.Notes.Values.Count(),
+        jobs = s.Jobs.Values.Count(),
+        jobsFailed = s.Jobs.Values.Count(j => j.State == "failed"),
+        secretaryRequests = s.SecretaryRequests.Values.Count(),
+        wikiResources = s.WikiResources.Values.Count(),
+        usageRows = s.Usage.Count(),
+        modelCalls = s.ModelCalls.Count(),
+      },
+      spend = new { mode = s.Spend.Mode, hasMonthlyCap = s.Spend.MonthlyCapUsd.HasValue },
+      model = new { hasKeyOverride = !string.IsNullOrWhiteSpace(s.ModelApiKeyOverride), chatOverride = string.IsNullOrWhiteSpace(s.ModelChatOverride) ? "default" : "custom", lastTestOk = s.ModelLastTestOk, lastTestAt = s.ModelLastTestAt },
+      security = new { secure = PeopleOps.IsSecure(s), hasAdmin = !string.IsNullOrWhiteSpace(PeopleOps.AdminEmail(s)) },
+    });
+  }
+  catch (Exception ex) { return Results.Json(new { error = "Diagnostics unavailable: " + ex.GetType().Name }, statusCode: 503); }
+});
 app.MapHub<BoardHub>("/hubs/board");
 
 static (string mission, string stage, string policy) EffectiveGuestView(InMemoryStore s, SimCEO.Api.Domain.Board b)
@@ -398,13 +452,15 @@ app.MapPost("/api/boards", (InMemoryStore s, HttpRequest req, Board input) =>
   var owner = AuthOps.TrySession(s, req, out var em) ? em : PeopleOps.UserOf(s, req);
   input.OwnerKey = owner;
   input.AccessEnforced = false;
-  try { s.Boards.Flush(); } catch { }
   input.CreatedAt = DateTime.UtcNow;
   input.ActiveConfig = false;
   input.ActiveJson = "{}";
   input.LeadProfileVersion = 0;
-  s.Boards[input.Id] = input;
-  s.Audit.Add(new AuditEvent { BoardId = input.Id, Action = "board.create", Detail = JsonSerializer.Serialize(new { input.Name }) });
+  Atomic.Run(s, () =>
+  {
+    s.Boards[input.Id] = input;
+    Atomic.Audit(s, new AuditEvent { BoardId = input.Id, Action = "board.create", Detail = JsonSerializer.Serialize(new { input.Name }) });
+  });
   return Results.Created($"/api/boards/{input.Id}", input);
 });
 
@@ -493,7 +549,7 @@ app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input)
   if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest("Name is required.");
   if (string.IsNullOrWhiteSpace(input.Description)) return Results.BadRequest("Description is required.");
   if (string.IsNullOrWhiteSpace(input.ProfileJson) || input.ProfileJson.Trim().Length < 20) return Results.BadRequest("Profile is required (describe background, strengths, and limits).");
-  s.Roster[input.Id] = input;
+  Atomic.Run(s, () => { s.Roster[input.Id] = input; });
   return Results.Created($"/api/roster/{input.Id}", input);
 });
 app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId) =>
@@ -539,8 +595,19 @@ app.MapDelete("/api/boards/{boardId:guid}/advisors/{advisorId:guid}", (InMemoryS
   if (PeopleOps.BadToken(s, req) is { } badDelAdv) return badDelAdv;
   if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
   if (!s.Advisors.TryGetValue(advisorId, out var a) || a.BoardId != boardId) return Results.NotFound();
-  a.Removed = true;
-  s.Advisors.Flush();
+  var advId = a.Id;
+  try
+  {
+    Atomic.Run(s, () =>
+    {
+      if (!s.Advisors.TryGetValue(advId, out var cur) || cur.BoardId != boardId) throw new InvalidOperationException("Advisor is gone.");
+      if (!PeopleOps.Can(s, req, boardId, null, "manage")) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+      cur.Removed = true;
+    });
+  }
+  catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+  catch (InvalidOperationException) { return Results.NotFound(); }
+  catch (Exception ex) { return Results.Json(new { error = "Advisor removal failed; no state changed: " + ex.Message }, statusCode: 500); }
   return Results.NoContent();
 });
 
@@ -564,7 +631,7 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
   {
     lock (s.SetupLock)
     {
-      Atomic.Run(() =>
+      Atomic.Run(s, () =>
       {
         if (PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
         if (!s.Advisors.TryGetValue(advisorId, out var a2) || a2.BoardId != boardId || a2.Removed) throw new InvalidOperationException("Advisor is gone.");
@@ -579,7 +646,7 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
   catch (InvalidOperationException iox) when (iox.Message.StartsWith("gate:")) { return Results.Json(new { error = "Advisor became ineligible (" + iox.Message["gate:".Length..] + "); review, then approve." }, statusCode: 409); }
   catch (Exception ex) { return Results.Json(new { error = "Approval could not be stored: " + ex.Message }, statusCode: 500); }
   if (!s.Advisors.TryGetValue(advisorId, out var done)) return Results.NotFound();
-  s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = done.BoardRole }) });
+  Atomic.Audit(s, new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = done.BoardRole }) });
   return Results.Ok(done);
 });
 
@@ -626,8 +693,20 @@ app.MapPost("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest
     input.ParticipantIdsJson = JsonSerializer.Serialize(ids);
   }
   input.CreatedAt = DateTime.UtcNow;
-  s.Meetings[input.Id] = input;
-  s.Messages[input.Id] = MessageList.Detached(input.Id, new List<Message>());
+  var newMeeting = input;
+  try
+  {
+    Atomic.Run(s, () =>
+    {
+      if (!s.Boards.ContainsKey(boardId)) throw new InvalidOperationException("Board is gone.");
+      if (PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+      s.Meetings[newMeeting.Id] = newMeeting;
+      s.Messages[newMeeting.Id] = MessageList.Detached(newMeeting.Id, new List<Message>());
+    });
+  }
+  catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+  catch (InvalidOperationException) { return Results.NotFound(); }
+  catch (Exception ex) { return Results.Json(new { error = "Meeting creation failed; no state changed: " + ex.Message }, statusCode: 500); }
   return Results.Created($"/api/meetings/{input.Id}", input);
 });
 
@@ -653,7 +732,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
   IResult? msgGate = null;
   lock (s.MessageLock)
   {
-    Atomic.Run(() =>
+    Atomic.Run(s, () =>
     {
     // Fresh fetch + authority inside the backend unit: a detached pre-lock
     // meeting row must never source the mutation after an intervening
@@ -720,7 +799,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
     if (!s.Meetings.TryGetValue(meetingId, out var curDraftMtg)) return Results.NotFound();
     try
     {
-      created = Atomic.Run(() =>
+      created = Atomic.Run(s, () =>
       {
         if (!s.Meetings.TryGetValue(meetingId, out var curMtg2) || curMtg2 is null) return Results.NotFound();
         if (PeopleOps.Check(s, req, curMtg2.BoardId, meetingId, "contribute") is { } deniedRecDraftIn) return deniedRecDraftIn;
@@ -736,7 +815,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
       });
     }
     catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
-    if (pendingCreateAudit is not null) s.Audit.Add(pendingCreateAudit);
+    if (pendingCreateAudit is not null) Atomic.Audit(s, pendingCreateAudit);
     return created;
   }
 });
@@ -785,7 +864,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemorySto
     if (!s.Meetings.TryGetValue(meetingId, out var curDirMtg)) return Results.NotFound("meeting");
     try
     {
-      createdDir = Atomic.Run(() =>
+      createdDir = Atomic.Run(s, () =>
       {
         if (!s.Meetings.TryGetValue(meetingId, out var curDirMtg2) || curDirMtg2 is null) return Results.NotFound("meeting");
         if (!PeopleOps.Can(s, req, curDirMtg2.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
@@ -808,7 +887,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemorySto
       });
     }
     catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
-    if (pendingDirAudit is not null) s.Audit.Add(pendingDirAudit);
+    if (pendingDirAudit is not null) Atomic.Audit(s, pendingDirAudit);
     return createdDir;
   }
 });
@@ -838,7 +917,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
   {
     try
     {
-      approveResult = Atomic.Run(() =>
+      approveResult = Atomic.Run(s, () =>
       {
         if (!s.Drafts.TryGetValue(draftId, out var draft) || draft is null || draft.MeetingId != meetingId)
           return Results.Conflict("Stale or already-decided draft.");
@@ -913,7 +992,7 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
     }
     catch (Exception) { return Results.Json(new { error = "Record mutation failed before commit; no state changed." }, statusCode: 500); }
   }
-  if (pendingApproveAudit is not null) s.Audit.Add(pendingApproveAudit);
+  if (pendingApproveAudit is not null) Atomic.Audit(s, pendingApproveAudit);
   return approveResult;
 });
 

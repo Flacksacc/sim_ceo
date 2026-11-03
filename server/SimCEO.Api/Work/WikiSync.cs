@@ -401,12 +401,12 @@ public sealed class WikiSyncService
     CommitOutcome outcome = CommitOutcome.StaleDiscarded;
     lock (_store.SetupLock)
     {
-      outcome = Atomic.Run(() => CommitLocked(resourceId, cap, staged, reason, isScheduled, wct, ct, out localFail, out localStatus));
+      outcome = Atomic.Run(_store, () => CommitLocked(resourceId, cap, staged, reason, isScheduled, wct, ct, out localFail, out localStatus));
       if (outcome == CommitOutcome.CommittedChanged)
         SourceGovernance.InvalidateBoardUnderSetupLock(_store, cap.BoardId, "wiki.sync-success " + resourceId + " " + reason);
     }
     if (outcome == CommitOutcome.CommittedChanged)
-      try { _store.Audit.Add(new AuditEvent { BoardId = cap.BoardId, Action = "wiki.sync-success", Detail = JsonSerializer.Serialize(new { resource = resourceId, revision = cap.Revision, pages = staged.Count }) }); } catch { }
+      try { Atomic.Audit(_store, new AuditEvent { BoardId = cap.BoardId, Action = "wiki.sync-success", Detail = JsonSerializer.Serialize(new { resource = resourceId, revision = cap.Revision, pages = staged.Count }) }); } catch { }
     failError = localFail; failStatus = localStatus;
     return outcome;
   }

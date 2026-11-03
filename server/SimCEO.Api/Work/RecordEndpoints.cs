@@ -1383,7 +1383,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1445,7 +1445,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     });    IResult ItemApprove(InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body)
     {
@@ -1455,7 +1455,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1506,7 +1506,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     }
 
@@ -1521,7 +1521,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1572,7 +1572,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     });    app.MapPost("/api/records/{draftId:guid}/items/revise", (InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body) =>
     {
@@ -1582,7 +1582,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1648,7 +1648,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     });
 
@@ -1660,7 +1660,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1705,7 +1705,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     });    IResult NewVersion(InMemoryStore s, HttpRequest req, Guid draftId, JsonElement body, string[] extraSupersedes, bool amend)
     {
@@ -1715,7 +1715,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var old) || old is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(old.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1793,7 +1793,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     }
 
@@ -1819,7 +1819,7 @@ public static partial class RecordsOps
       {
         try
         {
-          result = Atomic.Run(() =>
+          result = Atomic.Run(s, () =>
           {
             if (!s.Drafts.TryGetValue(draftId, out var d) || d is null) return Results.NotFound();
             if (!s.Meetings.TryGetValue(d.MeetingId, out var meeting) || meeting is null) return Results.NotFound("meeting");
@@ -1867,7 +1867,7 @@ public static partial class RecordsOps
         }
         catch (Exception) { return CommitFailed(); }
       }
-      if (pendingAudit is not null) s.Audit.Add(pendingAudit);
+      if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
     });
 

@@ -151,23 +151,34 @@ public static class SimCEOEndpoints
       if (PeopleOps.Check(s, req, id, null, "manage") is { } deniedBoard) return deniedBoard;
       lock (s.SetupLock)
       {
-        // Fresh fetch + authority inside the durable unit: the pre-lock row
-        // must not source the mutation after an intervening failure.
-        if (!s.Boards.TryGetValue(id, out b)) return Results.NotFound();
-        if (PeopleOps.Check(s, req, id, null, "manage") is { } deniedBoardIn) return deniedBoardIn;
-        if (body.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) b.Name = n.GetString() ?? "";
-        if (body.TryGetProperty("mission", out var m) && m.ValueKind == JsonValueKind.String) b.Mission = m.GetString() ?? "";
-        if (body.TryGetProperty("stage", out var st) && st.ValueKind == JsonValueKind.String) b.Stage = st.GetString() ?? "";
-        if (body.TryGetProperty("retainAudio", out var ra) && (ra.ValueKind == JsonValueKind.True || ra.ValueKind == JsonValueKind.False)) b.RetainAudio = ra.GetBoolean();
-        if (body.TryGetProperty("discussionPolicy", out var dp) && dp.GetString() is { } pol
-            && (pol == "focused" || pol == "balanced" || pol == "open")) b.DiscussionPolicy = pol;
-        if (body.TryGetProperty("dataUse", out var du) && du.GetString() is { } dataUse
-            && (dataUse == "standard" || dataUse == "contributor")) b.DataUse = dataUse;
-        if (body.TryGetProperty("archived", out var ar)
-            && (ar.ValueKind == JsonValueKind.True || ar.ValueKind == JsonValueKind.False)) b.Archived = ar.ValueKind == JsonValueKind.True;
-        b.DraftJson = JsonSerializer.Serialize(new { b.Name, b.Mission, b.Stage, b.RetainAudio, b.DiscussionPolicy, at = DateTime.UtcNow });
-        s.Boards.Flush();
-        return Results.Ok(b);
+        // Fetch, authority, mutation and flush share one store-bound unit: the
+        // pre-lock row must not source the mutation after an intervening
+        // tracker-clearing rollback, and a failed PATCH commits nothing.
+        try
+        {
+          Atomic.Run(s, () =>
+          {
+            if (!s.Boards.TryGetValue(id, out var cur) || cur is null) throw new InvalidOperationException("Board is gone.");
+            if (PeopleOps.Check(s, req, id, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            if (body.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String) cur.Name = n.GetString() ?? "";
+            if (body.TryGetProperty("mission", out var m) && m.ValueKind == JsonValueKind.String) cur.Mission = m.GetString() ?? "";
+            if (body.TryGetProperty("stage", out var st) && st.ValueKind == JsonValueKind.String) cur.Stage = st.GetString() ?? "";
+            if (body.TryGetProperty("retainAudio", out var ra) && (ra.ValueKind == JsonValueKind.True || ra.ValueKind == JsonValueKind.False)) cur.RetainAudio = ra.GetBoolean();
+            if (body.TryGetProperty("discussionPolicy", out var dp) && dp.GetString() is { } pol
+                && (pol == "focused" || pol == "balanced" || pol == "open")) cur.DiscussionPolicy = pol;
+            if (body.TryGetProperty("dataUse", out var du) && du.GetString() is { } dataUse
+                && (dataUse == "standard" || dataUse == "contributor")) cur.DataUse = dataUse;
+            if (body.TryGetProperty("archived", out var ar)
+                && (ar.ValueKind == JsonValueKind.True || ar.ValueKind == JsonValueKind.False)) cur.Archived = ar.ValueKind == JsonValueKind.True;
+            cur.DraftJson = JsonSerializer.Serialize(new { cur.Name, cur.Mission, cur.Stage, cur.RetainAudio, cur.DiscussionPolicy, at = DateTime.UtcNow });
+            s.Boards[cur.Id] = cur;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Board update failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (!s.Boards.TryGetValue(id, out var saved) || saved is null) return Results.NotFound();
+        return Results.Ok(saved);
       }
     });
 
@@ -216,43 +227,62 @@ public static class SimCEOEndpoints
       if (!sem.Wait(0)) return Results.Conflict("Draft is busy (interview running); retry.");
       try
       {
-        var has = s.WizardDrafts.TryGetValue(id, out var d);
-        if (has)
+        // Fetch, authority, version-guard and mutation share one store-bound
+        // unit against freshly fetched rows: nothing is mutated before every
+        // guard passes, so a denied or stale save changes nothing.
+        IResult? wizDenied = null;
+        try
         {
-          if (!WizardGuide.TryWizardUser(s, req, d, out _, out var deniedSv)) return deniedSv;
+          Atomic.Run(s, () =>
+          {
+            var has = s.WizardDrafts.TryGetValue(id, out var cur);
+            if (has)
+            {
+              if (!WizardGuide.TryWizardUser(s, req, cur, out _, out var deniedSv)) { wizDenied = deniedSv; return; }
+            }
+            cur ??= new WizardDraft { Id = id, Version = 1 };
+            if (!has)
+            {
+              if (!WizardGuide.TryWizardUser(s, req, null, out var newOwner, out var deniedNew)) { wizDenied = deniedNew; return; }
+              cur.OwnerKey = newOwner;
+            }
+            // Lane B: existing saves require an explicitly present integer expected version.
+            if (has)
+            {
+              if (!body.TryGetProperty("version", out var vw) || vw.ValueKind != JsonValueKind.Number
+                  || !vw.TryGetInt32(out var want) || want != cur.Version)
+                throw new InvalidOperationException("stale");
+            }
+            if (!has)
+            {
+              if (body.TryGetProperty("accountId", out var ac)) cur.AccountId = ac.ValueKind == JsonValueKind.String
+                && Guid.TryParse(ac.GetString(), out var ag) ? ag : Guid.Empty;
+              cur.Status = "Saved";
+            }
+            if (body.TryGetProperty("step", out var st) && st.ValueKind == JsonValueKind.Number) cur.Step = st.GetInt32();
+            if (body.TryGetProperty("presetKey", out var pk) && pk.ValueKind == JsonValueKind.String) cur.PresetKey = pk.GetString() ?? "";
+            if (body.TryGetProperty("fieldsJson", out var fj) && fj.ValueKind == JsonValueKind.String) cur.FieldsJson = fj.GetString() ?? "{}";
+            if (body.TryGetProperty("interviewJson", out var ij) && ij.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(ij.GetString())) cur.InterviewJson = ij.GetString()!;
+            if (body.TryGetProperty("provenanceJson", out var pj2) && pj2.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(pj2.GetString())) cur.ProvenanceJson = pj2.GetString()!;
+            WizardGuide.NormalizeInterview(cur);
+            cur.Version++;
+            cur.UpdatedAt = DateTime.UtcNow;
+            s.WizardDrafts[cur.Id] = cur;
+          });
         }
-        d ??= new WizardDraft { Id = id, Version = 1 };
-        if (!has)
+        catch (InvalidOperationException iox) when (iox.Message == "stale")
         {
-          if (!WizardGuide.TryWizardUser(s, req, null, out var newOwner, out var deniedNew)) return deniedNew;
-          d.OwnerKey = newOwner;
+          return Results.Conflict("Stale wizard draft; refresh and re-apply your edit with the current version.");
         }
-        // Lane B: existing saves require an explicitly present integer expected version.
-        if (has)
+        catch (Exception ex)
         {
-          if (!body.TryGetProperty("version", out var vw) || vw.ValueKind != JsonValueKind.Number
-              || !vw.TryGetInt32(out var want) || want != d.Version)
-            return Results.Conflict("Stale wizard draft; refresh and re-apply your edit with the current version.");
+          return Results.Json(new { error = "Wizard save failed; no state changed: " + ex.Message }, statusCode: 500);
         }
-        if (!has)
-        {
-          if (body.TryGetProperty("accountId", out var ac)) d.AccountId = ac.ValueKind == JsonValueKind.String
-            && Guid.TryParse(ac.GetString(), out var ag) ? ag : Guid.Empty;
-          d.Status = "Saved";
-        }
-        if (body.TryGetProperty("step", out var st) && st.ValueKind == JsonValueKind.Number) d.Step = st.GetInt32();
-        if (body.TryGetProperty("presetKey", out var pk) && pk.ValueKind == JsonValueKind.String) d.PresetKey = pk.GetString() ?? "";
-        if (body.TryGetProperty("fieldsJson", out var fj) && fj.ValueKind == JsonValueKind.String) d.FieldsJson = fj.GetString() ?? "{}";
-        if (body.TryGetProperty("interviewJson", out var ij) && ij.ValueKind == JsonValueKind.String
-            && !string.IsNullOrWhiteSpace(ij.GetString())) d.InterviewJson = ij.GetString()!;
-        if (body.TryGetProperty("provenanceJson", out var pj2) && pj2.ValueKind == JsonValueKind.String
-            && !string.IsNullOrWhiteSpace(pj2.GetString())) d.ProvenanceJson = pj2.GetString()!;
-        WizardGuide.NormalizeInterview(d);
-        d.Version++;
-        d.UpdatedAt = DateTime.UtcNow;
-        s.WizardDrafts[d.Id] = d;
-        s.WizardDrafts.Flush();
-        return Results.Ok(d);
+        if (wizDenied is not null) return wizDenied;
+        if (!s.WizardDrafts.TryGetValue(id, out var saved) || saved is null) return Results.NotFound();
+        return Results.Ok(saved);
       }
       finally { sem.Release(); }
     });
@@ -264,8 +294,26 @@ public static class SimCEOEndpoints
       WizardGuide.NormalizeInterview(d);
       if (!string.Equals(before, d.InterviewJson, StringComparison.Ordinal))
       {
-        d.UpdatedAt = DateTime.UtcNow;
-        s.WizardDrafts.Flush();
+        var normId = d.Id;
+        try
+        {
+          Atomic.Run(s, () =>
+          {
+            if (!s.WizardDrafts.TryGetValue(normId, out var cur) || cur is null) throw new InvalidOperationException("gone");
+            if (!WizardGuide.TryWizardUser(s, req, cur, out _, out _)) throw new UnauthorizedAccessException("revoked");
+            // Re-normalize the fresh row: normalization is idempotent, and the
+            // unit guarantees no concurrent interview write slips between the
+            // read and this save.
+            WizardGuide.NormalizeInterview(cur);
+            cur.UpdatedAt = DateTime.UtcNow;
+            s.WizardDrafts[cur.Id] = cur;
+          });
+        }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Wizard read failed: " + ex.Message }, statusCode: 500); }
+        if (!s.WizardDrafts.TryGetValue(normId, out var nd) || nd is null) return Results.NotFound();
+        return Results.Ok(nd);
       }
       return Results.Ok(d);
     });
@@ -283,8 +331,13 @@ public static class SimCEOEndpoints
         Transcript = body.TryGetProperty("partial", out var p) ? (p.GetString() ?? "") : "",
         AudioRetained = body.TryGetProperty("retainAudio", out var r) && r.GetBoolean(),
       };
-      s.VoiceTurns[t.Id] = t;
-      return Results.Created($"/api/voice/{t.Id}", t);
+      var newTurn = t;
+      try
+      {
+        Atomic.Run(s, () => { s.VoiceTurns[newTurn.Id] = newTurn; });
+      }
+      catch (Exception ex) { return Results.Json(new { error = "Voice draft failed; no state changed: " + ex.Message }, statusCode: 500); }
+      return Results.Created($"/api/voice/{newTurn.Id}", newTurn);
     });
     app.MapPost("/api/voice/{id:guid}/finalize", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
@@ -298,7 +351,7 @@ public static class SimCEOEndpoints
         // Unsent drafts are creator-private (no manager bypass); exactly once.
         Message? doneMsg = null;
         IResult? gateErr = null;
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           if (!s.VoiceTurns.TryGetValue(id, out var vt) || vt is null) { gateErr = Results.NotFound(); return; }
           if (PeopleOps.BadToken(s, req) is { }) { gateErr = Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401); return; }
@@ -390,7 +443,7 @@ public static class SimCEOEndpoints
       {
         lock (s.MessageLock)
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             // Fresh board/scope/caller/policy validation inside the backend
             // unit: revocation, meeting moves, or wiki-only switches between
@@ -447,7 +500,7 @@ public static class SimCEOEndpoints
       }
       return Results.Ok(s.Jobs.Values.OrderByDescending(j => j.UpdatedAt).Take(100));
     });
-    app.MapPost("/api/jobs", (InMemoryStore s, HttpRequest req, JobRow j) =>
+    app.MapPost("/api/jobs", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badJob) return badJob;
       if (PeopleOps.IsSecure(s))
@@ -457,12 +510,90 @@ public static class SimCEOEndpoints
         var isAdmin2 = !string.IsNullOrWhiteSpace(admin2) && string.Equals(admin2, ju2, StringComparison.OrdinalIgnoreCase);
         if (!isAdmin2) return PeopleOps.Denied();
       }
-      var existing = s.Jobs.Values.FirstOrDefault(x => x.IdempotencyKey == j.IdempotencyKey && j.IdempotencyKey != "");
-      if (existing is not null) return Results.Ok(existing); // no duplicates
-      j.Id = Guid.NewGuid();
-      j.UpdatedAt = DateTime.UtcNow;
-      s.Jobs[j.Id] = j;
-      return Results.Created($"/api/jobs/{j.Id}", j);
+      else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
+      // Strict known-kind/target submission: unknown kinds and invalid targets
+      // reject BEFORE any job row exists. Canonical payload identity gives
+      // same-payload-same-job replay; the same key with a different payload
+      // is a 409 conflict, never a silent duplicate.
+      if (!Work.JobWorker.TryParseTarget(body, out var target, out var targetErr) || target is null)
+        return Results.Json(new { error = targetErr }, statusCode: 422);
+      var key = body.TryGetProperty("idempotencyKey", out var kk) && kk.ValueKind == JsonValueKind.String ? (kk.GetString() ?? "") : "";
+      if (string.IsNullOrWhiteSpace(key)) return Results.BadRequest("idempotencyKey is required.");
+      JobRow? dup = null;
+      JobRow? created = null;
+      string? submitError = null;
+      int submitStatus = 400;
+      try
+      {
+        Atomic.Run(s, () =>
+        {
+          // Fresh authority inside the unit: a logout/admin-revocation between
+          // the entry check and this commit must not let a stale admin submit.
+          if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("revoked");
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var juIn)) throw new UnauthorizedAccessException("revoked");
+            if (!PeopleOps.IsInstallationAdmin(s, juIn)) throw new UnauthorizedAccessException("denied");
+          }
+          else if (!PeopleOps.IsOwner(req)) throw new UnauthorizedAccessException("denied");
+          // Target must exist and the caller must hold the scope the worker
+          // will act under (contribute for index sources, manage for wiki).
+          if (target.Kind == "index")
+          {
+            if (!s.Sources.TryGetValue(target.TargetId, out var tdoc) || tdoc is null) throw new InvalidOperationException("gone");
+            if (PeopleOps.Check(s, req, tdoc.BoardId, tdoc.MeetingId, "contribute") is not null) throw new UnauthorizedAccessException("denied-scope");
+          }
+          else
+          {
+            if (!s.WikiResources.TryGetValue(target.TargetId, out var twr) || twr is null) throw new InvalidOperationException("gone");
+            if (!Work.WikiAuth.CanManageResource(s, req, twr.BoardId, (twr.Scope ?? "board") == "meeting" ? "meeting" : "board", twr.MeetingId)) throw new UnauthorizedAccessException("denied-scope");
+          }
+          var canonical = Work.JobWorker.CanonicalPayload(target);
+          var fp = Work.JobWorker.Fingerprint(canonical);
+          var keyed = s.Jobs.Values.FirstOrDefault(x => x.IdempotencyKey == key && !string.IsNullOrWhiteSpace(key));
+          if (keyed is not null)
+          {
+            var keyFp = "";
+            try
+            {
+              using var kd = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(keyed.Payload) ? "{}" : keyed.Payload);
+              if (kd.RootElement.TryGetProperty("kind", out var kkv) && kkv.ValueKind == JsonValueKind.String
+                && kd.RootElement.TryGetProperty("targetId", out var ktv) && ktv.ValueKind == JsonValueKind.String
+                && Guid.TryParse(ktv.GetString(), out var kg))
+                keyFp = Work.JobWorker.Fingerprint(Work.JobWorker.CanonicalPayload(new Work.JobWorker.JobTarget((kkv.GetString() ?? "").Trim().ToLowerInvariant(), kg)));
+            }
+            catch (JsonException) { }
+            if (keyFp != fp) throw new InvalidOperationException("conflict");
+            dup = keyed;
+            return;
+          }
+          var same = Work.JobWorker.FindSamePayload(s, target);
+          if (same is not null) { dup = same; return; }
+          var nj = new JobRow
+          {
+            Id = Guid.NewGuid(),
+            IdempotencyKey = key,
+            Kind = target.Kind,
+            State = "pending",
+            Payload = canonical,
+            Attempts = 0,
+            Error = "",
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+          };
+          s.Jobs[nj.Id] = nj;
+          Atomic.Audit(s, new AuditEvent { Action = "job.submit", Detail = JsonSerializer.Serialize(new { job = nj.Id, kind = nj.Kind }) });
+          created = nj;
+        });
+      }
+      catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
+      catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException iox) when (iox.Message == "conflict") { return Results.Json(new { error = "Conflicting payload for the same idempotency key." }, statusCode: 409); }
+      catch (InvalidOperationException) { return Results.NotFound(); }
+      catch (Exception ex) { submitError = ex.Message; submitStatus = 500; }
+      if (submitError is not null) return Results.Json(new { error = "Job submission failed; no state changed: " + submitError }, statusCode: submitStatus);
+      if (dup is not null) return Results.Ok(dup);
+      return Results.Created($"/api/jobs/{created!.Id}", created);
     });
 
     // ---- Usage + audit + model-call ledger (Phase 9) ----
@@ -671,16 +802,23 @@ public static class SimCEOEndpoints
         if (PeopleOps.BadToken(s, req) is { } badCtl) return badCtl;
         if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound();
         if (PeopleOps.Check(s, req, m.BoardId, id, "manage") is { } deniedCtl) return deniedCtl;
-        lock (s.MessageLock)
+        try
         {
-          if (!s.Meetings.TryGetValue(id, out var cur)) return Results.NotFound();
-          if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is { } deniedCtl2) return deniedCtl2;
-          cur.State = state;
-          cur.Generation++;
-          s.Meetings.Flush();
-          s.Audit.Add(new AuditEvent { BoardId = cur.BoardId, Action = "meeting." + path, Detail = System.Text.Json.JsonSerializer.Serialize(new { meeting = id }) });
-          return Results.Ok(cur);
+          Atomic.Run(s, () =>
+          {
+            if (!s.Meetings.TryGetValue(id, out var cur)) throw new InvalidOperationException("Meeting is gone.");
+            if (PeopleOps.Check(s, req, cur.BoardId, id, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            cur.State = state;
+            cur.Generation++;
+            s.Meetings[cur.Id] = cur;
+            Atomic.Audit(s, new AuditEvent { BoardId = cur.BoardId, Action = "meeting." + path, Detail = System.Text.Json.JsonSerializer.Serialize(new { meeting = id }) });
+          });
         }
+        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+        catch (InvalidOperationException) { return Results.NotFound(); }
+        catch (Exception ex) { return Results.Json(new { error = "Meeting control failed; no state changed: " + ex.Message }, statusCode: 500); }
+        if (!s.Meetings.TryGetValue(id, out var done) || done is null) return Results.NotFound();
+        return Results.Ok(done);
       });
 
     // ---- Discussion run: bids -> challenge -> drafts -> ordered publish ----
@@ -744,6 +882,7 @@ public static class SimCEOEndpoints
       // so any in-flight publication generated before it must be discarded
       // even if meeting generation numbers happen to coincide.
       var epochBefore = s.SourceEpoch;
+      var restoreBefore = s.RestoreEpochId;
       var dirBefore = DiscussionDirFingerprint(s, m.BoardId, id);
       var effBefore = DiscussionEffFingerprint(s, m.BoardId, id);
       var leadFloor = MeetingTurns.LeadSeqAfter(s, id, 0);
@@ -951,7 +1090,7 @@ public static class SimCEOEndpoints
             // Authoritative commit inside the actual backend transaction gate: fetch, authorize,
             // validate and mutate here so a concurrent failed transaction cannot detach our objects.
             IResult? laneBGate = null;
-            Atomic.Run(() =>
+            Atomic.Run(s, () =>
             {
             List<string> LaneBRemaining() => rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
@@ -963,6 +1102,8 @@ public static class SimCEOEndpoints
               { var __tok2 = ""; try { var __ah2 = req.Headers["Authorization"].ToString(); if (__ah2.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) __tok2 = __ah2["Bearer ".Length..].Trim(); } catch { } string __em2 = ""; bool __sessOk2 = false; try { if (!string.IsNullOrEmpty(__tok2) && s.Sessions.TryGetValue(__tok2, out var __ss2) && __ss2.ExpiresAt > System.DateTime.UtcNow) { __sessOk2 = true; __em2 = __ss2.Email; } } catch { } if (string.IsNullOrEmpty(__em2)) { try { __em2 = PeopleOps.UserOf(s, req); } catch { } } if (PeopleOps.IsSecure(s) && !__sessOk2) { laneBGate = LaneBFail("session revoked or expired; publication refused", rounds.Count, LaneBRemaining()); return; } try { var __have2 = PeopleOps.AccessFor(s, cur.BoardId, id, __em2); bool __ok2 = PeopleOps.IsSecure(s) ? (__have2 is "manage" or "contribute" or "discuss") : (__have2 == "open" || __have2 is "manage" or "contribute" or "discuss"); if (!__ok2) { laneBGate = LaneBFail("access revoked; publication refused", rounds.Count, LaneBRemaining()); return; } } catch { laneBGate = LaneBFail("security unavailable; publication refused", rounds.Count, LaneBRemaining()); return; } }
               if (s.SourceEpoch != epochBefore)
                 { laneBGate = LaneBFail("source evidence changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
+              if (s.RestoreEpochId != restoreBefore)
+                { laneBGate = LaneBFail("domain was restored during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
               if (!string.Equals(DiscussionDirFingerprint(s, cur.BoardId, id), dirBefore, StringComparison.Ordinal))
                 { laneBGate = LaneBFail("adopted directions changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
               if (!string.Equals(DiscussionEffFingerprint(s, cur.BoardId, id), effBefore, StringComparison.Ordinal))
@@ -1028,7 +1169,7 @@ public static class SimCEOEndpoints
             if (manifest is not null)
               manifests.Add(new { advisor = adv.BoardRole, sources = manifest.SourceIds, seqs = manifest.MessageSeqs, tokens = manifest.TokenEstimate, evidence = manifest.Evidence });
           }
-            Atomic.Run(() =>
+            Atomic.Run(s, () =>
             {
               // Lane B: revision set BEFORE the same atomic commit that inserts group messages.
               if (batch.Count > 0) cur.DeliveredRevision = batch.Max(x => x.Sequence);
@@ -1045,7 +1186,7 @@ public static class SimCEOEndpoints
           }
         }
       }
-      s.Audit.Add(new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
+      Atomic.Audit(s, new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
       await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, id, "run-complete",
         new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) }, "read");
       outcome.Title = "Run: " + published.Count + " replies, " + yielded.Count + " yields";

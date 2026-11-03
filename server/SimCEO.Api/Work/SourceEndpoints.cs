@@ -149,7 +149,7 @@ public static class SourceEndpoints
       {
         lock (s.MessageLock)
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             // Fresh board/scope/caller/policy validation inside the backend
             // unit: a revocation, meeting move, or wiki-only switch between
@@ -577,7 +577,7 @@ public static class SourceEndpoints
       if (!ok)
         return Results.Json(new { error = finErr, stale }, statusCode: status);
       if (!s.Sources.TryGetValue(id, out var doc) || doc is null) return Results.NotFound();
-      s.Audit.Add(new AuditEvent { BoardId = doc.BoardId, Action = "source.retry", Detail = JsonSerializer.Serialize(new { id }) });
+      Atomic.Audit(s, new AuditEvent { BoardId = doc.BoardId, Action = "source.retry", Detail = JsonSerializer.Serialize(new { id }) });
       return Results.Ok(new { doc = ShapeDoc(s, doc), review = doc.ReviewState, reviewUnchanged = string.Equals(doc.ReviewState ?? "", reviewBefore, StringComparison.OrdinalIgnoreCase), eligibilityLost = lost });
     });
 

@@ -226,18 +226,24 @@ public static class PeopleOps
 
   public static void BumpMeeting(InMemoryStore s, Guid meetingId)
   {
-    try
+    // Post-commit effect: inside a store-bound unit the generation bump applies
+    // only after the outermost commit (never a phantom bump on rollback);
+    // outside any unit it runs immediately as before.
+    Atomic.DeferOrRun(s, () =>
     {
-      lock (s.MessageLock)
+      try
       {
-        if (s.Meetings.TryGetValue(meetingId, out var m))
+        lock (s.RootGate)
         {
-          m.Generation++;
-          s.Meetings.Flush();
+          if (s.Meetings.TryGetValue(meetingId, out var m))
+          {
+            m.Generation++;
+            s.Meetings.Flush();
+          }
         }
       }
-    }
-    catch { }
+      catch { }
+    });
   }
 
   public static bool WasExplicitlyLeft(InMemoryStore s, Guid boardId, Guid meetingId, string user) { try { var m = s.Memberships.Values.FirstOrDefault(x => x.BoardId == boardId && x.MeetingId == meetingId && string.Equals(x.UserKey, user, StringComparison.OrdinalIgnoreCase)); return m is not null && !m.Active; } catch { return false; } }
@@ -264,7 +270,7 @@ public static class SecurityOps
         var narrowed = 0; var reviewed = 0;
         var bumpAfter = new System.Collections.Generic.HashSet<System.Guid>();
         var wizAdopted = 0;
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
         try { state = s.Security.Values.FirstOrDefault(); } catch (Exception ex) { throw new InvalidOperationException("Security state unavailable.", ex); }
         if (state is not null && state.AuthRequired && state.MigrationDone) return;
@@ -336,9 +342,17 @@ public static class SecurityOps
         try { var __st = s.Security.Values.FirstOrDefault(); if (__st is not null) { __st.MigrationDone = true; s.Security[__st.Id] = __st; s.Security.Flush(); } } catch (Exception ex) { throw new InvalidOperationException("Migration commit failed.", ex); }
         didMigrate = true;
         }); // end Atomic: account/admin/security/ownership commit together
-        // Generation bumps happen AFTER the atomic commit (SetupLock -> MessageLock order; never MessageLock while holding the backend gate).
-        foreach (var __bm in bumpAfter) { try { PeopleOps.BumpMeeting(s, __bm); } catch { } }
-        if (didMigrate) s.Audit.Add(new AuditEvent { Action = "security.migrate", Detail = JsonSerializer.Serialize(new { admin = adminEmail, scopedAdded = narrowed, needsReview = reviewed }) });
+        // Generation bumps and the migration audit are post-COMMIT effects: inside
+        // a store-bound unit they defer to outermost success (never phantom on
+        // rollback); outside any unit they run immediately (legacy behavior).
+        var __bumpCopy = bumpAfter.ToList();
+        var __didMig = didMigrate;
+        var __adm = adminEmail; var __nar = narrowed; var __rev = reviewed;
+        Atomic.DeferOrRun(s, () =>
+        {
+          foreach (var __bm in __bumpCopy) { try { PeopleOps.BumpMeeting(s, __bm); } catch { } }
+          if (__didMig) Atomic.Audit(s, new AuditEvent { Action = "security.migrate", Detail = JsonSerializer.Serialize(new { admin = __adm, scopedAdded = __nar, needsReview = __rev }) });
+        });
       }
   }
 
@@ -350,7 +364,7 @@ public static class SecurityOps
       if (existing is not null && existing.AuthRequired) return (existing, false);
       if (s.Accounts.Values.Count > 1) { EnsureMigrated(s); existing = s.Security.Values.FirstOrDefault(); return (existing!, false); }
       var st = existing ?? new SecurityState { Id = Guid.NewGuid() };
-      Atomic.Run(() =>
+      Atomic.Run(s, () =>
       {
         st.AuthRequired = true;
         st.AdminEmail = email;
@@ -373,7 +387,7 @@ public static class SecurityOps
         }
         s.Roster.Flush();
       });
-      s.Audit.Add(new AuditEvent { Action = "security.first-admin", Detail = JsonSerializer.Serialize(new { admin = email }) });
+      Atomic.Audit(s, new AuditEvent { Action = "security.first-admin", Detail = JsonSerializer.Serialize(new { admin = email }) });
       return (st, true);
     }
   }
@@ -495,7 +509,7 @@ public static class PeopleEndpoints
         input.CreatedAt = DateTime.UtcNow;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (PeopleOps.Check(s, req, bid, null, "manage") is { } deniedAtomic) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
             s.Invites[input.Id] = input;
@@ -504,7 +518,7 @@ public static class PeopleEndpoints
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
         catch (Exception ex) { return Results.Json(new { error = "Invite could not be stored: " + ex.Message }, statusCode: 500); }
         PeopleOps.MarkEnforced(s, bid);
-        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "invite.create", Detail = JsonSerializer.Serialize(new { input.Email, input.Role, input.MeetingId }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "invite.create", Detail = JsonSerializer.Serialize(new { input.Email, input.Role, input.MeetingId }) });
         return Results.Created($"/api/invites/{input.Id}", input);
       }
     });
@@ -558,7 +572,7 @@ public static class PeopleEndpoints
         var acceptBid = inv.BoardId; var acceptMid = inv.MeetingId;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (!s.Invites.TryGetValue(id, out var curA) || curA.State != "pending")
               throw new InvalidOperationException("Invite is not pending.");
@@ -609,7 +623,7 @@ public static class PeopleEndpoints
           catch (UnauthorizedAccessException) { return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403); }
         catch (Exception ex) { return Results.Json(new { error = "Invite acceptance could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (acceptMid.HasValue) PeopleOps.BumpMeeting(s, acceptMid.Value); } catch { }
-        s.Audit.Add(new AuditEvent { BoardId = acceptBid, Action = "invite.accept", Detail = JsonSerializer.Serialize(new { user, meeting = acceptMid }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = acceptBid, Action = "invite.accept", Detail = JsonSerializer.Serialize(new { user, meeting = acceptMid }) });
         return Results.Ok(new { grant = acceptedGrant, meetingId = acceptMid, user });
       }
     });
@@ -641,7 +655,7 @@ public static class PeopleEndpoints
         var removedUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             // Recheck once more inside the durable unit.
             if (boardWide)
@@ -673,7 +687,7 @@ public static class PeopleEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Revocation could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (inv.MeetingId.HasValue) PeopleOps.BumpMeeting(s, inv.MeetingId.Value); else if (boardWide) foreach (var __mm in s.Meetings.Values.Where(mm => mm.BoardId == inv.BoardId).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
         foreach (var u in removedUsers) PeopleOps.RevokeLive(u, inv.BoardId, boardWide ? null : inv.MeetingId);
-        s.Audit.Add(new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { target, scope = boardWide ? "board" : "meeting", meeting = inv.MeetingId }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { target, scope = boardWide ? "board" : "meeting", meeting = inv.MeetingId }) });
         return Results.Ok(inv);
       }
     });
@@ -707,7 +721,7 @@ public static class PeopleEndpoints
         Grant? created = null;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (PeopleOps.Check(s, req, bid, input.MeetingId, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
             foreach (var old in s.Grants.Values.Where(g => g.BoardId == bid
@@ -724,7 +738,7 @@ public static class PeopleEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Grant could not be stored: " + ex.Message }, statusCode: 500); }
         var g = created!;
         try { if (g.MeetingId.HasValue) PeopleOps.BumpMeeting(s, g.MeetingId.Value); else foreach (var mm in s.Meetings.Values.Where(m => m.BoardId == g.BoardId).ToList()) PeopleOps.BumpMeeting(s, mm.Id); } catch { }
-        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "grant.set", Detail = JsonSerializer.Serialize(new { g.UserKey, g.MeetingId, g.Access }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "grant.set", Detail = JsonSerializer.Serialize(new { g.UserKey, g.MeetingId, g.Access }) });
         return Results.Created($"/api/grants/{g.Id}", g);
       }
     });
@@ -744,7 +758,7 @@ public static class PeopleEndpoints
         // storage failure returns 500 with no partial commit and no false NoContent.
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (PeopleOps.Check(s, req, bid, mid, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
             if (!s.Grants.TryGetValue(id, out _)) throw new InvalidOperationException("Grant is gone.");
@@ -759,7 +773,7 @@ public static class PeopleEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Grant revocation could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (mid.HasValue) PeopleOps.BumpMeeting(s, mid.Value); else foreach (var __mm in s.Meetings.Values.Where(m => m.BoardId == bid).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
         PeopleOps.RevokeLive(user, bid, mid);
-        s.Audit.Add(new AuditEvent { BoardId = bid, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { user, meeting = mid }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { user, meeting = mid }) });
         return Results.NoContent();
       }
     });
@@ -802,7 +816,7 @@ public static class PeopleEndpoints
         Membership? joined = null;
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("Invalid or expired session token.");
             var ju = PeopleOps.IsSecure(s) && AuthOps.TrySession(s, req, out var jeJ) ? jeJ : PeopleOps.UserOf(s, req);
@@ -844,7 +858,7 @@ public static class PeopleEndpoints
           return Results.Json(new { error = "Authentication required." }, statusCode: 401);
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             foreach (var g in s.Grants.Values.Where(g => g.BoardId == mtg.BoardId && g.MeetingId == meetingId
               && string.Equals(g.UserKey, lu, StringComparison.OrdinalIgnoreCase)).ToList())
@@ -857,7 +871,7 @@ public static class PeopleEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Leave could not be stored: " + ex.Message }, statusCode: 500); }
         try { PeopleOps.BumpMeeting(s, meetingId); } catch { }
         PeopleOps.RevokeLive(lu, mtg.BoardId, meetingId);
-        s.Audit.Add(new AuditEvent { BoardId = mtg.BoardId, Action = "membership.leave", Detail = JsonSerializer.Serialize(new { user = lu, meeting = meetingId }) });
+        Atomic.Audit(s, new AuditEvent { BoardId = mtg.BoardId, Action = "membership.leave", Detail = JsonSerializer.Serialize(new { user = lu, meeting = meetingId }) });
         return Results.Ok(new { left = true, meetingId });
       }
     });
@@ -880,7 +894,7 @@ public static class PeopleEndpoints
         var revokedLive = new List<string>();
         try
         {
-          Atomic.Run(() =>
+          Atomic.Run(s, () =>
           {
             // Recheck CURRENT repair authority inside the durable unit.
             var __adm2 = PeopleOps.AdminEmail(s); var __me2 = PeopleOps.UserOf(s, req);
@@ -923,7 +937,7 @@ public static class PeopleEndpoints
         catch (Exception ex) { return Results.Json(new { error = "Access repair could not be stored: " + ex.Message }, statusCode: 500); }
         foreach (var __u in revokedLive.Distinct(StringComparer.OrdinalIgnoreCase)) PeopleOps.RevokeLive(__u, bid, null);
       }
-      s.Audit.Add(new AuditEvent { BoardId = bid, Action = "access.repair", Detail = JsonSerializer.Serialize(new { repaired = repaired.Count }) });
+      Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "access.repair", Detail = JsonSerializer.Serialize(new { repaired = repaired.Count }) });
       return Results.Ok(new { repaired });
     });
   }

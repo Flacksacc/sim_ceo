@@ -195,13 +195,13 @@ public static class WikiEndpoints
           SyncIntervalMinutes = v.Interval,
           NextSyncAt = null, LastStatus = "disabled", LastError = "", HasCredential = false,
         };
-        Atomic.Run(() =>
+        Atomic.Run(s, () =>
         {
           s.WikiResources[r.Id] = r;
           if (!string.IsNullOrEmpty(token)) { creds.SetToken(r.Id, token); r.HasCredential = true; }
           s.WikiResources.Flush();
         });
-        try { s.Audit.Add(new AuditEvent { BoardId = bid, Action = "wiki.create", Detail = JsonSerializer.Serialize(new { resource = r.Id, scope = r.Scope }) }); } catch { }
+        try { Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "wiki.create", Detail = JsonSerializer.Serialize(new { resource = r.Id, scope = r.Scope }) }); } catch { }
         return Results.Created("/api/wiki-resources/" + r.Id, ShapeResource(s, r));
       }
     });
@@ -296,7 +296,7 @@ public static class WikiEndpoints
           return bump;
         });
         if (!s.WikiResources.TryGetValue(id, out var after)) return Results.NotFound();
-        if (changed) try { s.Audit.Add(new AuditEvent { BoardId = after.BoardId, Action = "wiki.reconfigure", Detail = JsonSerializer.Serialize(new { resource = after.Id, rev = after.ConfigRevision }) }); } catch { }
+        if (changed) try { Atomic.Audit(s, new AuditEvent { BoardId = after.BoardId, Action = "wiki.reconfigure", Detail = JsonSerializer.Serialize(new { resource = after.Id, rev = after.ConfigRevision }) }); } catch { }
         return Results.Ok(ShapeResource(s, after));
       }
     });
@@ -397,7 +397,7 @@ public static class WikiEndpoints
           s.WikiResources.Flush();
           return true;
         });
-        try { s.Audit.Add(new AuditEvent { BoardId = bid, Action = "wiki.delete", Detail = JsonSerializer.Serialize(new { resource = id }) }); } catch { }
+        try { Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "wiki.delete", Detail = JsonSerializer.Serialize(new { resource = id }) }); } catch { }
         return Results.Ok(new { deleted = id });
       }
     });

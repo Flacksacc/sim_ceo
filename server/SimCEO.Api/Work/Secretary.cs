@@ -527,11 +527,11 @@ public static class SecretaryTransitions
 {
   public static T Run<T>(InMemoryStore s, Func<T> op)
   {
-    lock (s.SetupLock) { lock (s.MessageLock) { return Atomic.Run(op); } }
+    lock (s.SetupLock) { lock (s.MessageLock) { return Atomic.Run(s, op); } }
   }
   public static void Run(InMemoryStore s, Action op)
   {
-    lock (s.SetupLock) { lock (s.MessageLock) { Atomic.Run(op); } }
+    lock (s.SetupLock) { lock (s.MessageLock) { Atomic.Run(s, op); } }
   }
   public static bool TryBindAttempt(InMemoryStore s, Guid reqId, Guid attempt, bool answer, out SecretaryRequest? req)
   {
@@ -713,7 +713,7 @@ public static class SecretaryEndpoints
       string replayKind = "";
       IResult? early = null;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        try { early = Atomic.Run<IResult?>(() =>
+        try { early = Atomic.Run<IResult?>(s, () =>
         {
           if (!s.Meetings.TryGetValue(id, out var cur0)) return Results.NotFound("meeting");
           var sub0 = SecretaryDirect.SubmissionHash(normalized, rawCaller);
@@ -892,6 +892,9 @@ public static class SecretaryEndpoints
       }
       if (reserved is null || string.IsNullOrEmpty(reservedPrompt)) return Results.Json(new { error = "Reservation failed; retry with the same nonce." }, statusCode: 409);
       var myReq = reserved; var myAttempt = myReq.AttemptId;
+      // Global restore identity pin: a restore between reservation and
+      // publication must discard the stale reply even if snapshots coincide.
+      var restoreBeforeS = s.RestoreEpochId;
       var delivered = reservedDelivered;
       string prompt = reservedPrompt;
       string modelText;
@@ -906,7 +909,7 @@ public static class SecretaryEndpoints
         IResult pubResult;
         try
         {
-        pubResult = Atomic.Run<IResult>(() =>
+        pubResult = Atomic.Run<IResult>(s, () =>
         {
           if (!s.SecretaryRequests.TryGetValue(myReq.Id, out var fresh) || fresh is null) return Results.Conflict("Secretary request moved on; retry.");
           if (fresh.AttemptId != myAttempt) return Results.Conflict("Secretary request moved on; retry.");
@@ -923,6 +926,11 @@ public static class SecretaryEndpoints
           if (!SecretaryContext.SnapshotEquals(beforeSnap, nowSnap))
           {
             fresh.Status = "discarded"; fresh.Error = SecretaryContext.SnapshotMismatchReason(beforeSnap, nowSnap); s.SecretaryRequests.Flush();
+            return Results.Json(new { error = fresh.Error }, statusCode: 409);
+          }
+          if (s.RestoreEpochId != restoreBeforeS)
+          {
+            fresh.Status = "discarded"; fresh.Error = "Domain was restored during secretary work; retry with the same nonce."; s.SecretaryRequests.Flush();
             return Results.Json(new { error = fresh.Error }, statusCode: 409);
           }
           if (outcome.Kind == "question")
@@ -977,7 +985,7 @@ public static class SecretaryEndpoints
       SecretaryRequest? replayAns = null;
       IResult? earlyAns = null;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        earlyAns = Atomic.Run<IResult?>(() =>
+        earlyAns = Atomic.Run<IResult?>(s, () =>
         {
           if (!s.SecretaryRequests.TryGetValue(reqId, out var reqRow) || reqRow is null || reqRow.MeetingId != id) return Results.NotFound("secretary request not found.");
           if (!s.Meetings.TryGetValue(id, out var cur0)) return Results.NotFound("meeting");
@@ -1079,6 +1087,7 @@ public static class SecretaryEndpoints
       }
       if (reservedAns is null || string.IsNullOrEmpty(reservedAnsPrompt)) return Results.Json(new { error = "Continuation reservation failed; retry." }, statusCode: 409);
       var myReq2 = reservedAns;
+      var restoreBeforeA = s.RestoreEpochId;
       var autoEvidence = reservedAnsDelivered;
       string prompt2 = reservedAnsPrompt;
       string modelText2;
@@ -1105,7 +1114,7 @@ public static class SecretaryEndpoints
         IResult pubResult2;
         try
         {
-        pubResult2 = Atomic.Run<IResult>(() =>
+        pubResult2 = Atomic.Run<IResult>(s, () =>
         {
           if (!s.SecretaryRequests.TryGetValue(myReq2.Id, out var fresh2) || fresh2 is null) return Results.Conflict("Secretary request moved on; retry.");
           if (fresh2.AnswerAttemptId != myAnsAttempt) return Results.Conflict("Secretary request moved on; retry.");
@@ -1122,6 +1131,11 @@ public static class SecretaryEndpoints
           if (!SecretaryContext.SnapshotEquals(before2, nowSnap2))
           {
             fresh2.Status = "discarded"; fresh2.Error = SecretaryContext.SnapshotMismatchReason(before2, nowSnap2); s.SecretaryRequests.Flush();
+            return Results.Json(new { error = fresh2.Error }, statusCode: 409);
+          }
+          if (s.RestoreEpochId != restoreBeforeA)
+          {
+            fresh2.Status = "discarded"; fresh2.Error = "Domain was restored during secretary work; retry with the same nonce."; s.SecretaryRequests.Flush();
             return Results.Json(new { error = fresh2.Error }, statusCode: 409);
           }
           var noteBody2 = outcome2.Body;
@@ -1204,7 +1218,7 @@ public static class SecretaryEndpoints
       if (string.IsNullOrWhiteSpace(nbody)) return Results.BadRequest("body is required.");
       Note? created = null;
       lock (s.SetupLock) { lock (s.MessageLock) {
-        return Atomic.Run<IResult>(() =>
+        return Atomic.Run<IResult>(s, () =>
         {
           if (!s.Notes.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
           if (!PeopleOps.Can(s, req, fresh.BoardId, fresh.MeetingId, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
@@ -1237,7 +1251,7 @@ public static class SecretaryEndpoints
       if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("expectedRevision", out var ev) && ev.ValueKind == JsonValueKind.Number) ev.TryGetInt32(out want);
       if (want != cur.Revision) return Results.Json(new { error = "Stale revision; refresh history and retry.", currentRevision = cur.Revision }, statusCode: 409);
       lock (s.SetupLock) { lock (s.MessageLock) {
-        return Atomic.Run<IResult>(() =>
+        return Atomic.Run<IResult>(s, () =>
         {
           if (!s.Notes.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
           if (!PeopleOps.Can(s, req, fresh.BoardId, fresh.MeetingId, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
