@@ -136,13 +136,30 @@ public static class OpsEndpoints
         if (ownerDefault is not null) leadSource = "inherit";
         else if (LeadSetup.InheritsGlobalLead(s, b) && LeadSetup.ResolveLead(s) is not null) leadSource = "inherit-global";
       }
+      // Embedded snapshots must not leak inherited content: an activated
+      // inheriting board stores the effective (owner-default or legacy-global)
+      // profile inside ActiveJson. Export a sanitized board clone with the lead
+      // redacted unless this board carries its own explicit override.
+      string exportActive = b.ActiveJson ?? "";
+      if (ownLead is null) exportActive = LeadSetup.RedactLeadJson(exportActive);
+      var exportBoard = new Board
+      {
+        Id = b.Id, Name = b.Name, Mission = b.Mission, Stage = b.Stage,
+        Archived = b.Archived, ActiveConfig = b.ActiveConfig,
+        DraftJson = b.DraftJson ?? "{}", ActiveJson = exportActive,
+        LeadProfileVersion = b.LeadProfileVersion, RetainAudio = b.RetainAudio,
+        BlockedTypes = b.BlockedTypes ?? "", SourcePolicyMode = b.SourcePolicyMode ?? "allowAll",
+        DiscussionPolicy = b.DiscussionPolicy ?? "balanced", DataUse = b.DataUse ?? "contributor",
+        OwnerKey = b.OwnerKey ?? "", AccessEnforced = b.AccessEnforced,
+        CreatedAt = b.CreatedAt,
+      };
       var rosterRows = s.Roster.Values.Where(r => rosterIds.Contains(r.Id)).ToList();
       var topAccount = rosterRows.Where(r => r.AccountId != Guid.Empty).Select(r => r.AccountId).FirstOrDefault();
       var snapshot = new
       {
         version = 1,
         accountId = topAccount == Guid.Empty ? "" : topAccount.ToString(),
-        board = b,
+        board = exportBoard,
         lead = effLead,
         leadSource,
         advisors = copies,

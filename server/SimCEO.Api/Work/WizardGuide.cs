@@ -95,8 +95,10 @@ public static class WizardGuide
           return Results.Conflict("Stale wizard draft; refresh and re-apply your edit.");
         var answer = body.TryGetProperty("answer", out var av) && av.ValueKind == JsonValueKind.String ? (av.GetString() ?? "") : "";
         var turns = ReadTurns(d);
-        var before = new HashSet<int>(Blockers(d).Select(b => b.step));
-        var currentQ = ReadPendingQuestion(d) ?? NextQuestion(d);
+        bool hasDefaultPre = false;
+        try { if (TryWizardUser(s, req, d, out var preUser, out _)) hasDefaultPre = LeadSetup.ResolveDefaultForOwner(s, preUser) is not null; } catch { hasDefaultPre = false; }
+        var before = new HashSet<int>(BlockersForOwner(d, hasDefaultPre).Select(b => b.step));
+        var currentQ = ReadPendingQuestion(d) ?? NextQuestionForOwner(d, hasDefaultPre);
         string question;
         string analysis;
         var extractOk = true;
@@ -106,7 +108,9 @@ public static class WizardGuide
         {
           question = currentQ;
           analysis = "Starting the setup interview from the current draft.";
-          var after0 = Blockers(d);
+          bool hasDefaultStart = hasDefaultPre;
+          try { if (TryWizardUser(s, req, d, out var startUser, out _)) hasDefaultStart = LeadSetup.ResolveDefaultForOwner(s, startUser) is not null; } catch { }
+          var after0 = BlockersForOwner(d, hasDefaultStart);
           var checkpoints0 = ReadCheckpoints(d);
           var draftId0 = d.Id; var ver0 = d.Version;
           try
@@ -132,7 +136,10 @@ public static class WizardGuide
           catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard interview", iox); }
           catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard interview") ?? Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(draftId0, out var saved0) || saved0 is null) return Results.NotFound("wizard draft");
-          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = saved0.Version, fields = FieldStates(saved0), blockers = Blockers(saved0), checkpoints = ReadCheckpoints(saved0), turns, done = Blockers(saved0).Count == 0 });
+          bool hasDefaultRet0 = false;
+          try { if (TryWizardUser(s, req, saved0, out var ret0User, out _)) hasDefaultRet0 = LeadSetup.ResolveDefaultForOwner(s, ret0User) is not null; } catch { }
+          var ret0Blockers = BlockersForOwner(saved0, hasDefaultRet0);
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = saved0.Version, fields = FieldStates(saved0), blockers = ret0Blockers, checkpoints = ReadCheckpoints(saved0), turns, done = ret0Blockers.Count == 0 });
         }
         else
         {
@@ -170,10 +177,12 @@ public static class WizardGuide
           var gw = new ModelGateway(s);
           var gate = PeopleOps.Guard(gw, req);
           InterviewParsed? parsed = null;
+          bool hasDefaultPost = hasDefaultPre;
+          try { if (TryWizardUser(s, req, savedP, out var postUser0, out _)) hasDefaultPost = LeadSetup.ResolveDefaultForOwner(s, postUser0) is not null; } catch { }
           if (gate is not null)
           {
             analysis = "Recorded. The guide is paused by usage controls, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
-            question = NextQuestion(d);
+            question = NextQuestionForOwner(d, hasDefaultPost);
             extractOk = false;
             extractError = "usage-capped";
           }
@@ -196,12 +205,12 @@ public static class WizardGuide
                 extractError = "unparsed-model-output";
               }
               else analysis = parsed.analysis;
-              question = string.IsNullOrWhiteSpace(parsed?.nextQuestion) ? NextQuestion(d) : parsed!.nextQuestion;
+              question = string.IsNullOrWhiteSpace(parsed?.nextQuestion) ? NextQuestionForOwner(d, hasDefaultPost) : parsed!.nextQuestion;
             }
             catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException or TaskCanceledException or HttpRequestException or JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
             {
               analysis = "Recorded. The guide model is unavailable, so nothing was extracted. Your answer is saved: retry later or use the fast-path form.";
-              question = NextQuestion(d);
+              question = NextQuestionForOwner(d, hasDefaultPost);
               extractOk = false;
               extractError = ex.GetType().Name;
               Atomic.Audit(s, new AuditEvent { Action = "wizard.interview-fallback", Detail = ex.GetType().Name });
@@ -241,7 +250,11 @@ public static class WizardGuide
               foreach (var u in pendingUpdates)
                 if (ApplyFieldUpdate(cur, u.Key, u.Value)) applied.Add(u.Key);
               if (turns.Count > 0) turns[^1] = turns[^1] with { analysis = analysis };
-              var after = Blockers(cur);
+              string compUser = "";
+              try { if (!TryWizardUser(s, req, cur, out compUser, out _)) throw PeopleOps.AuthFault(s, req); } catch (UnauthorizedAccessException) { throw; } catch { throw new InvalidOperationException("security-unavailable"); }
+              bool hasDefaultComp = false;
+              try { hasDefaultComp = LeadSetup.ResolveDefaultForOwner(s, compUser) is not null; } catch { hasDefaultComp = false; }
+              var after = BlockersForOwner(cur, hasDefaultComp);
               var checkpoints = ReadCheckpoints(cur);
               foreach (var st in before.Except(after.Select(b => b.step)).OrderBy(x => x))
                 checkpoints.Add(new InterviewCheckpoint(DateTime.UtcNow, "Step " + st + " ready: " + StepLabel(st)));
@@ -263,7 +276,10 @@ public static class WizardGuide
           catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Wizard interview", iox); }
           catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Wizard interview") ?? Results.Json(new { error = "Wizard interview failed; no state changed: " + ex.Message }, statusCode: 500); }
           if (!s.WizardDrafts.TryGetValue(completionId, out var doneIv) || doneIv is null) return Results.NotFound("wizard draft");
-          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = doneIv.Version, fields = FieldStates(doneIv), blockers = Blockers(doneIv), checkpoints = ReadCheckpoints(doneIv), turns, done = Blockers(doneIv).Count == 0 });
+          bool hasDefaultDone = false;
+          try { if (TryWizardUser(s, req, doneIv, out var doneUser, out _)) hasDefaultDone = LeadSetup.ResolveDefaultForOwner(s, doneUser) is not null; } catch { }
+          var doneBlockers = BlockersForOwner(doneIv, hasDefaultDone);
+          return Results.Ok(new { question, analysis, applied, extractOk, extractError, pendingQuestion = question, version = doneIv.Version, fields = FieldStates(doneIv), blockers = doneBlockers, checkpoints = ReadCheckpoints(doneIv), turns, done = doneBlockers.Count == 0 });
         }
       }
       finally { sem.Release(); }

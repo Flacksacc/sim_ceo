@@ -476,10 +476,13 @@ public static class SimCEOEndpoints
       // Effective board lead: strict override, else owner default, else legacy global (admin-only).
       var effLead = LeadSetup.ResolveLeadForBoard(s, b);
       object? lead = effLead;
+      bool isViewerAdmin = false;
+      try { isViewerAdmin = PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req)); }
+      catch { isViewerAdmin = false; }
       bool hideGlobal = false;
       try
       {
-        if (effLead is not null && LeadSetup.LeadSource(effLead, bid) == "global" && !PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req))) { lead = null; hideGlobal = true; }
+        if (effLead is not null && LeadSetup.LeadSource(effLead, bid) == "global" && !isViewerAdmin) { lead = null; hideGlobal = true; }
       }
       catch { lead = null; hideGlobal = true; }
       var total = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed);
@@ -492,6 +495,14 @@ public static class SimCEOEndpoints
         // full legacy-global profile. Serve redacted views (lead null) so the
         // installation content never leaks to non-admin readers.
         canonical = LeadSetup.CanonicalDraftJsonWithLead(s, b, null);
+        shownActive = LeadSetup.RedactLeadJson(shownActive);
+      }
+      else if (!isViewerAdmin)
+      {
+        // Historical snapshots are independent of current resolution: an
+        // admin-owned board activated under legacy global keeps that profile
+        // inside ActiveJson even after a default/override takes over. Never
+        // expose stored snapshot lead content to non-admin viewers.
         shownActive = LeadSetup.RedactLeadJson(shownActive);
       }
       return Results.Ok(new
