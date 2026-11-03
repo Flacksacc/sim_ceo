@@ -254,15 +254,15 @@ if ($Action -eq "start") {
   if ([string]::IsNullOrWhiteSpace($cfgJson)) { throw "update: cannot resolve compose config; refusing." }
   $cfg = ($cfgJson | ConvertFrom-Json)
   if ($null -eq $cfg -or $null -eq $cfg.services -or $null -eq $cfg.services.db -or $null -eq $cfg.services.app -or $null -eq $cfg.volumes) { throw "update: compose config missing services/volumes; refusing." }
-  $dbSvcVols = @($cfg.services.db.volumes | Where-Object { $_.type -eq "volume" -and $_.target -eq "/var/lib/postgresql/data" })
-  $appSvcVols = @($cfg.services.app.volumes | Where-Object { $_.type -eq "volume" -and $_.target -eq "/app/data" })
+  $dbSvcVols = @($cfg.services.db.volumes | Where-Object { $_.type -ceq "volume" -and $_.target -ceq "/var/lib/postgresql/data" })
+  $appSvcVols = @($cfg.services.app.volumes | Where-Object { $_.type -ceq "volume" -and $_.target -ceq "/app/data" })
   if ($dbSvcVols.Count -ne 1) { throw "update: compose db service must map exactly one volume at /var/lib/postgresql/data; refusing." }
   if ($appSvcVols.Count -ne 1) { throw "update: compose app service must map exactly one volume at /app/data; refusing." }
-  $topDb = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -eq $dbSvcVols[0].source })
+  $topDb = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -ceq $dbSvcVols[0].source })
   if ($topDb.Count -ne 1) { throw ("update: compose top-level volume '" + $dbSvcVols[0].source + "' not resolved; refusing.") }
   $expDbName = $topDb[0].Value.name
   if ([string]::IsNullOrWhiteSpace($expDbName)) { throw ("update: compose top-level volume '" + $dbSvcVols[0].source + "' has no resolved name; refusing.") }
-  $topApp = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -eq $appSvcVols[0].source })
+  $topApp = @($cfg.volumes.PSObject.Properties | Where-Object { $_.Name -ceq $appSvcVols[0].source })
   if ($topApp.Count -ne 1) { throw ("update: compose top-level volume '" + $appSvcVols[0].source + "' not resolved; refusing.") }
   $expAppName = $topApp[0].Value.name
   if ([string]::IsNullOrWhiteSpace($expAppName)) { throw ("update: compose top-level volume '" + $appSvcVols[0].source + "' has no resolved name; refusing.") }
@@ -270,8 +270,8 @@ if ($Action -eq "start") {
   $appTarget = $appSvcVols[0].target
   # Named-volume identity comes from Mount.Name (Source can be a DockerVM
   # filesystem path, not a volume name).
-  $dbLive = @($dbMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq $dbTarget -and $_.Name -eq $expDbName })
-  $appLive = @($appMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -eq "volume" -and $_.Destination -eq $appTarget -and $_.Name -eq $expAppName })
+  $dbLive = @($dbMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -ceq "volume" -and $_.Destination -ceq $dbTarget -and $_.Name -ceq $expDbName })
+  $appLive = @($appMountsRaw | ConvertFrom-Json | Where-Object { $_.Type -ceq "volume" -and $_.Destination -ceq $appTarget -and $_.Name -ceq $expAppName })
   if ($dbLive.Count -ne 1) { throw ("update: live db mount does not match compose mapping (need volume '" + $expDbName + "' at '" + $dbTarget + "'); refusing.") }
   if ($appLive.Count -ne 1) { throw ("update: live app mount does not match compose mapping (need volume '" + $expAppName + "' at '" + $appTarget + "'); refusing.") }
   $volNames = @($expDbName, $expAppName) | Sort-Object -Unique
@@ -293,7 +293,7 @@ if ($Action -eq "start") {
   & docker tag $curImageId $rollbackTag | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "update: rollback tag failed; refusing to build." }
   $rollbackId = ((docker inspect -f '{{.Id}}' $rollbackTag 2>$null) | Out-String).Trim()
-  if ($rollbackId -ne $curImageId) { throw ("update: rollback tag does not resolve to the live image id; refusing to build. Rollback ref attempted: " + $rollbackTag) }
+  if ($rollbackId -cne $curImageId) { throw ("update: rollback tag does not resolve to the live image id; refusing to build. Rollback ref attempted: " + $rollbackTag) }
   Write-Host ("rollback ref preserved: " + $rollbackTag + " (pinned to live image id)")
   Invoke-Compose -argv @("build", "app")
   Write-Host "new app image built (old app still serving; nothing recreated yet)"
@@ -383,7 +383,7 @@ if ($Action -eq "start") {
   & docker tag $RollbackTag $appImageTag | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "rollback: retag failed; refusing to recreate app." }
   $rtId = ((docker inspect -f '{{.Id}}' $appImageTag 2>$null) | Out-String).Trim()
-  if ($rtId -ne $rbId) { throw "rollback: retagged image does not resolve to the rollback image id; refusing to recreate app." }
+  if ($rtId -cne $rbId) { throw "rollback: retagged image does not resolve to the rollback image id; refusing to recreate app." }
   Write-Host ("rollback: retagged " + $appImageTag + " to pinned rollback image")
   Invoke-Compose -argv @("up", "-d", "--no-deps", "--no-build", "app")
   if (-not (Wait-AppHealthy 180)) { throw ("rollback FAILED: app never healthy after retag recreate; backups from the update run remain under " + $repo + "/.tmp/update-*/; primary decision required.") }
