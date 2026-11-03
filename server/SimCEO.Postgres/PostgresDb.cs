@@ -31,6 +31,8 @@ public sealed class PostgresDb : DbContext
   public DbSet<SimCEO.Api.Account> AuthAccounts => Set<SimCEO.Api.Account>();
   public DbSet<Membership> Memberships => Set<Membership>();
   public DbSet<SecurityState> SecurityStates => Set<SecurityState>();
+  public DbSet<UsageRow> UsageRows => Set<UsageRow>();
+  public DbSet<SimCEO.Api.Work.ModelCall> ModelCalls => Set<SimCEO.Api.Work.ModelCall>();
 
   protected override void OnModelCreating(ModelBuilder b)
   {
@@ -46,6 +48,12 @@ public sealed class PostgresDb : DbContext
     b.Entity<BoardAdvisor>().HasIndex(x => x.BoardId);
     b.Entity<Meeting>().HasIndex(x => x.BoardId);
     b.Entity<SimCEO.Api.Account>().HasIndex(a => a.Email).IsUnique();
+    b.Entity<UsageRow>().HasIndex(x => x.BoardId);
+    b.Entity<UsageRow>().HasIndex(x => x.MeetingId);
+    b.Entity<UsageRow>().HasIndex(x => x.At);
+    b.Entity<SimCEO.Api.Work.ModelCall>().HasIndex(x => x.BoardId);
+    b.Entity<SimCEO.Api.Work.ModelCall>().HasIndex(x => x.MeetingId);
+    b.Entity<SimCEO.Api.Work.ModelCall>().HasIndex(x => x.At);
   }
 }
 
@@ -382,6 +390,30 @@ public static class PgBoot
       // One-time idempotent legacy migration: pending for new, approved stays, then heads backfill runs at request time.
       db.Database.ExecuteSqlRaw("UPDATE \"Sources\" SET \"ReviewState\" = CASE WHEN \"Approved\" THEN 'approved' ELSE 'pending' END WHERE (\"ReviewState\" = 'pending' OR \"ReviewState\" = '') AND \"Approved\" = TRUE");
       // Canonical family keys and legacy collision resolution run in app code (SourceGovernance.MigrateStore); SQL leaves new rows empty.
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"UsageRows\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"Kind\" text NOT NULL DEFAULT '', \"Model\" text NOT NULL DEFAULT '', \"InputTokens\" integer NOT NULL DEFAULT 0, \"OutputTokens\" integer NOT NULL DEFAULT 0, \"CachedInputTokens\" integer NOT NULL DEFAULT 0, \"SearchCalls\" integer NOT NULL DEFAULT 0, \"LatencyMs\" bigint NOT NULL DEFAULT 0, \"RanSearch\" boolean NOT NULL DEFAULT false, \"Status\" text NOT NULL DEFAULT 'succeeded', \"ProviderCallId\" text NULL, \"CostBasis\" text NULL, \"Cost\" numeric NULL, \"BoardId\" uuid NULL, \"MeetingId\" uuid NULL, \"At\" timestamp with time zone NOT NULL DEFAULT now(), \"Note\" text NOT NULL DEFAULT '')");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"OutputTokens\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"CachedInputTokens\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"SearchCalls\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"LatencyMs\" bigint NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"RanSearch\" boolean NOT NULL DEFAULT false");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"Status\" text NOT NULL DEFAULT 'succeeded'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"ProviderCallId\" text NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"UsageRows\" ADD COLUMN IF NOT EXISTS \"CostBasis\" text NULL");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"ModelCalls\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"Model\" text NOT NULL DEFAULT '', \"Purpose\" text NOT NULL DEFAULT '', \"InputTokens\" integer NOT NULL DEFAULT 0, \"OutputTokens\" integer NOT NULL DEFAULT 0, \"CachedInputTokens\" integer NOT NULL DEFAULT 0, \"LatencyMs\" bigint NOT NULL DEFAULT 0, \"RanSearch\" boolean NOT NULL DEFAULT false, \"SearchCalls\" integer NOT NULL DEFAULT 0, \"ProviderCallId\" text NULL, \"Status\" text NOT NULL DEFAULT 'succeeded', \"Cost\" numeric NULL, \"CostBasis\" text NULL, \"BoardId\" uuid NULL, \"MeetingId\" uuid NULL, \"SearchNote\" text NULL, \"At\" timestamp with time zone NOT NULL DEFAULT now())");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"CachedInputTokens\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"SearchCalls\" integer NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"ProviderCallId\" text NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"Status\" text NOT NULL DEFAULT 'succeeded'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"Cost\" numeric NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"CostBasis\" text NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"BoardId\" uuid NULL");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"ModelCalls\" ADD COLUMN IF NOT EXISTS \"MeetingId\" uuid NULL");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_UsageRows_BoardId\" ON \"UsageRows\" (\"BoardId\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_UsageRows_MeetingId\" ON \"UsageRows\" (\"MeetingId\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_UsageRows_At\" ON \"UsageRows\" (\"At\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_BoardId\" ON \"ModelCalls\" (\"BoardId\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_MeetingId\" ON \"ModelCalls\" (\"MeetingId\")");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_ModelCalls_At\" ON \"ModelCalls\" (\"At\")");
       Pg.Backend = new PostgresBackend(db);
       return true;
     }

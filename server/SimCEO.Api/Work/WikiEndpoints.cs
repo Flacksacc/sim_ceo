@@ -356,8 +356,25 @@ public static class WikiEndpoints
       if (PeopleOps.BadToken(s, req) is { } bad) return bad;
       if (!WikiAuth.CanManageResource(s, req, r.BoardId, r.Scope == "meeting" ? "meeting" : "board", r.MeetingId)) return PeopleOps.Denied();
       if (!r.Enabled) return Results.Json(new { error = "Resource is disabled; enable it first." }, statusCode: 409);
-      var caller = PeopleOps.UserOf(s, req);
-      var (ok, error, status) = await sync.SyncAsync(id, "manual", caller, false);
+      // Secure installations bind the trigger to the live session: spoofed
+      // X-User names are rejected here, and the token travels to the commit
+      // gate for liveness revalidation (logout/revoke before commit fails).
+      string caller;
+      string? callerToken = null;
+      if (PeopleOps.IsSecure(s))
+      {
+        if (!AuthOps.TrySession(s, req, out var sessUser)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+        caller = sessUser;
+        try
+        {
+          var ah = req.Headers["Authorization"].ToString() ?? "";
+          if (ah.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase)) callerToken = ah["Bearer ".Length..].Trim();
+        }
+        catch { }
+        if (string.IsNullOrWhiteSpace(callerToken)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      }
+      else caller = PeopleOps.UserOf(s, req);
+      var (ok, error, status) = await sync.SyncAsync(id, "manual", caller, false, default, callerToken);
       if (!s.WikiResources.TryGetValue(id, out var cur)) return Results.NotFound();
       var shaped = ShapeResource(s, cur);
       if (!ok) return Results.Json(new { error, resource = shaped }, statusCode: status);

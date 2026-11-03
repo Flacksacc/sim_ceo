@@ -61,11 +61,12 @@ public sealed class WikiSyncService
   private sealed record WikiCapture(
     long Revision, long Generation, string Origin, Guid BoardId, string Scope, Guid? MeetingId,
     string Token, string Caller,
-    List<string> Allow, List<string> Excl, List<string> Tags, string Locale);
+    List<string> Allow, List<string> Excl, List<string> Tags, string Locale,
+    string? CallerToken);
 
   private enum CommitOutcome { CommittedChanged, CommittedUnchanged, StaleDiscarded, Failed }
 
-  private (WikiCapture? cap, long rev, long gen, string? error, int status) CaptureUnderLock(Guid resourceId, string caller)
+  private (WikiCapture? cap, long rev, long gen, string? error, int status) CaptureUnderLock(Guid resourceId, string caller, string? callerToken = null)
   {
     lock (_store.SetupLock)
     {
@@ -104,20 +105,20 @@ public sealed class WikiSyncService
       return (new WikiCapture(rev, gen, origin, r2.BoardId, scope, scope == "meeting" ? r2.MeetingId : null,
         token, caller,
         WikiRules.ParseList(r2.AllowlistJson), WikiRules.ParseList(r2.ExclusionsJson),
-        WikiRules.ParseList(r2.RequiredTagsJson), r2.Locale ?? ""), rev, gen, null, 200);
+        WikiRules.ParseList(r2.RequiredTagsJson), r2.Locale ?? "", callerToken), rev, gen, null, 200);
     }
   }
 
   // Manual trigger with caller identity; scheduled triggers pass isScheduled=true and callerUser="system".
-  public async Task<(bool ok, string? error, int status)> SyncAsync(Guid resourceId, string reason, string? callerUser = null, bool isScheduled = false, CancellationToken ct = default)
+  public async Task<(bool ok, string? error, int status)> SyncAsync(Guid resourceId, string reason, string? callerUser = null, bool isScheduled = false, CancellationToken ct = default, string? callerToken = null)
   {
     var gate = Gate(resourceId);
     if (!gate.Wait(0)) return (false, "A sync is already running for this resource; wait for it to finish.", 409);
-    try { return await RunAsync(resourceId, reason, callerUser, isScheduled, ct).ConfigureAwait(false); }
+    try { return await RunAsync(resourceId, reason, callerUser, isScheduled, ct, callerToken).ConfigureAwait(false); }
     finally { gate.Release(); }
   }
 
-  private async Task<(bool ok, string? error, int status)> RunAsync(Guid resourceId, string reason, string? callerUser, bool isScheduled, CancellationToken ct)
+  private async Task<(bool ok, string? error, int status)> RunAsync(Guid resourceId, string reason, string? callerUser, bool isScheduled, CancellationToken ct, string? callerToken = null)
   {
     // Whole-operation deadline starts BEFORE DNS/headers and covers
     // headers+body+parse+staging+commit. Checked again before commit.
@@ -127,7 +128,7 @@ public sealed class WikiSyncService
     // Immutable coherent capture under the writers' boundary (F1): origin +
     // credential + revision + generation + rules + scope are copied while holding
     // SetupLock, with the token read and re-verified under that same lock.
-    var (cap, rev0, gen0, capError, capStatus) = CaptureUnderLock(resourceId, (callerUser ?? "").Trim());
+    var (cap, rev0, gen0, capError, capStatus) = CaptureUnderLock(resourceId, (callerUser ?? "").Trim(), callerToken);
     if (cap is null)
     {
       if (capStatus == 502)
@@ -443,6 +444,23 @@ public sealed class WikiSyncService
       if (string.IsNullOrWhiteSpace(cap.Caller)
         || !WikiAuth.CanManageByUser(_store, cap.BoardId, cap.Scope, cap.MeetingId, cap.Caller))
       { failError = "Wiki sync authorization revoked before commit; staged results discarded."; failStatus = 403; return CommitOutcome.Failed; }
+      // Session liveness at commit: a logout/revocation between trigger and
+      // commit refuses publication. The token was captured at the endpoint.
+      if (SimCEO.Api.PeopleOps.IsSecure(_store))
+      {
+        var okSess = false;
+        try
+        {
+          if (!string.IsNullOrWhiteSpace(cap.CallerToken)
+            && _store.Sessions.TryGetValue(cap.CallerToken, out var sess)
+            && sess.ExpiresAt > System.DateTime.UtcNow
+            && string.Equals(sess.Email ?? "", cap.Caller ?? "", System.StringComparison.OrdinalIgnoreCase))
+            okSess = true;
+        }
+        catch { }
+        if (!okSess)
+        { failError = "Wiki sync session ended before commit; staged results discarded."; failStatus = 403; return CommitOutcome.Failed; }
+      }
     }
     // Deadline recheck INSIDE the commit boundary, after waiting for the lock:
     // no write happens after expiry (F13).

@@ -327,9 +327,18 @@ public sealed class AuditEvent
 
 public sealed class UsageRow
 {
+  [Key] public Guid Id { get; set; } = Guid.NewGuid();
   public string Kind { get; set; } = "";
   public string Model { get; set; } = "";
   public int InputTokens { get; set; }
+  public int OutputTokens { get; set; }
+  public int CachedInputTokens { get; set; }
+  public int SearchCalls { get; set; }
+  public long LatencyMs { get; set; }
+  public bool RanSearch { get; set; }
+  public string Status { get; set; } = "succeeded";
+  public string? ProviderCallId { get; set; }
+  public string? CostBasis { get; set; }
   public decimal? Cost { get; set; }
   public Guid? BoardId { get; set; }
   public Guid? MeetingId { get; set; }

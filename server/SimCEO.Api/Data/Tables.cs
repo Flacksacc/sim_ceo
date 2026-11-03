@@ -151,7 +151,7 @@ public sealed class Table<T> where T : class
   }
 }
 
-/// <summary>Append-only stream. Memory-only by design (audit/usage/cost ledger are ephemeral).</summary>
+/// <summary>Append-only stream. Memory-only by design (audit is ephemeral).</summary>
 public sealed class Bag<T> : IEnumerable<T>
 {
   private readonly ConcurrentBag<T> _bag = new();
@@ -277,6 +277,39 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
     }
     foreach (var mid in b.MessageMeetings())
       yield return new KeyValuePair<Guid, List<Domain.Message>>(mid, new MessageList(b, mid, b.MeetingMessages(mid)));
+  }
+
+  System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+/// <summary>Durable append-only ledger for usage/model-call events.
+/// Memory mode (no PG backend): session-lifetime in-memory bag, clearly
+/// labeled session-lifetime in the UI. PG mode: the database is the
+/// exclusive source of truth. New events are published ONLY by committing
+/// them to Postgres; nothing is pre-published to memory, no memory cache is
+/// merged into database reads, and database read failures propagate instead
+/// of silently returning memory/empty rows as durable history.
+/// Immutable events: callers add once per actual provider call and never
+/// mutate. Same-call ledger/event pairs commit atomically when the caller
+/// uses Atomic.Run. Storage failures throw and must never be swallowed as
+/// malformed-provider errors and must never trigger a second accounting
+/// attempt (see UsageStorageException).</summary>
+public sealed class DurableBag<T> : IEnumerable<T> where T : class
+{
+  private readonly ConcurrentBag<T> _mem = new();
+
+  public void Add(T item)
+  {
+    var b = Pg.Backend;
+    if (b is null) { _mem.Add(item); return; }
+    b.Upsert(item);
+    if (!b.IsTransacting) b.Save();
+  }
+
+  public IEnumerator<T> GetEnumerator()
+  {
+    var b = Pg.Backend;
+    if (b is null) return _mem.GetEnumerator();
+    return b.All<T>().GetEnumerator();
   }
 
   System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();

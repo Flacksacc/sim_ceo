@@ -14,8 +14,29 @@ public static class WikiAuth
   public static bool IsBoardManager(InMemoryStore s, HttpRequest req, Guid boardId)
     => IsBoardManagerUser(s, boardId, PeopleOps.UserOf(s, req));
 
+  // Auth8 integration: in secure mode there is no open/demo bypass and no
+  // grantless default. Board owner and installation admin are recognized;
+  // everyone else needs an explicit grant. The literal "system" principal is
+  // reserved for in-process scheduled work and never satisfies a remote call.
+  static bool SecureApplies(InMemoryStore s) { try { return PeopleOps.IsSecure(s); } catch { return false; } }
+
+  static bool IsOwnerOrAdmin(InMemoryStore s, Guid boardId, string user)
+  {
+    try
+    {
+      if (s.Boards.TryGetValue(boardId, out var b) && !string.IsNullOrWhiteSpace(b.OwnerKey)
+        && string.Equals(b.OwnerKey, user, StringComparison.OrdinalIgnoreCase)) return true;
+    }
+    catch { }
+    try { return PeopleOps.IsInstallationAdmin(s, user); } catch { return false; }
+  }
+
   public static bool IsBoardManagerUser(InMemoryStore s, Guid boardId, string user)
   {
+    if (SecureApplies(s)) return IsOwnerOrAdmin(s, boardId, user)
+      || s.Grants.Values.Any(g => g.BoardId == boardId && g.MeetingId == null
+        && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase)
+        && (g.Access == "manage" || g.Access == "open"));
     if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return true;
     if (!s.Grants.Values.Any(g => g.BoardId == boardId) && !s.Invites.Values.Any(i => i.BoardId == boardId)) return true;
     return s.Grants.Values.Any(g => g.BoardId == boardId && g.MeetingId == null
@@ -38,9 +59,15 @@ public static class WikiAuth
     if (scope == "meeting")
     {
       if (!meetingId.HasValue) return false;
-      if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return true;
-      if (string.Equals(user, "system", StringComparison.OrdinalIgnoreCase)) return true;
-      if (!s.Grants.Values.Any(g => g.BoardId == boardId) && !s.Invites.Values.Any(i => i.BoardId == boardId)) return true;
+      if (SecureApplies(s))
+      {
+        if (IsOwnerOrAdmin(s, boardId, user)) return true;
+      }
+      else
+      {
+        if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!s.Grants.Values.Any(g => g.BoardId == boardId) && !s.Invites.Values.Any(i => i.BoardId == boardId)) return true;
+      }
       if (IsBoardManagerUser(s, boardId, user)) return true;
       return s.Grants.Values.Any(g => g.BoardId == boardId && g.MeetingId == meetingId
         && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase)
@@ -61,10 +88,16 @@ public static class WikiAuth
   public static bool CanReadByUser(InMemoryStore s, Guid boardId, string scope, Guid? meetingId, string user)
   {
     if (string.IsNullOrWhiteSpace(user)) return false;
-    if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return true;
-    if (string.Equals(user, "system", StringComparison.OrdinalIgnoreCase)) return true;
-    var hasAnyGrant = s.Grants.Values.Any(g => g.BoardId == boardId) || s.Invites.Values.Any(i => i.BoardId == boardId);
-    if (!hasAnyGrant) return true; // single-user default
+    if (SecureApplies(s))
+    {
+      if (IsOwnerOrAdmin(s, boardId, user)) return true;
+    }
+    else
+    {
+      if (string.Equals(user, "owner", StringComparison.OrdinalIgnoreCase)) return true;
+      var hasAnyGrant = s.Grants.Values.Any(g => g.BoardId == boardId) || s.Invites.Values.Any(i => i.BoardId == boardId);
+      if (!hasAnyGrant) return true; // single-user default
+    }
     var sc = (scope ?? "board").Trim().ToLowerInvariant() == "meeting" ? "meeting" : "board";
     if (sc == "board")
     {

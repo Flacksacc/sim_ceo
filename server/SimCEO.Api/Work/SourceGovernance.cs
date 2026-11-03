@@ -52,6 +52,44 @@ public static class SourceGovernance
     return boardId.ToString("N") + "|" + sc + "|" + mid + "|" + org + "|" + norm;
   }
 
+
+  public static bool IsWikiOrigin(string? origin) =>
+    string.Equals((origin ?? "").Trim(), "wiki", StringComparison.OrdinalIgnoreCase);
+
+  // Shared canonical identity (Source6 + Wiki7 integration contract). Upload
+  // families canonicalize from board/scope/meeting/origin/file. Wiki families
+  // are resource-bound and IMMUTABLE: the stored key is validated structurally
+  // (resource binding + original locale/path) and never recomputed from mutable
+  // resource config, so reconfigured locales/rules cannot rewrite historical
+  // families or collapse distinct connectors. Returns false with an explicit
+  // error for empty wiki keys (re-sync the connector) and structural mismatches.
+  public static bool TryCanonicalFamilyKey(SourceDoc d, out string canonical, out string error)
+  {
+    canonical = ""; error = "";
+    if (!IsWikiOrigin(d.Origin))
+    {
+      canonical = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
+      return true;
+    }
+    var parts = (d.FamilyKey ?? "").Split("|");
+    if (parts.Length != 7 || parts[3] != "wiki")
+    { error = "Snapshot wiki source family is not a resource-bound wiki identity; re-sync the connector instead of migrating a bare key."; return false; }
+    if (!Guid.TryParseExact(parts[0], "N", out var b) || b != d.BoardId)
+    { error = "Snapshot wiki source family binds another board."; return false; }
+    var sc = (d.Scope ?? "").Trim().ToLowerInvariant() == "meeting" ? "meeting" : "board";
+    if (parts[1] != sc)
+    { error = "Snapshot wiki source family binds another scope."; return false; }
+    var mid = sc == "meeting" && d.MeetingId.HasValue ? d.MeetingId.Value.ToString("N") : "-";
+    if (parts[2] != mid)
+    { error = "Snapshot wiki source family binds another meeting."; return false; }
+    if (!Guid.TryParseExact(parts[4], "N", out var rid) || !d.ResourceId.HasValue || rid != d.ResourceId.Value)
+    { error = "Snapshot wiki source family binds another connector resource."; return false; }
+    if (!string.Equals(parts[6] ?? "", d.FileName ?? "", StringComparison.Ordinal))
+    { error = "Snapshot wiki source path does not match its family identity; re-sync the connector instead."; return false; }
+    canonical = d.FamilyKey;
+    return true;
+  }
+
   public static string PolicyModeOf(Board? b)
   {
     var m = (b?.SourcePolicyMode ?? "allowAll").Trim().ToLowerInvariant();
@@ -106,8 +144,10 @@ public static class SourceGovernance
     }
     if (string.IsNullOrWhiteSpace(d.Origin)) { d.Origin = "upload"; dirty = true; }
     else { var o = d.Origin.Trim().ToLowerInvariant(); if (o != d.Origin) { d.Origin = o; dirty = true; } }
-    if (string.IsNullOrWhiteSpace(d.FamilyKey))
+    if (string.IsNullOrWhiteSpace(d.FamilyKey) && !IsWikiOrigin(d.Origin))
     {
+      // Wiki rows never take an upload-style key here: an empty wiki family
+      // means the connector must re-sync, not a silent recomputation.
       d.FamilyKey = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
       dirty = true;
     }
@@ -204,12 +244,15 @@ public static class SourceGovernance
         Atomic.Run(() =>
         {
           foreach (var d in s.Sources.Values.ToList()) EnsureMigrated(s, d);
-          // 1. Canonical family identity for every row. Legacy rows may
+          // 1. Canonical family identity for every non-wiki row. Legacy rows may
           // carry wrong or empty keys (path prefixes, case variants,
           // pre-family snapshots); new code always writes canonical keys,
-          // so this step converges immediately.
+          // so this step converges immediately. Wiki rows are resource-bound
+          // and immutable: validated structurally by TryCanonicalFamilyKey,
+          // never recomputed from mutable resource config.
           foreach (var d in s.Sources.Values.ToList())
           {
+            if (IsWikiOrigin(d.Origin)) continue;
             var canon = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
             if (!string.Equals(d.FamilyKey ?? "", canon, StringComparison.Ordinal))
               d.FamilyKey = canon;
@@ -348,7 +391,7 @@ public static class SourceGovernance
     }
     foreach (var d in s.Sources.Values.ToList())
     {
-      if (string.IsNullOrWhiteSpace(d.FamilyKey))
+      if (string.IsNullOrWhiteSpace(d.FamilyKey) && !IsWikiOrigin(d.Origin))
         d.FamilyKey = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
     }
     // Same deterministic collision path as live startup: predecessor inline
@@ -452,11 +495,16 @@ public static class SourceGovernance
       var org = string.IsNullOrWhiteSpace(d.Origin) ? "upload" : d.Origin.Trim().ToLowerInvariant();
       if (org == "wiki" && d.ResourceId.HasValue && d.ResourceId.Value == Guid.Empty)
       { error = "snapshot wiki source carries an empty resource id."; return false; }
-      var canon = FamilyKeyFor(d.BoardId, d.Scope, d.MeetingId, d.Origin, d.FileName);
+      // Shared canonical identity: upload families recompute from request fields;
+      // wiki families validate structurally against their immutable resource binding
+      // and are never recomputed from mutable resource config.
+      if (!TryCanonicalFamilyKey(d, out var canon, out var famErr))
+      { error = famErr; return false; }
       if (string.IsNullOrWhiteSpace(d.FamilyKey))
       {
         // Empty key: only legitimate as a uniformly empty legacy graph,
         // canonicalized (+collisions resolved) inside the restore unit.
+        // Wiki rows never take this path (empty wiki keys fail closed above).
         if (!legacyKeys)
         { error = "snapshot source has an empty family outside a legacy graph."; return false; }
         canonical[d.Id] = canon;

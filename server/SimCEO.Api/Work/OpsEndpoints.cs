@@ -683,12 +683,14 @@ public static class OpsEndpoints
         var isAdmSp = !string.IsNullOrWhiteSpace(admSp) && string.Equals(admSp, sp, StringComparison.OrdinalIgnoreCase);
         if (!isAdmSp) return PeopleOps.Denied();
       }
+      else if (!PeopleOps.IsOwner(req)) return PeopleOps.Denied();
       var now = DateTime.UtcNow;
       var (known, unknown) = ModelGateway.MonthSpend(s);
       var cap = s.Spend.MonthlyCapUsd;
+      var storageMode = Pg.Backend is null ? "memory-session-lifetime" : "postgres-durable";
       return Results.Ok(new
       {
-        month = $"{now.Year:D4}-{now.Month:D2}",
+        month = now.ToString("yyyy-MM"),
         monthlyCapUsd = cap,
         mode = s.Spend.Mode,
         knownSpendUsd = known,
@@ -696,8 +698,17 @@ public static class OpsEndpoints
         overCap = cap.HasValue && known >= cap.Value,
         enforced = s.Spend.Mode == "block" && cap.HasValue,
         note = unknown > 0
-          ? "Some calls have unknown cost (stubs); enforcement counts known costs only."
-          : "All recorded costs known.",
+          ? "Some calls have unknown cost (unpriced models or unobservable units); enforcement counts known costs only. Costs are ESTIMATES, not provider invoices."
+          : "All recorded costs known. Costs are ESTIMATES, not provider invoices.",
+        pricingBasis = new
+        {
+          checkedDate = UsageAccounting.PricingCheckedDate,
+          pricing = UsageAccounting.PricingDocs,
+          searchGrounding = UsageAccounting.SearchDocs,
+          speechToText = UsageAccounting.SpeechDocs,
+          imageGeneration = UsageAccounting.ImageDocs,
+        },
+        storage = storageMode,
       });
     });
 
