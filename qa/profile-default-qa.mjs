@@ -42,6 +42,13 @@ function parsedLeadOfActive(activeJson){
     return {present:true, value:o.lead};
   } catch { return {present:false, value:undefined, parseError:true}; }
 }
+// Export snapshots use web (camelCase) casing: board.activeJson. Accept legacy
+// PascalCase only as fallback; never treat a missing/empty snapshot as proof.
+function exportActiveJsonOf(ej){
+  const b = (ej&&(ej.board||ej.Board))||{};
+  const v = b.activeJson ?? b.ActiveJson ?? "";
+  return typeof v==="string" ? v : "";
+}
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 async function uploadPortrait(rid, authHeaders){
   const form = new FormData();
@@ -204,10 +211,14 @@ const OVERRIDEMK = MK("override");
       try{
         const ej = JSON.parse(gExp.json.snapshot);
         ok("globalact-export-no-top", !(ej.lead||ej.Lead), "top lead must be absent for hidden global");
-        const emb = (ej.board&&ej.board.ActiveJson)||"";
+        const gBoard = ej.board||ej.Board||{};
+        const emb = exportActiveJsonOf(ej);
+        ok("globalact-export-active-nonempty", typeof emb==="string" && emb.length>2, "len="+(typeof emb==="string"?emb.length:"?"));
         const plx = parsedLeadOfActive(emb);
-        const leakx = stringsOf(ej.board||{}).join("\n").includes(GLOBALMK);
-        ok("globalact-export-active-redacted", (!plx.present)||plx.value===null, "present="+plx.present);
+        ok("globalact-export-parse-ok", !plx.parseError, "parseError must be false");
+        ok("globalact-export-active-redacted", plx.present && plx.value===null, "lead must be null; present="+plx.present);
+        ok("globalact-export-activated-config", (gBoard.activeConfig===true||gBoard.ActiveConfig===true), "ActiveConfig must be true for activated board");
+        const leakx = stringsOf(ej.board||ej.Board||{}).join("\n").includes(GLOBALMK);
         ok("globalact-export-no-leak", !leakx, "leak?");
       } catch(e){ ok("globalact-bob-export", false, String(e).slice(0,160)); }
     } else {
@@ -263,8 +274,9 @@ const OVERRIDEMK = MK("override");
     const lsk = String(ej.leadSource||ej.LeadSource||"").toLowerCase();
     const hasLeadContent = !!(ej.lead||ej.Lead);
     ok("export-inherit-marker", lsk==="inherit" && !hasLeadContent, "source="+lsk+" hasLead="+hasLeadContent);
-    const emb = (ej.board&&ej.board.ActiveJson) || ej.Board?.ActiveJson || "";
+    const emb = exportActiveJsonOf(ej);
     const pl = parsedLeadOfActive(emb);
+    ok("export-active-parse-ok", !pl.parseError, "parseError must be false");
     const cleanActive = (!pl.present) || (pl.value===null);
     ok("export-active-redacted", cleanActive, "active lead present="+pl.present+" val="+String(JSON.stringify(pl.value)||"").slice(0,80));
     const allStr = stringsOf(ej).join("\n");
@@ -293,8 +305,9 @@ const OVERRIDEMK = MK("override");
     const ej = JSON.parse(expO.json.snapshot);
     const lsk = String(ej.leadSource||ej.LeadSource||"").toLowerCase();
     ok("export-explicit-marker", lsk==="board" && !!(ej.lead||ej.Lead), "source="+lsk);
-    const emb = (ej.board&&ej.board.ActiveJson) || ej.Board?.ActiveJson || "";
+    const emb = exportActiveJsonOf(ej);
     const pl = parsedLeadOfActive(emb);
+    ok("export-explicit-active-parse-ok", !pl.parseError, "parseError must be false");
     ok("export-explicit-active-redacted", (!pl.present) || pl.value===null, "active lead should be redacted even with override; present="+pl.present);
     const topLead = ej.lead||ej.Lead||{};
     ok("export-explicit-top-retained", (topLead.background||topLead.Background)===OVERRIDEMK, "top lead must retain override");
@@ -374,9 +387,13 @@ const OVERRIDEMK = MK("override");
       const ej = JSON.parse(expBob.json.snapshot);
       const lsk = String(ej.leadSource||ej.LeadSource||"").toLowerCase();
       ok("act-bob-export-inherit", lsk==="inherit" && !(ej.lead||ej.Lead), "source="+lsk);
-      const emb = (ej.board&&ej.board.ActiveJson)||"";
+      const aBoard = ej.board||ej.Board||{};
+      const emb = exportActiveJsonOf(ej);
+      ok("act-bob-export-active-nonempty", typeof emb==="string" && emb.length>2, "len="+(typeof emb==="string"?emb.length:"?"));
       const pl = parsedLeadOfActive(emb);
-      ok("act-bob-export-active-redacted", (!pl.present) || pl.value===null, "active lead must be null/absent; present="+pl.present);
+      ok("act-bob-export-parse-ok", !pl.parseError, "parseError must be false");
+      ok("act-bob-export-active-redacted", pl.present && pl.value===null, "active lead must be null; present="+pl.present);
+      ok("act-bob-export-activated-config", (aBoard.activeConfig===true||aBoard.ActiveConfig===true), "ActiveConfig must be true");
       ok("act-bob-export-no-leak", !stringsOf(ej).join("\n").includes("alice bg"), "leak?");
     } catch(e){ ok("act-bob-export-inherit", false, String(e).slice(0,160)); }
   } else {
@@ -392,10 +409,11 @@ const OVERRIDEMK = MK("override");
       const ej = JSON.parse(expBob2.json.snapshot);
       const top = ej.lead||ej.Lead||{};
       ok("act-export-top-override", (top.background||top.Background)===OVERRIDEMK, "top must retain override");
-      const emb = (ej.board&&ej.board.ActiveJson)||"";
+      const emb = exportActiveJsonOf(ej);
       const pl = parsedLeadOfActive(emb);
-      const leak = stringsOf(ej.board||{}).join("\n").includes("alice bg");
-      ok("act-export-historical-redacted", ((pl.present && pl.value===null) || !pl.present) && !leak, "leadNull="+pl.present+"/"+String(JSON.stringify(pl.value)||"").slice(0,40)+" leak="+leak);
+      const leak = stringsOf(ej.board||ej.Board||{}).join("\n").includes("alice bg");
+      ok("act-export-historical-parse-ok", !pl.parseError, "parseError must be false");
+      ok("act-export-historical-redacted", pl.present && pl.value===null && !leak, "leadNull="+pl.present+"/"+String(JSON.stringify(pl.value)||"").slice(0,40)+" leak="+leak);
     } catch(e){ ok("act-export-top-override", false, String(e).slice(0,160)); }
   } else {
     ok("act-export-top-override", false, "no export");
