@@ -20,6 +20,12 @@ public sealed record ActiveIndexJob(Guid JobId, long Epoch, int Generation);
 
 public static class SourceGovernance
 {
+  /// <summary>Code-only FinishIndex fault seam for rollback tests. In-process QA may set
+  /// <see cref="FinishIndexCallbackFault"/> to force the ACTUAL FinishIndex unit callback to fail AFTER
+  /// staged section/head/event writes, proving full rollback. Never exposed via HTTP routes, environment,
+  /// or headers: it is a plain in-process Func like the PgFaults seams.</summary>
+  public static Func<bool>? FinishIndexCallbackFault;
+
   public const int MaxSections = 20;
   public const int MaxSectionChars = 2000;
   public const int MaxTotalChars = 12000;
@@ -1533,6 +1539,10 @@ public static class SourceGovernance
             cur.IndexState = "completed"; cur.IndexError = ""; cur.IndexCompletedAt = DateTime.UtcNow;
             s.Sources.Flush(); s.SourceSections.Flush();
             RecordEvent(s, cur, eventName, "gen" + res.Generation + " sections" + built.Count);
+            // QA-only inner-callback fault (code-only, never HTTP/env/header): fires AFTER staged writes inside
+            // the ACTUAL unit callback, so the fault escapes and rolls back ALL staged effects. A predecessor
+            // inner-catch that swallowed this would commit partials and fail the rollback assertions.
+            if (FinishIndexCallbackFault?.Invoke() == true) throw new InvalidOperationException("injected finish-index callback fault (SourceGovernance.FinishIndexCallbackFault)");
           // No catch inside the unit: a partial-write failure must escape Atomic.Run so ALL staged source/section/head/event effects roll back instead of committing partials.
         });
         if (stale)

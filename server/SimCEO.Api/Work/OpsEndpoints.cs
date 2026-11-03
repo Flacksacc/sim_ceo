@@ -1182,40 +1182,27 @@ public static class BackupGraphValidator
     }
     foreach (var x in r.sources) if (x is null || Empty(x.Id) || Empty(x.BoardId)) return "Backup source missing lineage.";
     foreach (var ss in r.sections ?? new List<Domain.SourceSection>()) if (ss is null || Empty(ss.Id) || Empty(ss.SourceId)) return "Backup source section missing lineage.";
-    foreach (var d in r.drafts)
+    // Record graphs are validated by the ONE shared complete staged validator (Records F2): typed history
+    // + final revision/token/actor/item correspondence, approved/discarded disjointness, supersedes
+    // parent/cycle, snapshot declared-ref/approved/version/dedup, scope IDs/hash/state. The legacy inline
+    // loop (which demanded SupersedesJson OBJECTS while healthy amend writes STRING ids) is REPLACED here,
+    // not stacked: this call is the only record-graph gate before destructive replacement.
+    var sourceOriginals = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    foreach (var xs in r.sources)
     {
-      if (d is null || Empty(d.Id) || Empty(d.BoardId) || Empty(d.MeetingId)) return "Backup record draft missing lineage.";
-      if (!string.IsNullOrWhiteSpace(d.ApprovedJson))
+      if (xs is null || xs.Id == Guid.Empty) continue;
+      var best = xs.Version; var found = false;
+      foreach (var ee in r.events ?? Enumerable.Empty<Domain.SourceEvent>())
       {
-        try
-        {
-          using var _ap = System.Text.Json.JsonDocument.Parse(d.ApprovedJson);
-          // Typed shape: approved list must be an array of string ids ([1] is malformed and must reject before any write).
-          if (_ap.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft ApprovedJson must be an array.";
-          foreach (var _ae in _ap.RootElement.EnumerateArray())
-          {
-            if (_ae.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft ApprovedJson entries must be strings.";
-          }
-        }
-        catch { return "Backup record draft ApprovedJson is not valid JSON."; }
+        if (ee is null || ee.SourceId != xs.Id || !string.Equals(ee.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)) continue;
+        var det = ee.Detail ?? ""; var arrow = det.IndexOf("->", StringComparison.Ordinal);
+        if (arrow <= 1) continue;
+        if (int.TryParse(det.Substring(0, arrow).Trim().TrimStart('v', 'V'), out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
       }
-      foreach (var dj in new[] { d.ItemsJson, d.SupersedesJson })
-      {
-        if (string.IsNullOrWhiteSpace(dj)) continue;
-        try
-        {
-          using var _dd = System.Text.Json.JsonDocument.Parse(dj);
-          // Typed shape: record graphs must be arrays of objects (object {}, [1], numeric ids are malformed and must reject before any write).
-          if (_dd.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return "Backup record draft JSON must be an array.";
-          foreach (var _de in _dd.RootElement.EnumerateArray())
-          {
-            if (_de.ValueKind != System.Text.Json.JsonValueKind.Object) return "Backup record draft entries must be objects.";
-            if (_de.TryGetProperty("id", out var _did) && _did.ValueKind != System.Text.Json.JsonValueKind.String) return "Backup record draft entry id must be a string.";
-          }
-        }
-        catch { return "Backup record draft JSON is not valid JSON."; }
-      }
+      sourceOriginals[xs.Id.ToString()] = found ? best : xs.Version;
     }
+    var recordErr = RecordsOps.ValidateRestoreEntries(r.drafts, sourceOriginals);
+    if (recordErr is not null) return recordErr;
     // Effective binaries must decode before any live mutation: malformed base64 rejects (no silent Data=null loss).
     if (r.blobs is not null)
     {

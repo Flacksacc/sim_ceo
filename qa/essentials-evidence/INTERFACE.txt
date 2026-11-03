@@ -1,0 +1,107 @@
+ESSENTIALS-EVIDENCE PUBLIC PARSER/VALIDATOR INTERFACE (Muse second repair)
+Scope: SourceGovernance.cs, Evidence.cs, RecordEndpoints.cs, Secretary.cs
+record branches only, OpsEndpoints record-validation loop only.
+MAIN.tmp/essentials-evidence-interface.txt is not writable from this lane
+(No MAIN rule); this owned copy is the authoritative handoff text.
+
+1) EvidenceRef.TryParseRecordRef(string? rf, out Guid recordId, out string itemId, out string error) -> bool
+   File: server/SimCEO.Api/Work/Evidence.cs (public, static).
+   Contract: bare "<guid>" = legacy whole-record ref (itemId ""); "<guid>:<itemId>" =
+   explicit item ref where itemId must be NONEMPTY and canonical (no leading/trailing
+   whitespace). Split is on the FIRST colon so item ids containing colons round-trip
+   with ForRecordItem. Anything else (blank, "A:", "A: ", "<guid>:", "<guid>: ", ":s1",
+   non-GUID parts) returns false and must NEVER fall back to whole-record.
+   Wire parsing (EvidenceRef.Parse) stays lenient by design; strictness is enforced by
+   actual consumers. Source/caller compatibility: old bare-GUID refs keep working
+   everywhere; callers that built composites by string concat now route through this.
+
+2) RecordsOps.ValidateRestoreEntries(IEnumerable<RecordDraft> drafts, IDictionary<string,int>? sourceOriginalOf = null) -> string? (null = valid)
+   File: server/SimCEO.Api/Work/RecordEndpoints.cs (public, static).
+   The ONE shared complete staged record validator, called by Ops BEFORE any destructive
+   replacement (BackupGraphValidator.Validate). Covers: lineage IDs + uniqueness; typed
+   items (ItemMap/ValidateDraftItems, rejects numeric ids); Approved/Discarded strict
+   string lists + membership + disjointness; typed history (StrictHistoryEntries: seq
+   ascent, integral counters, non-empty actor/token) + final revision/token tip match
+   (HistoryTipMatches) + actor/item-action correspondence (HistoryActionCheck: approve->
+   approved, discard->discarded, revise->items, branch/create carry none); supersedes
+   strict string GUIDs + parent existence in the SAME batch + same board/meeting scope +
+   batch-local cycle detection (A->B->A); snapshot shape (StrictSnapshotEntries) +
+   SnapshotRestoreCheck (item exists, declared-ref correspondence, one entry per
+   item/ref/version, no same-target different versions, entry on approved items,
+   requested-version pin == entry version or genuine same-source original alias
+   (requested1/resolved3 valid, unrelated999 rejected), available entries carry bytes);
+   status/state coherence (known statuses, no empty decisions, content hash when review
+   state present).
+   Legacy rule: blank token AND blank history AND blank snapshots (genuine pre-review v2
+   rows, e.g. the primary 20261103-141739 backup drafts with no DiscardedJson/ReviewToken/
+   HistoryJson/EvidenceSnapshotJson) are ACCEPTED with bytes preserved: reads stay
+   lenient, every mutation still fails closed via StrictStateCheck until explicit repair.
+   No approval history is fabricated; no healthy old graph is blanket-rejected.
+   sourceOriginalOf maps source-id -> ORIGINAL (pre-renumber) version; Ops builds it from
+   the staged backup's own sources+migrate-version events (fallback: current version).
+
+3) RecordsOps shared helpers (public, static, same file)
+   - HistoryTipMatches(RecordDraft d, out string error): final history entry revision/token
+     equals the row's ReviewRevision/ReviewToken. Used by StrictStateCheck AND the restore validator.
+   - HistoryActionCheck(...map, approved, discarded...): per-action item correspondence.
+   - SnapshotRestoreCheck(map, approved, snaps, sourceOriginalOf, out error): restore-time
+     snapshot correspondence (stricter than live reads; see above).
+   - RefScalarsValid(JsonElement refs, out string error): shared ref/scalar gate used by BOTH
+     BuildExport modes. Non-array refs, non-object entries, numeric kind/ref/id/version props
+     fail the whole export closed (no failopen partial render, no erasure of stored bytes).
+     BuildExport additionally prevalidates EVERY item (approved or not) before any render decision.
+
+4) RecordsOps.TryBuildSnapshots(..., Func<string,int?> sourceOriginalOf)
+   Required (not optional) alias resolver: requested1/resolved3 captures available at the
+   RESOLVED canonical version; unrelated999 captures unavailable. Production call sites pass
+   SourceGovernance.OriginalVersionOf lookups; QA passes store-backed maps.
+
+5) RecordsOps live/stored record resolution (public behavior, same file)
+   - ResolveEvidenceAuthorized: explicit item refs resolve the REFERENCED item; LIVE Current
+     requires the effective referenced owner (EffectiveChains over the REFERENCED record's
+     scope) to be (referencedRecordId, referencedVersion). A replaced historical item
+     (A:s1 BUY superseded by B:s1 CUT) is NOT live-current. Whole-record cards additionally
+     require non-empty export text (empty/invalid approved content never yields available).
+     Malformed composites are unavailable, never whole-record.
+   - MergeEvidenceForRead: stored snapshots show historical bytes with CurrentEligible=false
+     when the owner moved (readable but non-current); readback covers declared refs by the
+     version-less target identity, so requested1 reads back EXACTLY ONE available canonical3
+     card instead of appending an unavailable duplicate. Unversioned v1 one-card preserved.
+
+6) Secretary record consumers (server/SimCEO.Api/Work/Secretary.cs, record branches only)
+   - SecretaryContext.CanonicalizeCaller record branch: bare GUID = approved whole-record with
+     exact export scope; item refs resolve the REFERENCED item at its pinned version with exact
+     item/quote scope (excerpt must be contained in the ITEM text, never whole-export for an
+     item cite); historical pins preserve approved exact bytes with their version; malformed
+     composites dropped.
+   - SecretaryContext.BuildPacket caller-record branch: item cites emit
+     "CALLER RECORD vN [item]: <exact item text or exact quote>"; whole-record unchanged;
+     malformed skipped.
+   - EvidenceAvailability.Resolve record branch: bare GUID current-iff approved/current;
+     item refs: removed/moved/meeting/pin/approved/item checks + effective-owner Current
+     ("current" only while the referenced owner still owns it, else "record item replaced").
+     Malformed composite -> "record ref malformed".
+   Publication/reservation/auth/recovery paths untouched; automatic APPROVED RECORD packet
+   section untouched.
+
+7) SourceGovernance.FinishIndexCallbackFault (public static Func<bool>?, code-only seam)
+   File: server/SimCEO.Api/Work/SourceGovernance.cs. QA-only inner-callback fault fired AFTER
+   staged section/head/event writes inside the ACTUAL FinishIndex unit callback: the fault
+   escapes (no inner catch) so Atomic rolls back ALL staged effects. Never HTTP/env/header.
+   A predecessor inner-catch that swallowed this fault would commit partials and fail the
+   rollback assertions (threwFin must be true).
+
+8) OpsEndpoints change (record-validation loop ONLY)
+   BackupGraphValidator.Validate: the legacy per-draft inline loop (which demanded SupersedesJson
+   OBJECTS while healthy amend writes STRING ids) is REPLACED by the single call
+   RecordsOps.ValidateRestoreEntries(r.drafts, sourceOriginals). Capture/restore authority,
+   spend, auth, jobs/voice, wiki, blobs, images untouched.
+
+CALLERS MAP (production)
+  EvidenceRef.TryParseRecordRef <- RecordsOps.SnapshotAuthorize, RecordsOps.ResolveEvidenceAuthorized,
+    RecordsOps.MergeEvidenceForRead (incl. trailing coverage), SecretaryContext.CanonicalizeCaller,
+    SecretaryContext.BuildPacket, EvidenceAvailability.Resolve.
+  RecordsOps.ValidateRestoreEntries <- OpsEndpoints.BackupGraphValidator.Validate (+ QA).
+  RecordsOps.TryBuildSnapshots(+resolver) <- RecordEndpoints ItemApprove/approve-all,
+    Program.cs legacy-compat approve, QA.
+  SourceGovernance.FinishIndexCallbackFault <- set ONLY by in-process QA; read inside FinishIndex.

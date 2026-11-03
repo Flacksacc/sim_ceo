@@ -140,6 +140,34 @@ public sealed record EvidenceRef(
   // item refs encode sourceRecordId:itemId so ownership resolves the
   // REFERENCED item (not the destination item) at its historical version.
   // Whole-record refs (bare recordId, no colon) remain readable for legacy.
+  // Shared STRICT record-ref parser (Records F1/F5 handoff). Valid shapes:
+  //   bare "<guid>"              -> legacy whole-record ref (itemId ""), version pin applies to the record.
+  //   "<guid>:<itemId>"          -> explicit item ref; itemId must be a NONEMPTY canonical id
+  //                                (no leading/trailing whitespace, never blank). Interior colons belong to the
+  //                                item id: the FIRST colon separates record from item so ForRecordItem round-trips.
+  // Anything else is invalid and must NEVER fall back to whole-record: "A:", "A: ", "<guid>: ",
+  // ":s1", non-GUID record parts, and blank refs all fail. Wire parsing (Parse) stays lenient;
+  // strictness is enforced by actual consumers (resolver, snapshots, Secretary callers).
+  // Public contract: EvidenceRef.TryParseRecordRef(out Guid recordId, out string itemId [""=whole-record]).
+  public static bool TryParseRecordRef(string? rf, out Guid recordId, out string itemId, out string error)
+  {
+    recordId = Guid.Empty; itemId = ""; error = "";
+    if (string.IsNullOrWhiteSpace(rf)) { error = "record ref is blank."; return false; }
+    var colon = rf!.IndexOf(":");
+    if (colon < 0)
+    {
+      if (!Guid.TryParse(rf.Trim(), out recordId) || recordId == Guid.Empty) { error = "record ref is not a record id."; recordId = Guid.Empty; return false; }
+      return true;
+    }
+    var left = rf.Substring(0, colon);
+    var right = rf.Substring(colon + 1);
+    if (!Guid.TryParse(left.Trim(), out recordId) || recordId == Guid.Empty) { error = "record ref record part is not a record id."; recordId = Guid.Empty; return false; }
+    if (string.IsNullOrWhiteSpace(right)) { error = "record item ref carries an empty item id; whole-record fallback is forbidden."; return false; }
+    if (right != right.Trim()) { error = "record item ref item id is not canonical (leading/trailing whitespace)."; return false; }
+    itemId = right;
+    return true;
+  }
+
   public static EvidenceRef ForRecordItem(string recordId, int version, string itemId, string? excerpt = null) =>
     new("record", recordId + ":" + itemId, version, null, "record v" + version + " [" + itemId + "]", excerpt);
 

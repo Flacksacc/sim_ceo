@@ -986,7 +986,8 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
           stagedLegacy = stagedLegacyNext;
         }
         var acards = RecordsOps.ResolveEvidenceAuthorized(s, req, draft);
-        if (!RecordsOps.TryBuildSnapshots(draft.EvidenceSnapshotJson, map2, acards, itemIds.Where(x => x is not null).Select(x => x!), draft.ReviewRevision + 1, out var newSnapsLegacy, out var snerr))
+        if (!RecordsOps.TryBuildSnapshots(draft.EvidenceSnapshotJson, map2, acards, itemIds.Where(x => x is not null).Select(x => x!), draft.ReviewRevision + 1, out var newSnapsLegacy, out var snerr,
+          refId => Guid.TryParse(refId, out var og3) && s.Sources.TryGetValue(og3, out var odoc3) && odoc3 is not null ? SourceGovernance.OriginalVersionOf(s, odoc3) : (int?)null))
           return Results.Json(new { error = snerr }, statusCode: 422);
         draft.ApprovedJson = RecordsOps.ToIdList(ap.OrderBy(v => v, StringComparer.Ordinal));
         draft.HistoryJson = stagedLegacy;
