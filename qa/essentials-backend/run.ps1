@@ -180,23 +180,51 @@ function Invoke-Bounded([string]$file, [string[]]$argList, [string]$workdir, $en
     try { $p.Dispose() } catch {}
     return 127
   }
-  # Optional stdin feed (existing contract extension for PgExecQ): small SQL
-  # text is written synchronously BEFORE the concurrent drain starts, then
-  # stdin closes, so a piped psql still sees EOF. Callers without stdin pass
-  # nothing and keep the exact previous behavior.
-  if ($stdinText -ne "") {
-    try { $p.StandardInput.Write($stdinText); $p.StandardInput.Close() }
-    catch {
-      Fail $tag ("stdin feed failed :: " + $_.Exception.Message)
-      try { $p.Kill($true) } catch {}
-      try { $p.Dispose() } catch {}
-      return 124
-    }
-  }
+  # Bounded stdin feed within the same overall operation budget: BOTH output
+  # drains start FIRST (concurrent, no WaitForExit-before-ReadToEnd deadlock),
+  # then stdin writes/closes under the same deadline. A blocked stdin write
+  # cannot escape the bounded contract. Callers without stdin keep the exact
+  # previous behavior. No new framework; same Task/Wait + checked exit + cleanup.
+  $opStart = [DateTime]::UtcNow
+  $opBudgetMs = $secs * 1000
   try {
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($secs * 1000)) {
+    if ($stdinText -ne "") {
+      $stdinRemainMs = $opBudgetMs - ([DateTime]::UtcNow - $opStart).TotalMilliseconds
+      if ($stdinRemainMs -le 0) {
+        Fail $tag "stdin feed exceeded operation budget before write"
+        try { $p.Kill($true) } catch {}
+        try { $p.Dispose() } catch {}
+        return 124
+      }
+      try {
+        $wTask = $p.StandardInput.WriteAsync($stdinText)
+        $wWaitMs = [int][Math]::Max(1000, [Math]::Min($stdinRemainMs, $opBudgetMs))
+        if (-not $wTask.Wait($wWaitMs)) {
+          Fail $tag ("stdin feed timed out within operation budget (" + $wWaitMs + "ms)")
+          try { $p.Kill($true) } catch {}
+          try { $p.Dispose() } catch {}
+          return 124
+        }
+        if ($wTask.IsFaulted) { throw $wTask.Exception.InnerException }
+        try { $p.StandardInput.Close() } catch { throw }
+      }
+      catch {
+        Fail $tag ("stdin feed failed :: " + $_.Exception.Message)
+        try { $p.Kill($true) } catch {}
+        try { $p.Dispose() } catch {}
+        return 124
+      }
+    }
+    $exitRemainMs = $opBudgetMs - ([DateTime]::UtcNow - $opStart).TotalMilliseconds
+    if ($exitRemainMs -le 0) {
+      try { $p.Kill($true) } catch {}
+      $p.WaitForExit(5000) | Out-Null
+      Fail $tag ("timed out after " + $secs + "s; killed")
+      return 124
+    }
+    if (-not $p.WaitForExit([int]$exitRemainMs)) {
       try { $p.Kill($true) } catch {}
       $p.WaitForExit(5000) | Out-Null
       Fail $tag ("timed out after " + $secs + "s; killed")

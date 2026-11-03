@@ -72,6 +72,12 @@ public static class SimCEOEndpoints
   // branch; live re-reads happen only inside commit units that compare
   // against them. Never hold the root across a provider await: this capture
   // is fully synchronous (policy/store reads only, no dispatch).
+  private static T CloneDetached<T>(T row) where T : class
+  {
+    var json = JsonSerializer.Serialize(row);
+    return JsonSerializer.Deserialize<T>(json)!;
+  }
+
   private sealed record DiscussionCapture(
     Meeting Meeting,
     Board? RunBoard,
@@ -95,7 +101,10 @@ public static class SimCEOEndpoints
     Dictionary<Guid, string> LaneBPrints,
     int RequestedCap,
     int EffectiveCap,
-    Guid PriorCapNoteId);
+    Guid PriorCapNoteId,
+    string BoardNameBefore,
+    string BoardMissionBefore,
+    string BoardStageBefore);
 
   private static bool TryCaptureDiscussionContext(InMemoryStore s, Guid id, Meeting m, JsonElement body, HttpRequest req,
     out DiscussionCapture? cap, out IResult? error)
@@ -110,6 +119,11 @@ public static class SimCEOEndpoints
     int pickedCount = 0;
     List<BoardAdvisor> eligible = new();
     string spark = "";
+    int leadVersion = 0;
+    string leadFingerprint = "lead:none";
+    string boardNameBefore = "";
+    string boardMissionBefore = "";
+    string boardStageBefore = "";
     (Guid epochId, long epochRev) publishPin = default;
     long epochBefore = 0; Guid restoreBefore = Guid.Empty;
     long gen = 0; string dirBefore = ""; string effBefore = ""; long leadFloor = 0;
@@ -191,12 +205,32 @@ public static class SimCEOEndpoints
         catch (JsonException) { }
       }
       if (priorCap.HasValue) effectiveCap = Math.Min(priorCap.Value, requestedCap);
+      // Detached snapshot inside the SAME root boundary: lead identity,
+      // board effective content, and every object that leaves the root are
+      // copied here. A failed concurrent mutation that rolls back can never
+      // mutate the run packet source. Never hold the root across an await.
+      leadVersion = lead?.Version ?? 0;
+      leadFingerprint = LeadIdentityFingerprint(lead);
+      if (runBoard is not null)
+      {
+        var effView = LeadSetup.EffectiveView(s, runBoard);
+        boardNameBefore = effView.name ?? "";
+        boardMissionBefore = effView.mission ?? "";
+        boardStageBefore = effView.stage ?? "";
+      }
+      snapM = CloneDetached(snapM);
+      if (runBoard is not null) runBoard = CloneDetached(runBoard);
+      if (lead is not null) lead = CloneDetached(lead);
+      candidates = candidates.Select(CloneDetached).ToList();
+      eligible = eligible.Select(CloneDetached).ToList();
+      yielded = new List<object>(yielded);
+      invitedIds = new HashSet<Guid>(invitedIds);
+      laneBPrints = new Dictionary<Guid, string>(laneBPrints);
     }
-    var leadVersion = lead?.Version ?? 0;
-    var leadFingerprint = LeadIdentityFingerprint(lead);
     cap = new DiscussionCapture(snapM, runBoard, policy, lead, leadVersion, leadFingerprint,
       candidates, eligible, yielded, pickedCount, spark, publishPin, epochBefore, restoreBefore,
-      gen, dirBefore, effBefore, leadFloor, invitedIds, laneBPrints, requestedCap, effectiveCap, priorCapNoteId);
+      gen, dirBefore, effBefore, leadFloor, invitedIds, laneBPrints, requestedCap, effectiveCap, priorCapNoteId,
+      boardNameBefore, boardMissionBefore, boardStageBefore);
     return true;
   }
 
@@ -1054,6 +1088,9 @@ public static class SimCEOEndpoints
       var leadFloor = dx.LeadFloor;
       var invitedIds = dx.InvitedIds;
       var laneBPrints = dx.LaneBPrints;
+      var boardNameBefore = dx.BoardNameBefore;
+      var boardMissionBefore = dx.BoardMissionBefore;
+      var boardStageBefore = dx.BoardStageBefore;
       string LaneBFingerprint(BoardAdvisor laneBAdv) => RosterOps.ReviewedInputFingerprint(s, laneBAdv);
       var effectiveCap = dx.EffectiveCap;
       var priorCapNoteId = dx.PriorCapNoteId;
@@ -1061,8 +1098,8 @@ public static class SimCEOEndpoints
       if (body.TryGetProperty("leadVersion", out var lv) && lv.ValueKind == JsonValueKind.Number
           && lv.GetInt32() != leadVersion)
         return Results.Conflict("Lead profile changed; refresh and retry with the current version.");
-      if (m.State == MeetingState.Paused)
-        return Results.Conflict("Meeting is paused; resume to run discussion.");
+      { MeetingState preState = m.State; try { if (s.Meetings.TryGetValue(id, out var preMtg) && preMtg is not null) preState = preMtg.State; } catch { } if (preState == MeetingState.Paused)
+        return Results.Conflict("Meeting is paused; resume to run discussion."); }
       if (eligible.Count == 0)
         return Results.Json(new { error = "No advisors available for discussion.", fixes = pickedCount > 0 ? new[] { "Re-pick participants from this board's current advisors." } : new[] { "Approve at least one advisor on this board before running discussion." }, yielded }, statusCode: 409);
       var ownerOverride = PeopleOps.IsOwner(req);
@@ -1185,16 +1222,17 @@ public static class SimCEOEndpoints
         LaneBFail("provider failure during bidding", 0, laneBRemain);
         return PeopleOps.ModelError(laneBEx);
       }
-      if (m.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
+      { long freshGenAfterBid = gen; MeetingState freshStateAfterBid = MeetingState.Active; try { if (s.Meetings.TryGetValue(id, out var freshAfterBid) && freshAfterBid is not null) { freshGenAfterBid = freshAfterBid.Generation; freshStateAfterBid = freshAfterBid.State; } } catch { }
+      if (freshStateAfterBid is not (MeetingState.Active or MeetingState.AwaitingBrief))
       {
         var laneBRemainStateAfterBid = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
         return LaneBFail("meeting state changed; unsent drafts discarded", 0, laneBRemainStateAfterBid);
       }
-      if (m.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
+      if (freshGenAfterBid != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
       {
         var laneBRemainAfterBid = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
         return LaneBFail("new owner turn arrived; unsent drafts discarded", 0, laneBRemainAfterBid);
-      }
+      } }
       var bidScores = bidResults.ToDictionary(b => b.adv.Id, b => b.score);
       var willing = eligible.Where(a => bidScores.TryGetValue(a.Id, out var sc) && sc > 0).ToList();
       // Lane B: enforce the durable per-lead minimum before selection and again at commit.
@@ -1251,11 +1289,12 @@ public static class SimCEOEndpoints
           }
           finally { draftSem.Release(); }
         }));
-        if (m.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
+        { long freshGenBetween = gen; try { if (s.Meetings.TryGetValue(id, out var freshBetween) && freshBetween is not null) freshGenBetween = freshBetween.Generation; } catch { }
+        if (freshGenBetween != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
         {
           var laneBRemainBetween = rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
           return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, laneBRemainBetween);
-        }
+        } }
         if (drafts.Any(d => d.manifest is not null && d.manifest.SourceIds.Count > 0)) evSupported = true;
         var challenged = DiscussionPolicy.AssignChallenge(round, evSupported, a => (double)(a.BoardRole.Length % 5));
         lastChallenged = challenged?.BoardRole ?? lastChallenged;
@@ -1295,6 +1334,15 @@ public static class SimCEOEndpoints
               { laneBGate = LaneBFail("lead profile changed; refresh and retry with the current version", rounds.Count, LaneBRemaining()); return; }
             var policyNow = EffectiveDiscussionPolicy(s, cur.BoardId);
             if (!string.Equals(policyNow, policy, StringComparison.Ordinal)) { laneBGate = LaneBFail("discussion policy changed; refresh and retry with the current version", rounds.Count, LaneBRemaining()); return; }
+            // Narrow board-content compare from the detached capture: the packet
+            // embeds the effective name/mission/stage, so a committed board edit
+            // during generation must discard instead of publishing stale content.
+            // A failed board PATCH that rolled back leaves live content equal to
+            // the capture, so it does not discard.
+            { string freshName = ""; string freshMission = ""; string freshStage = "";
+              try { if (s.Boards.TryGetValue(cur.BoardId, out var freshBoard) && freshBoard is not null) { var fv = LeadSetup.EffectiveView(s, freshBoard); freshName = fv.name ?? ""; freshMission = fv.mission ?? ""; freshStage = fv.stage ?? ""; } } catch { }
+              if (!string.Equals(freshName, boardNameBefore, StringComparison.Ordinal) || !string.Equals(freshMission, boardMissionBefore, StringComparison.Ordinal) || !string.Equals(freshStage, boardStageBefore, StringComparison.Ordinal))
+                { laneBGate = LaneBFail("board content changed during generation; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; } }
             // Lane B: re-derive the durable minimum at commit; it can only stay equal or shrink.
             var commitCap = effectiveCap;
             foreach (var capNote in s.Notes.Values.Where(n => n.MeetingId == id && n.Kind == "run-cap").ToList())
@@ -1319,7 +1367,7 @@ public static class SimCEOEndpoints
               if (text is null || error is not null) { yielded.Add(new { advisor = adv.BoardRole, reason = "provider-error" }); continue; }
               if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) { abstained.Add(adv.BoardRole); yielded.Add(new { advisor = adv.BoardRole, reason = "abstained" }); continue; }
               // Lane B: fresh-fetch; a sync or edit/review during generation yields/discards the stale response.
-              if (!s.Advisors.TryGetValue(adv.Id, out var freshAdv) || freshAdv.Removed || freshAdv.BoardId != m.BoardId)
+              if (!s.Advisors.TryGetValue(adv.Id, out var freshAdv) || freshAdv.Removed || freshAdv.BoardId != cur.BoardId)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
               if (!invitedIds.Contains(adv.Id) && !freshAdv.Approved)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "reapproval-required" }); continue; }
@@ -1336,7 +1384,7 @@ public static class SimCEOEndpoints
             var (clean, stance) = MessageTags.SplitStance(text);
             var msg = new Message
             {
-              MeetingId = id, BoardId = m.BoardId, AdvisorId = adv.Id,
+              MeetingId = id, BoardId = cur.BoardId, AdvisorId = adv.Id,
               Sequence = ++next,
               Sender = "advisor", AdvisorName = adv.BoardRole,
               Content = clean + (adv == challenged ? " [challenge: evidence-supported]" : ""),
@@ -1368,7 +1416,8 @@ public static class SimCEOEndpoints
           }
         }
       }
-      Atomic.Audit(s, new AuditEvent { BoardId = m.BoardId, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) });
+      { Guid auditBoard = m.BoardId; try { if (s.Meetings.TryGetValue(id, out var auditMtg) && auditMtg is not null) auditBoard = auditMtg.BoardId; } catch { }
+      Atomic.Audit(s, new AuditEvent { BoardId = auditBoard, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) }); }
       await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, id, "run-complete",
         new { meetingId = id, published = published.Count, revision = (s.Meetings.TryGetValue(id, out var __bc) ? __bc.DeliveredRevision : m.DeliveredRevision) }, "read");
       var finalTitle = "Run: " + published.Count + " replies, " + yielded.Count + " yields";

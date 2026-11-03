@@ -87,6 +87,29 @@ sealed class FailBackend : IPgBackend
   {
     lock (_gate) return _live.TryGetValue(Key<T>(id), out var v) ? (T)v : null;
   }
+  public TResult? Project<T, TResult>(Guid id, Func<T?, TResult?> project) where T : class
+  {
+    lock (_gate)
+    {
+      _live.TryGetValue(Key<T>(id), out var v);
+      var typed = v as T;
+      return project(typed);
+    }
+  }
+  public void Mutate<T>(Guid id, Func<T> create, Action<T> mutate) where T : class
+  {
+    lock (_gate)
+    {
+      if (!_live.TryGetValue(Key<T>(id), out var v) || v is not T existing)
+      {
+        var e = create();
+        try { var ip = typeof(T).GetProperty("Id"); if (ip is not null && ip.CanWrite) { var cur = ip.GetValue(e); if (cur is Guid g && g != id) ip.SetValue(e, id); } } catch { }
+        mutate(e);
+        _live[Key<T>(id)] = e;
+      }
+      else mutate(existing);
+    }
+  }
   public List<T> All<T>() where T : class
   {
     lock (_gate)

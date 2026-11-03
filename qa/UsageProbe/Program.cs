@@ -1038,6 +1038,8 @@ sealed class FailReadBackend : SimCEO.Api.Data.IPgBackend
   public FailReadBackend(SimCEO.Api.Data.IPgBackend inner) { Inner = inner; }
   public T? Find<T>(Guid id) where T : class => throw new InvalidOperationException("qa injected read failure");
   public List<T> All<T>() where T : class => throw new InvalidOperationException("qa injected read failure");
+  public TResult? Project<T, TResult>(Guid id, Func<T?, TResult?> project) where T : class => throw new InvalidOperationException("qa injected read failure");
+  public void Mutate<T>(Guid id, Func<T> create, Action<T> mutate) where T : class => throw new InvalidOperationException("qa injected read failure");
   public void Upsert<T>(T entity) where T : class => Inner.Upsert(entity);
   public bool Remove<T>(Guid id) where T : class => Inner.Remove<T>(id);
   public void Clear<T>() where T : class => Inner.Clear<T>();
@@ -1072,6 +1074,8 @@ sealed class FailBackend : SimCEO.Api.Data.IPgBackend
   }
   public T? Find<T>(Guid id) where T : class => Inner.Find<T>(id);
   public List<T> All<T>() where T : class => Inner.All<T>();
+  public TResult? Project<T, TResult>(Guid id, Func<T?, TResult?> project) where T : class => Inner.Project<T, TResult>(id, project);
+  public void Mutate<T>(Guid id, Func<T> create, Action<T> mutate) where T : class => Inner.Mutate<T>(id, create, mutate);
   public void Upsert<T>(T entity) where T : class { Upserts++; try { var gid = RowId(entity); if (gid != Guid.Empty) Attempted.Add((typeof(T).Name, gid)); } catch { } if (FailOnUpsert == Upserts) throw new InvalidOperationException("qa injected storage failure on append " + Upserts); Inner.Upsert(entity); }
   public bool Remove<T>(Guid id) where T : class => Inner.Remove<T>(id);
   public void Clear<T>() where T : class => Inner.Clear<T>();

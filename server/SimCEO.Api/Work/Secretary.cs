@@ -1568,8 +1568,14 @@ return null;
             created = next;
           }
           return Results.Ok(created);
-        }); } catch (Exception editEx) when (SecretaryEndpoints.IsStorageFault(editEx))
-        { return Results.Json(new { error = "Storage fault during note edit; safe to retry." }, statusCode: 502); }
+        }); } catch (Exception editEx)
+        {
+          var editMapped = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(editEx, "Note edit");
+          if (editMapped is not null) return editMapped;
+          if (SecretaryEndpoints.IsStorageFault(editEx))
+            return Results.Json(new { error = "Storage fault during note edit; safe to retry." }, statusCode: 502);
+          throw;
+        }
       } }
     });
     app.MapPost("/api/notes/{id:guid}/reverse", (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
@@ -1596,8 +1602,14 @@ return null;
             s.Notes.Flush(); s.NoteHistories.Flush();
           }
           return Results.Ok(fresh);
-        }); } catch (Exception revEx) when (SecretaryEndpoints.IsStorageFault(revEx))
-        { return Results.Json(new { error = "Storage fault during note reversal; safe to retry." }, statusCode: 502); }
+        }); } catch (Exception revEx)
+        {
+          var revMapped = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(revEx, "Note reversal");
+          if (revMapped is not null) return revMapped;
+          if (SecretaryEndpoints.IsStorageFault(revEx))
+            return Results.Json(new { error = "Storage fault during note reversal; safe to retry." }, statusCode: 502);
+          throw;
+        }
       } }
     });
     app.MapGet("/api/notes/{id:guid}/history", (InMemoryStore s, HttpRequest req, Guid id) =>

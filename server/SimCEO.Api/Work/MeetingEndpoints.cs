@@ -263,7 +263,10 @@ public static class MeetingEndpoints
           return null;
         }); } catch (Exception ncEx)
         {
-          if (ncEx is InvalidOperationException && (ncEx.Message ?? "").Contains("meeting moved", StringComparison.OrdinalIgnoreCase))
+          var ncMapped = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ncEx, "Note creation");
+          if (ncMapped is not null)
+            gateErr = ncMapped;
+          else if (ncEx is InvalidOperationException && (ncEx.Message ?? "").Contains("meeting moved", StringComparison.OrdinalIgnoreCase))
             gateErr = Results.Json(new { error = "Meeting moved during note creation; retry." }, statusCode: 409);
           else if (SimCEO.Api.Work.SecretaryEndpoints.IsStorageFault(ncEx))
             gateErr = Results.Json(new { error = "Storage fault during note creation; safe to retry." }, statusCode: 502);

@@ -167,6 +167,7 @@ if ($Action -eq "start") {
   } else {
     Write-Host "  compose ps needs private config; listing owned project containers by label (secret-free):"
     docker ps --filter "label=com.docker.compose.project=$Project" --format "table {{.Names}} {{.Status}} {{.Ports}}"
+    if ($LASTEXITCODE -ne 0) { throw "label-only status failed (exit $LASTEXITCODE)" }
   }
   try {
     $r = Invoke-WebRequest -Uri ("http://localhost:" + $AppPort + "/ready") -TimeoutSec 5 -UseBasicParsing
@@ -183,9 +184,11 @@ if ($Action -eq "start") {
     Invoke-Compose -argv @("stop")
   } else {
     $ids = @(docker ps -q --filter "label=com.docker.compose.project=$Project" 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($LASTEXITCODE -ne 0) { throw "label-only stop enumeration failed (exit $LASTEXITCODE)" }
     if ($ids.Count -eq 0) { Write-Host "  no running owned project containers found; nothing to stop." }
     else {
       docker stop @ids | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "label-only stop failed (exit $LASTEXITCODE)" }
       Write-Host ("  stopped " + $ids.Count + " owned container(s) without secret interpolation.")
     }
   }

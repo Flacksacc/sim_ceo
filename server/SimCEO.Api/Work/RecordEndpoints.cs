@@ -1299,9 +1299,13 @@ public static partial class RecordsOps
     try { return PeopleOps.UserOf(s, req); } catch { return "owner"; }
   }
 
-  private static IResult CommitFailed()
+  private static IResult CommitFailed(Exception ex, string action)
   {
-    return Results.Json(new { error = "Record mutation failed before commit; no state changed." }, statusCode: 500);
+    var mapped = SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, action);
+    if (mapped is not null) return mapped;
+    if (ex is InvalidOperationException iox)
+      return SimCEO.Api.Work.CommitOutcome.StorageFault(action, iox);
+    return Results.Json(new { error = action + " failed before commit; no state changed." }, statusCode: 500);
   }
 
   private static bool IsSuperseded(RecordDraft d)
@@ -1433,7 +1437,7 @@ public static partial class RecordsOps
             };
             Dictionary<string, object?> payload;
             try { payload = RecordsOps.ReviewPayload(s, req, staged, meeting); }
-            catch (Exception px) { return Results.Json(new { error = "Review payload failed before commit; no state changed (" + px.GetType().Name + ")." }, statusCode: 500); }
+            catch (Exception px) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(px, "Review payload") ?? Results.Json(new { error = "Review payload failed before commit; no state changed (" + px.GetType().Name + ")." }, statusCode: 500); }
             d.Watermark = newWm;
             d.HistoryJson = newHistoryF;
             d.ReviewRevision++;
@@ -1443,7 +1447,7 @@ public static partial class RecordsOps
             return Results.Ok(payload);
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record refresh"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1504,7 +1508,7 @@ public static partial class RecordsOps
             return Results.Ok(RecordsOps.SafeDraft(d));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record approve"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1570,7 +1574,7 @@ public static partial class RecordsOps
             return Results.Ok(RecordsOps.SafeDraft(d));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record approve-all"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1646,7 +1650,7 @@ public static partial class RecordsOps
             return Results.Ok(RecordsOps.SafeDraft(d));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record revise"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1703,7 +1707,7 @@ public static partial class RecordsOps
             return Results.Ok(RecordsOps.SafeDraft(d));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record discard"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1791,7 +1795,7 @@ public static partial class RecordsOps
             return Results.Created("/api/records/" + next.Id, RecordsOps.SafeDraft(next));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record version"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
@@ -1865,7 +1869,7 @@ public static partial class RecordsOps
             return Results.Ok(RecordsOps.SafeDraft(d));
           });
         }
-        catch (Exception) { return CommitFailed(); }
+        catch (Exception ex) { return CommitFailed(ex, "Record discard-all"); }
       }
       if (pendingAudit is not null) Atomic.Audit(s, pendingAudit);
       return result;
