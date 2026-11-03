@@ -604,7 +604,17 @@ public static class OpsEndpoints
       // Deep graph validation BEFORE any destructive mutation: non-null entries, unique
       // IDs, complete parent relationships, valid GUID keys and strict base64 binaries.
       var graphError = ValidateRestoreGraph(restored);
-      if (graphError is not null) return Results.BadRequest(graphError);
+      if (graphError is not null)
+      {
+        // Record-graph rejection (F2): a well-formed backup whose staged record
+        // graph fails the complete validator (wiped modern history, forged
+        // lifecycle, bad correspondence) rejects as 422 with the exact cause,
+        // matching the other domain-graph rejections below. Malformed shapes
+        // (missing collections, nulls, dups, dangling lineage) stay 400.
+        if (graphError.StartsWith("Backup record ", StringComparison.Ordinal))
+          return Results.Json(new { error = graphError }, statusCode: 422);
+        return Results.BadRequest(graphError);
+      }
       // Phase 6 graph validation: canonical identities, uniqueness, parent
       // relationships, heads, section metadata, legal states. Malformed or
       // forged graphs are rejected with zero partial state.
@@ -1308,12 +1318,12 @@ public static class BackupGraphValidator
     // loop (which demanded SupersedesJson OBJECTS while healthy amend writes STRING ids) is REPLACED here,
     // not stacked: this call is the only record-graph gate before destructive replacement.
     // Staged source-version maps (F3/P1): built from the staged graph's own
-    // sources+migrate-version events+heads via the shared helper, so alias and
+    // sources+migrate-version events via the shared helper, so alias and
     // canonical validation reflect actual staged provenance, never caller invention.
+    // Canonical identity is the referenced row's own Version (never the head/max).
     var (sourceOriginals, sourceCanonicals) = RecordsOps.BuildSourceVersionMaps(
       r.sources ?? Enumerable.Empty<Domain.SourceDoc>(),
-      r.events ?? Enumerable.Empty<Domain.SourceEvent>(),
-      r.heads ?? Enumerable.Empty<Domain.SourceFamilyHead>());
+      r.events ?? Enumerable.Empty<Domain.SourceEvent>());
     // Controlled old-schema legacy-marker import (F2/P1): pre-marker backups (version<4)
     // carry no LegacyReview property, so missing (null) markers become true ONLY where
     // the recognized old prehistory shape and genuine base contract validate. Modern v4

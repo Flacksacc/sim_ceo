@@ -140,7 +140,15 @@ public static partial class RecordsOps
       {
         if (el.TryGetProperty(opt, out var pov) && pov.ValueKind != JsonValueKind.String) return "";
       }
-      if (el.TryGetProperty("refs", out var prf) && !RefScalarsValid(prf, out _)) return "";
+      if (el.TryGetProperty("refs", out var prf))
+      {
+        if (!RefScalarsValid(prf, out _)) return "";
+        // Semantic ref parity (F6): a scalar-well-typed but unparseable ref
+        // ({} / unknown kind / missing identity) fails BOTH export modes here,
+        // before any render decision. Stored bytes are never rewritten.
+        foreach (var rr in prf.EnumerateArray())
+          if (EvidenceRef.Parse(rr) is null) return "";
+      }
       itemIds.Add(pi.GetString()!);
     }
     // Approval-to-item correspondence (F6): a ghost approved id (no draft item)
@@ -250,7 +258,12 @@ public static partial class RecordsOps
         {
           if (el.TryGetProperty(opt, out var ov) && ov.ValueKind != JsonValueKind.String) return false;
         }
-        if (el.TryGetProperty("refs", out var rf) && !RefScalarsValid(rf, out _)) return false;
+        if (el.TryGetProperty("refs", out var rf))
+        {
+          if (!RefScalarsValid(rf, out _)) return false;
+          foreach (var rr in rf.EnumerateArray())
+            if (EvidenceRef.Parse(rr) is null) return false;
+        }
       }
       return true;
     }
@@ -275,6 +288,7 @@ public static partial class RecordsOps
       ["reviewRevision"] = d.ReviewRevision, ["reviewToken"] = d.ReviewToken,
       ["historyJson"] = d.HistoryJson, ["supersedesJson"] = d.SupersedesJson,
       ["decided"] = d.Decided, ["status"] = d.Status, ["createdAt"] = d.CreatedAt,
+      ["legacyReview"] = d.LegacyReview,
     };
   }  public static Dictionary<string, JsonElement> ItemMap(string itemsJson, out string error)
   {
@@ -729,43 +743,27 @@ public static partial class RecordsOps
   }
 
   // Shared staged source-version map builder (F3/P1 contract). Both maps derive from
-  // the STAGED graph's own rows: original = min migrate-version from-version for the
-  // source (fallback: the staged current version, never an alias); canonical = the
-  // staged head pin for the source's family when positive, else the staged family max.
-  // Ops restore and QA build both maps with this helper, so a forged alias (pin 1
-  // with no real migrate event) falls back to canonical and fails the declared pin.
+  // the STAGED graph's own rows, keyed by the REFERENCED source row itself:
+  // original = the genuine migrate-version alias root for that row (validated
+  // destination/eventVersion/per-source chain via SourceGovernance; fallback: the
+  // staged row version, never an alias); canonical = the referenced row's OWN
+  // Version, never the current family head or maximum. A valid historical capture
+  // (pin 1 / capture 3 on a v3 row) therefore stays restorable after a newer head
+  // (T v4) moves the family, and a capture naming another row's version (pin 1 /
+  // capture 4) fails. Ops restore and QA build both maps with this helper, so a
+  // forged alias (pin 1 with no genuine migrate chain) falls back to the row
+  // version and fails the declared pin.
   public static (Dictionary<string, int> OriginalOf, Dictionary<string, int> CanonicalOf) BuildSourceVersionMaps(
-    IEnumerable<Domain.SourceDoc> sources, IEnumerable<Domain.SourceEvent> events, IEnumerable<Domain.SourceFamilyHead> heads)
+    IEnumerable<Domain.SourceDoc> sources, IEnumerable<Domain.SourceEvent> events)
   {
     var srcList = sources.Where(x => x is not null && x.Id != Guid.Empty).ToList();
     var evtList = (events ?? Enumerable.Empty<Domain.SourceEvent>()).Where(x => x is not null).ToList();
-    var headList = (heads ?? Enumerable.Empty<Domain.SourceFamilyHead>()).Where(x => x is not null).ToList();
     var orig = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     foreach (var xs in srcList)
-    {
-      var best = xs.Version; var found = false;
-      foreach (var ee in evtList)
-      {
-        if (ee.SourceId != xs.Id || !string.Equals(ee.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)) continue;
-        var det = ee.Detail ?? ""; var arrow = det.IndexOf("->", StringComparison.Ordinal);
-        if (arrow <= 1) continue;
-        if (int.TryParse(det.Substring(0, arrow).Trim().TrimStart('v', 'V'), out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
-      }
-      orig[xs.Id.ToString()] = found ? best : xs.Version;
-    }
-    var famMax = new Dictionary<string, int>(StringComparer.Ordinal);
-    foreach (var xs in srcList)
-    {
-      var fk = xs.BoardId.ToString("N") + "|" + (xs.FamilyKey ?? "");
-      famMax[fk] = famMax.TryGetValue(fk, out var mm) ? Math.Max(mm, xs.Version) : xs.Version;
-    }
+      orig[xs.Id.ToString()] = SourceGovernance.GenuineOriginalVersion(evtList, xs.Id, xs.Version) ?? xs.Version;
     var canon = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     foreach (var xs in srcList)
-    {
-      var fk = xs.BoardId.ToString("N") + "|" + (xs.FamilyKey ?? "");
-      var pin = headList.Where(h => h.BoardId == xs.BoardId && string.Equals(h.FamilyKey ?? "", xs.FamilyKey ?? "", StringComparison.Ordinal) && h.HeadVersion > 0).Select(h => (int?)h.HeadVersion).FirstOrDefault();
-      canon[xs.Id.ToString()] = pin ?? (famMax.TryGetValue(fk, out var fm) ? fm : xs.Version);
-    }
+      canon[xs.Id.ToString()] = xs.Version;
     return (orig, canon);
   }
   // Whitespace-robust blank JSON array test (F2/P1): null, empty, "[]", and "[ ]" all
@@ -862,8 +860,8 @@ public static partial class RecordsOps
   // pre-review v2 backups) are ACCEPTED with bytes preserved: they read/export readonly and every
   // mutation still fails closed until explicit repair. No approval history is fabricated and no
   // healthy old graph is blanket-rejected. Only malformed graphs fail here.
-  // sourceOriginalOf maps a source id string to its ORIGINAL version (pre-renumber alias root).
-  // sourceCanonicalOf maps a source id string to its CANONICAL version (staged head pin, else family max); alias capture must equal it.
+  // sourceOriginalOf maps a source id string to its ORIGINAL version (genuine alias root, else row version).
+  // sourceCanonicalOf maps a source id string to its CANONICAL version (the referenced row's own Version); alias capture must equal it.
   public static string ValidateRestoreEntries(IEnumerable<RecordDraft> drafts, IDictionary<string, int>? sourceOriginalOf = null, IDictionary<string, int>? sourceCanonicalOf = null)
   {
     var byId = new Dictionary<string, RecordDraft>(StringComparer.OrdinalIgnoreCase);
@@ -934,8 +932,21 @@ public static partial class RecordsOps
         if (legacyErr is not null) return legacyErr;
         continue;
       }
+      // Legitimate writer-created superseded parents (F2): a whole-draft revision
+      // (and the pending legacy-copy path) deliberately leaves the parent
+      // superseded/decided with empty decision sets, writer-typed history, and a
+      // lined child superseding it. Recognize that shape BEFORE the ordinary
+      // decided-with-no-decisions reject; forged decided-empty rows (non-superseded,
+      // or superseded without history/child) still reject here, and the parent
+      // below still faces the full typed history/lineage/cycle/hash/version gates.
       if (d.Decided && apSet.Count == 0 && dcSet.Count == 0)
-        return "Backup record draft decided with no decisions.";
+      {
+        var supersededParentOk = string.Equals((d.Status ?? "").Trim(), "superseded", StringComparison.OrdinalIgnoreCase)
+          && !IsBlankJsonArray(d.HistoryJson)
+          && drafts.Any(x => x is not null && x.Id != d.Id && SupersededIdSet(x).Contains(d.Id.ToString()));
+        if (!supersededParentOk)
+          return "Backup record draft decided with no decisions.";
+      }
       // Modern writer-identity correspondence (F2): version, content hash, and
       // status/decided lifecycle must match actual writer semantics. Legacy
       // pre-review rows (above) stay byte-preserved and readonly.
@@ -1866,6 +1877,7 @@ public static partial class RecordsOps
       ["evidence"] = cards,
       ["historyCount"] = HistoryCount(d.HistoryJson),
       ["meetingWatermark"] = mtg.DeliveredRevision,
+      ["legacyReview"] = d.LegacyReview,
       ["effectiveIds"] = mine is null ? new List<string>() : mine.EffectiveIds,
       ["effectiveExport"] = mine is null ? "" : mine.ConciseExport,
       ["lineageEffects"] = AmendmentEffects(s, d),
@@ -1924,6 +1936,7 @@ public static partial class RecordsOps
       ["evidence"] = cards,
       ["historyCount"] = histCount,
       ["meetingWatermark"] = mtg.DeliveredRevision,
+      ["legacyReview"] = d.LegacyReview,
       ["effectiveIds"] = mine is null ? new List<string>() : mine.EffectiveIds,
       ["effectiveExport"] = mine is null ? "" : mine.ConciseExport,
       ["lineageEffects"] = AmendmentEffects(s, d),
@@ -2068,7 +2081,13 @@ public static partial class RecordsOps
               return Results.Json(new { error = "Review changed since you loaded it; refresh review and choose again." }, statusCode: 409);
             if (wantWm != d.Watermark)
               return Results.Json(new { error = "Stale refresh snapshot; reload the review and refresh deliberately." }, statusCode: 409);
-            if (d.Watermark == meeting.DeliveredRevision)
+            // Narrow legacy-adoption exception (F2): a pending genuine-legacy row whose
+            // watermark already equals the meeting watermark may still enter modern
+            // review through this explicit refresh, which writes the first history
+            // entry (adoption) with no invented approval. Non-legacy equal-watermark
+            // rows stay 409. After adoption the history is non-blank, so later
+            // same-watermark refreshes return to 409.
+            if (d.Watermark == meeting.DeliveredRevision && !RecordsOps.IsLegacyAdoptable(d))
               return Results.Json(new { error = "Review is already current; approve deliberately instead of refreshing." }, statusCode: 409);
             var actor = ActorOf(s, req);
             var viewedV = d.Version; var viewedH = d.Hash; var viewedW = d.Watermark; var viewedT = d.ReviewToken;

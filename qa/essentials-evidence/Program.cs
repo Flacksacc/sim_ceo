@@ -47,7 +47,7 @@ static void SeedSections(InMemoryStore s, SourceDoc d)
 }
 static void SeedMigrateEvent(InMemoryStore s, Guid boardId, Guid sourceId, int fromV, int toV)
 {
-  var e = new SourceEvent { BoardId = boardId, SourceId = sourceId, Action = "migrate-version", Detail = "v" + fromV + "->v" + toV };
+  var e = new SourceEvent { BoardId = boardId, SourceId = sourceId, FamilyKey = "", Version = toV, Action = "migrate-version", Detail = "v" + fromV + "->v" + toV };
   s.SourceEvents[e.Id] = e; s.SourceEvents.Flush();
 }
 static int? OrigOf(InMemoryStore s, string refId)
@@ -81,7 +81,7 @@ static (int exit, string stdout, string stderr, bool timedOut) RunBounded(string
 }
 // Staged maps built the Ops way (F3/P1 contract): from the store's own sources+events+heads.
 static (Dictionary<string, int> orig, Dictionary<string, int> canon) MapsOf(InMemoryStore s)
-  => RecordsOps.BuildSourceVersionMaps(s.Sources.Values, s.SourceEvents.Values, s.SourceHeads.Values);
+  => RecordsOps.BuildSourceVersionMaps(s.Sources.Values, s.SourceEvents.Values);
 var mem = new InMemoryStore();
 var ownerReq = FakeReq(""); var aliceReq = FakeReq("alice"); var bobReq = FakeReq("bob");
 var bid1 = SeedBoard(mem, "allowAll", "");
@@ -324,6 +324,9 @@ recV2.Hash = H(recV2.ItemsJson);
     ("unapproved-numeric-detail", "[{\"id\":\"g1\",\"text\":\"good\"},{\"id\":\"u9\",\"text\":\"unapproved\",\"detail\":5}]"),
     ("ghost-approved", "[{\"id\":\"g1\",\"text\":\"good\"}]"),
     ("numeric-approved", "[{\"id\":1,\"text\":\"x\"}]"),
+    ("refs-empty-object", "[{\"id\":\"g1\",\"text\":\"good\",\"refs\":[{}]}]"),
+    ("ref-unknown-kind", "[{\"id\":\"g1\",\"text\":\"good\",\"refs\":[{\"kind\":\"zzz\",\"ref\":\"x\"}]}]"),
+    ("ref-missing-identity", "[{\"id\":\"g1\",\"text\":\"good\",\"refs\":[{\"kind\":\"note\"}]}]"),
   };
   foreach (var (cname, citems) in cases)
   {
@@ -494,6 +497,74 @@ draftB.Hash = H(draftB.ItemsJson);
     b2.ItemsJson = g.ItemsJson; b2.ApprovedJson = g.ApprovedJson; b2.DiscardedJson = g.DiscardedJson; b2.ReviewRevision = g.ReviewRevision; b2.ReviewToken = g.ReviewToken; b2.HistoryJson = g.HistoryJson; b2.EvidenceSnapshotJson = g.EvidenceSnapshotJson; b2.Decided = g.Decided; b2.Status = g.Status;
   }, stagedOrig, stagedCanon);
 }
+// ---- F2 whole-draft revise parent: writer-shaped superseded/decided/empty restores ----
+{
+  var f2rMeet = new Meeting { BoardId = bid1, Title = "f2r-m", State = MeetingState.Active, Generation = 0 }; mem.Meetings[f2rMeet.Id] = f2rMeet; mem.Meetings.Flush();
+  var rItems = "[{\"id\":\"s1\",\"text\":\"BUY\"},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
+  var rParentHist = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f2-R1\",\"action\":\"revise-child\",\"itemId\":\"\",\"oldText\":\"" + rItems.Replace("\"", "\\\"") + "\",\"newText\":\"" + rItems.Replace("\"", "\\\"") + "\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"h2r\",\"viewedWatermark\":0,\"viewedToken\":\"tok-f2-R0\",\"at\":\"2026-01-01T00:00:00Z\"}]";
+  var rParent = new RecordDraft { BoardId = bid1, MeetingId = f2rMeet.Id, Version = 1, Watermark = 0, ItemsJson = rItems, Hash = "h2r", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f2-R1", HistoryJson = rParentHist, SupersedesJson = "[]", EvidenceSnapshotJson = "[]", Decided = true, Status = "superseded" };
+  rParent.Hash = H(rParent.ItemsJson);
+  var rChildHist = "[{\"seq\":1,\"revision\":1,\"token\":\"tok-f2-R0\",\"action\":\"revise-branch\",\"itemId\":\"\",\"oldText\":\"\",\"newText\":\"\",\"actor\":\"alice\",\"viewedVersion\":1,\"viewedHash\":\"h2r\",\"viewedWatermark\":0,\"viewedToken\":\"tok-f2-R0\",\"at\":\"2026-01-01T00:00:00Z\"}]";
+  var rChild = new RecordDraft { BoardId = bid1, MeetingId = f2rMeet.Id, Version = 2, Watermark = 0, ItemsJson = rItems, Hash = "h2r", ApprovedJson = "[]", DiscardedJson = "[]", ReviewRevision = 1, ReviewToken = "tok-f2-R0", HistoryJson = rChildHist, SupersedesJson = "[\"" + rParent.Id + "\"]", EvidenceSnapshotJson = "[]", Decided = false, Status = "open" };
+  rChild.Hash = H(rChild.ItemsJson);
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { rParent, rChild }) is null, "f2-revise-parent-accepts", "writer superseded/decided/empty + history + lined child");
+  var noHistJson = JsonSerializer.Serialize(rParent);
+  var noHist = JsonSerializer.Deserialize<RecordDraft>(noHistJson)!; noHist.HistoryJson = "[]";
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { noHist, rChild }) is not null, "f2-reject-revise-parent-no-history", "superseded decided-empty without history still rejects");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { rParent }) is not null, "f2-reject-revise-parent-no-child", "superseded decided-empty without a superseding child still rejects");
+  var apprJson = JsonSerializer.Serialize(rParent);
+  var apprOnly = JsonSerializer.Deserialize<RecordDraft>(apprJson)!; apprOnly.Status = "approved";
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { apprOnly, rChild }) is not null, "f2-reject-decided-empty-approved", "ordinary decided-empty rejects before any superseded exception");
+  var legJson = JsonSerializer.Serialize(rParent);
+  var legParent = JsonSerializer.Deserialize<RecordDraft>(legJson)!; legParent.LegacyReview = true;
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { legParent, rChild }) is null, "f2-legacy-copy-parent-accepts", "pending legacy-copy parent restores via the same narrow shape");
+}
+// ---- F3 head-movement + forged-destination: canonical follows the REFERENCED row ----
+{
+  // A later source T v4 is approved in docA3's family; S stays the same v3 row.
+  // Canonical identity must remain S's own version (3), so the genuine pin-1 /
+  // capture-3 snapshot stays restorable, while capture-4 (another row's version) rejects.
+  var docT = SeedSource(mem, bid1, aliasFile, 4, "approved", Sha("alias-bytes-T-newhead")); SeedSections(mem, docT);
+  headA3.HeadVersion = 4; headA3.HeadSourceId = docT.Id; mem.SourceHeads.Flush();
+  var f3Meet = new Meeting { BoardId = bid1, Title = "f3-m", State = MeetingState.Active, Generation = 0 }; mem.Meetings[f3Meet.Id] = f3Meet; mem.Meetings.Flush();
+  var (movedOrig, movedCanon) = MapsOf(mem);
+  Expect(movedCanon.TryGetValue(docA3.Id.ToString(), out var movedCanonS) && movedCanonS == 3, "f3-canon-follows-row-after-head-move", "canon=" + movedCanonS);
+  Expect(movedOrig.TryGetValue(docA3.Id.ToString(), out var movedOrigS) && movedOrigS == 1, "f3-orig-survives-head-move", "orig=" + movedOrigS);
+  var movedItems = "[{\"id\":\"s1\",\"text\":\"CUT\",\"refs\":[{\"kind\":\"source\",\"ref\":\"" + docA3.Id + "\",\"version\":1}]},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
+  var movedHist = "[{\"seq\":1,\"revision\":2,\"token\":\"tok-f3-M1\",\"action\":\"approve\",\"itemId\":\"s1\",\"oldText\":\"\",\"newText\":\"CUT\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"hxm\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"},{\"seq\":2,\"revision\":2,\"token\":\"tok-f3-M1\",\"action\":\"approve\",\"itemId\":\"s2\",\"oldText\":\"\",\"newText\":\"KEEP\",\"actor\":\"alice\",\"viewedVersion\":2,\"viewedHash\":\"hxm\",\"viewedWatermark\":0,\"viewedToken\":\"t\",\"at\":\"2026-01-01T00:00:00Z\"}]";
+  RecordDraft MovedDraft(string snapJson)
+  {
+    var g = new RecordDraft { BoardId = bid1, MeetingId = f3Meet.Id, Version = 1, Watermark = 0, ItemsJson = movedItems, Hash = "hxm", ApprovedJson = "[\"s1\",\"s2\"]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f3-M1", HistoryJson = movedHist, SupersedesJson = "[]", EvidenceSnapshotJson = snapJson, Decided = true, Status = "approved" };
+    g.Hash = H(g.ItemsJson);
+    return g;
+  }
+  var movedGood = MovedDraft("[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + docA3.Id + "\",\"version\":3,\"available\":true,\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { movedGood }, movedOrig, movedCanon) is null, "f3-alias-survives-head-move", "pin-1/capture-3 restorable after T v4");
+  var movedBad = MovedDraft("[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + docA3.Id + "\",\"version\":4,\"available\":true,\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { movedBad }, movedOrig, movedCanon) is not null, "f3-alias-rejects-new-head-version", "capture-4 is not S canonical-3");
+  // Forged migration destination: v1->v999 pinned on a v3 row is not a genuine
+  // chain to the row version, so no alias is established (orig falls back to 3).
+  var forgFile = "forg-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt";
+  var docF = SeedSource(mem, bid1, forgFile, 3, "approved", Sha("forg-bytes")); SeedSections(mem, docF);
+  var fev = new SourceEvent { BoardId = bid1, SourceId = docF.Id, FamilyKey = docF.FamilyKey, Version = 3, Action = "migrate-version", Detail = "v1->v999" };
+  mem.SourceEvents[fev.Id] = fev; mem.SourceEvents.Flush();
+  var headF = new SourceFamilyHead { BoardId = bid1, FamilyKey = docF.FamilyKey, HeadVersion = 3, HeadSourceId = docF.Id, HighWater = 3 }; mem.SourceHeads[headF.Id] = headF; mem.SourceHeads.Flush();
+  var (forgOrig, forgCanon) = MapsOf(mem);
+  Expect(forgOrig.TryGetValue(docF.Id.ToString(), out var forgOrigF) && forgOrigF == 3, "f3-forged-destination-no-alias", "orig=" + forgOrigF);
+  var forgItems = "[{\"id\":\"s1\",\"text\":\"CUT\",\"refs\":[{\"kind\":\"source\",\"ref\":\"" + docF.Id + "\",\"version\":1}]},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
+  RecordDraft ForgDraft(string snapJson)
+  {
+    var g = new RecordDraft { BoardId = bid1, MeetingId = f3Meet.Id, Version = 1, Watermark = 0, ItemsJson = forgItems, Hash = "hxf", ApprovedJson = "[\"s1\",\"s2\"]", DiscardedJson = "[]", ReviewRevision = 2, ReviewToken = "tok-f3-F1", HistoryJson = movedHist.Replace("tok-f3-M1", "tok-f3-F1").Replace("hxm", "hxf"), SupersedesJson = "[]", EvidenceSnapshotJson = snapJson, Decided = true, Status = "approved" };
+    g.Hash = H(g.ItemsJson);
+    return g;
+  }
+  var forgPin1 = ForgDraft("[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + docF.Id + "\",\"version\":3,\"available\":true,\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]");
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { forgPin1 }, forgOrig, forgCanon) is not null, "f3-forged-destination-pin1-rejects", "v1->v999 establishes no orig-1");
+  var forgItems3 = "[{\"id\":\"s1\",\"text\":\"CUT\",\"refs\":[{\"kind\":\"source\",\"ref\":\"" + docF.Id + "\",\"version\":3}]},{\"id\":\"s2\",\"text\":\"KEEP\"}]";
+  var forgPin3 = ForgDraft("[{\"itemId\":\"s1\",\"kind\":\"source\",\"ref\":\"" + docF.Id + "\",\"version\":3,\"available\":true,\"title\":\"t\",\"excerpt\":\"x\",\"at\":\"2026-01-01T00:00:00Z\",\"revision\":2}]");
+  forgPin3.ItemsJson = forgItems3; forgPin3.Hash = H(forgItems3);
+  Expect(RecordsOps.ValidateRestoreEntries(new[] { forgPin3 }, forgOrig, forgCanon) is null, "f3-forged-destination-row-pin-accepts", "pin-3/capture-3 is the row version");
+}
 // ---- F2 genuine old v2 PRIMARY backup: legacy rows accepted, bytes preserved, readonly ----
 {
   var backupPath = Environment.GetEnvironmentVariable("ESSENTIALS_LEGACY_BACKUP");
@@ -563,10 +634,10 @@ static string FullSnap(InMemoryStore s)
   foreach (var d in s.Sources.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("SRC " + d.Id + "|" + d.BoardId + "|" + d.FileName + "|" + d.Version + "|" + d.ReviewState + "|" + d.Approved + "|" + d.Excluded + "|" + d.Scope + "|" + (d.MeetingId?.ToString() ?? "-") + "|" + d.Origin + "|" + (d.ResourceId?.ToString() ?? "-") + "|" + d.FamilyKey + "|" + d.IndexState + "|" + d.IndexGeneration + "|" + (d.IndexError ?? "") + "|" + (d.IndexCompletedAt?.ToString("o") ?? "-") + "|" + (d.ContentHash ?? "") + "|" + (d.ExtractionJson ?? "") + "|orig=" + (d.Original is null ? "-" : Sha(Convert.ToBase64String(d.Original))) + "|" + d.CreatedAt.ToString("o"));
   foreach (var x in s.SourceSections.Values.OrderBy(x => x.SourceId.ToString()).ThenBy(x => x.Ordinal)) sb.AppendLine("SEC " + x.Id + "|" + x.SourceId + "|" + x.BoardId + "|" + x.FamilyKey + "|" + x.SourceVersion + "|" + (x.ContentHash ?? "") + "|" + x.Ordinal + "|" + (x.Heading ?? "") + "|" + (x.Location ?? "") + "|g" + x.IndexGeneration + "|" + (x.Text ?? "") + "|" + x.CreatedAt.ToString("o"));
   foreach (var h in s.SourceHeads.Values.OrderBy(x => x.BoardId.ToString() + x.FamilyKey)) sb.AppendLine("HEAD " + h.Id + "|" + h.BoardId + "|" + h.FamilyKey + "|" + h.HeadVersion + "|" + h.HeadSourceId + "|hw" + h.HighWater + "|fl" + h.FloorVersion + "|" + h.UpdatedAt.ToString("o"));
-  foreach (var e in s.SourceEvents.Values.OrderBy(x => x.CreatedAt).ThenBy(x => x.Id.ToString())) sb.AppendLine("EVT " + e.Id + "|" + e.BoardId + "|" + e.SourceId + "|" + (e.Action ?? "") + "|" + (e.Detail ?? "") + "|" + e.CreatedAt.ToString("o"));
+  foreach (var e in s.SourceEvents.Values.OrderBy(x => x.CreatedAt).ThenBy(x => x.Id.ToString())) sb.AppendLine("EVT " + e.Id + "|" + e.BoardId + "|" + e.SourceId + "|" + (e.FamilyKey ?? "") + "|v" + e.Version + "|" + (e.Action ?? "") + "|" + (e.Detail ?? "") + "|" + e.CreatedAt.ToString("o"));
   foreach (var m in s.Meetings.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("MTG " + m.Id + "|" + m.BoardId + "|" + (m.Title ?? "") + "|" + (m.Brief ?? "") + "|" + (m.ParticipantIdsJson ?? "") + "|" + m.State + "|gen" + m.Generation + "|rev" + m.DeliveredRevision + "|" + m.CreatedAt.ToString("o"));
-  foreach (var kv in s.Messages.OrderBy(x => x.Key.ToString())) foreach (var m in kv.Value.OrderBy(x => x.Sequence)) sb.AppendLine("MSG " + kv + "#" + m.Sequence + "|" + (m.Sender ?? "") + "|" + (m.AdvisorName ?? "") + "|" + (m.Content ?? "") + "|" + (m.Stance ?? "") + "|" + (m.Status ?? "") + "|" + (m.ParentSequence?.ToString() ?? "-") + "|" + (m.AdvisorId == Guid.Empty ? "-" : m.AdvisorId.ToString()) + "|" + m.CreatedAt.ToString("o"));
-  foreach (var d in s.Drafts.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("DRAFT " + d.Id + "|" + d.BoardId + "|" + d.MeetingId + "|v" + d.Version + "|wm" + d.Watermark + "|" + (d.ItemsJson ?? "") + "|" + (d.Hash ?? "") + "|" + (d.ApprovedJson ?? "") + "|" + (d.DiscardedJson ?? "") + "|rr" + d.ReviewRevision + "|" + (d.ReviewToken ?? "") + "|" + (d.HistoryJson ?? "") + "|" + (d.SupersedesJson ?? "") + "|" + (d.EvidenceSnapshotJson ?? "") + "|" + d.Decided + "|" + (d.Status ?? "") + "|" + d.CreatedAt.ToString("o"));
+  foreach (var kv in s.Messages.OrderBy(x => x.Key.ToString())) foreach (var m in kv.Value.OrderBy(x => x.Sequence)) sb.AppendLine("MSG " + kv.Key + "#" + m.Sequence + "|board " + m.BoardId + "|" + (m.Sender ?? "") + "|" + (m.AdvisorName ?? "") + "|" + (m.Content ?? "") + "|" + (m.Stance ?? "") + "|" + (m.Status ?? "") + "|" + (m.ParentSequence?.ToString() ?? "-") + "|" + (m.AdvisorId == Guid.Empty ? "-" : m.AdvisorId.ToString()) + "|" + m.CreatedAt.ToString("o"));
+  foreach (var d in s.Drafts.Values.OrderBy(x => x.Id.ToString())) sb.AppendLine("DRAFT " + d.Id + "|" + d.BoardId + "|" + d.MeetingId + "|v" + d.Version + "|wm" + d.Watermark + "|" + (d.ItemsJson ?? "") + "|" + (d.Hash ?? "") + "|" + (d.ApprovedJson ?? "") + "|" + (d.DiscardedJson ?? "") + "|rr" + d.ReviewRevision + "|" + (d.ReviewToken ?? "") + "|" + (d.HistoryJson ?? "") + "|" + (d.SupersedesJson ?? "") + "|" + (d.EvidenceSnapshotJson ?? "") + "|" + d.Decided + "|" + (d.Status ?? "") + "|leg" + (!d.LegacyReview.HasValue ? "-" : (d.LegacyReview.Value ? "1" : "0")) + "|" + d.CreatedAt.ToString("o"));
   foreach (var a in s.Audit.OrderBy(x => x.CreatedAt).ThenBy(x => (x.Action ?? "") + (x.Detail ?? ""))) sb.AppendLine("AUD " + a.BoardId + "|" + (a.Action ?? "") + "|" + (a.Detail ?? "") + "|" + a.CreatedAt.ToString("o"));
   foreach (var kv in s.ActiveIndexJobs.OrderBy(x => x.Key.ToString())) sb.AppendLine("JOB " + kv.Key + "|" + kv.Value.JobId + "|e" + kv.Value.Epoch + "|g" + kv.Value.Generation);
   return sb.ToString();
@@ -746,6 +817,8 @@ frecA.Hash = H(frecA.ItemsJson);
   // .NET precision) so the pre-fault snapshot reads the same PG-microsecond-rounded truth as the post-rollback
   // snapshot. Comparing tracked-memory precision against DB precision would be a measurement artifact, not state.
   pgDbCtx.ChangeTracker.Clear();
+  var gen1SecTuples = ps.SourceSections.Values.Where(x => x.SourceId == finDoc.Id).OrderBy(x => x.Ordinal).Select(x => x.Ordinal + "|" + (x.Heading ?? "") + "|" + (x.Location ?? "") + "|" + (x.Text ?? "") + "|" + x.SourceVersion + "|" + (x.ContentHash ?? "")).ToList();
+  var gen1Extraction = finCur0 is not null ? (finCur0.ExtractionJson ?? "") : "";
   var snapBefore = FullSnap(ps);
   var rawSecBefore = RawSqlSections(pgDbCtx, finDoc.Id);
   var rawSrcBefore = RawSqlSource(pgDbCtx, finDoc.Id);
@@ -784,6 +857,11 @@ frecA.Hash = H(frecA.ItemsJson);
   PgExpect(!ps.ActiveIndexJobs.ContainsKey(finDoc.Id), "f8-reservation-retired", "retire after success");
   var retrySecs = ps.SourceSections.Values.Where(x => x.SourceId == finDoc.Id).OrderBy(x => x.Ordinal).ToList();
   PgExpect(retrySecs.Count >= 1 && retrySecs.All(x => x.SourceVersion == 1 && x.IndexGeneration == 2 && !string.IsNullOrWhiteSpace(x.Text)), "f8-retry-persisted-complete", "gen2 sections persisted, count=" + retrySecs.Count);
+  var retryTuples = ps.SourceSections.Values.Where(x => x.SourceId == finDoc.Id && x.IndexGeneration == 2).OrderBy(x => x.Ordinal).Select(x => x.Ordinal + "|" + (x.Heading ?? "") + "|" + (x.Location ?? "") + "|" + (x.Text ?? "") + "|" + x.SourceVersion + "|" + (x.ContentHash ?? "")).ToList();
+  PgExpect(retryTuples.Count == gen1SecTuples.Count && retryTuples.SequenceEqual(gen1SecTuples), "f8-retry-exact-contents", "gen2 sections reproduce gen1 expected tuples, count=" + retryTuples.Count);
+  var idxEvt = ps.SourceEvents.Values.Where(x => x.SourceId == finDoc.Id && string.Equals(x.Action ?? "", "index", StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.CreatedAt).FirstOrDefault();
+  PgExpect(idxEvt is not null && (idxEvt.Detail ?? "") == "gen2 sections" + retryTuples.Count, "f8-retry-exact-event", "index event carries exact gen2 detail, got=" + (idxEvt is null ? "none" : (idxEvt.Detail ?? "")));
+  PgExpect(finCur2 is not null && (finCur2.ExtractionJson ?? "") == gen1Extraction && gen1Extraction.Contains("finish fault body text"), "f8-retry-extraction-preserved", "retry keeps the exact stamped extraction bytes");
   // Independent reread after tracking clear (F8): the healthy retry's complete contents
   // are reread from durable state, not EF-tracked memory: doc, sections, events, heads,
   // audit entries, and reservation retirement.
@@ -926,6 +1004,20 @@ Emit("HTTP SECTION START");
 var httpFailed = false;
 void HttpFail(string name, string detail) { Fail(name, detail); httpFailed = true; }
 void HttpExpect(bool ok, string name, string detail) { if (ok) Pass(name, detail); else { Fail(name, detail); httpFailed = true; } }
+void HttpTerminal(string name, string detail) { Fail(name, detail); httpFailed = true; throw new InvalidOperationException("http-terminal:" + name + " " + detail); }
+bool HttpOwnsListener(System.Diagnostics.Process? pr, int port, string name)
+{
+  var alive = false;
+  try { alive = pr is not null && !pr.HasExited; } catch { alive = false; }
+  var bound = !PortFree(port);
+  var ok = alive && bound;
+  HttpExpect(ok, name, "child-alive=" + alive + " port-bound=" + bound + " port=" + port);
+  return ok;
+}
+void HttpRequireListener(System.Diagnostics.Process? pr, int port, string name)
+{
+  if (!HttpOwnsListener(pr, port, name)) HttpTerminal(name + "-terminal", "retained child is not the responding listener; refusing mutation into a foreign app.");
+}
 static (System.Net.HttpStatusCode status, JsonDocument doc) GetJson(System.Net.Http.HttpClient h, string url)
 {
   using var resp = h.GetAsync(url).GetAwaiter().GetResult();
@@ -1092,6 +1184,7 @@ var apiOut1 = new System.Text.StringBuilder(); var apiErr1 = new System.Text.Str
 var apiOut2 = new System.Text.StringBuilder(); var apiErr2 = new System.Text.StringBuilder();
 var apiOut3 = new System.Text.StringBuilder(); var apiErr3 = new System.Text.StringBuilder();
 string? httpA = null; string? httpB = null; string? httpUpg = null;
+var httpACreated = false; var httpBCreated = false; var httpUpgCreated = false;
 var apiDir = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "server", "SimCEO.Api", "bin", "Release", "net10.0"));
 var apiDll = System.IO.Path.Combine(apiDir, "SimCEO.Api.dll");
 System.Diagnostics.Process StartApi(string db, int port, System.Text.StringBuilder o, System.Text.StringBuilder e, string ring, string csBase)
@@ -1151,8 +1244,9 @@ try
   var repoRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
   var apiProj = System.IO.Path.Combine(repoRoot, "server", "SimCEO.Api", "SimCEO.Api.csproj");
   var (buildExit, buildOut, buildErr, buildTo) = RunBounded("dotnet", "build \"" + apiProj + "\" -c Release --nologo -v q", 600000);
-  HttpExpect(!buildTo && buildExit == 0, "http-api-build-native", "exit=" + buildExit + " timedOut=" + buildTo + " tail=" + (buildOut + buildErr).Trim().Replace("\n", " ").Replace("\r", "")); HttpExpect(PortFree(5146), "http-preflight-5146-free", "own API port must be free");
-  HttpExpect(PortFree(5246), "http-preflight-5246-free", "own second API port must be free");
+  HttpExpect(!buildTo && buildExit == 0, "http-api-build-native", "exit=" + buildExit + " timedOut=" + buildTo + " tail=" + (buildOut + buildErr).Trim().Replace("\n", " ").Replace("\r", "")); var preFree5146 = PortFree(5146); HttpExpect(preFree5146, "http-preflight-5146-free", "own API port must be free");
+  var preFree5246 = PortFree(5246); HttpExpect(preFree5246, "http-preflight-5246-free", "own second API port must be free");
+  if (!preFree5146 || !preFree5246) HttpTerminal("http-preflight-terminal", "occupied API port; refusing dependent acquisition/mutation into a foreign app.");
   string ExecSql(string cs, string sql)
   {
     var opt = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<SimCEO.Postgres.PostgresDb>().UseNpgsql(cs).Options;
@@ -1162,9 +1256,10 @@ try
   httpA = "essentials_evidence_httpa_" + Guid.NewGuid().ToString("N").Substring(0, 8);
   httpB = "essentials_evidence_httpb_" + Guid.NewGuid().ToString("N").Substring(0, 8);
   httpUpg = "essentials_evidence_httpupg_" + Guid.NewGuid().ToString("N").Substring(0, 8);
-  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\"");
-  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpB + "\"");
-  ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpUpg + "\"");
+try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpA + "\""); httpACreated = true; } catch (Exception dbExA) { HttpExpect(false, "http-db-create-a", dbExA.GetType().Name + " " + dbExA.Message); }
+  try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpB + "\""); httpBCreated = true; } catch (Exception dbExB) { HttpExpect(false, "http-db-create-b", dbExB.GetType().Name + " " + dbExB.Message); }
+  try { ExecSql(csBaseAdmin, "CREATE DATABASE \"" + httpUpg + "\""); httpUpgCreated = true; } catch (Exception dbExU) { HttpExpect(false, "http-db-create-upg", dbExU.GetType().Name + " " + dbExU.Message); }
+  if (!httpACreated || !httpBCreated || !httpUpgCreated) HttpTerminal("http-db-acquire-terminal", "exclusive DB acquisition failed; refusing dependent boot/mutation and never dropping a colliding name.");
   Emit("HTTP exclusive DBs: " + httpA + " " + httpB + " " + httpUpg);
   // ---- P1b: genuine old backup restores through the actual route, then exports ----
   string? legacyPath = Environment.GetEnvironmentVariable("ESSENTIALS_LEGACY_BACKUP");
@@ -1185,7 +1280,9 @@ try
   apiProc1 = StartApi(httpA!, 5146, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "wikiring1"), csBaseAdmin);
   apiDrain1a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardOutput, apiOut1));
   apiDrain1b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc1.StandardError, apiErr1));
-  HttpExpect(WaitReady(http, "http://127.0.0.1:5146", 45), "http-api1-ready-postgres", "boot on fresh exclusive DB");
+  var ready1 = WaitReady(http, "http://127.0.0.1:5146", 45); HttpExpect(ready1, "http-api1-ready-postgres", "boot on fresh exclusive DB");
+  if (!ready1) HttpTerminal("http-api1-ready-terminal", "readiness failed; refusing restore into an unverified listener.");
+  HttpRequireListener(apiProc1, 5146, "http-own-5146-before-legacy");
   var (rsSt, rsDoc) = PostJson(http, "http://127.0.0.1:5146/api/backup/restore", new { snapshot = legacySnap, hash = legacyHash });
   HttpExpect(rsSt == System.Net.HttpStatusCode.OK, "http-legacy-restore-200", "status=" + (int)rsSt + " " + rsDoc.RootElement.GetRawText());
   var (exSt, exDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
@@ -1296,7 +1393,9 @@ try
   apiProc2 = StartApi(httpB!, 5246, apiOut2, apiErr2, System.IO.Path.Combine(artifactDir, "wikiring2"), csBaseAdmin);
   apiDrain2a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc2.StandardOutput, apiOut2));
   apiDrain2b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc2.StandardError, apiErr2));
-  HttpExpect(WaitReady(http, "http://127.0.0.1:5246", 45), "http-api2-ready-postgres", "boot on fresh exclusive DB");
+  var ready2 = WaitReady(http, "http://127.0.0.1:5246", 45); HttpExpect(ready2, "http-api2-ready-postgres", "boot on fresh exclusive DB");
+  if (!ready2) HttpTerminal("http-api2-ready-terminal", "readiness failed; refusing restore into an unverified listener.");
+  HttpRequireListener(apiProc2, 5246, "http-own-5246-before-e0");
   var (rtSt, rtDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = e0Snap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(e0Snap)) });
   HttpExpect(rtSt == System.Net.HttpStatusCode.OK, "http-E0-restore-200", "own export round-trips, status=" + (int)rtSt + " " + rtDoc.RootElement.GetRawText().Substring(0, Math.Min(300, rtDoc.RootElement.GetRawText().Length)));
   var (reSt, reDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
@@ -1313,35 +1412,58 @@ try
   HttpExpect(preSt == System.Net.HttpStatusCode.OK && preNorm == e0Norm, "http-pre-attempt-baseline", "baseline export matches sent export before tampered attempt");
   var tampered = TamperDropFamilyMember(e0Snap, out var tamperDetail);
   HttpExpect(tamperDetail.StartsWith("drop-source"), "http-tamper-constructed", tamperDetail);
+  HttpRequireListener(apiProc2, 5246, "http-own-5246-before-e0-tamper");
   var (ngSt, ngDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tampered, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tampered)) });
   HttpExpect(ngSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-tampered-restore-422", "status=" + (int)ngSt + " " + ngDoc.RootElement.GetRawText().Substring(0, Math.Min(300, ngDoc.RootElement.GetRawText().Length)));
   HttpExpect(ngDoc.RootElement.GetRawText().Contains("skips version"), "http-tamper-error-shape", "dense-gap rejection names the skipped version");
   var (unSt, unDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
   var unSnap = unDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var unFailExact = NormFailedStable(unSnap); EmitFailedDiff(preFailExact, unSnap, artifactDir, "e0-prior", "http-prior-unchanged-after-422"); HttpExpect(unSt == System.Net.HttpStatusCode.OK && unFailExact == preFailExact, "http-prior-unchanged-after-422", "rejected restore leaves generations, owners, and every other field byte-identical (only root at excluded)");
-  // Modern v4 wiped-history forgery over the actual route: the first modern draft keeps its
-  // explicit null/false marker but loses its history. Restore must 422 with zero mutation.
-  string wipedSnap = ""; string wipeDetail = "no-draft";
+  // Modern v4 wiped-history forgery over the actual route: HistoryJson is a STRING
+  // (backup serializes draft entities directly), so select a known modern row with an
+  // explicit false marker, verify its history STRING is nonempty, then assign the
+  // STRING "[]". All other fields (marker, revision, token, items, hash, snapshots)
+  // are preserved. Construction is required before POST; restore must 422 with the
+  // modern wiped-history reason and zero mutation.
+  string wipedSnap = ""; string wipeDetail = "no-draft"; var wipePosted = false;
   try
   {
     var wnode = System.Text.Json.Nodes.JsonNode.Parse(e0Snap);
     var wdrafts = wnode?["drafts"] as System.Text.Json.Nodes.JsonArray;
     if (wdrafts is not null) foreach (var wd in wdrafts)
     {
-      if (wd is System.Text.Json.Nodes.JsonObject wdo && (wdo["HistoryJson"] as System.Text.Json.Nodes.JsonArray)?.Count > 0)
+      if (wd is System.Text.Json.Nodes.JsonObject wdo)
       {
-        wdo["HistoryJson"] = new System.Text.Json.Nodes.JsonArray();
-        wipeDetail = "wiped-history " + (wdo["Id"]?.GetValue<string>() ?? "?");
-        break;
+        var wipeMarker = wdo["LegacyReview"]?.GetValue<bool?>();
+        var wipeHistStr = wdo["HistoryJson"]?.GetValue<string>();
+        if (wipeMarker == false && !string.IsNullOrWhiteSpace(wipeHistStr))
+        {
+          var wipeHistCount = 0;
+          try { using var whdoc = JsonDocument.Parse(wipeHistStr); if (whdoc.RootElement.ValueKind == JsonValueKind.Array) wipeHistCount = whdoc.RootElement.GetArrayLength(); } catch { wipeHistCount = 0; }
+          if (wipeHistCount > 0)
+          {
+            wdo["HistoryJson"] = "[]";
+            wipeDetail = "wiped-history " + (wdo["Id"]?.GetValue<string>() ?? "?");
+            break;
+          }
+        }
       }
     }
     wipedSnap = wnode?.ToJsonString() ?? "";
   }
   catch (Exception wex) { wipeDetail = "unparseable:" + wex.GetType().Name; }
   HttpExpect(wipeDetail.StartsWith("wiped-history"), "http-wipe-constructed", wipeDetail);
-  var (wSt, wDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = wipedSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(wipedSnap)) });
+  HttpExpect(wipeDetail.StartsWith("wiped-history") && !string.IsNullOrWhiteSpace(wipedSnap), "http-wipe-snapshot-built", "construction required before POST");
+  var wSt = System.Net.HttpStatusCode.ServiceUnavailable; var wDoc = JsonDocument.Parse("{\"error\":\"wipe construction failed; restore not attempted\"}");
+  if (wipeDetail.StartsWith("wiped-history") && !string.IsNullOrWhiteSpace(wipedSnap))
+  {
+    HttpRequireListener(apiProc2, 5246, "http-own-5246-before-wipe");
+    (wSt, wDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = wipedSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(wipedSnap)) });
+    wipePosted = true;
+  }
   HttpExpect(wSt == System.Net.HttpStatusCode.UnprocessableEntity, "http-wiped-history-422", "status=" + (int)wSt + " " + wDoc.RootElement.GetRawText().Substring(0, Math.Min(300, wDoc.RootElement.GetRawText().Length)));
+  HttpExpect(wDoc.RootElement.GetRawText().Contains("without decision history"), "http-wiped-history-reason", "modern wiped row must fail for the exact history reason");
   var (wBackSt, wBackDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
-  var wBackSnap = wBackDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var wBackExact = NormFailedStable(wBackSnap); EmitFailedDiff(preFailExact, wBackSnap, artifactDir, "e0-wiped-prior", "http-wiped-prior-unchanged"); HttpExpect(wBackSt == System.Net.HttpStatusCode.OK && wBackExact == preFailExact, "http-wiped-prior-unchanged", "wiped modern v4 export rejects with generations, owners, and every other field unchanged");
+  var wBackSnap = wBackDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var wBackExact = NormFailedStable(wBackSnap); EmitFailedDiff(preFailExact, wBackSnap, artifactDir, "e0-wiped-prior", "http-wiped-prior-unchanged"); HttpExpect(wipePosted && wBackSt == System.Net.HttpStatusCode.OK && wBackExact == preFailExact, "http-wiped-prior-unchanged", "wiped modern v4 export rejects with generations, owners, and every other field unchanged");
   // ---- P1a: physical upg clone upgrades, exports, and restores through actual routes ----
   var dumpFile = "/tmp/ess_ev_httpupg_dump.sql";
   var (dumpExit, dumpOut, dumpErr, dumpTo) = RunBounded("docker", "exec simceo-integration-qa-pg pg_dump -U simceo -d essentials_backend_upg -f " + dumpFile, 300000);
@@ -1357,10 +1479,13 @@ try
   try { ExecSql(csUpg, "DELETE FROM \"AuthAccounts\""); ExecSql(csUpg, "DELETE FROM \"SecurityStates\""); HttpExpect(true, "http-upg-scrub-security", "security rows scrubbed on exclusive clone"); }
   catch (Exception scrubEx) { HttpExpect(false, "http-upg-scrub-security", scrubEx.GetType().Name + " " + scrubEx.Message); }
   KillApi(ref apiProc1, apiDrain1a, apiDrain1b, apiOut1, apiErr1, System.IO.Path.Combine(artifactDir, "api1.log"));
+  var reuse5146 = PortFree(5146); HttpExpect(reuse5146, "http-5146-reuse-free", "prior child reaped before upgraded clone reuses 5146");
+  if (!reuse5146) HttpTerminal("http-5146-reuse-terminal", "5146 still bound after api1 kill; refusing to boot the clone into ambiguity.");
   apiProc3 = StartApi(httpUpg!, 5146, apiOut3, apiErr3, System.IO.Path.Combine(artifactDir, "wikiring3"), csBaseAdmin);
   apiDrain3a = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc3.StandardOutput, apiOut3));
   apiDrain3b = System.Threading.Tasks.Task.Run(() => DrainLines(apiProc3.StandardError, apiErr3));
-  HttpExpect(WaitReady(http, "http://127.0.0.1:5146", 60), "http-api3-ready-postgres", "upgraded clone boots (schema upgrade + floor/stub backfill)");
+  var ready3 = WaitReady(http, "http://127.0.0.1:5146", 60); HttpExpect(ready3, "http-api3-ready-postgres", "upgraded clone boots (schema upgrade + floor/stub backfill)");
+  if (!ready3) HttpTerminal("http-api3-ready-terminal", "upgraded-clone readiness failed; refusing restore into an unverified listener.");
   var (ueSt, ueDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
   HttpExpect(ueSt == System.Net.HttpStatusCode.OK, "http-upg-export-200", "status=" + (int)ueSt);
   var upgSnap = ueDoc.RootElement.GetProperty("snapshot").GetString() ?? "";
@@ -1387,15 +1512,16 @@ try
   HttpExpect(upgDenseFloor1, "http-upg-dense-floor1", "dense upgraded family carries floor 1");
   long liveMaxUpg = 0;
   string preFlSnap = "";
-  { var (preFlSt, preFlDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  { var (preFlSt, preFlDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
     preFlSnap = preFlSt == System.Net.HttpStatusCode.OK ? preFlDoc.RootElement.GetProperty("snapshot").GetString() ?? "" : "";
     if (preFlSt == System.Net.HttpStatusCode.OK) {
       using var preFlDoc2 = JsonDocument.Parse(preFlDoc.RootElement.GetProperty("snapshot").GetString() ?? "{}"); foreach (var pm in preFlDoc2.RootElement.GetProperty("meetings").EnumerateArray()) if (pm.TryGetProperty("Generation", out var pgv) && pgv.ValueKind == JsonValueKind.Number && pgv.TryGetInt64(out var pgl) && pgl > liveMaxUpg) liveMaxUpg = pgl; HttpExpect(preFlSt == System.Net.HttpStatusCode.OK, "http-upg-live-max", "liveMaxUpg=" + liveMaxUpg);
     }
   }
-  var (urSt, urDoc) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = upgSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(upgSnap)) });
+  HttpRequireListener(apiProc3, 5146, "http-own-5146-before-upg");
+  var (urSt, urDoc) = PostJson(http, "http://127.0.0.1:5146/api/backup/restore", new { snapshot = upgSnap, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(upgSnap)) });
   HttpExpect(urSt == System.Net.HttpStatusCode.OK, "http-upg-restore-200", "valid upgraded own-export restores (was honest-422), status=" + (int)urSt + " " + urDoc.RootElement.GetRawText().Substring(0, Math.Min(300, urDoc.RootElement.GetRawText().Length)));
-  var (uvSt, uvDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
+  var (uvSt, uvDoc) = GetJson(http, "http://127.0.0.1:5146/api/backup");
   var uvSnap = uvDoc.RootElement.GetProperty("snapshot").GetString() ?? ""; var uvNorm = NormExportStable(uvSnap); EmitNormDiff(upgNorm, uvSnap, artifactDir, "upg-roundtrip", "http-upg-roundtrip-identical"); HttpExpect(uvSt == System.Net.HttpStatusCode.OK && uvNorm == upgNorm, "http-upg-roundtrip-identical", "upgraded restore preserves complete data byte-identically (modulo at+generation-floor)"); CheckGenFloor(upgSnap, uvSnap, liveMaxUpg, "http-upg-genfloor"); CheckBoardOwners(upgSnap, uvSnap, preFlSnap, "http-owners-upg-roundtrip");
   // Pre-attempt baseline + live generation max for the upg floor assertion.
   var (preUpgSt, preUpgDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
@@ -1407,6 +1533,7 @@ try
   HttpExpect(preUpgSt == System.Net.HttpStatusCode.OK, "http-upg-pre-baseline", "liveMaxUpg=" + liveMaxUpg);
   var tamperedUpg = TamperDropFamilyMember(upgSnap, out var tamperUpgDetail);
   HttpExpect(tamperUpgDetail.StartsWith("drop-source"), "http-upg-tamper-constructed", tamperUpgDetail);
+  HttpRequireListener(apiProc2, 5246, "http-own-5246-before-upg-tamper");
   var (unSt2, unDoc2) = PostJson(http, "http://127.0.0.1:5246/api/backup/restore", new { snapshot = tamperedUpg, hash = SimCEO.Api.Work.Hashing.FullHash(System.Text.Encoding.UTF8.GetBytes(tamperedUpg)) });
   HttpExpect(unSt2 == System.Net.HttpStatusCode.UnprocessableEntity, "http-upg-tampered-422", "status=" + (int)unSt2 + " " + unDoc2.RootElement.GetRawText().Substring(0, Math.Min(300, unDoc2.RootElement.GetRawText().Length)));
   var (ufSt, ufDoc) = GetJson(http, "http://127.0.0.1:5246/api/backup");
@@ -1423,9 +1550,9 @@ finally
   {
     var dropOpt = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<SimCEO.Postgres.PostgresDb>().UseNpgsql(csBaseAdmin).Options;
     using var dropDb = new SimCEO.Postgres.PostgresDb(dropOpt);
-    foreach (var hdb in new[] { httpA, httpB, httpUpg })
+    foreach (var (hdb, created) in new[] { (httpA, httpACreated), (httpB, httpBCreated), (httpUpg, httpUpgCreated) })
     {
-      if (string.IsNullOrWhiteSpace(hdb)) continue;
+      if (string.IsNullOrWhiteSpace(hdb) || !created) continue;
       try { dropDb.Database.ExecuteSqlRaw("DROP DATABASE \"" + hdb + "\" WITH (FORCE)"); } catch (Exception ex) { hcerrs.Add("drop-" + hdb + ": " + ex.Message); }
     }
     using var verifyDb = new SimCEO.Postgres.PostgresDb(dropOpt);

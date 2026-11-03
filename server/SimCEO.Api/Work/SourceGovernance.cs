@@ -191,23 +191,61 @@ public static class SourceGovernance
   // version, then creation order: an old duplicate parked above the actual
   // newer version never outranks it. No schema change: the alias is derived
   // from persisted, backed-up history events.
+  // Narrow genuine-alias evaluator (F3/P1): a migrate-version event establishes an
+  // original-version alias ONLY when it is pinned to the referenced row (the
+  // event's scalar Version equals the row's Version, as genuine server-written
+  // renumber events are) and its recorded mapping chains to that row version
+  // (detail v{from}->v{to} with 1 <= from < to). Multi-edge renumber chains
+  // compose transitively (v1->v2 then v2->v3 on the final v3 row still
+  // establishes orig 1); a forged destination (v1->v999 on a v3 row) reaches
+  // nothing and yields no alias. Returns null when no genuine alias exists,
+  // so callers fall back to the row version (never an alias).
+  public static int? GenuineOriginalVersion(IEnumerable<SourceEvent> events, Guid sourceId, int rowVersion)
+  {
+    try
+    {
+      if (events is null || rowVersion < 1) return null;
+      var edges = new List<(int from, int to)>();
+      foreach (var e in events)
+      {
+        if (e is null || e.SourceId != sourceId) continue;
+        if (!string.Equals(e.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)) continue;
+        if (e.Version != rowVersion) continue;
+        var det = e.Detail ?? "";
+        var arrow = det.IndexOf("->", StringComparison.Ordinal);
+        if (arrow <= 1 || arrow + 2 >= det.Length) continue;
+        var left = det.Substring(0, arrow).Trim().TrimStart('v', 'V');
+        var right = det.Substring(arrow + 2).Trim().TrimStart('v', 'V');
+        if (!int.TryParse(left, out var fv) || !int.TryParse(right, out var tv)) continue;
+        if (fv < 1 || tv < 1 || fv >= tv) continue;
+        edges.Add((fv, tv));
+      }
+      if (edges.Count == 0) return null;
+      // Transitive closure of from-versions that reach the referenced row
+      // version through recorded edges. A forged edge (v1->v999) terminates
+      // off-chain and never contributes.
+      var reach = new HashSet<int>();
+      foreach (var (f, t) in edges) if (t == rowVersion) reach.Add(f);
+      bool grew;
+      do
+      {
+        grew = false;
+        foreach (var (f, t) in edges) if (reach.Contains(t) && reach.Add(f)) grew = true;
+      } while (grew);
+      if (reach.Count == 0) return null;
+      return reach.Min();
+    }
+    catch { return null; }
+  }
   public static int OriginalVersionOf(InMemoryStore s, SourceDoc d)
   {
     try
     {
-      var best = d.Version;
-      var found = false;
-      foreach (var e in s.SourceEvents.Values.Where(x => x.SourceId == d.Id && string.Equals(x.Action ?? "", "migrate-version", StringComparison.OrdinalIgnoreCase)).ToList())
-      {
-        var det = e.Detail ?? "";
-        var arrow = det.IndexOf("->", StringComparison.Ordinal);
-        if (arrow <= 1) continue;
-        var from = det.Substring(0, arrow).Trim().TrimStart('v', 'V');
-        if (int.TryParse(from, out var fv) && fv >= 1 && (!found || fv < best)) { best = fv; found = true; }
-      }
-      return found ? best : d.Version;
+      if (d is null) return 1;
+      var alias = GenuineOriginalVersion(s.SourceEvents.Values.Where(x => x.SourceId == d.Id), d.Id, d.Version);
+      return alias ?? d.Version;
     }
-    catch { return d.Version; }
+    catch { return d is null ? 1 : d.Version; }
   }
 
   public static void EnsureMissingHeads(InMemoryStore s)
