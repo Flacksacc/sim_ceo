@@ -45,15 +45,26 @@ if ($ApiPort -ne $OWN_API -or $FakePort -ne $OWN_FAKE -or $WebPort -ne $OWN_WEB 
   exit 2
 }
 $ownedDb = @()
-# LIVE provider arming (leg8 ONLY, OFF by default): the real app key arrives
-# privately from PRIMARY in the runner child ENV AFTER deterministic final
-# builds. Capture it once, then STRIP it from this process so no other child
-# can inherit it implicitly; forward it ONLY to the leg8 API + leg env.
-# Never log it, never use the inherited coding-profile key.
+# LIVE provider arming (leg8 ONLY, OFF by default): the real app key AND the
+# selected private APP base arrive privately from PRIMARY in the runner child
+# ENV AFTER deterministic final builds. Capture both once, then STRIP them
+# from this process so no other child can inherit them implicitly; forward
+# them ONLY to the leg8 API + leg env (blank base => app ModelGatewayBase
+# default https://api.meta.ai/v1; NEVER the fake). Never log the key (base
+# is nonsecret), never use the inherited coding-profile key/base.
 $liveArmed = ([System.Environment]::GetEnvironmentVariable("ESS_QA_LIVE", "Process") -eq "1")
 $liveKey = [System.Environment]::GetEnvironmentVariable("META_API_KEY", "Process")
+$liveBase = [System.Environment]::GetEnvironmentVariable("META_API_BASE", "Process")
 if ($liveArmed -and [string]::IsNullOrWhiteSpace($liveKey)) { throw "ESS_QA_LIVE=1 but no META_API_KEY in runner env; primary must supply the app key via child env" }
-if ($liveArmed) { [System.Environment]::SetEnvironmentVariable("META_API_KEY", $null, "Process"); [System.Environment]::SetEnvironmentVariable("ESS_QA_LIVE", $null, "Process") }
+if ($liveArmed -and -not [string]::IsNullOrWhiteSpace($liveBase)) {
+  $lbCheck = $liveBase.Trim().TrimEnd('/')
+  if ($lbCheck -match '127\.0\.0\.1|localhost|::1|:5242|/fake' -or $lbCheck -notmatch '^https?://') { throw "ESS_QA_LIVE=1 but META_API_BASE is loopback/fake/unsupported [$lbCheck]; refusing to send real key to fake" }
+}
+if ($liveArmed) {
+  $liveBaseLog = if ([string]::IsNullOrWhiteSpace($liveBase)) { "https://api.meta.ai/v1 (app ModelGatewayBase default)" } else { $liveBase.Trim() }
+  Write-Output ("  live-base=" + $liveBaseLog)
+  [System.Environment]::SetEnvironmentVariable("META_API_KEY", $null, "Process"); [System.Environment]::SetEnvironmentVariable("ESS_QA_LIVE", $null, "Process"); [System.Environment]::SetEnvironmentVariable("META_API_BASE", $null, "Process")
+}
 $ownedDb = @()
 $containerWasRunning = $false
 function Step($n) { Write-Output ""; Write-Output ("=== " + $n + " ===") }
@@ -274,7 +285,7 @@ try {
     if (Test-Path $legDir) { throw "leg artifact dir already exists (refusing overwrite): $legDir" }
     New-Item -ItemType Directory -Force $legDir | Out-Null
     $legBaseEnv = @{ ESS_QA_PROJECTROOT = $ProjectRoot; ESS_QA_APPROOT = $Approot; ESS_QA_HEAD = $head; ESS_QA_DIRTY_HASH = $dirtyHash; ESS_QA_RUN_ID = $runId; ESS_QA_LEG = $leg; ESS_QA_CONTAINER_IDENT = (Join-Path $artRoot "container-ident.json"); ESS_QA_ARTIFACT_DIR = $legDir; ESS_QA_PUBLISH_DIR = $pubDir; ESS_QA_API_DLL = $dll; ESS_QA_API_DLL_HASH = $apiDllHash; ESS_QA_PG_DLL_HASH = $pgDllHash; QA_API = "http://127.0.0.1:$ApiPort"; QA_FAKE = "http://127.0.0.1:$FakePort"; QA_WEB = "http://127.0.0.1:$WebPort" }
-    if ($liveArmed -and $leg -eq "leg8") { $legBaseEnv["ESS_QA_LIVE"] = "1"; $legBaseEnv["META_API_KEY"] = $liveKey }
+    if ($liveArmed -and $leg -eq "leg8") { $legBaseEnv["ESS_QA_LIVE"] = "1"; $legBaseEnv["META_API_KEY"] = $liveKey; if (-not [string]::IsNullOrWhiteSpace($liveBase)) { $legBaseEnv["META_API_BASE"] = $liveBase.Trim() } }
     if ($leg -eq "leg0") {
       $p0 = $null
       try {
@@ -329,7 +340,12 @@ try {
     $apiProc = $null; $fakeProc = $null; $webProc = $null; $legProc = $null
     try {
       $apiEnv = @{ ASPNETCORE_URLS = "http://127.0.0.1:$ApiPort"; META_API_BASE = "http://127.0.0.1:$FakePort"; META_API_KEY = "qa-dummy"; USE_POSTGRES = "1"; CONNECTIONSTRINGS__APP = $pgConn }
-      if ($liveArmed -and $leg -eq "leg8") { $apiEnv["META_API_KEY"] = $liveKey }
+      if ($liveArmed -and $leg -eq "leg8") {
+        $apiEnv["META_API_KEY"] = $liveKey
+        if ([string]::IsNullOrWhiteSpace($liveBase)) { $apiEnv.Remove("META_API_BASE") }
+        else { $apiEnv["META_API_BASE"] = $liveBase.Trim() }
+        if ($apiEnv.ContainsKey("META_API_BASE") -and [string]$apiEnv["META_API_BASE"] -match '127\.0\.0\.1|localhost|::1|:5242') { throw "refusing fake/loopback META_API_BASE for live leg8" }
+      }
       $apiProc = Start-Owned "dotnet" @($dll) $pubDir $apiEnv $apiOut $apiErr
       Write-Output ("  api-pid=" + $apiProc.Id)
       $fakeProc = Start-Owned "node.exe" @("qa/essentials/helpers/essentials-fake.mjs", "--port", "$FakePort") $ProjectRoot @{} $fakeOut $fakeErr
