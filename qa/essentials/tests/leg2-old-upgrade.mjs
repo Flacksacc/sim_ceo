@@ -49,6 +49,68 @@ const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 const normVal = (v) => JSON.stringify(v);
 const stripQ = (x) => String(x || "").replace(/^"|"$/g, "");
 const keyOf = (o) => String(o["Id"] ?? o["id"] ?? o["ID"] ?? Object.values(o)[0]);
+
+// Native PG JSON scalar lexemes preserved as STRINGS for old-field acceptance
+// (no JS number parsing): exact raw value slices from Postgres-emitted JSON.
+// Raw strict equality keeps SQL NULL ("null") distinct from literal "null"
+// ('"null"'), "<NULL>", "", control/newline escapes, user bytes, and numeric
+// scale/precision (bigint/decimal lexemes that JSON.parse rounds identically
+// stay distinct). Postgres emits deterministic escaping, so raw equality is
+// exact for strings too; numbers/booleans/null compare by exact lexeme.
+const lexRowsOf = (raw) => {
+  const objs = [];
+  const s = String(raw || "");
+  if (s.trim() === "" || s.trim() === "[]") return [];
+  let depth = 0, inStr = false, esc = false, start = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") { if (depth === 0) start = i; depth++; }
+    else if (ch === "}") { depth--; if (depth === 0 && start >= 0) { objs.push(s.slice(start, i + 1)); start = -1; } }
+  }
+  return objs.map((o) => {
+    const fields = {};
+    let i = 1; const n = o.length;
+    const skipWs = () => { while (i < n && /\s/.test(o[i])) i++; };
+    while (i < n - 1) {
+      skipWs();
+      if (o[i] === "}") break;
+      if (o[i] === ",") { i++; continue; }
+      if (o[i] !== '"') break;
+      const ks = i; i++;
+      let e = false;
+      while (i < n) { const c = o[i]; if (e) e = false; else if (c === "\\") e = true; else if (c === '"') break; i++; }
+      const keyRaw = o.slice(ks, i + 1); i++;
+      let key; try { key = JSON.parse(keyRaw); } catch { break; }
+      skipWs();
+      if (o[i] !== ":") break;
+      i++; skipWs();
+      if (i >= n) break;
+      const vs = i; const c = o[i];
+      if (c === undefined || c === "}") break;
+      if (c === '"') { i++; let ee = false; while (i < n) { const d = o[i]; if (ee) ee = false; else if (d === "\\") ee = true; else if (d === '"') break; i++; } i++; }
+      else if (c === "n" || c === "t" || c === "f") { while (i < n && /[a-z]/.test(o[i])) i++; }
+      else { while (i < n && /[-+0-9.eE]/.test(o[i])) i++; }
+      fields[key] = o.slice(vs, i);
+      skipWs();
+      if (o[i] === ",") i++;
+    }
+    return fields;
+  });
+};
+const lexByKey = (fpEntry) => {
+  const lexRows = lexRowsOf(fpEntry.json);
+  const m = new Map();
+  (fpEntry.parsed || []).forEach((o, ix) => { m.set(String(keyOf(o)), lexRows[ix] || {}); });
+  return m;
+};
+const oldLexEqual = (aRaw, bRaw) => aRaw === bRaw;
 function docker(args, timeoutMs = 60000) {
   return execFileSync("docker", args, { windowsHide: true, timeout: timeoutMs, stdio: "pipe" }).toString();
 }
@@ -195,6 +257,23 @@ try {
     ctx.ok("numeric-change-detected", sha256(rawN2) !== sha256(rawN), "sha moves on one digit change");
     psql(DB, "DROP TABLE qa_numeric_probe");
     ctx.ok("numeric-probe-dropped", true, "probe removed before fingerprint A");
+  // ACTUAL comparator representation/difference path (not merely raw
+  // includes/sha): the acceptance comparator itself must flag JS-loss
+  // lexeme pairs as CHANGED and identical lexemes as equal. These pairs
+  // collapse under JSON.parse+JSON.stringify but native lexemes differ.
+  {
+    const bigA = "9007199254740993", bigB = "9007199254740992";
+    const decA = "12345678901234567890.123456789", decB = "12345678901234567890.123456788";
+    const scaleA = "1.00", scaleB = "1";
+    ctx.ok("numeric-js-collapses-bigint", JSON.stringify(JSON.parse(bigA)) === JSON.stringify(JSON.parse(bigB)), "JS rounds bigint pair identically");
+    ctx.ok("numeric-js-collapses-decimal", JSON.stringify(JSON.parse(decA)) === JSON.stringify(JSON.parse(decB)), "JS rounds decimal pair identically");
+    ctx.ok("numeric-js-collapses-scale", JSON.stringify(JSON.parse(scaleA)) === JSON.stringify(JSON.parse(scaleB)), "JS rounds scale pair identically");
+    ctx.ok("numeric-comparator-bigint-changed", !oldLexEqual(bigA, bigB), bigA + " vs " + bigB);
+    ctx.ok("numeric-comparator-decimal-changed", !oldLexEqual(decA, decB), "decimal lexemes differ");
+    ctx.ok("numeric-comparator-scale-changed", !oldLexEqual(scaleA, scaleB), "1.00 vs 1");
+    ctx.ok("numeric-comparator-identical-stable", oldLexEqual(bigA, bigA) && oldLexEqual(decA, decA), "identical lexemes equal");
+    ctx.ok("numeric-comparator-null-vs-string", !oldLexEqual("null", '"null"') && !oldLexEqual("null", '"<NULL>"') && !oldLexEqual("null", '""'), "NULL distinct from literals");
+  }
   }
 // On byte mismatch: NAME-ALIGNED per-column diff of the first differing
   // rows (max 3) over PARSED JSON values, so migration normalizations are
@@ -204,6 +283,8 @@ try {
     const colsB = (b.cols || []).map(stripQ);
     const byIdB = new Map();
     for (const o of (b.parsed || [])) byIdB.set(keyOf(o), o);
+    const lexDetA = lexByKey(a);
+    const lexDetB = lexByKey(b);
     const detail = [];
     for (const oa of (a.parsed || [])) {
       const id = keyOf(oa);
@@ -211,8 +292,12 @@ try {
       if (!ob) { detail.push({ key: id.slice(0, 60), missingInB: true }); }
       else {
         const changed = [];
+        const lexArow = (lexDetA.get(id) || {});
+        const lexBrow = (lexDetB.get(id) || {});
         for (const col of new Set([...Object.keys(oa), ...Object.keys(ob)])) {
-          if (normVal(oa[col]) !== normVal(ob[col])) changed.push({ col, before: normVal(oa[col]).slice(0, 220), after: normVal(ob[col]).slice(0, 220) });
+          const aL = lexArow[col], bL = lexBrow[col];
+          const same = (aL !== undefined && bL !== undefined) ? oldLexEqual(aL, bL) : normVal(oa[col]) === normVal(ob[col]);
+          if (!same) changed.push({ col, before: String(aL !== undefined ? aL : normVal(oa[col])).slice(0, 220), after: String(bL !== undefined ? bL : normVal(ob[col])).slice(0, 220) });
         }
         if (changed.length > 0) detail.push({ key: id.slice(0, 60), changedCols: changed.map((x) => x.col), changed });
       }
@@ -325,6 +410,8 @@ try {
     schemaDiff.addedColumns[t] = addedCols;
     const mapA = new Map((fpA[t].parsed || []).map((o) => [keyOf(o), o]));
     const mapB = new Map((fpB[t].parsed || []).map((o) => [keyOf(o), o]));
+    const lexA = lexByKey(fpA[t]);
+    const lexB = lexByKey(fpB[t]);
     // Uniform-default backfill proof for every added column: the same
     // server default on EVERY pre-existing row, recorded for review.
     const backfillVals = {};
@@ -342,7 +429,10 @@ try {
       if (!ob) { justified = false; justification = "row lost " + String(id).slice(0, 40); break; }
       for (const col of Object.keys(oa)) {
         if (!colsB.includes(col)) { justified = false; changedOldCols.add("dropped-col:" + col); continue; }
-        if (normVal(oa[col]) === normVal(ob[col])) continue;
+        const aLex = (lexA.get(String(id)) || {})[col];
+        const bLex = (lexB.get(String(id)) || {})[col];
+        if (aLex !== undefined && bLex !== undefined) { if (oldLexEqual(aLex, bLex)) continue; }
+        else if (normVal(oa[col]) === normVal(ob[col])) continue;
         if (addedCols.includes(col)) continue;
         // Sources collision renumber: Version may move ONLY with a
         // server-owned migrate-version event AND preserved content bytes.
@@ -351,7 +441,7 @@ try {
           continue;
         }
         justified = false;
-        changedOldCols.add(col + ":[" + normVal(oa[col]).slice(0, 60) + "]->[" + normVal(ob[col]).slice(0, 60) + "]");
+        changedOldCols.add(col + ":[" + String(aLex !== undefined ? aLex : normVal(oa[col])).slice(0, 60) + "]->[" + String(bLex !== undefined ? bLex : normVal(ob[col])).slice(0, 60) + "]");
       }
       if (!justified) break;
     }
