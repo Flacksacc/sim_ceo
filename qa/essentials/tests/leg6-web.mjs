@@ -239,7 +239,17 @@ try {
     ctx.ok("nav-tab-" + exp.key + "-selected", st.cur === "page", "aria-current=" + st.cur);
     ctx.ok("nav-tab-" + exp.key + "-section", !!st.hasSec, "section[" + exp.section + "] present");
     if (exp.heading) ctx.ok("nav-tab-" + exp.key + "-heading", (st.heading || "").indexOf(exp.heading.slice(0, 12)) >= 0, "h2=" + st.heading);
-    ctx.ok("nav-tab-" + exp.key + "-action", st.body.indexOf(exp.action) >= 0, "action/content=" + exp.action);
+    if (exp.key === "meet") {
+      const hasMeetingParam = st.hash.indexOf("meeting=") >= 0;
+      if (hasMeetingParam) {
+        ctx.ok("nav-tab-meet-action", st.body.indexOf("Discussion") >= 0 && st.body.indexOf("Run discussion") >= 0, "detail hash=" + st.hash);
+      } else {
+        ctx.ok("nav-tab-meet-action", st.body.indexOf("Start meeting") >= 0 && st.body.indexOf("Search meetings") >= 0, "list hash=" + st.hash);
+        ctx.ok("nav-tab-meet-list-title", st.body.indexOf(run + " meeting") >= 0, "agenda title hash=" + st.hash);
+      }
+    } else {
+      ctx.ok("nav-tab-" + exp.key + "-action", st.body.indexOf(exp.action) >= 0, "action/content=" + exp.action);
+    }
   }
   // First-3 user flow exercised via actual UI rail clicks above (setup Boards,
   // lead Profile, advisor Board Advisors). REST seed stays fixture only.
@@ -786,9 +796,17 @@ try {
       let ansBodyR = null;
       try { ansBodyR = JSON.parse(ansPostsB[ansPostsB.length - 1] || "{}"); } catch (e) {}
       ctx.ok("secF-retry-same-request", !!ansBodyR && !!envF && ansBodyR.requestId === envF.requestId && ansBodyR.answer === answerF, "retry reused the SAME requestId + exact bytes");
-      const rowF = await get("/api/meetings/" + mid + "/secretary/requests/" + (envF ? envF.requestId : "missing"), { token: tokA });
+      const wRowF = await waitFor("secF-request-completed-wait", async () => {
+        const cur = await get("/api/meetings/" + mid + "/secretary/requests/" + (envF ? envF.requestId : "missing"), { token: tokA });
+        if (cur.status !== 200) return { done: false, note: "status=" + cur.status };
+        const rq = camel(cur.json, "request") || {};
+        if (String(camel(rq, "status") || "") === "completed" && String(camel(rq, "answer") || "") === answerF) return { done: true, value: cur };
+        return { done: false, note: "status=" + cur.status + " req=" + String(camel(rq, "status") || "") };
+      }, { timeoutMs: 30000 });
+      ctx.ok("secF-request-completed-wait", wRowF.ok, String(wRowF.last || "").slice(0, 200));
+      const rowF = wRowF.ok && wRowF.value ? wRowF.value : await get("/api/meetings/" + mid + "/secretary/requests/" + (envF ? envF.requestId : "missing"), { token: tokA });
       const rowFReq = camel(rowF.json, "request") || {};
-      ctx.ok("secF-request-completed", rowF.status === 200 && String(camel(rowFReq, "status") || "") === "completed" && String(camel(rowFReq, "answer") || "") === answerF, "status=" + rowF.status);
+      ctx.ok("secF-request-completed", rowF.status === 200 && String(camel(rowFReq, "status") || "") === "completed" && String(camel(rowFReq, "answer") || "") === answerF, "status=" + rowF.status + " req=" + String(camel(rowFReq, "status") || ""));
       const msgsF2 = mustArray(ctx, "secF-msgs-retry", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
       ctx.ok("secF-retry-no-dup-echo", msgsF2.length === msgsF1.length, "msgs " + msgsF1.length + "->" + msgsF2.length);
       const notesF2 = mustArray(ctx, "secF-notes-retry", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
@@ -797,12 +815,14 @@ try {
       ctx.ok("secF-retry-clears", !errDomF2.includes("Secretary error") && !errDomF2.includes("Secretary clarification"), errDomF2.slice(0, 300));
       const resetF = await fakeJson("/__ess/reset", { method: "POST", body: {} });
       ctx.ok("secF-fake-reset", resetF.status === 200, "status=" + resetF.status);
-      writeArt("secretary-first-answer-wire.json", { ask: askA, requestA: envB ? envB.requestId : null, answerA, requestF: envF ? envF.requestId : null, answerF, ansPosts: ansPostsB.length });
+      writeArt("secretary-first-answer-wire.json", { ask: askA, requestA: envB ? envB.requestId : null, answerB, requestF: envF ? envF.requestId : null, answerF, ansPosts: ansPostsB.length });
       try { page.off("request", onSecReqB); } catch (e) {}
     }
-    // --- P6c offline Retry -> Clear -> online: ZERO cleared posts, then a
+    // --- P6c ONLINE genuine 502 -> OFFLINE paused Retry -> Clear -> online: ZERO cleared posts, then a
     // FRESH positive ask MUST succeed (absence is never credit for never
-    // resumed). Counts ACTUAL finished browser POSTs after barriers. ---
+    // resumed). Counts ACTUAL finished browser POSTs after barriers. The
+    // offline Retry must PAUSE via TanStack onlineManager (disabled pending,
+    // old 502 error retained, zero POSTs), not fail fetch. ---
     {
       const finC = [];
       const failC = [];
@@ -818,19 +838,22 @@ try {
       const msgsO0 = mustArray(ctx, "secC-msgs-before", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
       const notesO0 = mustArray(ctx, "secC-notes-before", await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA }));
       const secKindO0 = notesO0.filter((n) => String(camel(n, "kind") || "").includes("secretary")).length;
+      const reqsO0 = mustArray(ctx, "secC-requests-before", await get("/api/meetings/" + mid + "/secretary/requests", { token: tokA }));
+      const fcO0 = await fakeJson("/__counts");
       const askO = "secretary: OFFLINE-QUEUED scope " + run + "?";
       await offScope.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askO);
       await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
-      await page.context().setOffline(true);
+      const armO = await fakeJson("/__ess/arm", { method: "POST", body: { route: "chat", times: 1, status: 502 } });
+      ctx.ok("secC-fake-armed", armO.status === 200, "status=" + armO.status);
       await offScope.getByRole("button", { name: "Send" }).click();
       await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid + "&mtab=takeaways", { waitUntil: "domcontentloaded", timeout: 30000 });
       try {
-        await page.waitForFunction(() => document.body.innerText.includes("Secretary error"), null, { timeout: 30000 });
-      } catch (e) { ctx.ok("secC-offline-error-visible", false, "offline Secretary error never rendered within 30s"); }
+        await page.waitForFunction(() => { const t = document.body.innerText; return t.includes("Secretary error") && /502/.test(t); }, null, { timeout: 30000 });
+      } catch (e) { ctx.ok("secC-initial-error-visible", false, "genuine online 502 Secretary error never rendered within 30s"); }
       const errDomO = await page.evaluate(() => document.body.innerText);
       ctx.ok("secC-offline-error-visible", errDomO.includes("Secretary error"), errDomO.slice(0, 300));
-      ctx.ok("secC-offline-error-genuine", /Failed to fetch|fetch failed|NetworkError|network|offline/i.test(errDomO), errDomO.slice(0, 300));
-      ctx.ok("secC-retry-offered", await page.getByRole("button", { name: "Retry secretary (same envelope)" }).count() >= 1, "same-envelope retry control present while offline");
+      ctx.ok("secC-offline-error-genuine", /502/.test(errDomO), errDomO.slice(0, 300));
+      ctx.ok("secC-retry-offered", await page.getByRole("button", { name: "Retry secretary (same envelope)" }).count() >= 1, "same-envelope retry control present after genuine 502");
       const envO = await page.evaluate((args) => {
         try {
           for (let i = 0; i < localStorage.length; i++) {
@@ -843,15 +866,31 @@ try {
         } catch (e) {}
         return null;
       }, { b: bid, m: mid });
-      ctx.ok("secC-envelope-saved-offline", !!envO && !!envO.nonce && envO.requestId === "", "fresh offline attempt envelope present, requestId unassigned");
+      ctx.ok("secC-envelope-saved-offline", !!envO && !!envO.nonce && envO.requestId === "", "genuine failed attempt envelope present, requestId unassigned");
+      const resetO = await fakeJson("/__ess/reset", { method: "POST", body: {} });
+      ctx.ok("secC-fake-reset", resetO.status === 200, "status=" + resetO.status);
+      const reqsAfterFail = mustArray(ctx, "secC-requests-failed", await get("/api/meetings/" + mid + "/secretary/requests", { token: tokA }));
+      const rowsOldNonce = reqsAfterFail.filter((r) => String(camel(r, "clientNonce") || "") === (envO ? envO.nonce : "__missing__"));
+      const fcAfterFail = await fakeJson("/__counts");
+      ctx.ok("secC-initial-dispatched-once", (fcAfterFail.json.chat | 0) === (fcO0.json.chat | 0) + 1, "chat " + fcO0.json.chat + "->" + fcAfterFail.json.chat);
+      await page.context().setOffline(true);
+      await page.evaluate(() => { try { window.dispatchEvent(new Event("offline")); } catch (e) {} });
+      await page.waitForTimeout(800);
+      const finBeforePaused = finC.length;
+      const failBeforePaused = failC.length;
+      const fcBeforePaused = await fakeJson("/__counts");
       await page.getByRole("button", { name: "Retry secretary (same envelope)" }).click();
       await page.waitForTimeout(3000);
+      const retryBtnO = page.getByRole("button", { name: "Retry secretary (same envelope)" });
+      const retryDisabled = await retryBtnO.isDisabled().catch(() => false);
+      ctx.ok("secC-paused-disabled", retryDisabled, "offline retry stays pending/disabled via onlineManager (no POST)");
       const errDomO2 = await page.evaluate(() => document.body.innerText);
-      ctx.ok("secC-retry-still-offline", errDomO2.includes("Secretary error"), errDomO2.slice(0, 300));
-      ctx.ok("secC-zero-finished-offline", finC.length === 0, "finished POSTs=" + finC.length);
-      ctx.ok("secC-attempts-never-left", failC.length >= 1, "failed browser attempts=" + failC.length);
+      ctx.ok("secC-retry-still-offline", errDomO2.includes("Secretary error") && /502/.test(errDomO2), errDomO2.slice(0, 300));
+      ctx.ok("secC-paused-no-post", finC.length === finBeforePaused && failC.length === failBeforePaused, "finished=" + finC.length + " failed=" + failC.length + " before=" + finBeforePaused + "/" + failBeforePaused);
       const msgsO1 = mustArray(ctx, "secC-msgs-offline", await get("/api/meetings/" + mid + "/messages?take=100", { token: tokA }));
       ctx.ok("secC-offline-no-publish", msgsO1.length === msgsO0.length, "msgs " + msgsO0.length + "->" + msgsO1.length);
+      const fcPaused = await fakeJson("/__counts");
+      ctx.ok("secC-paused-no-provider", (fcPaused.json.chat | 0) === (fcBeforePaused.json.chat | 0), "chat " + fcBeforePaused.json.chat + "->" + fcPaused.json.chat);
       await page.getByRole("button", { name: "Clear saved retry" }).click();
       await page.waitForTimeout(1000);
       const errDomO3 = await page.evaluate(() => document.body.innerText);
@@ -868,15 +907,24 @@ try {
       }, { b: bid, m: mid });
       ctx.ok("secC-clear-removes-envelope", leftKeys.length === 0, "leftover keys=" + leftKeys.join(","));
       await page.context().setOffline(false);
+      await page.evaluate(() => { try { window.dispatchEvent(new Event("online")); } catch (e) {} });
       const finAtResume = finC.length;
+      const fcAtResume = await fakeJson("/__counts");
       await page.waitForTimeout(2500);
       ctx.ok("secC-resume-posts-zero", finC.length === finAtResume, "finished POSTs after Clear+online=" + finC.length);
+      const reqsAfterResume = mustArray(ctx, "secC-requests-resumed", await get("/api/meetings/" + mid + "/secretary/requests", { token: tokA }));
+      const rowsOldAfter = reqsAfterResume.filter((r) => String(camel(r, "clientNonce") || "") === (envO ? envO.nonce : "__missing__"));
+      ctx.ok("secC-old-nonce-zero", rowsOldAfter.length === rowsOldNonce.length, "old nonce rows " + rowsOldNonce.length + "->" + rowsOldAfter.length);
+      const fcAfterResume = await fakeJson("/__counts");
+      ctx.ok("secC-old-nonce-no-provider", (fcAfterResume.json.chat | 0) === (fcAtResume.json.chat | 0), "chat " + fcAtResume.json.chat + "->" + fcAfterResume.json.chat);
       await page.goto(WEB + "/#/meet?board=" + bid + "&meeting=" + mid, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(1200);
       await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
       const askP = "secretary: ONLINE-RESUME scope " + run + "?";
       await offScope.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.").fill(askP);
       await offScope.locator('select[aria-label="Message audience"]').selectOption("secretary");
+      const finBeforeFresh = finC.length;
+      const fcBeforeFresh = await fakeJson("/__counts");
       await offScope.getByRole("button", { name: "Send" }).click();
       const wP = await waitFor("secC-positive-note", async () => {
         const ns = await get("/api/meetings/" + mid + "/notes?take=100", { token: tokA });
@@ -893,8 +941,13 @@ try {
       await page.waitForTimeout(1500);
       const domP = await page.evaluate(() => document.body.innerText);
       ctx.ok("secC-positive-renders", domP.includes("QA provisional note body for testing."), domP.slice(0, 300));
-      ctx.ok("secC-positive-single-post", finC.length === finAtResume + 1, "finished POSTs after fresh ask=" + finC.length);
-      writeArt("secretary-offline-wire.json", { finished: finC.length, failed: failC.length, atResume: finAtResume });
+      ctx.ok("secC-positive-single-post", finC.length === finBeforeFresh + 1, "finished POSTs after fresh ask=" + finC.length);
+      const fcAfterFresh = await fakeJson("/__counts");
+      ctx.ok("secC-positive-provider-once", (fcAfterFresh.json.chat | 0) === (fcBeforeFresh.json.chat | 0) + 1, "chat " + fcBeforeFresh.json.chat + "->" + fcAfterFresh.json.chat);
+      const reqsFinal = mustArray(ctx, "secC-requests-final", await get("/api/meetings/" + mid + "/secretary/requests", { token: tokA }));
+      const rowsFresh = reqsFinal.filter((r) => String(camel(r, "inputText") || camel(r, "input") || "").includes("ONLINE-RESUME"));
+      ctx.ok("secC-positive-request-once", rowsFresh.length === 1, "fresh nonce server rows=" + rowsFresh.length);
+      writeArt("secretary-offline-wire.json", { finished: finC.length, failed: failC.length, atResume: finAtResume, oldNonce: envO ? envO.nonce : null });
       try { page.off("requestfinished", onFinC); } catch (e) {}
       try { page.off("requestfailed", onFailC); } catch (e) {}
     }
