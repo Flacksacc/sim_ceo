@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.SignalR;
 using SimCEO.Api.Data;
 using SimCEO.Api.Domain;
@@ -10,6 +11,24 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<InMemoryStore>();
+// Phase7 Wiki keyring: stable private directory (WIKI_KEYRING_DIR overrides for isolated QA).
+{
+  var keyDir = Environment.GetEnvironmentVariable("WIKI_KEYRING_DIR");
+  if (string.IsNullOrWhiteSpace(keyDir))
+    keyDir = Path.Combine(AppContext.BaseDirectory, "data", "wiki-keyring");
+  try { Directory.CreateDirectory(keyDir!); } catch { }
+  var dp = builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(keyDir!)).SetApplicationName("simceo-wiki");
+  try
+  {
+    if (OperatingSystem.IsWindows())
+      dp.ProtectKeysWithDpapi();
+  }
+  catch { }
+}
+builder.Services.AddSingleton<SimCEO.Api.Work.IWikiClock, SimCEO.Api.Work.SystemWikiClock>();
+builder.Services.AddSingleton<SimCEO.Api.Work.WikiCredentialStore>();
+builder.Services.AddSingleton<SimCEO.Api.Work.WikiSyncService>();
+builder.Services.AddHostedService<SimCEO.Api.Work.WikiSyncHostedService>();
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyHeader().AllowAnyMethod().AllowCredentials().SetIsOriginAllowed(_ => true)));
 builder.Services.AddAntiforgery();
 

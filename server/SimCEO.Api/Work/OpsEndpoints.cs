@@ -330,6 +330,38 @@ public static class OpsEndpoints
         || !Guid.TryParse(se.GetString(), out var sourceId) || sourceId == Guid.Empty)
         return Results.BadRequest("sourceId is required.");
       if (!s.Sources.TryGetValue(sourceId, out var doc)) return Results.NotFound("source");
+      // Setup-use purpose gate for Wiki connectors (F9): missing resources,
+      // disabled/setup-off/failed/stale/pending/removed-page sources, and
+      // unauthorized scopes all reject WITHOUT adding a checkpoint. Only a
+      // healthy authorized setup-use positive control passes.
+      if (string.Equals((doc.Origin ?? "").Trim(), "wiki", System.StringComparison.OrdinalIgnoreCase))
+      {
+        static (bool ok, string error) WikiSetupAllowed(InMemoryStore s, HttpRequest req, SourceDoc d, out WikiResource? wrOut)
+        {
+          wrOut = null;
+          if (!d.ResourceId.HasValue || !s.WikiResources.TryGetValue(d.ResourceId.Value, out var wr)) return (false, "Wiki connector for this source is missing; reconfigure the connector before wizard extraction.");
+          wrOut = wr;
+          if (!wr.SetupUse) return (false, "This Wiki connector is not enabled for setup use; enable setup-use on the resource before wizard extraction.");
+          if (!wr.Enabled || !string.Equals(wr.LastStatus ?? "", "succeeded", StringComparison.OrdinalIgnoreCase)
+            || wr.ConfigRevision != wr.LastSuccessRevision || wr.LastSuccessRevision <= 0)
+            return (false, "Wiki connector evidence is not currently healthy; sync successfully before wizard extraction.");
+          HashSet<string> members;
+          try
+          {
+            var list = JsonSerializer.Deserialize<List<string>>(string.IsNullOrWhiteSpace(wr.SuccessPagesJson) ? "[]" : wr.SuccessPagesJson);
+            members = new HashSet<string>(list ?? new(), StringComparer.Ordinal);
+          }
+          catch { return (false, "Wiki connector evidence is not currently healthy; sync successfully before wizard extraction."); }
+          if (!members.Contains(d.FamilyKey ?? "")) return (false, "Wiki page is not in the current successful sync; sync successfully before wizard extraction.");
+          if (!SourceGovernance.IsEligible(s, d, d.Scope == "meeting" ? d.MeetingId : null))
+            return (false, "Wiki source is not eligible (pending, excluded, unindexed, or removed); approve and sync before wizard extraction.");
+          if (!WikiAuth.CanReadResource(s, req, wr.BoardId, wr.Scope, wr.MeetingId))
+            return (false, "Access revoked or not granted for this scope.");
+          return (true, "");
+        }
+        var (setupOk, setupErr) = WikiSetupAllowed(s, req, doc, out _);
+        if (!setupOk) return Results.Json(new { error = setupErr }, statusCode: 409);
+      }
       List<object> log;
       try
       {
@@ -362,25 +394,30 @@ public static class OpsEndpoints
     {
       if (!PeopleOps.IsOwner(req))
         return Results.Json(new { error = "Only the owner can export backups." }, statusCode: 403);
+      // Deterministic canonical ordering: every collection is sorted by
+      // identity (dictionaries by key) so backups hash stably and restores
+      // round-trip byte-identically (modulo the fresh export timestamp).
       var snapshot = new
       {
         version = 2,
         at = DateTime.UtcNow,
-        boards = s.Boards.Values.ToList(),
-        roster = s.Roster.Values.ToList(),
-        advisors = s.Advisors.Values.ToList(),
-        meetings = s.Meetings.Values.ToList(),
-        messages = s.Messages.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
-        notes = s.Notes.Values.ToList(),
-        drafts = s.Drafts.Values.ToList(),
-        sources = s.Sources.Values.ToList(), sections = s.SourceSections.Values.ToList(), heads = s.SourceHeads.Values.ToList(), events = s.SourceEvents.Values.ToList(),
-        blobs = s.Sources.Values.ToDictionary(
+        boards = s.Boards.Values.OrderBy(x => x.Id).ToList(),
+        roster = s.Roster.Values.OrderBy(x => x.Id).ToList(),
+        advisors = s.Advisors.Values.OrderBy(x => x.Id).ToList(),
+        meetings = s.Meetings.Values.OrderBy(x => x.Id).ToList(),
+        messages = s.Messages.OrderBy(kv => kv.Key).ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
+        notes = s.Notes.Values.OrderBy(x => x.Id).ToList(),
+        drafts = s.Drafts.Values.OrderBy(x => x.Id).ToList(),
+        sources = s.Sources.Values.OrderBy(x => x.Id).ToList(), sections = s.SourceSections.Values.OrderBy(x => x.Id).ToList(), heads = s.SourceHeads.Values.OrderBy(x => x.Id).ToList(), events = s.SourceEvents.Values.OrderBy(x => x.Id).ToList(),
+        wikiResources = WikiBackup.Export(s),
+        deletedWikiResourceIds = WikiBackup.DeletedWikiResourceIds(s),
+        blobs = s.Sources.Values.OrderBy(x => x.Id).ToDictionary(
           x => x.Id.ToString(), x => x.Original is null ? "" : Convert.ToBase64String(x.Original)),
-        leads = s.LeadProfiles.Values.ToList(),
-          wizardDrafts = s.WizardDrafts.Values.ToList(),
-        grants = s.Grants.Values.ToList(),
-        invites = s.Invites.Values.ToList(),
-        images = s.Images.Values.Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
+        leads = s.LeadProfiles.Values.OrderBy(x => x.Id).ToList(),
+          wizardDrafts = s.WizardDrafts.Values.OrderBy(x => x.Id).ToList(),
+        grants = s.Grants.Values.OrderBy(x => x.Id).ToList(),
+        invites = s.Invites.Values.OrderBy(x => x.Id).ToList(),
+        images = s.Images.Values.OrderBy(i => i.Id).Select(i => new { i.Id, i.RosterEntryId, i.BoardAdvisorId, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt, data = i.Data is null ? null : Convert.ToBase64String(i.Data) }).ToList(),
       };
       var json = JsonSerializer.Serialize(snapshot);
       return Results.Ok(new { snapshot = json, hash = Hashing.FullHash(Encoding.UTF8.GetBytes(json)), bytes = json.Length });
@@ -399,53 +436,116 @@ public static class OpsEndpoints
       catch (JsonException) { return Results.BadRequest("snapshot is not valid JSON."); }
       if (!doc.RootElement.TryGetProperty("version", out var v) || v.GetInt32() is not (1 or 2))
         return Results.BadRequest("Unsupported backup version.");
-      var restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
-        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-      if (restored is null) return Results.BadRequest("Unrecognized backup shape.");
+      BackupSnapshot? restored = null;
+      try
+      {
+        restored = JsonSerializer.Deserialize<BackupSnapshot>(snapshot,
+          new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+      }
+      catch (JsonException) { return Results.BadRequest("Snapshot is not a recognized backup shape."); }
+      if (restored is null
+        || restored.boards is null || restored.roster is null || restored.advisors is null
+        || restored.meetings is null || restored.messages is null || restored.notes is null
+        || restored.drafts is null || restored.sources is null || restored.blobs is null
+        || restored.leads is null || restored.grants is null || restored.invites is null
+        || restored.images is null)
+        return Results.BadRequest("Snapshot is missing required sections.");
+      // Typed Wiki graph prevalidation BEFORE any clear: strict required IDs,
+      // exact scopes, snapshot meeting parents, strict rule JSON, preserved
+      // history, and source/section graph validation. Secrets, dangling,
+      // cross-board, and malformed graphs reject without partial writes.
+      List<WikiBackupRecord>? wikiValidated = null;
+      try
+      {
+        using var vdoc = JsonDocument.Parse(snapshot);
+        var (recs, werr) = WikiBackup.Validate(vdoc.RootElement, s);
+        if (werr is not null) return Results.BadRequest(werr);
+        wikiValidated = recs;
+      }
+      catch (JsonException) { return Results.BadRequest("Snapshot wikiResources are malformed."); }
+      // Memory-backend rollback image (PG relies on the Atomic transaction below).
+      var memBackup = Pg.Backend is null ? WikiBackup.CaptureStore(s) : null;
       lock (s.SetupLock)
       {
-        s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
-        s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
-        s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
-        foreach (var b in restored.boards) s.Boards[b.Id] = b;
-        foreach (var r in restored.roster) s.Roster[r.Id] = r;
-        foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
-        foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
-        foreach (var kv in restored.messages)
-          if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
-        foreach (var n in restored.notes) s.Notes[n.Id] = n;
-        foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
-        foreach (var x in restored.sources) s.Sources[x.Id] = x; if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss; if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh; if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
-        // Deliberate legacy migration (P2 #9): pre-phase-6 snapshots carry
-        // Approved=true with no ReviewState field. The "" sentinel promotes
-        // those to "approved" without touching explicit decisions (rejected
-        // rows stay rejected), and completed-without-sections metadata is
-        // failed-closed until reindex.
-        SourceGovernance.MigrateRestoredSources(s);
-        foreach (var kv in restored.blobs)
-          if (Guid.TryParse(kv.Key, out var bid2))
-            if (s.Sources.TryGetValue(bid2, out var bdoc))
-              try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
-        s.Sources.Flush();
-        foreach (var img in restored.images)
+        try
         {
-          byte[]? data = null;
-          if (img.data is not null) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
-          s.Images[img.id] = new AdvisorImage
+          Atomic.Run(() =>
           {
-            Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
-            Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
-            Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
-            ContentType = img.contentType ?? "image/png", Data = data,
-            CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
-          };
+            s.Boards.Clear(); s.Roster.Clear(); s.Advisors.Clear(); s.Meetings.Clear(); s.Messages.Clear();
+            s.Notes.Clear(); s.Drafts.Clear(); s.Sources.Clear(); s.SourceSections.Clear(); s.SourceHeads.Clear(); s.SourceEvents.Clear();
+            s.WikiResources.Clear(); s.WikiSecrets.Clear();
+            s.LeadProfiles.Clear(); s.Grants.Clear(); s.Invites.Clear(); s.Images.Clear(); s.WizardDrafts.Clear();
+            foreach (var b in restored.boards) s.Boards[b.Id] = b;
+            foreach (var r in restored.roster) s.Roster[r.Id] = r;
+            foreach (var a in restored.advisors) s.Advisors[a.Id] = a;
+            foreach (var m in restored.meetings) s.Meetings[m.Id] = m;
+            foreach (var kv in restored.messages)
+              if (Guid.TryParse(kv.Key, out var mid)) s.Messages[mid] = MessageList.Detached(mid, kv.Value);
+            foreach (var n in restored.notes) s.Notes[n.Id] = n;
+            foreach (var d in restored.drafts) s.Drafts[d.Id] = d;
+            foreach (var x in restored.sources) s.Sources[x.Id] = x;
+            if (restored.sections is not null) foreach (var ss in restored.sections) s.SourceSections[ss.Id] = ss;
+            if (restored.heads is not null) foreach (var hh in restored.heads) s.SourceHeads[hh.Id] = hh;
+            if (restored.events is not null) foreach (var ee in restored.events) s.SourceEvents[ee.Id] = ee;
+            // Typed Wiki restore: exact validated export round-trips resource IDs,
+            // history, URLs, rules, scope, and schedule; credentials are absent
+            // and every resource is DISABLED with blocked cached sources.
+            // Validated BEFORE clear; applied atomically inside the same boundary.
+            // Validated invariants hold here; violations fail closed with rollback.
+            if (wikiValidated is not null)
+              foreach (var w in wikiValidated)
+              {
+                var r = new Domain.WikiResource
+                {
+                  Id = w.Id, BoardId = w.BoardId, Scope = w.Scope, MeetingId = w.MeetingId,
+                  BaseUrl = w.BaseUrl, Description = w.Description ?? "", AllowedUse = w.AllowedUse ?? "",
+                  SetupUse = w.SetupUse, ManualOnly = w.ManualOnly,
+                  AllowlistJson = w.AllowlistJson, ExclusionsJson = w.ExclusionsJson,
+                  RequiredTagsJson = w.RequiredTagsJson, Locale = w.Locale ?? "",
+                  ConfigRevision = w.ConfigRevision, AttemptGeneration = 1, AttemptStatus = "idle",
+                  SyncIntervalMinutes = w.SyncIntervalMinutes, CreatedAt = w.CreatedAt,
+                  Enabled = false, LastStatus = "disabled",
+                  LastError = "Restored from backup; reconfigure the credential and re-enable.",
+                  LastCompletedAt = null, LastSuccessAt = null,
+                  HasCredential = false, SuccessPagesJson = "[]", LastSuccessRevision = 0,
+                  NextSyncAt = null, UpdatedAt = DateTime.UtcNow,
+                };
+                if (!s.Boards.TryGetValue(r.BoardId, out _)) throw new InvalidOperationException("validated invariant violated: wiki board missing.");
+                if (r.Scope == "meeting" && (!r.MeetingId.HasValue || !s.Meetings.TryGetValue(r.MeetingId.Value, out var wmt) || wmt.BoardId != r.BoardId)) throw new InvalidOperationException("validated invariant violated: wiki meeting missing.");
+                s.WikiResources[r.Id] = r;
+              }
+            SourceGovernance.MigrateRestoredSources(s);
+            foreach (var kv in restored.blobs)
+              if (Guid.TryParse(kv.Key, out var bid2))
+                if (s.Sources.TryGetValue(bid2, out var bdoc))
+                  try { bdoc.Original = Convert.FromBase64String(kv.Value); } catch (FormatException) { }
+            s.Sources.Flush();
+            foreach (var img in restored.images)
+            {
+              byte[]? data = null;
+              if (img.data is not null) try { data = Convert.FromBase64String(img.data); } catch (FormatException) { }
+              s.Images[img.id] = new AdvisorImage
+              {
+                Id = img.id, RosterEntryId = img.rosterEntryId, BoardAdvisorId = img.boardAdvisorId,
+                Kind = img.kind ?? "upload", Provenance = img.provenance ?? "",
+                Review = string.IsNullOrWhiteSpace(img.review) ? "pending" : img.review,
+                ContentType = img.contentType ?? "image/png", Data = data,
+                CreatedAt = img.createdAt == default ? DateTime.UtcNow : img.createdAt,
+              };
+            }
+            foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
+            foreach (var g in restored.grants) s.Grants[g.Id] = g;
+            foreach (var i in restored.invites) s.Invites[i.Id] = i;
+            if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
+          });
         }
-        foreach (var l in restored.leads) s.LeadProfiles[l.Id] = l;
-        foreach (var g in restored.grants) s.Grants[g.Id] = g;
-        foreach (var i in restored.invites) s.Invites[i.Id] = i;
-        if (restored.wizardDrafts is not null) foreach (var w in restored.wizardDrafts) s.WizardDrafts[w.Id] = w;
-        s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) });
+        catch (Exception ex)
+        {
+          if (memBackup is not null) { try { WikiBackup.RestoreStore(s, memBackup); } catch { } }
+          return Results.Json(new { error = "Backup restore failed and was rolled back: " + ex.GetType().Name }, statusCode: 500);
+        }
       }
+      try { s.Audit.Add(new AuditEvent { Action = "backup.restore", Detail = JsonSerializer.Serialize(new { restored.at, boards = restored.boards.Count }) }); } catch { }
       return Results.Ok(new { restored = restored.boards.Count, at = restored.at });
     });
 
@@ -539,3 +639,6 @@ public static class CommandMap
     new { command = "/help", view = "Help", action = "This searchable coverage map" },
   };
 }
+
+
+

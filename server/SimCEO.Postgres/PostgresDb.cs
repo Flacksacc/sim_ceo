@@ -18,6 +18,8 @@ public sealed class PostgresDb : DbContext
   public DbSet<Message> Messages => Set<Message>();
   public DbSet<RecordDraft> Drafts => Set<RecordDraft>();
   public DbSet<SourceDoc> Sources => Set<SourceDoc>(); public DbSet<SourceSection> SourceSections => Set<SourceSection>(); public DbSet<SourceFamilyHead> SourceHeads => Set<SourceFamilyHead>(); public DbSet<SourceEvent> SourceEvents => Set<SourceEvent>();
+  public DbSet<WikiResource> WikiResources => Set<WikiResource>();
+  public DbSet<WikiResourceSecret> WikiSecrets => Set<WikiResourceSecret>();
   public DbSet<WizardDraft> WizardDrafts => Set<WizardDraft>();
   public DbSet<VoiceTurn> VoiceTurns => Set<VoiceTurn>();
   public DbSet<LeadProfile> LeadProfiles => Set<LeadProfile>();
@@ -264,6 +266,17 @@ public static class PgBoot
       db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"SourceEvents\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"SourceId\" uuid NOT NULL, \"FamilyKey\" text NOT NULL DEFAULT '', \"Version\" integer NOT NULL DEFAULT 1, \"Action\" text NOT NULL DEFAULT '', \"Detail\" text NOT NULL DEFAULT '', \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_Sources_FamilyKey\" ON \"Sources\" (\"FamilyKey\")");
       db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_SourceSections_SourceId\" ON \"SourceSections\" (\"SourceId\")");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"WikiResources\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"BoardId\" uuid NOT NULL, \"Scope\" text NOT NULL DEFAULT \'board\', \"MeetingId\" uuid NULL, \"BaseUrl\" text NOT NULL DEFAULT \'\', \"Description\" text NOT NULL DEFAULT \'\', \"AllowlistJson\" text NOT NULL DEFAULT \'[]\', \"ExclusionsJson\" text NOT NULL DEFAULT \'[]\', \"RequiredTagsJson\" text NOT NULL DEFAULT \'[]\', \"Locale\" text NOT NULL DEFAULT \'\', \"Enabled\" boolean NOT NULL DEFAULT FALSE, \"ConfigRevision\" bigint NOT NULL DEFAULT 1, \"SyncIntervalMinutes\" integer NOT NULL DEFAULT 60, \"NextSyncAt\" timestamp with time zone NULL, \"LastStatus\" text NOT NULL DEFAULT \'disabled\', \"LastError\" text NOT NULL DEFAULT \'\', \"LastCompletedAt\" timestamp with time zone NULL, \"LastSuccessRevision\" bigint NOT NULL DEFAULT 0, \"LastSuccessAt\" timestamp with time zone NULL, \"SuccessPagesJson\" text NOT NULL DEFAULT \'[]\', \"HasCredential\" boolean NOT NULL DEFAULT FALSE, \"CreatedAt\" timestamp with time zone NOT NULL DEFAULT NOW(), \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS \"WikiSecrets\" (\"Id\" uuid NOT NULL PRIMARY KEY, \"ResourceId\" uuid NOT NULL, \"ProtectedToken\" text NOT NULL DEFAULT \'\', \"UpdatedAt\" timestamp with time zone NOT NULL DEFAULT NOW())");
+      db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS \"IX_WikiResources_BoardId\" ON \"WikiResources\" (\"BoardId\")");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"Scope\" text NOT NULL DEFAULT \'board\'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"SuccessPagesJson\" text NOT NULL DEFAULT \'[]\'");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"LastSuccessRevision\" bigint NOT NULL DEFAULT 0");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"AllowedUse\" text NOT NULL DEFAULT ''");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"SetupUse\" boolean NOT NULL DEFAULT FALSE");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"ManualOnly\" boolean NOT NULL DEFAULT FALSE");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"AttemptGeneration\" bigint NOT NULL DEFAULT 1");
+      db.Database.ExecuteSqlRaw("ALTER TABLE \"WikiResources\" ADD COLUMN IF NOT EXISTS \"AttemptStatus\" text NOT NULL DEFAULT 'idle'");
       // One-time idempotent legacy migration: pending for new, approved stays, then heads backfill runs at request time.
       db.Database.ExecuteSqlRaw("UPDATE \"Sources\" SET \"ReviewState\" = CASE WHEN \"Approved\" THEN 'approved' ELSE 'pending' END WHERE (\"ReviewState\" = 'pending' OR \"ReviewState\" = '') AND \"Approved\" = TRUE");
       // FamilyKey backfill runs in app code (EnsureMigratedAll) to compute board/scope/origin-aware keys; SQL leaves new rows empty.
@@ -286,3 +299,5 @@ public static class AdvisorStore
   public static List<BoardAdvisor> ForBoard(PostgresDb db, Guid boardId) =>
     db.BoardAdvisors.Where(a => a.BoardId == boardId).ToList();
 }
+
+

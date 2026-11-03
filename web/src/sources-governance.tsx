@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type GovSource = {
   id: string; boardId: string; fileName: string; contentHash: string; version: number;
@@ -16,28 +16,43 @@ type HistEvent = { id: string; action: string; detail: string; createdAt: string
 type SecRow = { id: string; ordinal: number; heading: string; location: string; text: string; indexGeneration: number };
 type SecResp = { sourceId: string; version: number; contentHash: string; indexState: string; indexGeneration: number; indexError: string; indexCompletedAt?: string | null; sections: SecRow[] };
 
+// Shared-transport inbox API (F12): the App passes its applied shared
+// transport (demo identity + Bearer + auth epoch). The fallback preserves the
+// previous session-token-only behavior for standalone use and never reads
+// test-only globals.
+export type GovApi = {
+  get: <T,>(u: string) => Promise<T>;
+  post: <T,>(u: string, b?: unknown) => Promise<T>;
+  put: <T,>(u: string, b?: unknown) => Promise<T>;
+  patch: <T,>(u: string, b?: unknown) => Promise<T>;
+  upload: <T,>(u: string, f: FormData) => Promise<T>;
+};
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = {};
   const t = localStorage.getItem("simceo-token");
   if (t) (h as Record<string, string>)["Authorization"] = "Bearer " + t;
-  const act = (window as unknown as { __srcActAs?: string }).__srcActAs ?? "";
-  if (act) (h as Record<string, string>)["X-User"] = act;
   return h;
 }
 async function j<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error(r.status + " " + (await r.text()).slice(0, 400));
   return r.json() as Promise<T>;
 }
-const get = <T,>(u: string): Promise<T> => fetch(u, { headers: authHeaders() }).then(j<T>);
-const post = <T,>(u: string, b?: unknown): Promise<T> =>
-  fetch(u, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify(b ?? {}) }).then(j<T>);
-const putPolicy = (bid: string, blockedTypes: string, mode: string) =>
-  fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
-const patchScope = <T,>(id: string, b: unknown): Promise<T> =>
-  fetch("/api/sources/" + id, { method: "PATCH", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify(b) }).then(j<T>);
+function fallbackGovApi(): GovApi {
+  return {
+    get: <T,>(u: string) => fetch(u, { headers: authHeaders() }).then(j<T>),
+    post: <T,>(u: string, b?: unknown) => fetch(u, { method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify(b ?? {}) }).then(j<T>),
+    put: <T,>(u: string, b?: unknown) => fetch(u, { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify(b ?? {}) }).then(j<T>),
+    patch: <T,>(u: string, b?: unknown) => fetch(u, { method: "PATCH", headers: { "Content-Type": "application/json", ...authHeaders() }, body: JSON.stringify(b) }).then(j<T>),
+    upload: <T,>(u: string, f: FormData) => fetch(u, { method: "POST", headers: authHeaders(), body: f }).then(j<T>),
+  };
+}
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[] }) {
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; api?: GovApi }) {
   const { boardId, meetingId, meetings } = props;
+  const api = props.api ?? fallbackGovApi();
+  const boardRef = useRef(boardId);
+  boardRef.current = boardId;
+  const seqRef = useRef(0);
   const [groups, setGroups] = useState<ReviewGroup[] | null>(null);
   const [policy, setPolicy] = useState<{ blockedTypes: string; mode: string } | null>(null);
   const [blocked, setBlocked] = useState("");
@@ -52,35 +67,56 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
   const [recallHits, setRecallHits] = useState<{ kind: string; ref: string; text: string; score: number }[]>([]);
   const [uploadScope, setUploadScope] = useState("board");
 
+  function notifyWikiChanged() {
+    try { window.dispatchEvent(new CustomEvent("wiki-changed", { detail: { boardId: boardRef.current } })); } catch { }
+  }
   async function refresh() {
-    if (!boardId) return;
-    setLoading(true); setConflict("");
+    const myBoard = boardId;
+    // Guard origin board BEFORE touching shared sequence/state: obsolete
+    // closures for another board must never displace current-board data (F16).
+    // Successful refreshes never clear operation conflicts (F16).
+    if (boardRef.current !== myBoard) return;
+    if (!myBoard) return;
+    const seq = ++seqRef.current;
+    setLoading(true);
     try {
       const [g, p, c] = await Promise.all([
-        get<ReviewGroup[]>("/api/boards/" + boardId + "/sources/review"),
-        get<{ blockedTypes: string; mode: string }>("/api/boards/" + boardId + "/source-policy"),
-        get<unknown>("/api/boards/" + boardId + "/context"),
+        api.get<ReviewGroup[]>("/api/boards/" + myBoard + "/sources/review"),
+        api.get<{ blockedTypes: string; mode: string }>("/api/boards/" + myBoard + "/source-policy"),
+        api.get<unknown>("/api/boards/" + myBoard + "/context"),
       ]);
+      if (seqRef.current !== seq || boardRef.current !== myBoard) return;
       setGroups(g); setPolicy(p); setBlocked(p.blockedTypes ?? ""); setMode(p.mode ?? "allowAll"); setCtx(c);
     } catch (e) {
-      setConflict(String(e));
-    } finally { setLoading(false); }
+      if (seqRef.current === seq && boardRef.current === myBoard) setConflict(String(e));
+    } finally { if (seqRef.current === seq && boardRef.current === myBoard) setLoading(false); }
   }
-  useEffect(() => { refresh(); }, [boardId]);
+  useEffect(() => { setConflict(""); refresh(); }, [boardId]);
+  useEffect(() => {
+    const h = (ev: Event) => {
+      try { if ((ev as CustomEvent).detail?.boardId !== undefined && (ev as CustomEvent).detail.boardId !== boardRef.current) return; } catch { }
+      refresh();
+    };
+    window.addEventListener("wiki-changed", h);
+    return () => window.removeEventListener("wiki-changed", h);
+  }, [boardId]);
 
   async function act(id: string, op: string) {
     setConflict(""); setNotice("");
+    const opBoard = boardId;
     try {
-      if (op === "scope-board") await patchScope(id, { scope: "board" });
-      else await post("/api/sources/" + id + "/" + op, {});
+      if (op === "scope-board") await api.patch<unknown>("/api/sources/" + id, { scope: "board" });
+      else await api.post<unknown>("/api/sources/" + id + "/" + op, {});
+      if (boardRef.current !== opBoard) return;
       if (op === "approve" || op === "reject" || op === "exclude" || op === "restore") setNotice("Meeting evidence re-evaluated; affected active meetings paused.");
-      await refresh();
-    } catch (e) { setConflict(String(e)); }
+      await refresh(); notifyWikiChanged();
+    } catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
   }
   async function savePolicy() {
     setConflict(""); setNotice("");
-    try { await putPolicy(boardId, blocked, mode); setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); }
-    catch (e) { setConflict(String(e)); }
+    const opBoard = boardId;
+    try { await api.put<unknown>("/api/boards/" + boardId + "/source-policy", { blockedTypes: blocked, mode }); if (boardRef.current !== opBoard) return; setNotice("Policy applies immediately; affected meetings paused. Board discussion-policy activation is separate."); await refresh(); notifyWikiChanged(); }
+    catch (e) { if (boardRef.current === opBoard) setConflict(String(e)); }
   }
   const [uploadMeetingId, setUploadMeetingId] = useState("");
   const [moveMeetingId, setMoveMeetingId] = useState("");
@@ -98,11 +134,11 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
       fd.append("file", f);
       fd.append("scope", uploadScope);
       if (uploadScope === "meeting" && effUploadMeeting) fd.append("meetingId", effUploadMeeting);
-      const res = await fetch("/api/boards/" + boardId + "/sources/upload", { method: "POST", headers: authHeaders(), body: fd });
-      if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 400));
+      await api.upload<unknown>("/api/boards/" + boardId + "/sources/upload", fd);
+      if (boardRef.current !== boardId) return;
       setNotice("Uploaded as pending; explicit approval required before it becomes evidence.");
-      await refresh();
-    } catch (e) { setConflict(String(e)); }
+      await refresh(); notifyWikiChanged();
+    } catch (e) { if (boardRef.current === boardId) setConflict(String(e)); }
   }
   async function moveScope(id: string, scope: string) {
     setConflict(""); setNotice("");
@@ -113,23 +149,23 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
         if (!mid) throw new Error("Pick a target meeting for meeting scope.");
         body.meetingId = mid;
       }
-      await patchScope(id, body);
+      await api.patch<unknown>("/api/sources/" + id, body);
       setNotice("Scope change re-evaluates evidence; a moved approval re-enters pending review and the old head never revives.");
-      await refresh();
+      await refresh(); notifyWikiChanged();
     } catch (e) { setConflict(String(e)); }
   }
   async function loadHist(id: string) {
-    try { const h = await get<HistEvent[]>("/api/sources/" + id + "/history"); setHist((m) => ({ ...m, [id]: h })); }
+    try { const h = await api.get<HistEvent[]>("/api/sources/" + id + "/history"); setHist((m) => ({ ...m, [id]: h })); }
     catch (e) { setConflict(String(e)); }
   }
   async function loadSecs(id: string) {
-    try { const s = await get<SecResp>("/api/sources/" + id + "/sections"); setSecs((m) => ({ ...m, [id]: s })); }
+    try { const s = await api.get<SecResp>("/api/sources/" + id + "/sections"); setSecs((m) => ({ ...m, [id]: s })); }
     catch (e) { setConflict(String(e)); }
   }
   async function runRecall() {
     setConflict("");
     try {
-      const hits = await get<{ kind: string; ref: string; text: string; score: number }[]>("/api/boards/" + boardId + "/recall?q=" + encodeURIComponent(recallQ) + (meetingId ? "&meetingId=" + meetingId : ""));
+      const hits = await api.get<{ kind: string; ref: string; text: string; score: number }[]>("/api/boards/" + boardId + "/recall?q=" + encodeURIComponent(recallQ) + (meetingId ? "&meetingId=" + meetingId : ""));
       setRecallHits(hits);
     } catch (e) { setConflict(String(e)); }
   }
@@ -196,8 +232,8 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
                 <button onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>
                 <button onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>
                 <button onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>
-                <button onClick={() => moveScope(s.id, "board")} disabled={s.scope === "board"}>Move to board</button>
-                <button onClick={() => moveScope(s.id, "meeting")} disabled={s.scope === "meeting"}>Move to meeting</button>
+{s.origin === "wiki" ? <span className="badge">Manage connection via Wiki resource (scope authoritative)</span> : <><button onClick={() => moveScope(s.id, "board")} disabled={s.scope === "board"}>Move to board</button>
+<button onClick={() => moveScope(s.id, "meeting")} disabled={s.scope === "meeting"}>Move to meeting</button></>}
                 <button onClick={() => act(s.id, "reindex")}>Reindex</button>
                 <button onClick={() => act(s.id, "retry")}>Retry extraction</button>
                 <a href={"/api/sources/" + s.id + "/download"}>Download original</a>

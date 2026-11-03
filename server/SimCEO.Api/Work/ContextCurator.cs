@@ -77,6 +77,19 @@ public static class ContextCurator
       .Where(e => !string.IsNullOrWhiteSpace(e.text))
       .OrderByDescending(e => Score(e.text, words))
       .Take(6).ToList();
+    // Permitted-use guidance for Wiki excerpts: the resource's COMPLETE
+    // AllowedUse text is emitted ONCE per resource (never truncated, never
+    // redacted as content). This is model-use guidance, not content redaction,
+    // and credentials never enter model context.
+    var wikiUseIds = ranked
+      .Where(e => e.doc.ResourceId.HasValue)
+      .Select(e => e.doc.ResourceId!.Value).Distinct().ToList();
+    foreach (var rid in wikiUseIds)
+    {
+      if (s.WikiResources.TryGetValue(rid, out var wr) && wr.BoardId == m.BoardId
+        && wr.Enabled && !string.IsNullOrWhiteSpace(wr.AllowedUse))
+        sb.AppendLine($"[WIKI PERMITTED USE ({wr.Description.Trim()}): {wr.AllowedUse.Trim()}]");
+    }
     var sourceIds = new List<string>();
     var room = draftTokens * 4 - sb.Length;
     if (room > 0 && ranked.Count > 0)

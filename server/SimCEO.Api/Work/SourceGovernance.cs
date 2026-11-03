@@ -234,6 +234,8 @@ public static class SourceGovernance
     // match this exact source/version/hash/generation with nonempty text.
     // Raw extraction/original text must never satisfy eligibility (P2 #13).
     if (!HasValidSections(s, d)) return false;
+    // Phase7 seam: wiki docs additionally require a present, enabled, current-healthy resource with current membership.
+    if (!WikiEligibility.IsUsable(s, d)) return false;
     return true;
   }
 
@@ -383,6 +385,81 @@ public static class SourceGovernance
       }
     }
     try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
+  }
+  // Conditional variant: the callback reports whether it changed evidence.
+  // Meetings are paused / generation-bumped and the invalidation audit is
+  // written ONLY when the callback actually changed something. Stale or
+  // no-op completions (superseded sync attempts, unchanged refreshes,
+  // identical reconfigurations) must never pause meetings, bump generation,
+  // or write success/failure audits. Non-wiki callers keep MutateEvidence.
+  public static bool MutateEvidenceIfChanged(InMemoryStore s, Guid boardId, string reason, Func<bool> mutation)
+  {
+    bool changed;
+    lock (s.SetupLock)
+    {
+      lock (s.MessageLock)
+      {
+        changed = Atomic.Run(mutation);
+        if (changed) InvalidateLocked(s, boardId);
+      }
+    }
+    if (changed) try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
+    return changed;
+  }
+
+  // Meeting invalidation for callers that already hold SetupLock (they run
+  // their own Atomic unit): takes MessageLock, pauses/bumps affected
+  // meetings, and audits. Same lock order as MutateEvidence.
+  public static void InvalidateBoardUnderSetupLock(InMemoryStore s, Guid boardId, string reason)
+  {
+    lock (s.MessageLock)
+    {
+      InvalidateLocked(s, boardId);
+    }
+    try { s.Audit.Add(new AuditEvent { BoardId = boardId, Action = "source.invalidate", Detail = reason ?? "" }); } catch { }
+  }
+
+  // Bounded detached index staging for Wiki sync: builds exactly the sections
+  // IndexSource would persist for this document, WITHOUT touching the store.
+  // Returns false with a safe fixed error when the page is unindexable
+  // (failed/unreachable extraction, empty/whitespace text, or no nonempty
+  // sections), so the whole sync attempt can fail closed BEFORE publishing
+  // any new source row. Mirrors IndexSource's pure text/section logic.
+  public static bool TryStageIndexSections(SourceDoc template, out List<SourceSection> sections, out string error)
+  {
+    sections = new();
+    error = "";
+    var gen = template.IndexGeneration <= 0 ? 1 : template.IndexGeneration;
+    var md = Extraction.MarkdownOf(template.ExtractionJson);
+    var extStatus = "";
+    try
+    {
+      using var ej = JsonDocument.Parse(string.IsNullOrWhiteSpace(template.ExtractionJson) ? "{}" : template.ExtractionJson);
+      if (ej.RootElement.TryGetProperty("status", out var st) && st.ValueKind == JsonValueKind.String)
+        extStatus = (st.GetString() ?? "").Trim().ToLowerInvariant();
+    }
+    catch (JsonException) { }
+    if (string.IsNullOrWhiteSpace(md) && (extStatus == "failed" || extStatus == "unreachable"))
+    { error = "extraction failed or unreachable; raw bytes are not indexed without extractor output"; return false; }
+    var text = ReadableTextFor(template);
+    if (string.IsNullOrWhiteSpace(text))
+    { error = string.IsNullOrWhiteSpace(Extraction.MarkdownOf(template.ExtractionJson)) ? "no extractable text; extraction failed or binary without extractor output" : "empty text"; return false; }
+    var built = BuildSections(text);
+    if (built.Count == 0 || built.Any(b => string.IsNullOrWhiteSpace(b.Text)))
+    { error = "no indexable sections built"; return false; }
+    var now = DateTime.UtcNow;
+    int ord = 1;
+    foreach (var b in built)
+    {
+      sections.Add(new SourceSection
+      {
+        BoardId = template.BoardId, SourceId = template.Id, FamilyKey = template.FamilyKey ?? "",
+        SourceVersion = template.Version, ContentHash = template.ContentHash ?? "",
+        Ordinal = ord++, Heading = b.Heading ?? "", Location = b.Location ?? "", Text = b.Text ?? "",
+        IndexGeneration = gen, CreatedAt = now,
+      });
+    }
+    return true;
   }
 
   private static void InvalidateLocked(InMemoryStore s, Guid boardId)

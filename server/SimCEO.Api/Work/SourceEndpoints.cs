@@ -275,6 +275,12 @@ public static class SourceEndpoints
       if (!s.Sources.TryGetValue(id, out var doc)) return Results.NotFound();
       if (!PeopleOps.Can(s, req, doc.BoardId, doc.MeetingId, "contribute")) return PeopleOps.Denied();
       SourceGovernance.EnsureMigrated(s, doc);
+      // Wiki connector scope is authoritative: generic source scope editing
+      // must never corrupt wiki family identity (resourceId+locale+full path).
+      // Connector moves happen only via the Wiki resource endpoints, which
+      // preserve identity and revalidate rules. Reject direct wiki scope moves.
+      if (string.Equals((doc.Origin ?? "").Trim(), "wiki", System.StringComparison.OrdinalIgnoreCase) && body.ValueKind == JsonValueKind.Object && (body.TryGetProperty("scope", out _) || body.TryGetProperty("meetingId", out _)))
+        return Results.Json(new { error = "Wiki connector scope is authoritative; move the resource via its Wiki resource (scope/meeting), not generic source scope editing." }, statusCode: 409);
       // Origin is server-controlled: caller cannot spoof upload vs wiki.
       // Scope moves are collision-safe (P1 #2): a move into an occupied target
       // family is rejected with an actionable conflict, and approval never
@@ -442,3 +448,6 @@ public static class SourceEndpoints
     });
   }
 }
+
+
+
