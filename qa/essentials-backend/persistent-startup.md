@@ -76,12 +76,13 @@ no POST/PUT/import/restart/stop/Docker/SQL), and never prints bodies,
 drafts, or credentials (manifest holds statuses, SHA256s, counts only).
 
 Exact invocation from the MAIN checkout (helper file lives in this worktree,
-finds its sibling browser helper by its own path, operates on MAIN):
+finds its sibling browser helper by its own path, operates on MAIN).
+Requires PowerShell 7+ (`pwsh`); Windows PowerShell 5.1 is not supported.
 
 ```powershell
-powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo
+pwsh -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo
 # optionally also preserve original browser drafts via the existing allowlisted helper:
-powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo -IncludeBrowser
+pwsh -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo -IncludeBrowser
 ```
 
 What the helper verifies: the `/api/backup` wrapper snapshot string SHA256
@@ -95,15 +96,18 @@ images/etc, plus raw `/ready`, `/api/activity/jobs`, `/api/usage`,
 `/api/spending`, and per-meeting `/api/meetings/{Id}/voice`.
 
 Known old-backup omissions (documented in the capture manifest, must not be
-misread): the domain backup carries NO accounts/sessions/grants/invites/
-security-states/ACL (authstate is NOT exported and counts are never
-inferred); audit is API-capped at 200 so zero `auth.register` events proves
-nothing; `/api/model/status` never returns a raw key (only
-configured/source/model/chatOverride-empty); jobs/usage/model-calls
-endpoints truncate (take100/500/200). A complete capture is NOT cutover
+misread): the domain backup v2 carries grants/invites domain data but NO
+accounts/sessions/security-states/ACL (authstate is NOT exported and
+account/session counts are never inferred; grants/invites counts are domain
+data only, never permission/auth proof); audit is API-capped at 200 so zero
+`auth.register` events proves nothing; `/api/model/status` never returns a
+raw key (only configured/source/model/chatOverride-empty);
+jobs/usage/model-calls endpoints truncate (take100/500/200). A complete
+capture (native exit 0) means read-only data capture only and is NOT cutover
 readiness: the old in-memory API MUST NOT be stopped solely because a
-domain snapshot exists (the snapshot is unrestorable without authstate and
-is only one preflight input). Cutover/start remain BLOCKED on Docker
+domain snapshot exists (the snapshot is valid for domain restore - legacy v2
+domain restore passed the 315 probe - but NOT for full auth/policy state,
+and is only one preflight input). Cutover/start remain BLOCKED on Docker
 startup approval.
 
 Do NOT overwrite the older checkpoint

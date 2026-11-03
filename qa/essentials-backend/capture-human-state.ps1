@@ -39,16 +39,20 @@
 #   args exist), process env capture, Docker/config capture, imports,
 #   restarts, stops, SQL, cleanup/deletion of captures, Git commits.
 #
+# Requires PowerShell 7+ (pwsh). Windows PowerShell 5.1 is NOT supported
+# (ConvertFrom-Json -Depth and HttpClient redirect control require PS7).
+#
 # Usage (primary runs from the MAIN checkout; helper lives in the worktree,
 #   finds its sibling browser helper by its own path, operates on MAIN):
-#   powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo
-#   powershell -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo -IncludeBrowser
+#   pwsh -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo
+#   pwsh -File C:/Users/War/scrach/sim_ceo/.tmp/essentials-runnable-worktree/qa/essentials-backend/capture-human-state.ps1 -MainRoot C:/Users/War/scrach/sim_ceo -IncludeBrowser
 #
 # Exit codes: 0 = complete capture (hash-verified); 1 = incomplete/failed
 #   (partial private evidence is PRESERVED in the capture dir; nothing is
 #   deleted). This is a preservation tool only; success is NOT cutover
 #   approval and does NOT authorize stopping the old in-memory API.
 
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
   [string]$MainRoot = 'C:/Users/War/scrach/sim_ceo',
@@ -148,7 +152,12 @@ $MainEnvSha = (Get-FileHash -LiteralPath $MainEnvPath -Algorithm SHA256).Hash.To
 if ($EnvBackupSha -ne $MainEnvSha) { Fail-Now ("MAIN .env byte copy hash mismatch; aborting.") }
 
 # --- Read-only HTTP fetch (GET only, no auth headers, bounded timeout) ---
-$HttpClient = New-Object System.Net.Http.HttpClient
+# Automatic redirects are DISABLED so saved bytes always come from the exact
+# validated origin (a 3xx is recorded incomplete, never followed).
+Add-Type -AssemblyName System.Net.Http
+$HttpHandler = New-Object System.Net.Http.HttpClientHandler
+$HttpHandler.AllowAutoRedirect = $false
+$HttpClient = New-Object System.Net.Http.HttpClient($HttpHandler)
 $HttpClient.Timeout = [System.TimeSpan]::FromSeconds($TimeoutSec)
 $FetchLog = @()
 $AllOk = $true
@@ -156,7 +165,7 @@ $AllOk = $true
 function Invoke-CaptureGet([string]$Name, [string]$Path) {
   $url = $OriginNorm + $Path
   $dest = Join-Path $RawDir ($Name + '.raw.json')
-  $rec = [ordered]@{ name = $Name; path = $Path; file = ('raw/' + $Name + '.raw.json'); status = 0; bytes = 0; sha256 = ''; ok = $false; note = '' }
+  $rec = [ordered]@{ name = $Name; path = $Path; file = ('raw/' + $Name + '.raw.json'); status = 0; bytes = 0; sha256 = ''; ok = $false; note = ''; isArray = $false }
   try {
     $resp = $HttpClient.GetAsync($url).GetAwaiter().GetResult()
     $rec['status'] = [int]$resp.StatusCode
@@ -164,8 +173,14 @@ function Invoke-CaptureGet([string]$Name, [string]$Path) {
     [System.IO.File]::WriteAllBytes($dest, $body)
     $rec['bytes'] = $body.Length
     $rec['sha256'] = Get-HexSha256 $body
-    if ([int]$resp.StatusCode -ne 200) {
-      $rec['note'] = 'non-200; not counted'
+    $code = [int]$resp.StatusCode
+    if ($code -ge 300 -and $code -lt 400) {
+      $rec['note'] = 'redirect (3xx) not followed; not counted (never treated as empty)'
+      $script:AllOk = $false
+      return $rec
+    }
+    if ($code -ne 200) {
+      $rec['note'] = 'non-200; not counted (never treated as empty)'
       $script:AllOk = $false
       return $rec
     }
@@ -173,9 +188,17 @@ function Invoke-CaptureGet([string]$Name, [string]$Path) {
     try {
       $parsed = ConvertFrom-Json -InputObject $text -Depth 64
     } catch {
-      $rec['note'] = 'non-JSON body; not counted'
+      $rec['note'] = 'non-JSON body; not counted (never treated as empty)'
       $script:AllOk = $false
       return $rec
+    }
+    # Preserve top-level JSON array identity: ConvertFrom-Json enumerates, so
+    # '[]' arrives as $null and a one-item array as a scalar. The raw text
+    # decides: array-shaped bodies always yield an array value here.
+    if ($text.TrimStart().StartsWith('[')) {
+      $rec['isArray'] = $true
+      if ($null -eq $parsed) { $parsed = @() }
+      elseif ($parsed -isnot [System.Array]) { $parsed = ,$parsed }
     }
     $rec['ok'] = $true
     $rec['parsed'] = $parsed
@@ -187,10 +210,20 @@ function Invoke-CaptureGet([string]$Name, [string]$Path) {
   }
 }
 
-function Get-ArrayCount($Parsed) {
-  if ($null -eq $Parsed) { return @{ present = $false; count = 0 } }
+# Array identity comes from the raw body shape (see Invoke-CaptureGet), never
+# from the enumerated parse output. Failed/non-array bodies are NOT empty.
+function Get-ArrayCount($Parsed, [bool]$IsArray) {
+  if (-not $IsArray) { return @{ present = $false; count = 0 } }
+  if ($null -eq $Parsed) { return @{ present = $true; count = 0 } }
   if ($Parsed -is [System.Array]) { return @{ present = $true; count = $Parsed.Count } }
-  return @{ present = $false; count = 0 }
+  return @{ present = $true; count = @($Parsed).Count }
+}
+# Returns the native JSON value, $null when the JSON value is null, or
+# 'absent' when the property is missing (never conflates null with "").
+function Get-NativeField($Obj, [string]$Name) {
+  $prop = $Obj.PSObject.Properties[$Name]
+  if ($null -eq $prop) { return 'absent' }
+  return $prop.Value
 }
 
 $ReadyRec   = Invoke-CaptureGet 'ready' '/ready'
@@ -209,6 +242,7 @@ $BackupVerified = $false
 $SnapshotSha = ''
 $SnapshotBytes = 0
 $SnapshotFile = ''
+$SnapshotCountsNote = ''
 $DomainCounts = [ordered]@{}
 $MeetingIds = @()
 if ($BackupRec['ok']) {
@@ -231,39 +265,59 @@ if ($BackupRec['ok']) {
     $SnapshotSha = Get-HexSha256 $snapBytes
     $SnapshotBytes = $snapBytes.Length
     $BackupVerified = $true
-    # Count-only domain stats (no names/content leave this machine).
-    $snap = ConvertFrom-Json -InputObject $snapStr -Depth 64
-    foreach ($key in @('boards', 'roster', 'advisors', 'meetings', 'notes', 'drafts', 'sources', 'sections', 'heads', 'events', 'wikiResources', 'deletedWikiResourceIds', 'leads', 'wizardDrafts', 'jobs', 'voiceTurns', 'images', 'secretaryRequests', 'noteHistories')) {
-      $prop = $snap.PSObject.Properties[$key]
-      if ($null -eq $prop) { $DomainCounts[$key] = 'absent'; continue }
-      $val = $prop.Value
-      if ($val -is [System.Array]) { $DomainCounts[$key] = $val.Count } else { $DomainCounts[$key] = 'non-array' }
-    }
-    $msgsProp = $snap.PSObject.Properties['messages']
-    if ($null -eq $msgsProp) {
-      $DomainCounts['messages'] = 'absent'
-    } else {
-      $mKeys = $msgsProp.Value.PSObject.Properties
-      $mTotal = 0
-      foreach ($p in $mKeys) { if ($p.Value -is [System.Array]) { $mTotal += $p.Value.Count } }
-      $DomainCounts['messageThreads'] = $mKeys.Count
-      $DomainCounts['messages'] = $mTotal
-    }
-    $blobsProp = $snap.PSObject.Properties['blobs']
-    if ($null -eq $blobsProp) { $DomainCounts['blobs'] = 'absent' } else { $DomainCounts['blobs'] = $blobsProp.Value.PSObject.Properties.Count }
-    $meetProp = $snap.PSObject.Properties['meetings']
-    if ($null -ne $meetProp -and ($meetProp.Value -is [System.Array])) {
-      foreach ($m in $meetProp.Value) {
-        $idProp = $m.PSObject.Properties['id']
-        if ($null -ne $idProp -and -not [string]::IsNullOrWhiteSpace([string]$idProp.Value)) {
-          $MeetingIds += [string]$idProp.Value
-        }
-      }
-    }
   } catch {
     $BackupRec['ok'] = $false
     $BackupRec['note'] = 'wrapper verify failed: ' + $_.Exception.Message
     $AllOk = $false
+  }
+  # Domain counts are best-effort: a parse/count failure keeps the truthful raw
+  # hash verification but marks the capture incomplete with its recorded cause.
+  if ($BackupVerified) {
+    try {
+      # Count-only domain stats (no names/content leave this machine).
+      $snap = ConvertFrom-Json -InputObject $snapStr -Depth 64
+      foreach ($key in @('boards', 'roster', 'advisors', 'meetings', 'notes', 'drafts', 'sources', 'sections', 'heads', 'events', 'wikiResources', 'deletedWikiResourceIds', 'leads', 'wizardDrafts', 'jobs', 'voiceTurns', 'images', 'secretaryRequests', 'noteHistories', 'grants', 'invites')) {
+        $prop = $snap.PSObject.Properties[$key]
+        if ($null -eq $prop) { $DomainCounts[$key] = 'absent'; continue }
+        $val = $prop.Value
+        if ($null -eq $val) { $DomainCounts[$key] = 'null'; continue }
+        if ($val -is [System.Array]) { $DomainCounts[$key] = $val.Count } else { $DomainCounts[$key] = 'non-array' }
+      }
+      $msgsProp = $snap.PSObject.Properties['messages']
+      if ($null -eq $msgsProp) {
+        $DomainCounts['messages'] = 'absent'
+      } elseif ($null -eq $msgsProp.Value) {
+        $DomainCounts['messageThreads'] = 'null'
+        $DomainCounts['messages'] = 'null'
+      } elseif ($msgsProp.Value -is [System.Array]) {
+        $DomainCounts['messageThreads'] = 'non-dict'
+        $DomainCounts['messages'] = @($msgsProp.Value).Count
+      } else {
+        # Materialize before counting: member enumeration under StrictMode can
+        # otherwise throw or misbehave on empty dicts, hiding meeting ids.
+        $mKeys = @($msgsProp.Value.PSObject.Properties)
+        $mTotal = 0
+        foreach ($mp in $mKeys) { if ($mp.Value -is [System.Array]) { $mTotal += @($mp.Value).Count } }
+        $DomainCounts['messageThreads'] = $mKeys.Count
+        $DomainCounts['messages'] = $mTotal
+      }
+      $blobsProp = $snap.PSObject.Properties['blobs']
+      if ($null -eq $blobsProp) { $DomainCounts['blobs'] = 'absent' }
+      elseif ($null -eq $blobsProp.Value) { $DomainCounts['blobs'] = 'null' }
+      else { $DomainCounts['blobs'] = @($blobsProp.Value.PSObject.Properties).Count }
+      $meetProp = $snap.PSObject.Properties['meetings']
+      if ($null -ne $meetProp -and ($meetProp.Value -is [System.Array])) {
+        foreach ($m in $meetProp.Value) {
+          $idProp = $m.PSObject.Properties['id']
+          if ($null -ne $idProp -and -not [string]::IsNullOrWhiteSpace([string]$idProp.Value)) {
+            $MeetingIds += [string]$idProp.Value
+          }
+        }
+      }
+    } catch {
+      $SnapshotCountsNote = 'snapshot parse/count failed after hash match (hash verification retained): ' + $_.Exception.Message
+      $AllOk = $false
+    }
   }
 } else {
   $AllOk = $false
@@ -271,6 +325,7 @@ if ($BackupRec['ok']) {
 
 # --- Per-meeting voice (requires meeting ids from verified snapshot only) ---
 $VoiceLog = @()
+$VoiceNote = ''
 if ($BackupVerified -and $MeetingIds.Count -gt 0) {
   $idx = 0
   foreach ($mid in $MeetingIds) {
@@ -278,7 +333,7 @@ if ($BackupVerified -and $MeetingIds.Count -gt 0) {
     $vrec = Invoke-CaptureGet ('voice-' + $idx) ('/api/meetings/' + $mid + '/voice')
     $vrow = [ordered]@{ meetingIndex = $idx; status = $vrec['status']; file = $vrec['file']; bytes = $vrec['bytes']; sha256 = $vrec['sha256']; ok = $false; count = 'n/a'; note = $vrec['note'] }
     if ($vrec['ok']) {
-      $c = Get-ArrayCount $vrec['parsed']
+      $c = Get-ArrayCount $vrec['parsed'] ([bool]$vrec['isArray'])
       if ($c['present']) { $vrow['ok'] = $true; $vrow['count'] = $c['count'] }
       else { $vrow['note'] = 'non-array voice body; not counted as empty'; $AllOk = $false }
     } else {
@@ -287,13 +342,23 @@ if ($BackupVerified -and $MeetingIds.Count -gt 0) {
     $VoiceLog += $vrow
     $FetchLog += @($vrec)
   }
+  $VoiceNote = ('voice capture attempted for ' + $MeetingIds.Count + ' verified meeting id(s)')
+} elseif ($BackupVerified -and $SnapshotCountsNote -ne '') {
+  # Meeting ids are unknown because counting failed; the hash verification
+  # above still stands, the skip is reported here, capture is incomplete.
+  $VoiceNote = 'meeting ids unknown (snapshot counts failed); voice capture skipped and recorded here'
 } elseif ($BackupVerified) {
-  $AllOk = $false
+  # Zero meetings with ids in a verified snapshot: zero voice captures are
+  # required, so this completes with 0 voice (never a fake failure, and the
+  # skip is reported here rather than silently).
+  $VoiceNote = 'verified snapshot holds zero meetings with ids; zero voice captures required (complete with 0 voice)'
+} else {
+  $VoiceNote = 'snapshot not hash-verified; voice capture skipped'
 }
 
 # --- Count-only summaries for ledger routes (200 + JSON array required) ---
 function Get-CountSummary($Rec) {
-  $c = Get-ArrayCount $Rec['parsed']
+  $c = Get-ArrayCount $Rec['parsed'] ([bool]$Rec['isArray'])
   if ($Rec['ok'] -and $c['present']) { return @{ ok = $true; count = $c['count'] } }
   if ($Rec['ok']) { $Rec['note'] = 'non-array body; not counted as empty' }
   return @{ ok = $false; count = 'n/a' }
@@ -343,11 +408,13 @@ $SpendSummary = [ordered]@{ ok = $false; month = 'unknown'; mode = 'unknown'; mo
 if ($SpendRec['ok']) {
   try {
     $sp = $SpendRec['parsed']
-    $SpendSummary['month'] = [string]$sp.month
-    $SpendSummary['mode'] = [string]$sp.mode
-    $SpendSummary['monthlyCapUsd'] = [string]$sp.monthlyCapUsd
-    $SpendSummary['knownSpendUsd'] = [string]$sp.knownSpendUsd
-    $SpendSummary['unknownCostCalls'] = [string]$sp.unknownCostCalls
+    # Native JSON types preserved: monthlyCapUsd null stays null (never ""),
+    # and an actual mode of "" stays "" (never normalized to 'unknown').
+    $SpendSummary['month'] = Get-NativeField $sp 'month'
+    $SpendSummary['mode'] = Get-NativeField $sp 'mode'
+    $SpendSummary['monthlyCapUsd'] = Get-NativeField $sp 'monthlyCapUsd'
+    $SpendSummary['knownSpendUsd'] = Get-NativeField $sp 'knownSpendUsd'
+    $SpendSummary['unknownCostCalls'] = Get-NativeField $sp 'unknownCostCalls'
     $SpendSummary['ok'] = $true
   } catch {
     $SpendRec['note'] = 'unrecognized /api/spending shape'
@@ -360,37 +427,60 @@ if ($SpendRec['ok']) {
 $BrowserInfo = [ordered]@{ attempted = $false; exitCode = 'n/a'; consoleFile = ''; outFile = ''; note = 'not requested' }
 if ($IncludeBrowser) {
   $BrowserInfo['attempted'] = $true
-  $BrowserDir = Join-Path $CaptureRootFull 'browser'
-  $null = New-Item -ItemType Directory -Path $BrowserDir -Force
-  $BrowserOut = Join-Path $BrowserDir ('browser-drafts-' + $StampUtc + '-UTC.json')
-  $BrowserConsoleFile = Join-Path $BrowserDir 'browser-console.json'
-  & git -C $MainRootFull check-ignore -q $BrowserOut
-  if ($LASTEXITCODE -ne 0) { Fail-Now ("Browser out path is NOT Git-ignored; refusing browser capture: " + $BrowserOut) }
-  $consoleText = & node $BrowserHelperPath --out $BrowserOut --cdp $CdpEndpoint 2>&1 | Out-String
-  $code = $LASTEXITCODE
-  $BrowserInfo['exitCode'] = $code
-  $noBom2 = New-Object System.Text.UTF8Encoding $false
-  [System.IO.File]::WriteAllText($BrowserConsoleFile, $consoleText, $noBom2)
-  $BrowserInfo['consoleFile'] = 'browser/browser-console.json'
-  if ($code -eq 0 -and (Test-Path -LiteralPath $BrowserOut -PathType Leaf)) {
-    $BrowserInfo['outFile'] = 'browser/' + [System.IO.Path]::GetFileName($BrowserOut)
-    $BrowserInfo['note'] = 'helper exit 0 with complete app capture per helper fail-closed semantics (SimCEO 127.0.0.1:5174 app target + edge newtab skipped-non-app); no other browsers/origins captured or claimed'
-  } else {
-    $BrowserInfo['note'] = 'browser helper did NOT complete (nonzero exit or missing out file); partial evidence preserved, no other browsers/origins claimed'
+  try {
+    $BrowserDir = Join-Path $CaptureRootFull 'browser'
+    $null = New-Item -ItemType Directory -Path $BrowserDir -Force
+    $BrowserOut = Join-Path $BrowserDir ('browser-drafts-' + $StampUtc + '-UTC.json')
+    $BrowserConsoleFile = Join-Path $BrowserDir 'browser-console.json'
+    & git -C $MainRootFull check-ignore -q $BrowserOut
+    if ($LASTEXITCODE -ne 0) { throw New-Object System.Exception('Browser out path is NOT Git-ignored; refusing browser capture: ' + $BrowserOut) }
+    # Native stderr merged via 2>&1 surfaces as ErrorRecords; with
+    # EAP=Stop that would terminate before the manifest is written, so run
+    # the native helper with EAP=Continue and always persist partial
+    # evidence plus an INCOMPLETE manifest (never abort without one).
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $consoleText = & node $BrowserHelperPath --out $BrowserOut --cdp $CdpEndpoint 2>&1 | Out-String
+      $code = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $prevEap
+    }
+    $BrowserInfo['exitCode'] = $code
+    $noBom2 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($BrowserConsoleFile, $consoleText, $noBom2)
+    $BrowserInfo['consoleFile'] = 'browser/browser-console.json'
+    if ($code -eq 0 -and (Test-Path -LiteralPath $BrowserOut -PathType Leaf)) {
+      $BrowserInfo['outFile'] = 'browser/' + [System.IO.Path]::GetFileName($BrowserOut)
+      $BrowserInfo['note'] = 'helper exit 0 with complete app capture per helper fail-closed semantics (SimCEO 127.0.0.1:5174 app target + edge newtab skipped-non-app); no other browsers/origins captured or claimed'
+    } else {
+      $BrowserInfo['note'] = 'browser helper did NOT complete (nonzero exit or missing out file); partial evidence preserved, no other browsers/origins claimed'
+      $AllOk = $false
+    }
+  } catch {
+    $BrowserInfo['note'] = 'browser capture error (partial evidence preserved): ' + $_.Exception.Message
+    try {
+      $noBomErr = New-Object System.Text.UTF8Encoding $false
+      [System.IO.File]::WriteAllText($BrowserConsoleFile, ('browser capture error: ' + $_.Exception.Message), $noBomErr)
+      $BrowserInfo['consoleFile'] = 'browser/browser-console.json'
+    } catch { }
     $AllOk = $false
   }
 }
 
 $HttpClient.Dispose()
+$HttpHandler.Dispose()
 
 # --- Nonsecret manifest (statuses/hashes/counts ONLY) ---
+# Per-route status/hash/count/error-note rows. Ledger-route ok flags reflect
+# array-count success: a 200 non-array body is NOT ok and is never empty.
 $RouteRows = @()
 foreach ($f in $FetchLog) {
   $row = [ordered]@{ name = $f['name']; path = $f['path']; file = $f['file']; status = $f['status']; bytes = $f['bytes']; sha256 = $f['sha256']; ok = $f['ok']; note = $f['note'] }
-  if ($f['name'] -eq 'activity-jobs') { $row['count'] = $JobsSummary['count'] }
-  if ($f['name'] -eq 'usage') { $row['count'] = $UsageSummary['count'] }
-  if ($f['name'] -eq 'activity-audit') { $row['count'] = $AuditSummary['count'] }
-  if ($f['name'] -eq 'models-calls') { $row['count'] = $CallsSummary['count'] }
+  if ($f['name'] -eq 'activity-jobs') { $row['count'] = $JobsSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$JobsSummary['ok']) }
+  elseif ($f['name'] -eq 'usage') { $row['count'] = $UsageSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$UsageSummary['ok']) }
+  elseif ($f['name'] -eq 'activity-audit') { $row['count'] = $AuditSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$AuditSummary['ok']) }
+  elseif ($f['name'] -eq 'models-calls') { $row['count'] = $CallsSummary['count']; $row['ok'] = ([bool]$f['ok'] -and [bool]$CallsSummary['ok']) }
   $RouteRows += $row
 }
 
@@ -411,12 +501,15 @@ $Manifest = [ordered]@{
     semantics = 'SHA256 over UTF8 bytes of EXACT snapshot string, lowercase hex (old Hashing.FullHash); wrapper raw + snapshot preserved as separate exact bytes, no re-serialization'
   }
   domainCounts = $DomainCounts
+  snapshotCountsNote = $SnapshotCountsNote
+  routes = $RouteRows
   voice = $VoiceLog
+  voiceNote = $VoiceNote
   modelStatus = $ModelSummary
   spending = $SpendSummary
   browser = $BrowserInfo
   omissions = @(
-    'authstate NOT exported: domain backup carries NO accounts/sessions/grants/invites/security-states/ACL; capture proves nothing about account/session counts',
+    'authstate NOT exported: domain backup v2 carries grants/invites domain data but NO accounts/sessions/security-states/ACL; capture proves nothing about account/session counts and grants/invites MUST NOT be labeled as permissions or auth proof',
     'audit is capped at 200 by the API; zero auth.register events is inference only, MUST NOT be labeled as exported accounts/sessions or proof of zero',
     '/api/model/status returns configured/source/model/chatOverride only; raw key is NEVER returned by this route (confirmed read-only in old source ModelSettingsEndpoints.cs) and keyHint stays in the private raw file',
     'observed store and caps/truncation risks recorded in ready/routes; jobs take100, usage take500, audit take200, model-calls take200 may truncate',
@@ -426,7 +519,7 @@ $Manifest = [ordered]@{
     snapshotDataCaptured = $BackupVerified
     authStateExported = $false
     complete = $false
-    note = 'Capture success (even when complete) is NOT cutover readiness and does NOT authorize stopping the old in-memory API. Cutover/start remain BLOCKED on Docker startup approval.'
+    note = 'Capture success (even when complete) is NOT cutover readiness and does NOT authorize stopping the old in-memory API. The snapshot is valid for domain restore (legacy v2 domain restore passed the 315 probe) but NOT for full auth/policy state. Cutover/start remain BLOCKED on Docker startup approval.'
   }
 }
 $Manifest['verdict']['complete'] = ($AllOk -and $BackupVerified)
