@@ -88,3 +88,58 @@ was left unshipped (single-entry build restored); density toggle borrowed.
   when a real service answers `/search` with an array.
 - Single-process EF context with a lock: fine for one replica, not for
   multi-replica app deployments.
+
+## Lane D client/API repairs (2026-11-02, MAIN, no barrier run yet)
+
+- Atomic human-message append + DeliveredRevision/Generation in Atomic.Run inside MessageLock; forged advisor fields cleared.
+- Record approve calls ValidateDraftItems for legacy persisted drafts; empty/duplicate/invalid rejected.
+- LeadSetup binds the selected portrait identity, review state and provenance in the activation hash; ResolveLead global-only, board fallback, canonical identity/content/version.
+- ModelPolicy: Standard data-use constrains effective model even with global contributor override (accepted snapshot preserved).
+- Profile UI hydration keyed by board/profile ID+version with reset on missing; stray quote-space artifact removed; effective board lead GET fallback is lane B.
+- Import UI sends current local accountId; wizard UI sends/updates version for save/start/answer/create; no UI-owned source of truth.
+- Adopt-to-record: POST /api/meetings/{id}/record/from-direction with noteId (contribute check, board/meeting scope, exact multiline byte roundtrip, unapproved draft/current watermark/hash); UI Record this direction routes to record review; manual raw JSON path compatible.
+- QA: --only unknown fails nonzero; browser console/page errors fail exit with own new context (never closes browser); fake provider QA-BADENVELOPE/QA-RESEARCHERR test-only controls; runner portable paths + real vite.qa.config + production PG publish verification; restart asserts portraits/approvals/interview/record/run outcomes; lane regression hooks run after core suite when present.
+- Status: source/tests patched and compile-checked (dotnet build 0 errors; node --check clean). No shared QA stack restarted; no full suites run until all lanes report ready. No phase PASS claimed.
+
+## Muse QA harness integration (2026-11-02, syntax check only, no full run)
+
+- qa/run-qa.ps1 is now the one authoritative runner: preflight port gates, isolated build, fake :5199,
+  HTTP mem plus backup, real C-sharp provider-envelope x8 on own :5202, isolated storage x7 and public-evidence
+  probe artifacts, selftest, web build, production publish PG-staging assert, PG block with identity-boundary
+  after pg plus backup and before persist-write, ownerless seed split across restart, rollback probe plus
+  pending-restart write bracketing the owned :5100 restart with pid-change and port-gone gates, lanes on both
+  backends, and -Browser extras (portable npm ci, profile-identity, navigation fixture) after the 23-check workflow.
+- Barrier: main plus nav merge and retriever repairs are pending, so no full run was executed; PS parse 0 errors
+  and node --check clean on all wired suites. Detail: .tmp/muse-qa-harness-integration-result.txt.
+
+## Primary checkpoint 2026-11-02 (America/New_York, MAIN ONLY, phases 0-3 ACCEPTED)
+
+Muse authored all application, test and script code; primary reviewed it and ran the acceptance checks. Backend commit 94d5ce0. API code unchanged between backend/live runs and final UI. Original 3 boards (2 archived) restored on :5080/:5173 with their saved contents and archival states preserved. Primary independently viewed desktop / dark / mobile screens.
+
+### Harness
+- Full: `qa/run-qa.ps1 -Pg -Browser` (backend HTTP/selftest/probes/publish/PG/lanes + browser).
+- Frontend rerun only: `qa/run-qa.ps1 -BrowserOnly` (explicitly NOT backend acceptance; skips backend HTTP/selftest/probes/publish/PG/lane blocks).
+
+### Backend legs (both full runs passed these; full runs FAILED UI-only, NOT whole-PASS)
+- `.tmp/primary-combined-qa.log` + `.tmp/primary-combined-qa2.log`: memory HTTP 182 + backup 6; published-PG HTTP 182 + backup 6; provider envelope 8 (real C# gateway on own loopback :5202, dummy key); storage-failure 7 (isolated artifact); public-evidence fetch 105 (injected fixtures only); selftest + web build + production publish PG-staging at actual runtime; identity-boundary 30 (PG only, after pg+backup, before persist-write); persist-write 12 / persist-verify 17 across owned :5100 restart (pid-change + port-gone gates); actual pending-research / interview restart + SQL rollback probes on the PG leg; roster 87/89 plus ownerless PG seed 90; discussion 40 mem + 40 PG; import/interview 30 mem + 30 PG; core-snapshot 16 mem + 16 PG.
+- Run 1 UI failures: app 22+1 fail, profile/wizard FATALS. Run 2 UI failures: wizard 4 fails + FATAL. Backend counts above still stand; do not cite either full log as whole-PASS.
+
+### BrowserOnly final (frontend only, `.tmp/primary-browser-qa5.log`, QA RUNNER PASS browser-only)
+- App 30 (real Adopt UI + returned record ID, exact draft-unapproved, from-direction 201/exact/url/review/draft-unapproved/old-approved); profile 19; dossier-evidence 15; wizard 57; navigation fixture 222 (desktop + mobile 390 + resize, dark included). No backend acceptance claimed by this log alone.
+
+### Live generated text vs deterministic provider tests
+- Actual Meta generated text: `.tmp/live-text-gate-primary6.log` LIVE GATE PASS 76 (wizard interview, grounded Grace Hopper dossier, fictional advisor + discussion, ledger + usage, 43 s actual runtime).
+- Deterministic provider API tests (do NOT cite as generated text): real C# gateway envelope x8, storage x7, public-evidence 105, plus fake-provider QA-BADENVELOPE / QA-RESEARCHERR actual negative cases (retires the old insufficient-evidence-only-code-verified / not-naturally-triggerable notes).
+
+### Restored-app read-only smoke
+- `.tmp/primary-restored-live-navigation.log`: real user app on :5173, 9/0, read-only (board list, board/meeting hash writes, meeting heading, reload hash, Profile/Help, no page errors).
+
+### Independent closures
+- `.tmp/phase03-nonwizard-final-closure-review.txt` (findings 1,3-6 closed in source/bounded probes; not full 0-3 acceptance by itself).
+- `.tmp/public-evidence-ancestor-closure-review.txt` (hidden-ancestor excerpts 7/0 in-RAM AngleSharp hydration).
+- `.tmp/wizard-guide-final-closure-review.txt` (setup-guide bypass closed in source + props probes).
+- Planned tag after commit (not created by this edit): phase03-verified-20261102.
+
+### Limits preserved
+- ASR codec path, image-live behavior, live readiness/runtime beyond the logged runs, and phase 9 accounting depth remain unverified and are not claimed. Phases 4-10 stay unchecked: phase 6 review-rejected (13 defects in fresh Muse fixing; PRODUCT skill creation owned by phase 6, not Main), phases 8/9 in separate worktrees unaccepted, phases 4/5/7/10 not implemented. Skill PRODUCT creation is not duplicated here.
+- Reporting hygiene: `qa/navigation.cjs` footer now prints actual BASE/CDP instead of hardcoded :5175 (reporting only; no assertions/behavior). Obsolete `qa/launch.py` helper removed (run-qa owns launches via hidden Start-Hidden; no references remained).

@@ -975,7 +975,7 @@ async function liveSmoke(browser) {
     console.log("suite crashed: " + String(e && e.stack || e).split("\n").slice(0, 5).join("\n"));
   }
   console.log("----");
-  console.log("mode: " + (LIVE ? "live-smoke (real :5080 backend via :5175 proxy, read-only navigation)" : "deterministic fixtures (user :5080 API untouched; :5175 serves the worktree bundle)"));
+  console.log("mode: " + (LIVE ? "live-smoke (read-only navigation against " + BASE + " via " + CDP + ")" : "deterministic fixtures (user :5080 API untouched; bundle under test at " + BASE + " via " + CDP + ")"));
   console.log("passed: " + passed + ", failed: " + failed);
   if (failures.length) console.log("failures:\n - " + failures.join("\n - "));
   // Never close the user's browser; our contexts were closed per-suite.

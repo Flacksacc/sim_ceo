@@ -47,6 +47,10 @@ function fixtureHandler(reqLog, unhandled) {
     nextMeeting: 1,
     nextRecord: 1,
     delays: {},
+    // Board-scoped leads mirror LeadSetup: board-owned else global fallback,
+    // explicit versioned saves (stale base version => 409, success => max+1).
+    leads: { "b-alpha": { ...LEAD } },
+    globalLead: null,
   };
   const boardById = (id) =>
     store.boards.find((b) => b.id === id) || (id === BOLD.id ? BOLD : undefined);
@@ -233,7 +237,48 @@ function fixtureHandler(reqLog, unhandled) {
     if ((m = p.match(/^\/api\/wizard\/([^/]+)\/suggest$/)) && req.method() === "POST") {const w=store.wizards[m[1]];if(!w)return V("unknown wizard");return J({suggestion:"Fixture guide.",nextQuestion:"Fixture?",fields:{}});}
     if ((m = p.match(/^\/api\/wizard\/([^/]+)\/interview$/)) && req.method() === "POST") {const w=store.wizards[m[1]];if(!w)return V("unknown wizard");let ibody={};try{ibody=req.postDataJSON()||{};}catch{}if(ibody.version===undefined||ibody.version!==w.version)return J({error:"Stale wizard draft; refresh and re-apply your edit with the current version."},409);w.version+=1;return J({question:"Fixture?",analysis:"Recorded.",applied:[],turns:[],checkpoints:[],version:w.version});}
     if ((m = p.match(/^\/api\/wizard\/([^/]+)\/create$/)) && req.method() === "POST") {const w=store.wizards[m[1]];if(!w)return V("unknown wizard");if(w.status&&w.status.indexOf("created:")===0){const bid=w.status.slice(8);const prior=store.boards.find((x)=>x.id===bid);if(prior)return J({board:prior,advisors:[],resumed:true});}let f={};try{f=JSON.parse(w.fieldsJson||"{}");if(!f||typeof f!=="object"||Array.isArray(f))f={};}catch{f={};}const trim2=(s)=>typeof s==="string"?s.trim():"";const nm2=trim2(f.name);const ms2=trim2(f.mission);const advRaw2=Array.isArray(f.advisors)?f.advisors:[];const adv2=advRaw2.filter((x)=>x&&typeof x.role==="string"&&x.role.trim()!=="");const lead2=(f.lead&&typeof f.lead==="object"&&!Array.isArray(f.lead))?trim2(f.lead.name):"";const blockers=[];if(!nm2)blockers.push({field:"name",step:1,message:"Give the board a name."});if(!ms2)blockers.push({field:"mission",step:1,message:"Describe what the board is for."});if(adv2.length===0)blockers.push({field:"advisors",step:2,message:"Add at least one advisor."});if(adv2.length>10)blockers.push({field:"advisors",step:2,message:"A board holds at most ten advisors."});if(!lead2)blockers.push({field:"lead",step:3,message:"Tell us who leads the board."});if(blockers.length)return J({blockers},409);const nn=store.nextBoard++;const nb={id:"b-new-"+nn,name:nm2,mission:ms2};store.boards=[...store.boards,nb];store.meetings[nb.id]=[];store.advisors[nb.id]=[];w.status="created:"+nb.id;w.version+=1;return J({board:nb,advisors:[]});}
-    if (p === "/api/lead") return J(LEAD);
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/lead$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      // Truthful contract (mirrors Endpoints ResolveLeadFor): board-owned else
+      // global fallback, else 404. Never 200 null for a missing profile.
+      if (req.method() === "GET") {
+        if (store.leads[m[1]]) return J(store.leads[m[1]]);
+        if (store.globalLead) return J(store.globalLead);
+        return V("no saved profile for board");
+      }
+      if (req.method() === "POST") {
+        let lb = {};
+        try { lb = req.postDataJSON() || {}; } catch {}
+        const cur = store.leads[m[1]] ? store.leads[m[1]].version : 0;
+        if (cur !== 0 && lb.version !== cur) return J({ error: "Stale lead profile; refresh and re-apply your edit." }, 409);
+        const saved = { id: store.leads[m[1]] ? store.leads[m[1]].id : ("l-" + m[1]), boardId: m[1], version: cur + 1,
+          name: lb.name || "", roleLabel: lb.roleLabel || "Board Lead", background: lb.background || "",
+          familiarTopics: lb.familiarTopics || "", simplerTopics: lb.simplerTopics || "", commPrefs: lb.commPrefs || "",
+          updatedAt: "2026-11-02", provenanceJson: "{}" };
+        store.leads[m[1]] = saved;
+        return J(saved);
+      }
+      return N("no fixture");
+    }
+    if (p === "/api/lead") {
+      // Truthful contract (mirrors Endpoints ResolveLead): 404 when absent.
+      if (req.method() === "GET") {
+        if (store.globalLead) return J(store.globalLead);
+        return V("no global lead");
+      }
+      if (req.method() === "POST") {
+        let gb = {};
+        try { gb = req.postDataJSON() || {}; } catch {}
+        const gcur = store.globalLead ? store.globalLead.version : 0;
+        if (gcur !== 0 && gb.version !== gcur) return J({ error: "Stale lead profile; refresh and re-apply your edit." }, 409);
+        store.globalLead = { id: store.globalLead ? store.globalLead.id : "l-global", boardId: "", version: gcur + 1,
+          name: gb.name || "", roleLabel: gb.roleLabel || "Board Lead", background: gb.background || "",
+          familiarTopics: gb.familiarTopics || "", simplerTopics: gb.simplerTopics || "", commPrefs: gb.commPrefs || "",
+          updatedAt: "2026-11-02", provenanceJson: "{}" };
+        return J(store.globalLead);
+      }
+      return N("no fixture");
+    }
     if (p === "/api/presets") return J([]);
     if (p === "/api/roster") return J([]);
     if (p === "/api/roster/count") return J({ total: 0 });

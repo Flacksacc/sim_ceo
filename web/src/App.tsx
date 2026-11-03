@@ -1465,6 +1465,30 @@ export default function App() {
   // a sentinel mismatch so the next hydration also keeps local progress
   // until the user successfully saves again.
   const wizLastSentRef = useRef<{ step: number; presetKey: string; fields: string } | null>(null);
+  // P2: synchronous identity-aware known-version store. Render-synced refs
+  // update only during React render, so two responses settling in the same
+  // tick can both pass a stale comparison and commit a downgrade (known v2,
+  // enqueue v4, enqueue v3, commit v3). Every version-accept path advances
+  // this store synchronously in the response handler instead.
+  const wizKnownRef = useRef<{ id: string; version: number | null }>({ id: "", version: null });
+  // TEST-ANCHOR-START: nextKnownWizVersion
+  const nextKnownWizVersion = (known: { id: string; version: number | null }, id: string, v: number) => {
+    if (typeof v !== "number") return known;
+    if (known.id !== id || known.version == null || v >= known.version) return { id, version: v };
+    return known;
+  };
+  // TEST-ANCHOR-END: nextKnownWizVersion
+  // Monotonic state update for the current draft: advances the synchronous
+  // store and only enqueues a React state change when it actually moves.
+  // Stale responses for the same draft return the identical store object and
+  // enqueue nothing, so a delayed older GET can never downgrade the guard.
+  const acceptWizVersion = (id: string, v: number) => {
+    const next = nextKnownWizVersion(wizKnownRef.current, id, v);
+    if (next !== wizKnownRef.current) {
+      wizKnownRef.current = next;
+      setWizVersion(v);
+    }
+  };
   // Version-only refresh after a rejected save: adopts the fresh strict
   // version guard without touching local fields/step, so the next save
   // retries with the current inputs instead of silently discarding them.
@@ -1473,7 +1497,9 @@ export default function App() {
     if (!target) return;
     get<{ version: number }>(`/api/wizard/${target}`).then((d) => {
       if (wizIdRef.current !== target) return;
-      if (typeof d.version === "number") setWizVersion(d.version);
+      // Synchronous identity-aware monotonic update: a delayed older response
+      // is ignored entirely and can never downgrade the strict guard.
+      if (typeof d.version === "number") acceptWizVersion(target, d.version);
     }).catch(() => { /* keep local edits; version stays for explicit retry */ }).finally(() => {
       refresh("wizreview");
     });
@@ -1515,7 +1541,7 @@ export default function App() {
     },
     onSuccess: (r) => {
       setWizId(r.id);
-      if (typeof r.version === "number") setWizVersion(r.version);
+      if (typeof r.version === "number") acceptWizVersion(r.id, r.version);
       localStorage.setItem("simceo-wizard", r.id);
       refresh("wizreview");
     },
@@ -1582,7 +1608,18 @@ export default function App() {
       // Discard late arrivals whose draft changed or was retired in flight
       // (a new draft started, or create-board consumed the id and cleared it).
       if (wizIdRef.current !== id) return;
-      if (typeof d.version === "number") setWizVersion(d.version);
+      // Monotonic version within the same draft: a delayed older GET (fresh
+      // save v3 then stale GET v2) must neither downgrade the strict guard
+      // nor rewind fields to its older snapshot — ignore it entirely.
+      const srvVer = typeof d.version === "number" ? d.version : null;
+      if (srvVer != null) {
+        // Stale responses for this draft are ignored entirely: no version
+        // downgrade and no field rewind. Fresh responses advance the
+        // synchronous store before any state below is applied.
+        const k = wizKnownRef.current;
+        if (k.id === id && k.version != null && srvVer < k.version) return;
+        acceptWizVersion(id, srvVer);
+      }
       // Discard stale hydration when newer local edits/progress changed
       // during the GET flight; the version above is still adopted so the next
       // save carries the strict guard without losing local inputs.
@@ -1593,6 +1630,11 @@ export default function App() {
       // first resume in a fresh session has no sent baseline, so real resume
       // GETs still apply below.
       const sent = wizLastSentRef.current;
+      // Unsaved field/preset edits reject the whole arrival (fields AND step).
+      // An explicit local step change (Back) since the last clean sync keeps
+      // the local step while still adopting the version and newer fields, so
+      // a later interview extract can apply without an intermediate save.
+      let keepLocalStep = false;
       if (sent) {
         const w = wizardRef.current;
         const currentFields = JSON.stringify({
@@ -1602,9 +1644,17 @@ export default function App() {
           lead: w.lead,
           advisors: w.seats,
         });
-        if (currentFields !== sent.fields || w.step !== sent.step || presetKeyRef.current !== sent.presetKey) return;
+        if (currentFields !== sent.fields || presetKeyRef.current !== sent.presetKey) return;
+        keepLocalStep = w.step !== sent.step;
       }
       const f = JSON.parse(d.fieldsJson || "{}");
+      // Snapshot pre-apply state: the baseline below must describe exactly
+      // what this accepted hydration writes (same fallbacks as the setters).
+      const wPrev = wizardRef.current;
+      const mergedLead = { ...wPrev.lead, ...(f.lead ?? {}) };
+      const mergedSeats: { role: string; name: string }[] = Array.isArray(f.advisors)
+        ? f.advisors.map((s: { role: string; name: string }) => ({ role: s.role ?? "", name: s.name ?? "" }))
+        : wPrev.seats;
       setWizard((w) => ({
         ...w,
         name: f.name ?? w.name,
@@ -1613,10 +1663,29 @@ export default function App() {
         seats: Array.isArray(f.advisors) ? f.advisors.map((s: { role: string; name: string }) => ({ role: s.role ?? "", name: s.name ?? "" })) : w.seats,
         lead: { ...w.lead, ...(f.lead ?? {}) },
       }));
-      if (typeof d.version === "number") setWizVersion(d.version);
       if (d.presetKey) setPresetKey(d.presetKey);
-      if (typeof d.step === "number" && d.step >= 1 && d.step <= 4)
+      // A background arrival never yanks explicit local navigation: when the
+      // user moved (Back) since the last clean sync, fields still apply but
+      // the local step stands until the next save makes it the baseline.
+      if (!keepLocalStep && typeof d.step === "number" && d.step >= 1 && d.step <= 4)
         setWizard((w) => ({ ...w, step: d.step }));
+      // The server state was accepted above: advance the last-clean baseline
+      // to what was just applied, so a later hydration (e.g. the second of
+      // two interview GETs) is not rejected as newer local edits. Dirty local
+      // edits never reach here — the guards above return early when present.
+      // When the local step was kept, the baseline still records the server
+      // step so later arrivals keep respecting the explicit navigation.
+      wizLastSentRef.current = {
+        step: (typeof d.step === "number" && d.step >= 1 && d.step <= 4) ? d.step : wPrev.step,
+        presetKey: d.presetKey || presetKeyRef.current,
+        fields: JSON.stringify({
+          name: f.name ?? wPrev.name,
+          mission: f.mission ?? wPrev.mission,
+          stage: f.stage ?? wPrev.stage,
+          lead: mergedLead,
+          advisors: mergedSeats,
+        }),
+      };
       try {
         const ij = JSON.parse(d.interviewJson || "{}");
         if (Array.isArray(ij.turns)) setIturns(ij.turns);
@@ -1635,7 +1704,7 @@ export default function App() {
       setIturns(r.turns ?? []);
       setIchecks(r.checkpoints ?? []);
       setIquestion(r.question ?? "");
-      if (typeof r.version === "number") setWizVersion(r.version);
+      if (typeof r.version === "number") acceptWizVersion(wizIdRef.current, r.version);
       setIanswer("");
       hydrateWizard();
       refresh("wizreview");
@@ -1688,6 +1757,9 @@ export default function App() {
       // for the old id is already discarded by the wizId check, and the next
       // new draft starts with no sent baseline so its resume applies.
       wizLastSentRef.current = null;
+      // Keep draft identity separate: the next draft must not inherit this
+      // draft's known version through the synchronous store.
+      wizKnownRef.current = { id: "", version: null };
       setWizard({
         name: "",
         mission: "",
@@ -3672,9 +3744,16 @@ const testModel = useMutation({
               <p role="status">
                 {" "}
                 {wizId
-                  ? "Draft saved on this device."
+                  ? (wizVersion == null ? "Loading saved draft\u2026" : "Draft saved on this device.")
                   : "Draft not saved yet on this device."}{" "}
               </p>{" "}
+              {!!wizId && wizVersion == null && (
+                <p className="muted">
+                  {" "}
+                  Loading the saved draft before editing protects server data.{" "}
+                  <button type="button" className="btn ghost" onClick={() => hydrateWizard()}>{" "}Retry load{" "}</button>{" "}
+                </p>
+              )}{" "}
               {wizard.step === 1 && (
                 <div className="card">
                   {" "}
@@ -3683,6 +3762,7 @@ const testModel = useMutation({
                     {" "}
                     Board name{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.name}
                       onChange={(e) =>
                         setWizard({ ...wizard, name: e.target.value })
@@ -3694,6 +3774,7 @@ const testModel = useMutation({
                     {" "}
                     Mission{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.mission}
                       onChange={(e) =>
                         setWizard({ ...wizard, mission: e.target.value })
@@ -3705,6 +3786,7 @@ const testModel = useMutation({
                     {" "}
                     Stage{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.stage}
                       onChange={(e) =>
                         setWizard({ ...wizard, stage: e.target.value })
@@ -3716,6 +3798,7 @@ const testModel = useMutation({
                     {" "}
                     Starting shape{" "}
                     <select
+                      disabled={!!wizId && wizVersion == null}
                       value={presetKey}
                       onChange={(e) => setPresetKey(e.target.value)}
                     >
@@ -3730,14 +3813,14 @@ const testModel = useMutation({
                   </label>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
+                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
                     <button
                       type="button"
                       className="primary"
-                      disabled={!wizard.name.trim()}
+                      disabled={!wizard.name.trim() || wizSave.isPending || (!!wizId && wizVersion == null)}
                       onClick={() => {
                         wizSave.mutate(2);
                         setWizard({ ...wizard, step: 2 });
@@ -3791,6 +3874,7 @@ const testModel = useMutation({
                     {" "}
                     Role{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={seatRole}
                       onChange={(e) => setSeatRole(e.target.value)}
                       placeholder="e.g. Finance reviewer"
@@ -3800,6 +3884,7 @@ const testModel = useMutation({
                     {" "}
                     Name, optional{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={seatName}
                       onChange={(e) => setSeatName(e.target.value)}
                       placeholder="Leave blank to decide later"
@@ -3809,7 +3894,7 @@ const testModel = useMutation({
                     {" "}
                     <button
                       type="button"
-                      disabled={!seatRole.trim() || wizard.seats.length >= 10}
+                      disabled={!seatRole.trim() || wizard.seats.length >= 10 || (!!wizId && wizVersion == null)}
                       onClick={() => {
                         setWizard({
                           ...wizard,
@@ -3828,7 +3913,7 @@ const testModel = useMutation({
                   </div>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
+                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
@@ -3842,7 +3927,7 @@ const testModel = useMutation({
                     <button
                       type="button"
                       className="primary"
-                      disabled={wizard.seats.length === 0}
+                      disabled={wizard.seats.length === 0 || wizSave.isPending || (!!wizId && wizVersion == null)}
                       onClick={() => {
                         wizSave.mutate(3);
                         setWizard({ ...wizard, step: 3 });
@@ -3862,6 +3947,7 @@ const testModel = useMutation({
                     {" "}
                     Name{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.name}
                       onChange={(e) =>
                         setWizard({
@@ -3875,6 +3961,7 @@ const testModel = useMutation({
                     {" "}
                     Role label{" "}
                     <select
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.roleLabel}
                       onChange={(e) =>
                         setWizard({
@@ -3903,6 +3990,7 @@ const testModel = useMutation({
                     {" "}
                     Background{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.background}
                       onChange={(e) =>
                         setWizard({
@@ -3917,6 +4005,7 @@ const testModel = useMutation({
                     {" "}
                     Subjects already familiar{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.familiarTopics}
                       onChange={(e) =>
                         setWizard({
@@ -3933,6 +4022,7 @@ const testModel = useMutation({
                     {" "}
                     Subjects needing simpler explanation{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.simplerTopics}
                       onChange={(e) =>
                         setWizard({
@@ -3949,6 +4039,7 @@ const testModel = useMutation({
                     {" "}
                     Communication preferences{" "}
                     <input
+                      disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.commPrefs}
                       onChange={(e) =>
                         setWizard({
@@ -3961,7 +4052,7 @@ const testModel = useMutation({
                   </label>{" "}
                   <div className="meetctl">
                     {" "}
-                    <button type="button" onClick={() => wizSave.mutate(undefined)}>
+                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
                       {" "}
                       Save draft{" "}
                     </button>{" "}
@@ -3975,7 +4066,7 @@ const testModel = useMutation({
                     <button
                       type="button"
                       className="primary"
-                      disabled={!wizard.lead.name.trim()}
+                      disabled={!wizard.lead.name.trim() || wizSave.isPending || (!!wizId && wizVersion == null)}
                       onClick={() => {
                         wizSave.mutate(4);
                         setWizard({ ...wizard, step: 4 });
@@ -3999,10 +4090,10 @@ const testModel = useMutation({
                     </div>
                   ))}{" "}
                   {iquestion && <p><b>Next question:</b> {iquestion}</p>}{" "}
-                  <label>Your answer<input value={ianswer} onChange={(e) => setIanswer(e.target.value)} placeholder="Answer in your own words" /></label>{" "}
+                  <label>Your answer<input disabled={!!wizId && wizVersion == null} value={ianswer} onChange={(e) => setIanswer(e.target.value)} placeholder="Answer in your own words" /></label>{" "}
                   <div className="meetctl">{" "}
-                    <button type="button" disabled={!wizId || askInterview.isPending} onClick={() => askInterview.mutate(ianswer)}>Send answer</button>{" "}
-                    <button type="button" className="btn ghost" disabled={!wizId} onClick={() => askInterview.mutate("")}>Start interview</button>{" "}
+                    <button type="button" disabled={!wizId || wizVersion == null || askInterview.isPending} onClick={() => askInterview.mutate(ianswer)}>Send answer</button>{" "}
+                    <button type="button" className="btn ghost" disabled={!wizId || wizVersion == null} onClick={() => askInterview.mutate("")}>Start interview</button>{" "}
                   </div>{" "}
                   {ichecks.length > 0 && (<div><h4>Checkpoints</h4><ul>{ichecks.map((c, i) => <li key={i}>{c.text}</li>)}</ul></div>)}{" "}
                   {(wizReview.data?.fields ?? []).length > 0 && (<div><h4>Setup fields</h4><ul>{(wizReview.data?.fields ?? []).map((f) => <li key={f.field}>Step {f.step} - {f.field}: {f.status}</li>)}</ul></div>)}{" "}
@@ -4025,7 +4116,7 @@ const testModel = useMutation({
                     <button
                       type="button"
                       onClick={() => suggest.mutate()}
-                      disabled={!wizId || suggest.isPending}
+                      disabled={!wizId || wizVersion == null || suggest.isPending}
                     >
                       {" "}
                       {suggest.isPending
@@ -4062,6 +4153,7 @@ const testModel = useMutation({
                           </span>{" "}
                           <button
                             type="button"
+                            disabled={!!wizId && wizVersion == null}
                             onClick={() => {
                               setWizard({
                                 ...wizard,
@@ -4085,6 +4177,7 @@ const testModel = useMutation({
                           </span>{" "}
                           <button
                             type="button"
+                            disabled={!!wizId && wizVersion == null}
                             onClick={() => {
                               setWizard({
                                 ...wizard,
@@ -4107,6 +4200,7 @@ const testModel = useMutation({
                           </span>{" "}
                           <button
                             type="button"
+                            disabled={!!wizId && wizVersion == null}
                             onClick={() => {
                               const l = guide.fields?.lead ?? {};
                               setWizard({
@@ -4146,6 +4240,7 @@ const testModel = useMutation({
                               <button
                                 type="button"
                                 disabled={
+                                  (!!wizId && wizVersion == null) ||
                                   wizard.seats.length >= 10 ||
                                   wizard.seats.some(
                                     (s) =>
@@ -4170,7 +4265,7 @@ const testModel = useMutation({
                           ))}{" "}
                           <button
                             type="button"
-                            disabled={wizard.seats.length >= 10}
+                            disabled={wizard.seats.length >= 10 || (!!wizId && wizVersion == null)}
                             onClick={() => applyGuideRoles(guide.fields?.roles)}
                           >
                             {" "}

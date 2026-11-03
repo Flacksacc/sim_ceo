@@ -3,16 +3,27 @@
 Reproducible browser QA for the app navigation repairs (hash routes, rail +
 list panel, drawer, Back/Forward, deep links, creation flows).
 
-## Modes
+## Authoritative runner
+
+- Full backend + browser: `qa/run-qa.ps1 -Pg -Browser` (isolated :5099/:5100/:5199/:5174, disposable PG :15433, selftest, publish, lanes, then browser block).
+- Frontend rerun only: `qa/run-qa.ps1 -BrowserOnly` (explicitly NOT backend acceptance; skips backend HTTP/selftest/probes/publish/PG/lane blocks; ends with `QA RUNNER PASS (browser-only; backend acceptance NOT claimed)`).
+- Never combine `-BrowserOnly` with `-Pg` (fail-closed).
+
+## Direct modes (when calling navigation.cjs by hand)
 
 - Fixture mode (default): deterministic `page.route` fixtures. The user API
-  on `:5080` is never touched; the worktree bundle is served on `:5175`.
-  `node navigation.cjs [--base=http://localhost:5175/] [--cdp=http://localhost:9333]`
-- Live smoke (read-only): `node navigation.cjs --live`. Skips honestly when
+  on `:5080` is never touched; the bundle under test is served at the passed
+  `--base` (runner uses `http://localhost:5174/`).
+  `node qa/navigation.cjs [--base=http://localhost:5174/] [--cdp=http://localhost:9333]`
+- Live smoke (read-only): `node qa/navigation.cjs --live [--base=http://localhost:5173/]`. Skips honestly when
   the backend is unreachable. Never creates data; selects a board and, when a
-  meeting exists, opens it, then reloads and visits Profile/Help.
+  meeting exists, opens it, then reloads and visits Profile/Help. The closing
+  `mode:` line prints the actual BASE/CDP under test (fixed 2026-11-02; was hardcoded :5175).
 
 Env overrides: `QA_BASE`, `CDP_URL`, `QA_SHOTS` (default `.tmp/qa`, git-ignored).
+
+Launches are owned by `qa/run-qa.ps1` (hidden Start-Hidden); the obsolete
+`qa/launch.py` helper was removed 2026-11-02 after confirming zero references.
 
 ## Fixtures (`fixtures.cjs`)
 

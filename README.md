@@ -41,10 +41,7 @@ the web page updates itself in the browser when web files change.
   lifecycle), Records (prepare, review, approve, revise, amend, discard,
   export), People (invites, grants), Activity (usage filters, jobs, model
   calls, audit), and Help (command coverage).
-- Honest stubs (metered, labeled unknown-cost): Meta Model API replies,
-  transcription, document extraction, image generation, and semantic recall.
-  Uploads, images, and downloads are real and bounded. No wiki connector:
-  documents are the knowledge input.
+- Meta generated text is real (live gate PASS 76, see docs/QA.md); deterministic provider envelopes are API-tested separately. Transcription codecs, live image generation, optional extraction/semantic services, runtime database-outage readiness, and accounting depth still need their later-phase checks. Uploads and downloads are real and bounded. The Wiki connector remains pending.
 - Grants: pass `X-User: <name>` (the People view has an "Act as" box).
   `owner` manages; with no invites/grants a board is open single-user; the
   first invite/grant opts it into enforcement and revocation sticks.
@@ -53,5 +50,4 @@ the web page updates itself in the browser when web files change.
   overrides. Enforcement counts known costs; stub calls are cost-unknown
   and reported separately.
 - Checks: `dotnet run --project server/SimCEO.Api -- --selftest`,
-  `npm run build` in `web/`, and the 40-assertion E2E in `/tmp/simceo-e2e.ps1`
-  (run with `pwsh`, needs the API on `:5099`).
+  `npm run build` in `web/`, and the authoritative QA runner `qa/run-qa.ps1 -Pg -Browser` (full backend + browser) or `qa/run-qa.ps1 -BrowserOnly` (frontend checks only, NOT backend acceptance). Phases 0-3 accepted 2026-11-02 on backend commit 94d5ce0; see docs/QA.md and docs/parity/ai-consult-parity.md.
