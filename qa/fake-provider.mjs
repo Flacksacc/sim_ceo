@@ -1,4 +1,5 @@
 import http from "node:http";
+import { findDelimiters } from "./voice-multipart.mjs";
 import fs from "node:fs";
 import crypto from "node:crypto";
 
@@ -65,25 +66,9 @@ function parseMultipart(buf, contentType) {
   if (!m) return null;
   const boundary = (m[1] || m[2] || "").trim();
   if (!boundary) return null;
-  // Legal delimiter lines only: start-of-body `--boundary`, or CRLF followed
-  // by `--boundary`, each followed by `--` (closing) or CRLF. Bare boundary
-  // bytes inside a payload without CRLF framing are data, not structure.
-  const marker = Buffer.from("--" + boundary);
-  const delims = [];
-  let from = 0;
-  for (;;) {
-    const i = buf.indexOf(marker, from);
-    if (i < 0) break;
-    const atStart = i === 0;
-    const afterCrlf = i >= 2 && buf[i - 2] === 13 && buf[i - 1] === 10;
-    const t = i + marker.length;
-    const b0 = t < buf.length ? buf[t] : -1;
-    const b1 = t + 1 < buf.length ? buf[t + 1] : -1;
-    const isClose = b0 === 45 && b1 === 45;
-    const isCrlf = b0 === 13 && b1 === 10;
-    if ((atStart || afterCrlf) && (isClose || isCrlf)) delims.push({ at: i, close: isClose, head: t + 2 });
-    from = i + 1;
-  }
+  // Strict shared scanner: closing `--boundary--` lines must be complete
+  // (optional padding then CRLF/end); longer suffixes stay payload.
+  const delims = findDelimiters(buf, boundary);
   const parts = [];
   for (let d = 0; d < delims.length; d++) {
     if (delims[d].close) break;

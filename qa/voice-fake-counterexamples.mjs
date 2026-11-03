@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { findDelimiters } from "./voice-multipart.mjs";
 const FAKE = process.env.QA_FAKE || "http://127.0.0.1:5206";
 let pass = 0, fail = 0;
 const failures = [];
@@ -77,6 +78,37 @@ function makeWav(sr, seconds, freq) {
   ok("bare-boundary-valid", l.validWav === true, JSON.stringify(l).slice(0, 200));
   ok("bare-boundary-bytes", l.audioBytes === wav.length, l.audioBytes + " vs " + wav.length);
   ok("bare-boundary-sha", l.audioSha256 === want, l.audioSha256 + " vs " + want);
+}
+// Counterexample 3: audio payload contains CRLF + `--boundary--` + a LONGER
+// suffix (`--NOT-A-DELIMITER`). The old prefix-only parser cut the audio at
+// the fake delimiter (1000 bytes); the strict parser must keep exact bytes.
+{
+  const boundary = "TESTBOUNDARY123";
+  const wav = makeWav(16000, 0.5, 440);
+  const fake = Buffer.from("\r\n--" + boundary + "--NOT-A-DELIMITER\r\n", "latin1");
+  wav.set([0, 0], 1000);
+  fake.copy(wav, 1002);
+  const reqJson = Buffer.from(JSON.stringify({ model: "m", audioEncoding: "WAV" }), "utf8");
+  const head1 = Buffer.from("--" + boundary + "\r\nContent-Disposition: form-data; name=\"request\";\r\nContent-Type: application/json\r\n\r\n", "latin1");
+  const head2 = Buffer.from("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"mic.wav\"\r\nContent-Type: audio/wav\r\n\r\n", "latin1");
+  const tail = Buffer.from("\r\n--" + boundary + "--\r\n", "latin1");
+  const rawBody = Buffer.concat([head1, reqJson, head2, wav, tail]);
+  const r = await fetch(FAKE + "/asr/transcribe", {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=" + boundary },
+    body: rawBody,
+  });
+  ok("close-suffix-accepted", r.status === 200, String(r.status));
+  const l = await last();
+  const want = crypto.createHash("sha256").update(wav).digest("hex").slice(0, 16);
+  ok("close-suffix-valid", l.validWav === true, JSON.stringify(l).slice(0, 200));
+  ok("close-suffix-bytes", l.audioBytes === wav.length, l.audioBytes + " vs " + wav.length);
+  ok("close-suffix-sha", l.audioSha256 === want, l.audioSha256 + " vs " + want);
+  // The ACTUAL shared extractor used by the browser suite must agree.
+  const dl = findDelimiters(rawBody, boundary);
+  const closes = dl.filter((d) => d.close);
+  const wantAt = rawBody.length - tail.length + 2;
+  ok("close-suffix-one-close", closes.length === 1 && closes[0].at === wantAt, JSON.stringify(dl.map((d) => ({ at: d.at, close: d.close }))));
 }
 // Sanity: plain valid WAV still fully valid.
 {

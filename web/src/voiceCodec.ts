@@ -81,53 +81,103 @@ export async function convertRecordedBlobToWav(
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!AC) throw new Error("Audio conversion unavailable in this browser.");
   // ONE total deadline for the whole conversion: blob read + decode + render.
-  // A single master timer bounds every stage and closes the owned context on
-  // timeout; caller abort races every stage. Late completions after settle are
-  // ignored and never touch caller state.
+  // A single master timer bounds every stage. Terminal cleanup is idempotent
+  // and bounded: the owned context is closed at most once and the close is
+  // never awaited, so a pending native close cannot retain the public
+  // conversion promise past the deadline or caller cancellation. Stage abort
+  // listeners are tracked and removed on every terminal path, the owned
+  // rendering source is disconnected on both abort and timeout, and the first
+  // terminal reason (cancel vs timeout) is preserved for late completions.
   let settled = false;
   let ac: AudioContext | null = null;
+  let renderSrc: { disconnect: () => void } | null = null;
   let timer: number | null = null;
-  const closeOwned = () => {
+  let closeStarted = false;
+  let terminalReason: string | null = null;
+  const stageAborts = new Set<() => void>();
+  const stageRemovers = new Set<() => void>();
+  const removeAllStage = () => {
+    const fns = Array.from(stageRemovers);
+    stageRemovers.clear();
+    stageAborts.clear();
+    for (const fn of fns) {
+      try { fn(); } catch { /* ignore */ }
+    }
+  };
+  const disconnectRender = () => {
+    const s = renderSrc;
+    renderSrc = null;
+    if (s) {
+      try { s.disconnect(); } catch { /* ignore */ }
+    }
+  };
+  const closeOnce = () => {
+    if (closeStarted) return;
+    closeStarted = true;
     const c = ac;
     ac = null;
     if (!c) return;
-    try { void c.close().catch(() => {}); } catch { /* ignore */ }
+    try {
+      const r = c.close() as unknown as Promise<void> | void;
+      if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+    } catch { /* ignore */ }
+  };
+  let terminalDone = false;
+  const terminal = (reason: string | null) => {
+    if (terminalReason === null && reason !== null) terminalReason = reason;
+    if (terminalDone) return;
+    terminalDone = true;
+    removeAllStage();
+    disconnectRender();
+    if (timer !== null) { try { window.clearTimeout(timer); } catch { /* ignore */ } timer = null; }
+    if (signal) signal.removeEventListener("abort", onAbortCleanup);
+    closeOnce();
   };
   const onAbortCleanup = () => {
     if (settled) return;
     settled = true;
-    if (timer !== null) { try { window.clearTimeout(timer); } catch { /* ignore */ } timer = null; }
-    if (signal) signal.removeEventListener("abort", onAbortCleanup);
-    closeOwned();
+    // Fire active stage rejectors first so no gated promise is stranded
+    // pending (which would hang the public promise when the master timer
+    // later observes settled and stays inert).
+    const fns = Array.from(stageAborts);
+    stageAborts.clear();
+    for (const fn of fns) {
+      try { fn(); } catch { /* ignore */ }
+    }
+    terminal("cancel");
   };
   if (signal) signal.addEventListener("abort", onAbortCleanup, { once: true });
   const timeoutGate = new Promise<never>((_, reject) => {
     timer = window.setTimeout(() => {
       if (settled) return;
       settled = true;
-      if (signal) signal.removeEventListener("abort", onAbortCleanup);
-      closeOwned();
+      terminal("timeout");
       reject(timeoutError());
     }, totalMs);
   });
   timeoutGate.catch(() => {});
   const gate = <T>(p: Promise<T>, onStageAbort?: () => void): Promise<T> => {
     return new Promise<T>((resolve, reject) => {
-      if (settled) { reject(cancelError()); return; }
+      if (settled) { reject(terminalReason === "timeout" ? timeoutError() : cancelError()); return; }
       if (signal && signal.aborted) { reject(cancelError()); return; }
-      const ab = () => { try { onStageAbort && onStageAbort(); } catch { /* ignore */ } reject(cancelError()); };
+      const ab = () => {
+        try { onStageAbort && onStageAbort(); } catch { /* ignore */ }
+        stageAborts.delete(ab);
+        if (!settled) { settled = true; terminal("cancel"); }
+        remove();
+        reject(cancelError());
+      };
+      const remove = () => {
+        if (signal) signal.removeEventListener("abort", ab);
+        stageRemovers.delete(remove);
+        stageAborts.delete(ab);
+      };
+      stageRemovers.add(remove);
+      stageAborts.add(ab);
       if (signal) signal.addEventListener("abort", ab, { once: true });
       p.then(
-        (v) => {
-          if (settled) return;
-          if (signal) signal.removeEventListener("abort", ab);
-          resolve(v);
-        },
-        (e) => {
-          if (settled) return;
-          if (signal) signal.removeEventListener("abort", ab);
-          reject(e);
-        },
+        (v) => { remove(); if (settled) return; resolve(v); },
+        (e) => { remove(); if (settled) return; reject(e); },
       );
     });
   };
@@ -143,7 +193,8 @@ export async function convertRecordedBlobToWav(
       const copy = raw.slice().buffer as ArrayBuffer;
       decoded = await raced(thisAc.decodeAudioData(copy));
     } catch (e) {
-      if (isAbortError(e, signal)) throw cancelError();
+      if (terminalReason === "timeout") throw timeoutError();
+      if (terminalReason === "cancel" || (signal && signal.aborted) || isAbortError(e, signal)) throw cancelError();
       if (settled) throw timeoutError();
       throw new Error("Could not decode recording; try again.");
     }
@@ -175,17 +226,20 @@ export async function convertRecordedBlobToWav(
       srcBuf.getChannelData(0).set(mono);
       const off = new OfflineAudioContext(1, targetLen, targetRate);
       const src = off.createBufferSource();
+      renderSrc = src;
       src.buffer = srcBuf;
       src.connect(off.destination);
       src.start(0);
       let rendered: AudioBuffer;
       try {
-        rendered = await raced(off.startRendering(), () => { try { src.disconnect(); } catch { /* ignore */ } });
+        rendered = await raced(off.startRendering(), () => { disconnectRender(); });
       } catch (e) {
-        if (isAbortError(e, signal)) throw cancelError();
+        if (terminalReason === "timeout") throw timeoutError();
+        if (terminalReason === "cancel" || (signal && signal.aborted) || isAbortError(e, signal)) throw cancelError();
         if (settled) throw timeoutError();
         throw e;
       }
+      renderSrc = null;
       const out = rendered.getChannelData(0).slice();
       durSec = out.length / targetRate;
       if (durSec <= 0) throw new Error("No audio captured.");
@@ -194,20 +248,19 @@ export async function convertRecordedBlobToWav(
       if (wavBytes.length > 10 * 1024 * 1024) throw new Error("Converted audio exceeds 10 MB.");
       wavBlob = new Blob([wavBytes.buffer as ArrayBuffer], { type: "audio/wav" });
     } finally {
-      try { await thisAc.close().catch(() => {}); } catch { /* ignore */ }
-      if (ac === thisAc) ac = null;
+      // Bounded terminal close: fire once, never awaited, so pending native
+      // cleanup cannot retain the public promise. terminal() also removes
+      // stage listeners and disconnects the render source on abort/timeout.
+      if (ac === thisAc) terminal(null);
     }
-    if (settled) throw timeoutError();
+    if (settled) throw terminalReason === "cancel" ? cancelError() : timeoutError();
     settled = true;
-    if (timer !== null) { try { window.clearTimeout(timer); } catch { /* ignore */ } timer = null; }
-    if (signal) signal.removeEventListener("abort", onAbortCleanup);
+    terminal(null);
     return { wavBytes: wavBytes!, wavBlob: wavBlob!, durationSec: durSec, sampleRate: targetRate };
   } catch (e) {
     if (!settled) {
       settled = true;
-      if (timer !== null) { try { window.clearTimeout(timer); } catch { /* ignore */ } timer = null; }
-      if (signal) signal.removeEventListener("abort", onAbortCleanup);
-      closeOwned();
+      terminal("error");
     }
     throw e;
   }
