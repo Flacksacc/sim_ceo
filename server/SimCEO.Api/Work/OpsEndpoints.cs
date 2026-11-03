@@ -136,12 +136,13 @@ public static class OpsEndpoints
         if (ownerDefault is not null) leadSource = "inherit";
         else if (LeadSetup.InheritsGlobalLead(s, b) && LeadSetup.ResolveLead(s) is not null) leadSource = "inherit-global";
       }
-      // Embedded snapshots must not leak inherited content: an activated
-      // inheriting board stores the effective (owner-default or legacy-global)
-      // profile inside ActiveJson. Export a sanitized board clone with the lead
-      // redacted unless this board carries its own explicit override.
-      string exportActive = b.ActiveJson ?? "";
-      if (ownLead is null) exportActive = LeadSetup.RedactLeadJson(exportActive);
+      // Embedded snapshots must never leak historical content: an activated
+      // board stores the then-effective (owner-default or legacy-global)
+      // profile inside ActiveJson, which survives later overrides that do not
+      // reactivate. Export always redacts the embedded snapshot lead,
+      // independently of the current override; the current explicit override
+      // (if any) is retained separately in top-level lead.
+      string exportActive = LeadSetup.RedactLeadJson(b.ActiveJson ?? "");
       var exportBoard = new Board
       {
         Id = b.Id, Name = b.Name, Mission = b.Mission, Stage = b.Stage,

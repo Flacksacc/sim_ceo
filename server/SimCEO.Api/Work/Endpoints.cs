@@ -487,8 +487,14 @@ public static class SimCEOEndpoints
       catch { lead = null; hideGlobal = true; }
       var total = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed);
       var approved = s.Advisors.Values.Count(a => a.BoardId == bid && !a.Removed && a.Approved);
-      var canonical = LeadSetup.CanonicalDraftJson(s, b);
-      var shownActive = b.ActiveJson ?? "";
+      var canonicalFull = LeadSetup.CanonicalDraftJson(s, b);
+      var activeFull = b.ActiveJson ?? "";
+      // Dirty status is a config fact, not a display artifact: compute it on
+      // unredacted snapshots before any viewer-based redaction, so redaction
+      // alone never flips an unchanged activated board to dirty for non-admins.
+      bool dirtyFull = !string.Equals(canonicalFull, activeFull, StringComparison.Ordinal);
+      var canonical = canonicalFull;
+      var shownActive = activeFull;
       if (hideGlobal)
       {
         // A hidden top-level lead is not enough: canonical/active JSON embed the
@@ -511,7 +517,7 @@ public static class SimCEOEndpoints
         draftJson = b.DraftJson, activeJson = shownActive,
         canonicalJson = canonical,
         draftHash = Hashing.HashOf(canonical),
-        dirty = !string.Equals(canonical, shownActive, StringComparison.Ordinal),
+        dirty = dirtyFull,
         lead, advisors = new { total, approved },
       });
     });
