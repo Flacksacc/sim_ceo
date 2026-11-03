@@ -235,6 +235,7 @@ async function desktopSuite(browser) {
     const draftHash = await hashOf(page);
     await page.waitForTimeout(1800);
     await check(page, "prepared draft survives delayed records refresh", async () => (await hashOf(page)) === draftHash);
+    await page.locator('summary:has-text("Advanced JSON")').first().click();
     await page.getByRole("button", { name: "Request revision (new version)" }).click();
     await page.getByRole("heading", { name: /Review v2/ }).waitFor({ timeout: 15000 });
     await check(page, "revision creates next version review", () => page.getByRole("heading", { name: /Review v2/ }).isVisible());
@@ -274,6 +275,7 @@ async function desktopSuite(browser) {
     await check(page, "delayed prepare preserves B content", () => page.getByText("QA draft item").first().isVisible());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.locator('summary:has-text("Advanced JSON")').first().click();
     await setDelay(page, "record-write", 1500);
     await page.getByRole("button", { name: "Request revision (new version)" }).click();
     await page.waitForTimeout(300);
@@ -285,6 +287,8 @@ async function desktopSuite(browser) {
     await check(page, "delayed revise preserves B actions", () => page.getByRole("button", { name: "Request revision (new version)" }).isVisible());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("button", { name: "Approve a" }).first().click();
+    await page.getByRole("button", { name: "Amend (name superseded IDs)" }).waitFor({ timeout: 20000 });
     await setDelay(page, "record-write", 1500);
     await page.getByRole("button", { name: "Amend (name superseded IDs)" }).click();
     await page.waitForTimeout(300);

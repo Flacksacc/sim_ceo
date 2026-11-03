@@ -218,7 +218,29 @@ type RecordDraft = {
   decided: boolean;
   status: string;
   approvedJson: string;
+  discardedJson: string;
+  reviewRevision: number;
+  reviewToken: string;
+  historyJson: string;
   supersedesJson: string;
+};
+type RecordReviewNote = { id: string; kind: string; title: string; body: string; createdAt: string };
+type RecordReviewMsg = { sequence: number; sender: string; advisorName?: string | null; content: string };
+type RecordEvidence = { itemId: string; kind: string; ref: string; version?: number | null; title: string; excerpt: string; currentEligible: boolean; historical: boolean; missing: boolean };
+type LineageEffect = { id: string; text: string; status: string; fromVersion: number; toVersion: number };
+type RecordReview = {
+  draft: RecordDraft;
+  approved: string[];
+  discarded: string[];
+  pending: string[];
+  notes: RecordReviewNote[];
+  recentMessages: RecordReviewMsg[];
+  predecessors: string[];
+  successors: string[];
+  evidence: RecordEvidence[];
+  lineageEffects?: LineageEffect[];
+  historyCount: number;
+  meetingWatermark: number;
 };
 type Invite = {
   id: string;
@@ -2338,8 +2360,8 @@ const tabCount = (k: Tab): number | null => {
     .slice()
     .sort((a, b) => b.version - a.version)[0];
   const [recId, setRecId] = useState(route0.rec);
-  const liveSelRef = useRef({ boardId, meetingId, recId });
-  liveSelRef.current = { boardId, meetingId, recId };
+  const liveSelRef = useRef({ boardId, meetingId, recId, user: actAs || "owner" });
+  liveSelRef.current = { boardId, meetingId, recId, user: actAs || "owner" };
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -2414,9 +2436,191 @@ const tabCount = (k: Tab): number | null => {
       }
     }
   }, [recDetail.data]);
+  const recReview = useQuery({
+    queryKey: ["record-review", recId],
+    queryFn: () => get<RecordReview>(`/api/records/${recId}/review`),
+    enabled: !!recId && !!boardId && !!meetingId && boardOk && meetingOk && tab === "records",
+    retry: false,
+  });
+  const [reviewError, setReviewError] = useState<{ key: string; message: string } | null>(null);
+  const errKey = `${boardId}:${meetingId}:${recId}:${actAs || "owner"}`;
+  useEffect(() => {
+    setReviewError(null);
+  }, [boardId, meetingId, recId]);
+  const showReviewError = reviewError !== null && reviewError.key === errKey;
+  const [itemTexts, setItemTexts] = useState<Record<string, string>>({});
+  const editKey = (draftId: string, itemId: string) => `${draftId}:${itemId}`;
+  useEffect(() => {
+    setItemTexts({});
+  }, [boardId, meetingId, recId]);
+  const refreshReview = async () => {
+    if (!recOk) return;
+    const origin = { boardId, meetingId, recId, user: actAs || "owner" };
+    const stillLive = () => {
+      const live = liveSelRef.current;
+      return live.boardId === origin.boardId && live.meetingId === origin.meetingId && live.recId === origin.recId && live.user === origin.user;
+    };
+    try {
+      setReviewError(null);
+      const fresh = await get<RecordReview>(`/api/records/${origin.recId}/review`);
+      if (!stillLive()) return;
+      const fd = fresh.draft;
+      qc.setQueryData(["record", fd.id], fd);
+      refresh("records", "record");
+      await recReview.refetch();
+      if (!stillLive()) return;
+      if (fd.watermark === fresh.meetingWatermark) {
+        notify("Review is already current; approve deliberately.");
+        return;
+      }
+      const r = await post<unknown>(`/api/records/${fd.id}/refresh`, guardOf(fd));
+      if (!stillLive()) return;
+      const rd = (r as unknown as { draft?: RecordDraft })?.draft;
+      if (rd && (rd as RecordDraft).id) qc.setQueryData(["record", (rd as RecordDraft).id], rd);
+      refresh("records", "record");
+      void recReview.refetch();
+      notify("Review refreshed to current meeting input; choose deliberately.");
+    } catch (e) {
+      if (!stillLive()) return;
+      noteReviewError(e, origin);
+    }
+  };
+  const guardOf = (d: RecordDraft) => ({
+    version: d.version,
+    hash: d.hash,
+    reviewToken: d.reviewToken,
+    watermark: d.watermark,
+  });
+  const applyDraft = (r: unknown) => {
+    const upd = r as unknown as RecordDraft | undefined;
+    if (upd && (upd as RecordDraft).id) {
+      qc.setQueryData(["record", (upd as RecordDraft).id], upd);
+      qc.setQueryData<RecordDraft[] | undefined>(
+        ["records", (upd as RecordDraft).meetingId],
+        (old) =>
+          old
+            ? old.map((x) =>
+                x.id === (upd as RecordDraft).id ? { ...x, ...(upd as RecordDraft) } : x,
+              )
+            : old,
+      );
+      refresh("records", "record");
+      void recReview.refetch();
+    } else {
+      refresh("records", "record");
+      void recReview.refetch();
+    }
+  };
+  const noteReviewError = (e: unknown, origin: { boardId: string; meetingId: string; recId: string; user: string }) => {
+    const msg = String(e);
+    const message = msg.includes("409")
+      ? `${msg} — the review changed or the meeting moved on. Use Refresh review below, then choose again deliberately. No automatic retry was made.`
+      : msg;
+    setReviewError({ key: `${origin.boardId}:${origin.meetingId}:${origin.recId}:${origin.user}`, message });
+  };
+  const itemApprove = (itemId: string) => {
+    if (!recOk) return;
+    const d = recReview.data?.draft ?? recDetail.data;
+    if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
+    post<unknown>(`/api/records/${d.id}/items/approve`, { ...guardOf(d), itemId })
+      .then((r) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft(r);
+        const st = (r as unknown as RecordDraft)?.status;
+        notify(st === "approved" ? `Approved ${itemId}; review complete.` : `Approved ${itemId}.`);
+      })
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
+  };
+  const itemRevise = (itemId: string) => {
+    if (!recOk) return;
+    const d = recReview.data?.draft ?? recDetail.data;
+    if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    const text = (itemTexts[editKey(d.id, itemId)] ?? "").trim();
+    if (!text) {
+      alert("Revised text must be non-empty plain text.");
+      return;
+    }
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
+    const originDraftId = d.id;
+    post<unknown>(`/api/records/${d.id}/items/revise`, { ...guardOf(d), itemId, text })
+      .then((r) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft(r);
+        setItemTexts((old) => {
+          const next = { ...old };
+          delete next[`${originDraftId}:${itemId}`];
+          return next;
+        });
+        notify(`Revised ${itemId}; approved text untouched.`);
+      })
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
+  };
+  const itemDiscard = (itemId: string) => {
+    if (!recOk) return;
+    const d = recReview.data?.draft ?? recDetail.data;
+    if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
+    post<unknown>(`/api/records/${d.id}/items/discard`, { ...guardOf(d), itemId })
+      .then((r) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft(r);
+        notify(`Discarded ${itemId}; approved items preserved.`);
+      })
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
+  };
+  const approveAllFresh = () => {
+    if (!recOk) return;
+    const d = recReview.data?.draft ?? recDetail.data;
+    if (!d) return;
+    if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
+    post<unknown>(`/api/records/${d.id}/approve-all`, guardOf(d))
+      .then((r) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft(r);
+        notify("Approved all pending items.");
+      })
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
+  };
   const approveRec = (all: boolean) => {
     if (!recOk) return;
-    const d = recDetail.data;
+    const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     let ids = selItems;
@@ -2429,36 +2633,39 @@ const tabCount = (k: Tab): number | null => {
         ids = selItems;
       }
     }
-    const originMeetingId = meetingId;
     const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
     const originDraftId = d.id;
     post<unknown>(`/api/meetings/${originMeetingId}/record/approve`, {
       draftId: originDraftId,
+      version: d.version,
       hash: d.hash,
+      reviewToken: d.reviewToken,
       watermark: d.watermark,
       itemIds: ids,
     })
       .then((r) => {
-        const parsed = r as unknown as { approved?: string[]; draft?: string } | undefined;
-        const keyId = (parsed as { draft?: string } | undefined)?.draft ?? originDraftId;
-        const approvedJson = JSON.stringify((parsed as { approved?: string[] } | undefined)?.approved ?? ids);
-        qc.setQueryData<RecordDraft | undefined>(["record", keyId], (old) =>
-          old && old.id === keyId ? { ...old, decided: true, status: "approved", approvedJson } : old,
-        );
-        qc.setQueryData<RecordDraft[] | undefined>(["records", originMeetingId], (old) =>
-          old
-            ? old.map((x) => (x.id === keyId ? { ...x, decided: true, status: "approved", approvedJson } : x))
-            : old,
-        );
-        void originBoardId;
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft({ ...(d as RecordDraft), ...((r as unknown as { draft?: string })?.draft ? {} : {}) });
+        const parsed = r as unknown as { approved?: string[]; draft?: string; status?: string; pending?: string[] } | undefined;
+        const keyId = parsed?.draft ?? originDraftId;
+        void keyId;
         refresh("records", "record");
+        void recReview.refetch();
         notify(`Approved ${ids.length} item(s).`);
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
   };
   const reviseRec = (amend: boolean) => {
     if (!recOk) return;
-    const d = recDetail.data;
+    const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     let items: unknown = [];
@@ -2470,41 +2677,52 @@ const tabCount = (k: Tab): number | null => {
     }
     const originMeetingId = meetingId;
     const originBoardId = boardId;
-    const originDraftId = d.id;
-    void originDraftId;
     const originRecId = recId;
+    const originUser = actAs || "owner";
     post<RecordDraft>(`/api/records/${d.id}/${amend ? "amend" : "revise"}`, {
+      ...guardOf(d),
       items,
     })
       .then((r) => {
-        // Seed the revised/amended draft by its returned identity so a delayed
-        // refresh never discards the just-saved selection, and never render it
-        // under the wrong parent if the user switched while saving.
         const keyMeeting = (r as RecordDraft)?.meetingId ?? originMeetingId;
         const keyBoard = (r as RecordDraft)?.boardId ?? originBoardId;
+        const live = liveSelRef.current;
+        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || live.user !== originUser) return;
         qc.setQueryData<RecordDraft[] | undefined>(
           ["records", keyMeeting],
           (old) => (old ? [...old.filter((x) => x.id !== r.id), r] : [r]),
         );
         qc.setQueryData(["record", r.id], r);
-        const live = liveSelRef.current;
-        if (live.boardId === keyBoard && live.meetingId === keyMeeting && live.recId === originRecId) setRecId(r.id);
+        setRecId(r.id);
         refresh("records", "record");
+        void recReview.refetch();
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
   };
   const discardRec = () => {
     if (!recOk || !recDetail.data) return Promise.resolve();
-    const d = recDetail.data;
+    const d = recReview.data?.draft ?? recDetail.data;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
-    const originDraftId = d.id;
-    return post<unknown>(`/api/records/${originDraftId}/discard`, {}).then((r) => {
-      const updated = r as unknown as RecordDraft | undefined;
-      if (updated && (updated as RecordDraft).id) qc.setQueryData(["record", (updated as RecordDraft).id], updated);
-      refresh("records", "record");
-    });
-  };
-  const [draftItems, setDraftItems] = useState(
+    const originBoardId = boardId;
+    const originMeetingId = meetingId;
+    const originRecId = recId;
+    const originUser = actAs || "owner";
+    return post<unknown>(`/api/records/${d.id}/discard`, guardOf(d))
+      .then((r) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        applyDraft(r);
+      })
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== originUser) return;
+        noteReviewError(e, { boardId: originBoardId, meetingId: originMeetingId, recId: originRecId, user: originUser });
+      });
+  };  const [draftItems, setDraftItems] = useState(
     '[{"id":"1","text":"","detail":"","status":"proposed","scope":"meeting"}]',
   );
   const prepareDraft = () => {
@@ -2528,10 +2746,16 @@ const tabCount = (k: Tab): number | null => {
         );
         qc.setQueryData(["record", r.id], r);
         const live = liveSelRef.current;
-        if (live.boardId === keyBoard && live.meetingId === keyMeeting && live.recId === originRecId) setRecId(r.id);
+        if (live.boardId !== keyBoard || live.meetingId !== keyMeeting || live.recId !== originRecId || live.user !== (actAs || "owner")) return;
+        setRecId(r.id);
         refresh("records", "record");
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => {
+        const live = liveSelRef.current;
+        if (live.boardId !== originBoardId || live.meetingId !== originMeetingId || live.recId !== originRecId || live.user !== (actAs || "owner")) return;
+        const msg = String(e);
+        setReviewError({ key: `${originBoardId}:${originMeetingId}:${originRecId}:${actAs || "owner"}`, message: msg });
+      });
   };
   const invites = useQuery({
     queryKey: ["invites", boardId],
@@ -6226,7 +6450,7 @@ const testModel = useMutation({
                   {(recs.data ?? []).map((r) => (
                     <div className="card" key={r.id}>
                       {" "}
-                      <button onClick={() => setRecId(r.id)}>
+                      <button data-testid={`record-open-${r.id}`} onClick={() => setRecId(r.id)}>
                         {" "}
                         v{r.version} · {r.status}{r.decided ? " · decided" : ""}{" "}
                       </button>{" "}
@@ -6236,70 +6460,264 @@ const testModel = useMutation({
                       </span>{" "}
                     </div>
                   ))}{" "}
-                  {recOk && recDetail.data && (
-                    <div className="card key">
-                      {" "}
-                      <h3>
-                        {" "}
-                        Review v{recDetail.data.version} ({" "}
-                        {recDetail.data.status}){" "}
-                      </h3>{" "}
-                      <p>
-                        {" "}
-                        Hash <code>{recDetail.data.hash}</code> · watermark{" "}
-                        {recDetail.data.watermark}{" "}
-                      </p>{" "}
-                      {(() => {
-                        try {
-                          return (
-                            JSON.parse(recDetail.data.itemsJson) as {
-                              id?: string;
-                              text?: string;
-                            }[]
-                          ).map((it) => (
-                            <label key={it.id ?? it.text}>
-                              {" "}
-                              <input
-                                type="checkbox"
-                                checked={selItems.includes(it.id ?? "")}
-                                onChange={(e) =>
-                                  setSelItems(
-                                    e.target.checked
-                                      ? [...selItems, it.id ?? ""]
-                                      : selItems.filter(
-                                          (x) => x !== (it.id ?? ""),
-                                        ),
-                                  )
-                                }
-                              />{" "}
-                              [{it.id}] {it.text}{" "}
-                            </label>
-                          ));
-                        } catch {
-                          return <p>Unparseable items.</p>;
+                  {recOk && (recDetail.data || recReview.data?.draft) && (() => {
+                    const d: RecordDraft = recReview.data?.draft ?? recDetail.data!;
+                    let items: { id?: string; text?: string; detail?: string; status?: string; scope?: string }[] = [];
+                    let itemsValid = true;
+                    const isStr = (v: unknown): v is string => typeof v === "string";
+                    try {
+                      const parsed: unknown = JSON.parse(d.itemsJson);
+                      if (!Array.isArray(parsed)) itemsValid = false;
+                      else {
+                        const seen = new Set<string>();
+                        for (const el of parsed) {
+                          if (!el || typeof el !== "object") { itemsValid = false; break; }
+                          const rec = el as Record<string, unknown>;
+                          const id = rec.id;
+                          const text = rec.text;
+                          if (typeof id !== "string" || !id.trim() || id !== id.trim() || typeof text !== "string" || !text.trim() || seen.has(id)) { itemsValid = false; break; }
+                          seen.add(id);
+                          for (const k of ["detail", "status", "scope"]) {
+                            if (rec[k] !== undefined && !isStr(rec[k])) { itemsValid = false; break; }
+                          }
+                          if (!itemsValid) break;
+                          const refs = rec.refs;
+                          if (refs !== undefined) {
+                            if (!Array.isArray(refs)) { itemsValid = false; break; }
+                            for (const r of refs) {
+                              if (!r || typeof r !== "object") { itemsValid = false; break; }
+                              const rr = r as Record<string, unknown>;
+                              const kind = rr.kind; const ref = typeof rr.ref === "string" ? rr.ref : rr.id;
+                              if (!isStr(kind) || !kind.trim() || !isStr(ref) || !ref.trim()) { itemsValid = false; break; }
+                              const ver = rr.version;
+                              if (ver !== undefined && ver !== null && (typeof ver !== "number" || !Number.isInteger(ver) || ver < 0)) { itemsValid = false; break; }
+                              for (const mk of ["url", "title", "excerpt"]) {
+                                const mv = rr[mk];
+                                if (mv !== undefined && mv !== null && !isStr(mv)) { itemsValid = false; break; }
+                              }
+                              if (!itemsValid) break;
+                            }
+                            if (!itemsValid) break;
+                          }
                         }
-                      })()}{" "}
+                        if (itemsValid) items = parsed as { id?: string; text?: string; detail?: string; status?: string; scope?: string }[];
+                      }
+                    } catch { itemsValid = false; }
+                    let historyValid = true;
+                    let history: { seq?: number; at?: string; actor?: string; action?: string; itemId?: string; oldText?: string; newText?: string; viewedVersion?: number; viewedHash?: string; viewedWatermark?: number; viewedToken?: string; revision?: number; token?: string }[] = [];
+                    try {
+                      const h: unknown = JSON.parse(d.historyJson ?? "[]");
+                      if (!Array.isArray(h)) historyValid = false;
+                      else {
+                        for (const he of h) {
+                          if (!he || typeof he !== "object") { historyValid = false; break; }
+                          const hh = he as Record<string, unknown>;
+                          if (typeof hh.action !== "string" || !hh.action) { historyValid = false; break; }
+                          for (const k of ["itemId", "oldText", "newText", "actor", "viewedHash", "viewedToken", "token", "at"]) {
+                            if (hh[k] !== undefined && typeof hh[k] !== "string") { historyValid = false; break; }
+                          }
+                          if (!historyValid) break;
+                          for (const k of ["seq", "viewedVersion", "viewedWatermark", "revision"]) {
+                            if (hh[k] !== undefined && typeof hh[k] !== "number") { historyValid = false; break; }
+                          }
+                          if (!historyValid) break;
+                        }
+                        if (historyValid) history = h as typeof history;
+                      }
+                    } catch { historyValid = false; history = []; }
+                    const stateValid = itemsValid && historyValid;
+                    const strList = (raw: string): string[] => {
+                      try {
+                        const a: unknown = JSON.parse(raw ?? "[]");
+                        return Array.isArray(a) ? (a as unknown[]).filter((x): x is string => typeof x === "string") : [];
+                      } catch { return []; }
+                    };
+                    const approvedList = recReview.data?.approved ?? strList(d.approvedJson);
+                    const discardedList = recReview.data?.discarded ?? strList(d.discardedJson);
+                    const appr = new Set(approvedList);
+                    const disc = new Set(discardedList);
+                    const pend = itemsValid ? items.map((i) => i.id ?? "").filter((id) => id && !appr.has(id) && !disc.has(id)) : [];
+                    const canDecide = stateValid && pend.length > 0 && !d.decided;
+                    const statusOf = (id: string) => (appr.has(id) ? "approved" : disc.has(id) ? "discarded" : "pending");
+                    const evByItem = new Map<string, RecordEvidence[]>();
+                    for (const c of recReview.data?.evidence ?? []) {
+                      const arr = evByItem.get(c.itemId);
+                      if (arr) arr.push(c); else evByItem.set(c.itemId, [c]);
+                    }
+
+                    const preds = recReview.data?.predecessors ?? [];
+                    const succs = recReview.data?.successors ?? [];
+                    return (
+                    <div className="card key">
+                      <h3>
+                        Review v{d.version} ({d.status})
+                        {d.decided ? " · decided" : ""}
+                      </h3>
+                      <p>
+                        Hash <code>{d.hash}</code> · review token <code>{d.reviewToken ? d.reviewToken.slice(0, 12) : "—"}</code> · revision {d.reviewRevision} · watermark {d.watermark}
+                        {recReview.data ? ` · meeting now @ ${recReview.data.meetingWatermark}` : ""}
+                      </p>
+                      {(preds.length > 0 || succs.length > 0) && (
+                        <p>
+                          {preds.length > 0 && (
+                            <span>
+                              Supersedes{" "}
+                              {preds.map((p) => (
+                                <button key={p} type="button" className="btn ghost" onClick={() => setRecId(p)}>
+                                  {p.slice(0, 8)}
+                                </button>
+                              ))}{" "}
+                            </span>
+                          )}
+                          {succs.length > 0 && (
+                            <span>
+                              Successor{" "}
+                              {succs.map((p) => (
+                                <button key={p} type="button" className="btn ghost" onClick={() => setRecId(p)}>
+                                  {p.slice(0, 8)}
+                                </button>
+                              ))}
+                            </span>
+                          )}
+                        </p>
+                      )}
+                      <button type="button" className="btn ghost" onClick={refreshReview}>
+                        Refresh review
+                      </button>
+                      <p role="alert" className="error" hidden={!showReviewError}>
+                        {showReviewError && reviewError ? reviewError.message : "No review errors."}
+                      </p>
                       <div className="card">
-                        {" "}
-                        <h3>Compare with another version</h3>{" "}
+                        <h3>Working notes (provisional)</h3>
+                        {(recReview.data?.notes ?? []).length === 0 && (
+                          <p className="muted">No provisional working notes.</p>
+                        )}
+                        {(recReview.data?.notes ?? []).map((n) => (
+                          <div key={n.id}>
+                            <b>{n.title || n.kind}</b> <span className="badge">{n.kind}</span>
+                            <p>{n.body}</p>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="card">
+                        <h3>Recent meeting input</h3>
+                        {(recReview.data?.recentMessages ?? []).length === 0 && (
+                          <p className="muted">No messages yet.</p>
+                        )}
+                        {(recReview.data?.recentMessages ?? []).map((m) => (
+                          <div key={m.sequence}>
+                            [{m.sequence}] {m.sender}
+                            {m.advisorName ? `/${m.advisorName}` : ""}: {m.content}
+                          </div>
+                        ))}
+                      </div>
+                      {!stateValid && <p role="alert">Review state is malformed; no approval controls are shown.</p>}
+                      {stateValid && items.map((it) => {
+                        const id = it.id ?? "";
+                        const st = statusOf(id);
+                        return (
+                          <div className="card" key={id}>
+                            <span className={`badge ${st === "approved" ? "ok" : ""}`}>{st}</span>{" "}
+                            <b>[{id}]</b> {typeof it.text === "string" ? it.text : "(unreadable item text)"}
+                            {typeof it.detail === "string" && it.detail ? <p>detail: {it.detail}</p> : null}
+                            {(typeof it.status === "string" && it.status) || (typeof it.scope === "string" && it.scope) ? (
+                              <p className="muted">
+                                {[it.status, it.scope].filter((x): x is string => typeof x === "string" && x !== "").join(" · ")}
+                              </p>
+                            ) : null}
+                            {(evByItem.get(id) ?? []).map((c) => (
+                              <div key={`${c.kind}:${c.ref}`} className="muted">
+                                <span className="badge">{c.kind}</span> <b>{c.title || c.ref}</b>{" "}
+                                <span className="badge">{c.missing ? "missing" : c.currentEligible ? "current" : "historical"}</span>
+                                {c.excerpt && <p>{c.excerpt}</p>}
+                              </div>
+                            ))}
+                            {((recReview.data?.lineageEffects ?? []) as LineageEffect[]).filter((fx) => fx.id === id).map((fx) => (
+                              <div key={`fx-${fx.id}`} className="muted">
+                                <span className="badge">amendment</span>{" "}
+                                <span>
+                                  {fx.status === "replaced" && `replaced ancestor text (v${fx.fromVersion} → v${fx.toVersion})`}
+                                  {fx.status === "added" && `new in v${fx.toVersion}`}
+                                  {fx.status === "inherited" && `inherited from v${fx.fromVersion}`}
+                                  {fx.status === "reaffirmed" && `reaffirmed since v${fx.fromVersion}`}
+                                </span>
+                              </div>
+                            ))}
+                            {canDecide && st === "pending" && (
+                              <div className="meetctl">
+                                <button type="button" onClick={() => itemApprove(id)}>
+                                  Approve {id}
+                                </button>{" "}
+                                <input
+                                  aria-label={`Revised text for ${id}`}
+                                  value={itemTexts[`${d.id}:${id}`] ?? ""}
+                                  onChange={(e) => setItemTexts((old) => ({ ...old, [`${d.id}:${id}`]: e.target.value }))}
+                                  placeholder="Plain-text revision"
+                                />{" "}
+                                <button type="button" onClick={() => itemRevise(id)}>
+                                  Revise {id}
+                                </button>{" "}
+                                <button type="button" onClick={() => itemDiscard(id)}>
+                                  Discard {id}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <div>
+                        {canDecide && (
+                          <>
+                            <button type="button" onClick={approveAllFresh}>
+                              Approve all ({pend.length} pending)
+                            </button>{" "}
+                          </>
+                        )}
+                        {approvedList.length > 0 ? (
+                          <>
+                            <a href={`/api/records/${d.id}/export?format=concise`}>Export concise</a>
+                            <span> </span>
+                            <a href={`/api/records/${d.id}/export?format=detailed`}>Export detailed</a>
+                          </>
+                        ) : (
+                          <span className="muted">Nothing approved to export yet.</span>
+                        )}
+                      </div>
+                      {history.length > 0 && (
+                        <div className="card">
+                          <h3>Decision history ({history.length})</h3>
+                          <ul>
+                            {history.map((h, i) => (
+                              <li key={i}>
+                                #{h.seq ?? i + 1} {h.action}
+                                {h.itemId ? ` ${h.itemId}` : ""} by {h.actor ?? "owner"}
+                                {typeof h.viewedVersion === "number" ? ` (saw v${h.viewedVersion}` : ""}
+                                {typeof h.viewedWatermark === "number" ? ` @wm${h.viewedWatermark}` : ""}
+                                {typeof h.viewedVersion === "number" ? ")" : ""}
+                                {h.oldText ? ` — was: ${String(h.oldText).slice(0, 120)}` : ""}
+                                {h.newText && h.newText !== h.oldText ? ` → now: ${String(h.newText).slice(0, 120)}` : ""}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      <div className="card">
+                        <h3>Compare with another version</h3>
                         <label>
-                          {" "}
                           Earlier version{" "}
                           <select
                             value={cmpVer}
                             onChange={(e) => setCmpVer(e.target.value)}
                           >
-                            {" "}
-                            <option value="">— pick —</option>{" "}
+                            <option value="">— pick —</option>
                             {(recs.data ?? [])
-                              .filter((r) => r.id !== recDetail.data.id)
+                              .filter((r) => r.id !== d.id)
                               .map((r) => (
                                 <option key={r.id} value={r.id}>
-                                  {" "}
-                                  v{r.version} · {r.status}{" "}
+                                  v{r.version} · {r.status}
                                 </option>
-                              ))}{" "}
-                          </select>{" "}
+                              ))}
+                          </select>
                         </label>{" "}
                         {cmpVer &&
                           (() => {
@@ -6308,73 +6726,59 @@ const testModel = useMutation({
                             );
                             if (!other) return null;
                             const rows =
-                              recDetail.data.version >= other.version
+                              d.version >= other.version
                                 ? diffItems(
                                     other.itemsJson,
-                                    recDetail.data.itemsJson,
+                                    d.itemsJson,
                                   )
                                 : diffItems(
-                                    recDetail.data.itemsJson,
+                                    d.itemsJson,
                                     other.itemsJson,
                                   );
                             return rows.length === 0 ? (
                               <p>Identical item sets.</p>
                             ) : (
                               <ul>
-                                {" "}
-                                {rows.map((d, i) => (
+                                {rows.map((row, i) => (
                                   <li key={i}>
-                                    {" "}
-                                    <b>{d.mark}</b> [{d.key}] {d.text}{" "}
+                                    <b>{row.mark}</b> [{row.key}] {row.text}
                                   </li>
-                                ))}{" "}
+                                ))}
                               </ul>
                             );
                           })()}{" "}
-                      </div>{" "}
+                      </div>
                       <div>
-                        {" "}
-                        <button onClick={() => approveRec(false)}>
-                          {" "}
-                          Approve selected{" "}
-                        </button>{" "}
-                        <button onClick={() => approveRec(true)}>
-                          {" "}
-                          Approve all{" "}
-                        </button>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=concise`}
-                        >
-                          {" "}
-                          Export concise{" "}
-                        </a>{" "}
-                        <span> </span>{" "}
-                        <a
-                          href={`/api/records/${recDetail.data.id}/export?format=detailed`}
-                        >
-                          {" "}
-                          Export detailed{" "}
-                        </a>{" "}
-                      </div>{" "}
-                      <label>
-                        {" "}
-                        Revised items JSON{" "}
-                        <input
-                          value={revText}
-                          onChange={(e) => setRevText(e.target.value)}
-                        />{" "}
-                      </label>{" "}
-                      <button onClick={() => reviseRec(false)}>
-                        {" "}
-                        Request revision (new version){" "}
-                      </button>{" "}
-                      <button onClick={() => reviseRec(true)}>
-                        {" "}
-                        Amend (name superseded IDs){" "}
-                      </button>{" "}
-                      <button onClick={discardRec}>Discard draft</button>{" "}
+                        {d.decided && d.status === "approved" && (
+                          <button type="button" onClick={() => reviseRec(true)}>
+                            Amend (name superseded IDs)
+                          </button>
+                        )}
+                      </div>
+                      <details>
+                        <summary>Advanced JSON (whole-draft actions)</summary>
+                        <label>
+                          Revised items JSON{" "}
+                          <input
+                            value={revText}
+                            onChange={(e) => setRevText(e.target.value)}
+                          />{" "}
+                        </label>
+                        {canDecide && (
+                          <>
+                            <button type="button" onClick={() => reviseRec(false)}>
+                              Request revision (new version)
+                            </button>{" "}
+                            <button type="button" onClick={discardRec}>Discard draft</button>{" "}
+                          </>
+                        )}
+                        {!canDecide && !(d.decided && d.status === "approved") && (
+                          <p className="muted">No whole-draft actions available in this state.</p>
+                        )}
+                      </details>
                     </div>
-                  )}{" "}
+                    );
+                  })()}{" "}
                 </>
               )}{" "}
             </section>
@@ -6419,6 +6823,8 @@ const testModel = useMutation({
                     <button
                       onClick={() => {
                         actAs = actAsState.trim();
+                        setItemTexts({});
+                        setReviewError(null);
                         qc.invalidateQueries();
                       }}
                     >

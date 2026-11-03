@@ -206,6 +206,14 @@ if (args.Contains("--selftest"))
   if (evBad is not null) failures.Add("evidence-ref-invalid-kind");
   var evList = SimCEO.Api.Work.EvidenceRef.ParseList(JsonDocument.Parse("{\"evidence\":[{\"kind\":\"record\",\"ref\":\"r1\"}]}").RootElement, "evidence");
   if (evList.Count != 1 || evList[0].Kind != "record") failures.Add("evidence-ref-list");
+  var evNull = SimCEO.Api.Work.EvidenceRef.Parse(JsonDocument.Parse("{\"kind\":\"source\",\"ref\":\"abc\",\"version\":null}").RootElement);
+  if (evNull is null || evNull.Kind != "source" || evNull.Ref != "abc" || evNull.Version is not null) failures.Add("evidence-ref-null-version");
+  var noteForRound = new Note { Id = Guid.NewGuid(), BoardId = Guid.NewGuid(), MeetingId = Guid.NewGuid(), Kind = "direction", Title = "t", Body = "b", Scope = "board" };
+  var noteJson = SimCEO.Api.Work.EvidenceRef.ToJsonList(new[] { SimCEO.Api.Work.EvidenceRef.ForNote(noteForRound) });
+  var noteBack = SimCEO.Api.Work.EvidenceRef.Parse(JsonDocument.Parse(noteJson).RootElement.EnumerateArray().First());
+  if (noteBack is null || noteBack.Kind != "direction" || noteBack.Ref != noteForRound.Id.ToString() || noteBack.Version is not null) failures.Add("evidence-ref-note-roundtrip");
+  var noteNumVer = SimCEO.Api.Work.EvidenceRef.Parse(JsonDocument.Parse("{\"kind\":\"note\",\"ref\":\"" + noteForRound.Id.ToString() + "\",\"version\":3}").RootElement);
+  if (noteNumVer is null || !noteNumVer.Version.HasValue) failures.Add("evidence-ref-note-version-parses");
   var board3 = new Board { Id = Guid.NewGuid(), Name = "T3", CreatedAt = DateTime.UtcNow };
   store.Boards[board3.Id] = board3;
   var dupEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), Name = "DupMe", Description = "dup role strategist", ProfileJson = "{\"selftest\":\"complete profile for dup-role gate\"}", Version = 1 };
@@ -446,9 +454,37 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, Htt
     BoardId = meeting.BoardId, MeetingId = meetingId,
     Version = 1, Watermark = meeting.DeliveredRevision,
     ItemsJson = canon, Hash = Hashing.HashOf(canon),
+    ApprovedJson = "[]", DiscardedJson = "[]",
+    ReviewRevision = 1, ReviewToken = RecordsOps.NewReviewToken(),
+    HistoryJson = "[]",
   };
-  s.Drafts[draft.Id] = draft;
-  return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", draft);
+  RecordsOps.AppendHistory(draft, "create", "", "", canon, PeopleOps.UserOf(s, req));
+  AuditEvent? pendingCreateAudit = null;
+  IResult created = Results.Conflict("unreachable");
+  lock (s.MessageLock)
+  {
+    if (!s.Meetings.TryGetValue(meetingId, out var curDraftMtg)) return Results.NotFound();
+    try
+    {
+      created = Atomic.Run(() =>
+      {
+        if (!s.Meetings.TryGetValue(meetingId, out var curMtg2) || curMtg2 is null) return Results.NotFound();
+        if (!PeopleOps.Can(s, req, curMtg2.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+        if (!RecordsOps.ValidateDraftItems(items, out var recreateErr))
+          return Results.Json(new { error = recreateErr }, statusCode: 422);
+        draft.BoardId = curMtg2.BoardId;
+        draft.Watermark = curMtg2.DeliveredRevision;
+        draft.EvidenceSnapshotJson = "[]";
+        s.Drafts[draft.Id] = draft;
+        s.Drafts.Flush();
+        pendingCreateAudit = new AuditEvent { BoardId = draft.BoardId, Action = "record.create", Detail = JsonSerializer.Serialize(new { draft = draft.Id, version = draft.Version }) };
+        return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", RecordsOps.SafeDraft(draft));
+      });
+    }
+    catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
+    if (pendingCreateAudit is not null) s.Audit.Add(pendingCreateAudit);
+    return created;
+  }
 });
 
 app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement body) =>
@@ -483,10 +519,44 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/from-direction", (InMemorySto
     BoardId = meeting.BoardId, MeetingId = meetingId,
     Version = 1, Watermark = meeting.DeliveredRevision,
     ItemsJson = itemsJson, Hash = Hashing.HashOf(itemsJson),
+    ApprovedJson = "[]", DiscardedJson = "[]",
+    ReviewRevision = 1, ReviewToken = RecordsOps.NewReviewToken(),
+    HistoryJson = "[]",
   };
-  s.Drafts[draft.Id] = draft;
-  s.Audit.Add(new AuditEvent { BoardId = meeting.BoardId, Action = "record.from-direction", Detail = JsonSerializer.Serialize(new { draft = draft.Id, note = note.Id, item = itemId, watermark = draft.Watermark }) });
-  return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", draft);
+  RecordsOps.AppendHistory(draft, "create", "", "", itemsJson, PeopleOps.UserOf(s, req));
+  AuditEvent? pendingDirAudit = null;
+  IResult createdDir = Results.Conflict("unreachable");
+  lock (s.MessageLock)
+  {
+    if (!s.Meetings.TryGetValue(meetingId, out var curDirMtg)) return Results.NotFound("meeting");
+    try
+    {
+      createdDir = Atomic.Run(() =>
+      {
+        if (!s.Meetings.TryGetValue(meetingId, out var curDirMtg2) || curDirMtg2 is null) return Results.NotFound("meeting");
+        if (!PeopleOps.Can(s, req, curDirMtg2.BoardId, meetingId, "contribute")) return PeopleOps.Denied();
+        if (!s.Notes.TryGetValue(noteId, out var reNote) || reNote is null) return Results.NotFound("direction note not found.");
+        if (!string.Equals(reNote.Kind, "direction", StringComparison.OrdinalIgnoreCase)) return Results.Json(new { error = "Only adopted direction notes can be recorded." }, statusCode: 422);
+        if (reNote.BoardId != curDirMtg2.BoardId) return Results.Conflict("Direction belongs to another board.");
+        if (string.IsNullOrWhiteSpace(reNote.Scope)) return Results.Json(new { error = "Direction scope is empty; re-adopt with meeting or board scope." }, statusCode: 422);
+        if (reNote.Scope is not ("meeting" or "board")) return Results.Json(new { error = "Direction scope must be meeting or board." }, statusCode: 422);
+        if (reNote.Scope == "meeting" && reNote.MeetingId != Guid.Empty && reNote.MeetingId != meetingId)
+          return Results.Conflict("Direction belongs to another meeting.");
+        if (string.IsNullOrWhiteSpace(reNote.Body)) return Results.Json(new { error = "Direction text is empty." }, statusCode: 422);
+        if (!string.Equals(reNote.Body, note.Body, StringComparison.Ordinal)) return Results.Conflict("Direction changed during preparation; retry deliberately.");
+        draft.BoardId = curDirMtg2.BoardId;
+        draft.Watermark = curDirMtg2.DeliveredRevision;
+        draft.EvidenceSnapshotJson = "[]";
+        s.Drafts[draft.Id] = draft;
+        s.Drafts.Flush();
+        pendingDirAudit = new AuditEvent { BoardId = draft.BoardId, Action = "record.from-direction", Detail = JsonSerializer.Serialize(new { draft = draft.Id, note = reNote.Id, item = itemId, watermark = draft.Watermark }) };
+        return Results.Created($"/api/meetings/{meetingId}/record/{draft.Id}", RecordsOps.SafeDraft(draft));
+      });
+    }
+    catch (Exception) { return Results.Json(new { error = "Record creation failed before commit; no state changed." }, statusCode: 500); }
+    if (pendingDirAudit is not null) s.Audit.Add(pendingDirAudit);
+    return createdDir;
+  }
 });
 
 app.MapExtended();
@@ -494,20 +564,41 @@ app.MapNavigation();
 
 app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement body) =>
 {
-  var draftId = body.GetProperty("draftId").GetGuid();
-  var hash = body.GetProperty("hash").GetString() ?? "";
-  var watermark = body.GetProperty("watermark").GetInt64();
-  var itemIds = body.GetProperty("itemIds").EnumerateArray().Select(e => e.GetString()).ToList();
-  if (!PeopleOps.Can(s, req, s.Drafts.TryGetValue(draftId, out var preDraft) ? preDraft.BoardId : Guid.Empty, meetingId, "manage")) return PeopleOps.Denied();
+  Guid draftId = Guid.Empty;
+  try
+  {
+    if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("draftId", out var dv))
+    {
+      if (dv.ValueKind == JsonValueKind.String) Guid.TryParse(dv.GetString(), out draftId);
+    }
+  }
+  catch { }
+  if (draftId == Guid.Empty) return Results.BadRequest("draftId is required.");
+  var itemIds = new List<string>();
+  if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("itemIds", out var arr) && arr.ValueKind == JsonValueKind.Array)
+    foreach (var e in arr.EnumerateArray())
+      itemIds.Add(e.ValueKind == JsonValueKind.String ? (e.GetString() ?? "") : "");
+  AuditEvent? pendingApproveAudit = null;
+  IResult approveResult;
   lock (s.MessageLock)
   {
-    if (!s.Drafts.TryGetValue(draftId, out var draft) || draft.MeetingId != meetingId || draft.Decided)
-      return Results.Conflict("Stale or already-decided draft.");
-    if (!s.Meetings.TryGetValue(meetingId, out var mtg))
-      return Results.Conflict("Meeting moved on; refresh review.");
-    if (!string.Equals(draft.Hash, hash, StringComparison.OrdinalIgnoreCase)) return Results.Conflict("Draft hash mismatch; refresh review.");
-    if (draft.Watermark != watermark || draft.Watermark != mtg.DeliveredRevision || watermark != mtg.DeliveredRevision)
-      return Results.Conflict("Meeting moved on; refresh review.");
+    try
+    {
+      approveResult = Atomic.Run(() =>
+      {
+        if (!s.Drafts.TryGetValue(draftId, out var draft) || draft is null || draft.MeetingId != meetingId)
+          return Results.Conflict("Stale or already-decided draft.");
+        if (!s.Meetings.TryGetValue(meetingId, out var mtg) || mtg is null)
+          return Results.Conflict("Meeting moved on; refresh review.");
+        if (!PeopleOps.Can(s, req, draft.BoardId, meetingId, "manage")) return PeopleOps.Denied();
+        if (string.Equals(draft.Status, "superseded", StringComparison.OrdinalIgnoreCase))
+          return Results.Json(new { error = "Review is superseded by a newer version; use the successor." }, statusCode: 409);
+        if (draft.Decided)
+          return Results.Conflict("Stale or already-decided draft.");
+        if (!RecordsOps.StrictStateCheck(draft, out var serr))
+          return Results.Json(new { error = serr }, statusCode: 422);
+        if (!RecordsOps.CheckGuard(body, draft, mtg, out var gs, out var ge))
+          return Results.Json(new { error = ge }, statusCode: gs);
     Dictionary<string, int> counts;
     JsonDocument itemsDoc;
     try { itemsDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(draft.ItemsJson) ? "[]" : draft.ItemsJson); }
@@ -522,20 +613,51 @@ app.MapPost("/api/meetings/{meetingId:guid}/record/approve", (InMemoryStore s, H
           if (string.IsNullOrWhiteSpace(id)) continue;
           counts[id] = counts.TryGetValue(id, out var c0) ? c0 + 1 : 1;
         }
-    if (!RecordsOps.ValidateDraftItems(itemsDoc.RootElement, out var legacyErr))
-      return Results.Json(new { error = legacyErr }, statusCode: 422);
-    if (itemIds.Count == 0 || itemIds.Any(x => string.IsNullOrWhiteSpace(x)))
-      return Results.BadRequest("No items selected.");
-    if (itemIds.Distinct(StringComparer.Ordinal).Count() != itemIds.Count || itemIds.Any(x => !counts.TryGetValue(x!, out var cc) || cc != 1))
-      return Results.Json(new { error = "Selected items must be unique draft IDs matching exactly one non-empty item each." }, statusCode: 422);
-    draft.Decided = true;
-    draft.Status = "approved";
-    draft.ApprovedJson = JsonSerializer.Serialize(itemIds);
-    s.Drafts.Flush();
-    s.Audit.Add(new AuditEvent { BoardId = draft.BoardId, Action = "record.approve", Detail = JsonSerializer.Serialize(new { draftId, itemIds }) });
-    return Results.Ok(new { approved = itemIds, draft = draft.Id });
+      if (!RecordsOps.ValidateDraftItems(itemsDoc.RootElement, out var legacyErr))
+        return Results.Json(new { error = legacyErr }, statusCode: 422);
+      if (itemIds.Count == 0 || itemIds.Any(x => string.IsNullOrWhiteSpace(x)))
+        return Results.BadRequest("No items selected.");
+      if (itemIds.Distinct(StringComparer.Ordinal).Count() != itemIds.Count || itemIds.Any(x => !counts.TryGetValue(x!, out var cc) || cc != 1))
+        return Results.Json(new { error = "Selected items must be unique draft IDs matching exactly one non-empty item each." }, statusCode: 422);
+      RecordsOps.TryStrictIdList(draft.ApprovedJson, out var alreadyList, out _);
+      RecordsOps.TryStrictIdList(draft.DiscardedJson, out var goneList, out _);
+      var already = new HashSet<string>(alreadyList, StringComparer.Ordinal);
+      var gone = new HashSet<string>(goneList, StringComparer.Ordinal);
+      if (itemIds.Any(x => already.Contains(x!) || gone.Contains(x!)))
+        return Results.Conflict("One or more selected items are already decided; refresh review.");
+      var actor = PeopleOps.UserOf(s, req);
+      var av = draft.Version; var ah = draft.Hash; var aw = draft.Watermark; var at = draft.ReviewToken;
+      {
+        var ap = new HashSet<string>(already, StringComparer.Ordinal);
+        foreach (var x in itemIds) ap.Add(x!);
+        var newLegacyToken = RecordsOps.NewReviewToken();
+        var stagedLegacy = draft.HistoryJson;
+        var map2 = RecordsOps.ItemMap(draft.ItemsJson, out _);
+        foreach (var x in itemIds)
+        {
+          if (!RecordsOps.TryBuildHistoryJson(stagedLegacy, "approve", x, "", map2.TryGetValue(x!, out var it) ? RecordsOps.ItemText(it) : "", actor, av, ah, aw, at, draft.ReviewRevision + 1, newLegacyToken, out var stagedLegacyNext, out var hherr))
+            return Results.Json(new { error = hherr }, statusCode: 422);
+          stagedLegacy = stagedLegacyNext;
+        }
+        var acards = RecordsOps.ResolveEvidenceAuthorized(s, req, draft);
+        if (!RecordsOps.TryBuildSnapshots(draft.EvidenceSnapshotJson, map2, acards, itemIds.Where(x => x is not null).Select(x => x!), draft.ReviewRevision + 1, out var newSnapsLegacy, out var snerr))
+          return Results.Json(new { error = snerr }, statusCode: 422);
+        draft.ApprovedJson = RecordsOps.ToIdList(ap.OrderBy(v => v, StringComparer.Ordinal));
+        draft.HistoryJson = stagedLegacy;
+        draft.EvidenceSnapshotJson = newSnapsLegacy;
+        draft.ReviewRevision++;
+        draft.ReviewToken = newLegacyToken;
+        RecordsOps.RefreshDecided(draft);
+        s.Drafts.Flush();
+        pendingApproveAudit = new AuditEvent { BoardId = draft.BoardId, Action = "record.approve", Detail = JsonSerializer.Serialize(new { draftId, itemIds }) };
+          return Results.Ok(new { approved = itemIds, draft = draft.Id, version = draft.Version, reviewToken = draft.ReviewToken, reviewRevision = draft.ReviewRevision, status = draft.Status, pending = RecordsOps.PendingIds(draft) });
+        }
+      }
+      });
     }
+    catch (Exception) { return Results.Json(new { error = "Record mutation failed before commit; no state changed." }, statusCode: 500); }
   }
+  if (pendingApproveAudit is not null) s.Audit.Add(pendingApproveAudit);
+  return approveResult;
 });
-
 app.Run();

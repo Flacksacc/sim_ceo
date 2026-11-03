@@ -54,10 +54,9 @@ public static class ContextCurator
     var recent = Recent(s, m.Id, 12);
     foreach (var msg in recent)
       sb.AppendLine($"[{msg.Sequence}] {msg.Sender}{(msg.AdvisorName is null ? "" : "/" + msg.AdvisorName)}: {Truncate(msg.Content, 600)}");
-    foreach (var d in s.Drafts.Values
-      .Where(d => d.MeetingId == m.Id && d.Status == "approved")
-      .OrderByDescending(d => d.Version).Take(3))
-      sb.AppendLine($"APPROVED RECORD v{d.Version}: {Truncate(RecordsOps.BuildExport(d.ItemsJson, d.ApprovedJson, false), 1500)}");
+    foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.MeetingId == m.Id))
+      .Where(v => v.EffectiveIds.Count > 0).OrderByDescending(v => v.Head.Version).Take(3))
+      sb.AppendLine($"APPROVED RECORD v{v.Head.Version}: {Truncate(v.ConciseExport, 1500)}");
     var evidence = new List<EvidenceRef>();
     foreach (var n in s.Notes.Values
       .Where(n => n.BoardId == m.BoardId && n.Kind == "direction" && !n.Provisional
@@ -162,11 +161,12 @@ public static class ContextCurator
       if (string.IsNullOrWhiteSpace(text)) continue;
       hits.Add(new RecallHit("source", $"{doc.FileName} v{doc.Version}", Truncate(text, 600), Score(text, words)));
     }
-    foreach (var d in s.Drafts.Values.Where(d => d.BoardId == boardId && d.Status == "approved"))
+    foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.BoardId == boardId)))
     {
-      var text = RecordsOps.BuildExport(d.ItemsJson, d.ApprovedJson, false);
+      if (v.EffectiveIds.Count == 0) continue;
+      var text = v.ConciseExport;
       if (!string.IsNullOrWhiteSpace(text))
-        hits.Add(new RecallHit("record", $"record v{d.Version}", Truncate(text, 600), Score(text, words) + 2));
+        hits.Add(new RecallHit("record", $"record v{v.Head.Version}", Truncate(text, 600), Score(text, words) + 2));
     }
     foreach (var n in s.Notes.Values.Where(n => n.BoardId == boardId && n.Kind == "direction" && !n.Provisional))
       hits.Add(new RecallHit("direction", n.Id.ToString(), Truncate(n.Body, 400), Score(n.Body, words) + 2));
