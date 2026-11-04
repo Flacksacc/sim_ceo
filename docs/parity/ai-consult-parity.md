@@ -537,3 +537,26 @@ The existing database and volumes were retained. Deployment completed;
 isolated API/fake/browser test processes exited and test ports were verified
 closed. No background coding agents were used. The full parity goal remains
 paused; this checkpoint completes the requested tabs only.
+
+### 2026-11-04 — Roster list portraits deployed
+
+User feedback delivered in `afd3bba`: roster list rows show circular accepted
+portraits beside advisor names and board counts. Advisors without an available
+portrait show initials, including when image loading fails. Image requests use
+the existing authenticated API and release temporary object URLs on cleanup.
+
+Native build and integrated QA passed: 386 assertions, zero failures
+(`.tmp/primary-roster-portraits-integrated.log`). Live browser checks passed in
+light/dark themes and narrow layouts, including a deliberately invalid image
+response in an isolated browser context. No application writes or page errors;
+advisor, research and membership data preserved (timestamp precision normalized
+when comparing PostgreSQL reloads). Evidence:
+`.tmp/primary-roster-portraits-live-check-final.log` and
+`output/roster-portraits-review/2026-11-04`.
+
+Live image `sha256:3cabdf35c183fcd83696cea62f4c76b43d6d04308454ad38796ca9840b832b67`
+is healthy on port 5173. Original database container and volumes retained.
+Backup: `.tmp/update-20261104-163537-UTC-0470a8b5`; rollback:
+`simceo-essentials-app:rollback-20261104-163537-0470a8b5`.
+Owned QA stack and browser processes stopped; no background coding agents used.
+The broader parity goal remains paused.
