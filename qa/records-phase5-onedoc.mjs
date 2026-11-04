@@ -10,7 +10,8 @@ const EXPECT_PORTS = { QA_API: 15320, QA_FAKE: 15322 };
 for (const pair of [["QA_API", API, 15320], ["QA_FAKE", FAKE, 15322]]) {
   const nm = pair[0]; const v = pair[1]; const want = pair[2];
   let u; try { u = new URL(v); } catch { console.error("REFUSE bad " + nm + " " + v); process.exit(2); }
-  if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") { console.error("REFUSE non loopback " + nm); process.exit(2); }
+  if (u.protocol !== "http:") { console.error("REFUSE not http (no https variant) " + nm); process.exit(2); }
+  if (u.hostname !== "127.0.0.1") { console.error("REFUSE non loopback " + nm); process.exit(2); }
   if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
   if (u.search || u.hash || u.username || u.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo got " + v); process.exit(2); }
 }
@@ -22,7 +23,8 @@ const META_KEY = process.env.META_API_KEY || "";
 const EXPECT_BOOT = process.env.QA_FAKE_BOOT || "";
 if (!META_BASE) { console.error("REFUSE missing META_API_BASE: owned launcher must point the API at the scoped fake"); process.exit(2); }
 { let _u; try { _u = new URL(META_BASE); } catch { console.error("REFUSE bad META_API_BASE"); process.exit(2); }
-  if (_u.hostname !== "127.0.0.1" && _u.hostname !== "localhost") { console.error("REFUSE META_API_BASE non loopback"); process.exit(2); }
+  if (_u.protocol !== "http:") { console.error("REFUSE META_API_BASE not http"); process.exit(2); }
+  if (_u.hostname !== "127.0.0.1") { console.error("REFUSE META_API_BASE non loopback"); process.exit(2); }
   if (Number(_u.port) !== 15322) { console.error("REFUSE META_API_BASE must be 127.0.0.1:15322 got " + META_BASE); process.exit(2); }
   if (_u.search || _u.hash || _u.username || _u.password) { console.error("REFUSE META_API_BASE no query/fragment/userinfo"); process.exit(2); } }
 if (META_BASE !== FAKE) { console.error("REFUSE META_API_BASE must equal owned QA_FAKE exactly"); process.exit(2); }
@@ -183,8 +185,13 @@ preflight("setup-note", wn.status === 201, String(wn.status));
   globalThis.__usageBefore = u0.json.length;
   const sp = await get("/api/spending", ownerT);
   preflight("preflight-spending-policy", sp.status === 200 && sp.json && typeof sp.json.mode === "string", String(sp.status));
-  preflight("preflight-spending-cap", sp.json && ("monthlyCapUsd" in sp.json) && ("knownSpendUsd" in sp.json), JSON.stringify(sp.json).slice(0, 200));
-  preflight("preflight-spending-mode-value", sp.json && typeof sp.json.mode === "string", "mode=" + String(sp.json && sp.json.mode));
+  preflight("preflight-spending-mode-allowed", sp.json && (sp.json.mode === "" || sp.json.mode === "warn" || sp.json.mode === "block"), "mode=" + String(sp.json && sp.json.mode));
+  preflight("preflight-spending-cap-value", sp.json && (sp.json.monthlyCapUsd === null || sp.json.monthlyCapUsd === undefined || (typeof sp.json.monthlyCapUsd === "number" && sp.json.monthlyCapUsd >= 0)), JSON.stringify(sp.json).slice(0, 200));
+  preflight("preflight-spending-enforced-derived", sp.json && sp.json.enforced === (sp.json.mode === "block" && sp.json.monthlyCapUsd != null), "enforced=" + String(sp.json && sp.json.enforced));
+  preflight("preflight-spending-known-number", sp.json && typeof sp.json.knownSpendUsd === "number", "known=" + String(sp.json && sp.json.knownSpendUsd));
+  preflight("preflight-spending-overcap-derived", sp.json && sp.json.overCap === (sp.json.monthlyCapUsd != null && sp.json.knownSpendUsd >= sp.json.monthlyCapUsd), "overCap=" + String(sp.json && sp.json.overCap));
+  const spStranger = await get("/api/spending", strangerT);
+  preflight("preflight-spending-stranger-denied-not-enforcement", spStranger.status === 403, String(spStranger.status));
   const ms = await get("/api/model/status", ownerT);
   preflight("preflight-model-status", ms.status === 200 && ms.json && typeof ms.json.configured === "boolean", String(ms.status));
 }

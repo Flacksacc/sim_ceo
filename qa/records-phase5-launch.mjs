@@ -21,7 +21,8 @@ const LOGP = (n) => path.join(MAINTMP, "muse-r597-" + INST + "-" + n + ".log");
 function refuse(m) { console.error("REFUSE " + m); process.exit(2); }
 function checkUrl(v, want, name) {
   let u; try { u = new URL(v); } catch { refuse("bad " + name); }
-  if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") refuse("non loopback " + name);
+  if (u.protocol !== "http:") refuse(name + " must be http exactly");
+  if (u.hostname !== "127.0.0.1") refuse(name + " must be 127.0.0.1 exactly");
   if (Number(u.port) !== want) refuse(name + " must be 127.0.0.1:" + want + " got " + v);
   if (u.search || u.hash || u.username || u.password) refuse(name + " no query/fragment/userinfo");
 }
@@ -41,6 +42,17 @@ function portBusy(port) {
     try { s.connect(port, "127.0.0.1"); } catch { fin(false); }
   });
 }
+function portBusy6(port) {
+  return new Promise((resolve) => {
+    const s = new net.Socket(); let done = false;
+    const fin = (b) => { if (!done) { done = true; try { s.destroy(); } catch {} resolve(b); } };
+    s.setTimeout(1000);
+    s.once("connect", () => fin(true));
+    s.once("timeout", () => fin(false));
+    s.once("error", () => fin(false));
+    try { s.connect(port, "::1"); } catch { fin(false); }
+  });
+}
 async function fetchJson(url, opts) {
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 10000);
   try {
@@ -55,7 +67,7 @@ let cleaned = false;
 let cleanupFailed = false;
 let cleanupPromise = null;
 function runBounded(cmd, args, opts, timeoutMs) {
-  const r = spawnSync(cmd, args, { ...(opts || {}), timeout: timeoutMs });
+  const r = spawnSync(cmd, args, { ...(opts || {}), timeout: Math.min(timeoutMs, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - 30000)) });
   if (r.error && String((r.error && r.error.code) || "") === "ETIMEDOUT") throw new Error("BUILD TIMEOUT " + cmd + " " + (args || []).join(" "));
   if (r.status !== 0) throw new Error("BUILD FAIL " + cmd + " " + (args || []).join(" ") + " status=" + r.status + " " + String(r.stderr || "").slice(0, 300));
   return r;
@@ -66,8 +78,8 @@ async function boundedWait(child, ms) {
   return !!done;
 }
 function childEnv() {
-  const allowExact = new Set(["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "COMSPEC", "ComSpec", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "OS", "WINDIR", "PROGRAMFILES", "PROGRAMDATA", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]);
-  const allowPrefix = ["DOTNET_", "NUGET_", "NODE_", "NPM_", "PROGRAM"];
+  const allowExact = new Set(["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "COMSPEC", "ComSpec", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "OS", "WINDIR", "PROGRAMFILES", "PROGRAMDATA", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "DOTNET_NOLOGO"]);
+  const allowPrefix = ["NUGET_", "NODE_", "NPM_", "PROGRAM"];
   const denyRe = /API_KEY|SECRET|TOKEN|PASSWORD|OPENAI|ANTHROPIC|AZURE|GITHUB|META_|GOOGLE|AWS_|ASPNETCORE_|KESTREL_|DOTNET_URLS|PORT|URLS/i;
   const out = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -77,6 +89,8 @@ function childEnv() {
     if (denyRe.test(k)) continue;
     out[k] = v;
   }
+  for (const hk of Object.keys(out)) { if (hk !== "DOTNET_CONTENTROOT" && hk.indexOf("DOTNET_") === 0 && !allowExact.has(hk)) delete out[hk]; }
+  out["DOTNET_CONTENTROOT"] = PUB;
   out["PATH"] = process.env.PATH || process.env.Path || out["PATH"] || "";
   out["SystemRoot"] = process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows";
   out["SYSTEMROOT"] = out["SystemRoot"];
@@ -111,8 +125,8 @@ async function cleanupOnce() {
       } catch {}
     }
     try {
-      const b1 = await portBusy(15320); const b2 = await portBusy(15322);
-      if (b1 || b2) { console.error("FAIL ports still bound after cleanup 15320=" + b1 + " 15322=" + b2); cleanupFailed = true; return false; }
+      const b1 = await portBusy(15320); const b2 = await portBusy(15322); const b3 = await portBusy6(15320); const b4 = await portBusy6(15322);
+      if (b1 || b2 || b3 || b4) { console.error("FAIL ports still bound after cleanup 15320=" + b1 + " 15322=" + b2); cleanupFailed = true; return false; }
       console.log("ports closed verified");
       return !cleanupFailed;
     } catch (e) { console.error("FAIL cleanup probe " + String(e).slice(0, 200)); cleanupFailed = true; return false; }
@@ -147,6 +161,8 @@ async function main() {
   checkTotal("preflight");
   if (await portBusy(15320)) refuse("API port busy");
   if (await portBusy(15322)) refuse("FAKE port busy");
+  if (await portBusy6(15320)) refuse("API IPv6 port busy (unowned listener)");
+  if (await portBusy6(15322)) refuse("FAKE IPv6 port busy (unowned listener)");
   let srcSha = "";
   try { srcSha = String(spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, timeout: 15000 }).stdout || "").trim(); } catch {}
   console.log("source sha=" + (srcSha || "unknown"));
@@ -171,21 +187,26 @@ async function main() {
   const fakeProc = spawn("node", ["qa/records-phase5-fake.mjs", "--port", "15322"], { cwd: ROOT, windowsHide: true, stdio: ["ignore", fakeLog, fakeLog], env });
   if (!fakeProc.pid) throw new Error("fake spawn failed");
   children.push(fakeProc);
+  fakeProc.on("error", (e) => { console.error("SPAWN fake failed " + String((e && e.message) || e).slice(0, 200)); });
   const apiProc = spawn("dotnet", [dllP], { cwd: PUB, windowsHide: true, stdio: ["ignore", apiLog, apiLog], env });
   if (!apiProc.pid) throw new Error("api spawn failed");
   children.push(apiProc);
+  apiProc.on("error", (e) => { console.error("SPAWN api failed " + String((e && e.message) || e).slice(0, 200)); });
   console.log("fake pid=" + fakeProc.pid + " api pid=" + apiProc.pid + " src=" + (srcSha || "unknown").slice(0, 8) + " artifact=" + dllP);
   proof = await prove();
+  console.log("sanitized host: CONTENTROOT=" + env.DOTNET_CONTENTROOT + " hooksabsent=" + (("DOTNET_STARTUP_HOOKS" in env) ? "BAD" : "absent") + " leakedotnet=" + Object.keys(env).filter((k) => k !== "DOTNET_CONTENTROOT" && k.indexOf("DOTNET_") === 0).join(","));
   console.log("proven owned api/fake boot=" + String(proof.boot).slice(0, 8) + " chatBefore=" + proof.chatBefore);
   checkTotal("http-suite");
-  const httpR = spawnSync("node", ["qa/records-phase5-onedoc.mjs"], { cwd: ROOT, env: suiteEnv({}), stdio: "inherit", timeout: 480000 });
+  const httpR = spawnSync("node", ["qa/records-phase5-onedoc.mjs"], { cwd: ROOT, env: suiteEnv({}), stdio: "inherit", timeout: Math.min(480000, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - 120000)) });
   if (httpR.status !== 0) throw new Error("HTTP suite failed status=" + httpR.status);
   console.log("HTTP suite passed");
   fs.mkdirSync(path.join(ROOT, ".tmp", "records-phase5-shots"), { recursive: true });
   checkTotal("browser-suite");
-  const browserR = spawnSync("node", ["qa/browser/records-phase5-onedoc-ui.cjs"], { cwd: ROOT, env: suiteEnv({ QA_SHOTS: ".tmp/records-phase5-shots" }), stdio: "inherit", timeout: 900000 });
+  const browserR = spawnSync("node", ["qa/browser/records-phase5-onedoc-ui.cjs"], { cwd: ROOT, env: suiteEnv({ QA_SHOTS: ".tmp/records-phase5-shots" }), stdio: "inherit", timeout: Math.min(960000, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - 40000)) });
   if (browserR.status !== 0) throw new Error("browser suite failed status=" + browserR.status);
   console.log("browser suite passed");
+  checkTotal("final-success");
+  console.log("TOTAL guard passed at final success elapsedMs=" + (Date.now() - TOTAL_START));
 }
 try {
   await main();

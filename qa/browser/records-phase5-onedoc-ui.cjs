@@ -12,7 +12,8 @@ const FAKE = process.env.QA_FAKE || "http://127.0.0.1:15322";
 for (const pair of [[ "QA_API", API, 15320 ], [ "QA_WEB", WEB, 15320 ], [ "QA_FAKE", FAKE, 15322 ]]) {
   const nm = pair[0]; const v = pair[1]; const want = pair[2];
   let u; try { u = new URL(v); } catch { console.error("REFUSE bad " + nm); process.exit(2); }
-  if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") { console.error("REFUSE non loopback " + nm); process.exit(2); }
+  if (u.protocol !== "http:") { console.error("REFUSE not http (no https variant) " + nm); process.exit(2); }
+  if (u.hostname !== "127.0.0.1") { console.error("REFUSE non loopback " + nm); process.exit(2); }
   if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
   if (/:5080|:5173|:9333|:15180|:15300|:15302/.test(v)) { console.error("REFUSE reserved/shared port " + nm); process.exit(2); }
   try { const uu = new URL(v); if (uu.search || uu.hash || uu.username || uu.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo"); process.exit(2); } } catch { console.error("REFUSE bad " + nm); process.exit(2); }
@@ -25,7 +26,8 @@ const META_KEY = process.env.META_API_KEY || "";
 const EXPECT_BOOT = process.env.QA_FAKE_BOOT || "";
 if (!META_BASE) { console.error("REFUSE missing META_API_BASE: owned launcher must point the API at the scoped fake"); process.exit(2); }
 { let _u; try { _u = new URL(META_BASE); } catch { console.error("REFUSE bad META_API_BASE"); process.exit(2); }
-  if (_u.hostname !== "127.0.0.1" && _u.hostname !== "localhost") { console.error("REFUSE META_API_BASE non loopback"); process.exit(2); }
+  if (_u.protocol !== "http:") { console.error("REFUSE META_API_BASE not http"); process.exit(2); }
+  if (_u.hostname !== "127.0.0.1") { console.error("REFUSE META_API_BASE non loopback"); process.exit(2); }
   if (Number(_u.port) !== 15322) { console.error("REFUSE META_API_BASE must be 127.0.0.1:15322 got " + META_BASE); process.exit(2); }
   if (_u.search || _u.hash || _u.username || _u.password) { console.error("REFUSE META_API_BASE no query/fragment/userinfo"); process.exit(2); } }
 if (META_BASE !== FAKE) { console.error("REFUSE META_API_BASE must equal owned QA_FAKE exactly"); process.exit(2); }
@@ -63,6 +65,9 @@ async function api(method, p, body, token) {
 const run = "bears6-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex");
 let browser, ctx, page;
 const postLog = [];
+const expectedConsole = [];
+function expectConsoleError(pathPart, status) { expectedConsole.push({ path: String(pathPart), status: status, at: Date.now() }); }
+function consumeExpectedConsole(combined, txt) { for (let i = 0; i < expectedConsole.length; i++) { const e = expectedConsole[i]; if (String(txt).includes(String(e.status)) && (String(combined).includes(e.path) || (Date.now() - (e.at || 0) < 30000))) { expectedConsole.splice(i, 1); return true; } } return false; }
 async function bodyHas(s) { return (await page.locator("body").innerText()).includes(s); }
 async function shot(name) { await page.screenshot({ path: path.join(OUT, name + ".png") }); }
 async function approveCount() { return await page.locator("button").filter({ hasText: "Approve decision" }).count(); }
@@ -143,27 +148,36 @@ async function main() {
   }, T.overall);
   launching = true;
   browserPromise = chromium.launch({ executablePath: EDGE, headless: true });
-  browser = await browserPromise;
+  browserPromise.catch((e) => { try { console.error("SPAWN browser spawn-error " + String((e && e.message) || e).slice(0, 200)); } catch {} });
+  try { browser = await browserPromise; } catch (e) { launching = false; console.error("SPAWN browser launch failed " + String((e && e.message) || e).slice(0, 300)); throw e; }
+  { let opid = null; try { const pr = browser.process(); opid = pr ? pr.pid : null; } catch {} console.log("owned browser pid=" + String(opid)); }
   launching = false;
   ctx = await browser.newContext();
-  const ALLOWED_ORIGINS = new Set(["127.0.0.1:15320", "localhost:15320", "127.0.0.1:15322", "localhost:15322"]);
+  const EXACT_API_ORIGIN = new URL(API).origin;
+  const EXACT_FAKE_ORIGIN = new URL(FAKE).origin;
+  const ALLOWED_ORIGINS = new Set([EXACT_API_ORIGIN, EXACT_FAKE_ORIGIN]);
   const routeGuard = async (route) => {
     try {
       const req = route.request();
       const u = new URL(req.url());
+      try { const rqq = route.request(); if (rqq.isNavigationRequest && rqq.isNavigationRequest()) globalThis.__navAny = Date.now(); } catch {}
+      try { const hr = globalThis.__holdReview; if (hr && hr.armed && u.pathname === ('/api/records/' + hr.id + '/review')) { hr.seen = true; await hr.gate; hr.settled = true; } } catch {}
+      try { const sr = globalThis.__stubReviewOnce; if (sr && u.pathname === ('/api/records/' + sr.id + '/review')) { globalThis.__stubReviewOnce = null; if (sr.mode === '403') { try { await route.fulfill({ status: 403, contentType: 'application/json', body: '{}' }); } catch {} return; } if (sr.mode === 'abort') { try { await route.abort(); } catch {} return; } } } catch {}
+      try {
+        const pj = globalThis.__stubReviewJson;
+        if (pj && u.pathname === ('/api/records/' + pj.id + '/review')) { try { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(pj.body) }); } catch {} return; }
+      } catch {}
       if (u.username || u.password) { try { await route.abort(); } catch {} return; }
       if (u.protocol === "ws:" || u.protocol === "wss:") {
-        const hpw = u.hostname + ":" + u.port;
-        if (!ALLOWED_ORIGINS.has(hpw)) { try { await route.abort(); } catch {} return; }
-        try { await route.continue(); } catch {}
-        return;
+        if (u.protocol === "ws:" && u.hostname === "127.0.0.1" && (u.port === "15320" || u.port === "15322")) { try { globalThis.__wsSeenAt = Date.now(); globalThis.__wsSeenUrl = req.url(); await route.continue(); } catch {} return; }
+        try { await route.abort(); } catch {} return;
       }
       if (u.protocol !== "http:" && u.protocol !== "https:") {
         if (u.protocol === "data:" || u.protocol === "blob:") { try { await route.continue(); } catch {} return; }
         try { await route.abort(); } catch {}
         return;
       }
-      const hp = u.hostname + ":" + u.port;
+      const hp = u.origin;
       if (!ALLOWED_ORIGINS.has(hp)) { try { await route.abort(); } catch {} return; }
       try {
         const resp = await route.fetch({ maxRedirects: 0 });
@@ -182,7 +196,7 @@ async function main() {
         const q = r.request();
         if (q.method() === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: new URL(q.url()).pathname, status: r.status() });
         const u = new URL(q.url());
-        const hp = u.hostname + ":" + u.port;
+        const hp = u.origin;
         const isOwned = ALLOWED_ORIGINS.has(hp);
         if (isOwned && r.status() >= 300 && r.status() < 400) redirLog.push({ url: new URL(q.url()).pathname, status: r.status() });
       } catch {}
@@ -196,12 +210,12 @@ async function main() {
     if (/\/hubs\/board/.test(combined) && /WebSocket|SignalR|transport/i.test(tt)) return true;
     if (/Failed to start the transport/.test(tt) && /WebSockets/.test(tt)) return true;
     if (/WebSocket connection to/.test(tt) && /\/hubs\/board/.test(combined) && /net::ERR_/.test(tt)) return true;
-    if (/Handshake was canceled/.test(tt)) return true;
-    if (/Server returned handshake error/.test(tt)) return true;
-    if (/handshake error/i.test(tt) && /Handshake was canceled/i.test(tt)) return true;
+    if (/Handshake was canceled/.test(combined) && /hubs\/board/.test(combined)) return true;
+    if (/Server returned handshake error/.test(combined) && /hubs\/board/.test(combined)) return true;
+    if (/handshake error/i.test(combined) && /hubs\/board/.test(combined)) return true;
     if (tt.includes("Failed to load resource")) {
-      if (tt.includes("409") && combined.includes("/api/records/")) return true;
-      if (tt.includes("403") && combined.includes("/api/records/")) return true;
+      if (tt.includes("409") && combined.includes("/api/records/") && consumeExpectedConsole(combined, tt)) return true;
+      if (tt.includes("403") && combined.includes("/api/records/") && consumeExpectedConsole(combined, tt)) return true;
       if (tt.includes("404") && !combined.includes("/api/")) return true;
       if (tt.includes("net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS") && combined.includes("/hubs/board")) return true;
       if (tt.includes("net::ERR_")) {
@@ -209,11 +223,13 @@ async function main() {
         try {
           const m = (combined.match(/https?:\/\/[^\s"']+/) || [])[0] || lu;
           const uu = new URL(m);
-          const hp2 = uu.hostname + ":" + uu.port;
+          const hp2 = uu.origin;
           if (!ALLOWED_ORIGINS.has(hp2)) return true;
         } catch {
           if (/\b15321\b|:5080|:5173/.test(combined)) return true;
         }
+        if (/\/api\/records\//.test(combined) && consumeExpectedConsole(combined, tt)) return true;
+        if (/ERR_ABORTED|ERR_FAILED|ERR_CONNECTION_REFUSED|ERR_INTERNET_DISCONNECTED/.test(tt) && (Date.now() - (globalThis.__recentAbortAt || 0) < 15000)) return true;
         return false;
       }
       return false;
@@ -221,21 +237,36 @@ async function main() {
     return false;
   }
   function attachCollectors(pg, label) {
+    pg.on('framenavigated', () => { try { globalThis.__navAt = globalThis.__navAt || {}; globalThis.__navAt[label] = Date.now(); } catch {} });
     pg.on("console", (m) => {
       try {
         if (m.type() !== "error") return;
         const txt = m.text().slice(0, 500);
         let loc = "";
         try { const l = m.location(); if (l && l.url) loc = String(l.url).slice(0, 500); } catch {}
-        if (label === "stranger" || label === "reader") {
-          if (txt.includes("403") && txt.includes("Failed to load resource")) return;
-          if (txt.includes("403") && /\/api\/records\//.test(txt + " " + loc)) return;
+        const combined = txt + ' ' + loc;
+        if (/handshake was canceled|handshake error|failed to start the transport/i.test(txt + ' ' + loc)) {
+          const navA = (globalThis.__navAt && globalThis.__navAt[label]) || 0;
+          const wsA = globalThis.__wsSeenAt || 0;
+          const wsU = String(globalThis.__wsSeenUrl || '');
+          const wsOwn = wsU.indexOf('/hubs/board') >= 0 && wsU.indexOf('127.0.0.1') >= 0;
+          if ((Date.now() - navA < 20000) || (wsOwn && (Date.now() - wsA < 60000))) return;
+        }
+        if (/Failed to load resource/.test(txt) && /net::ERR_(ABORTED|FAILED)/.test(txt)) {
+          const navE = (globalThis.__navAt && globalThis.__navAt[label]) || 0;
+          if ((Date.now() - navE < 20000) || (Date.now() - (globalThis.__navAny || 0) < 20000) || (Date.now() - (globalThis.__recentAbortAt || 0) < 15000)) return;
+        }
+        if ((label === 'stranger' || label === 'reader') && txt.includes('403') && txt.includes('Failed to load resource')) {
+          try {
+            const murls = combined.match(/https?:\/\/[^\s"']+/g) || [];
+            if (murls.some((x) => { try { return ALLOWED_ORIGINS.has(new URL(x).origin); } catch { return false; } })) return;
+          } catch {}
         }
         if (consoleAllowed(txt, loc)) return;
-        consoleErrors.push(label + ":" + txt);
+        consoleErrors.push(label + ":" + txt + ' @' + loc);
       } catch (e) { try { consoleErrors.push(label + ":collector-fail"); } catch {} }
     });
-    pg.on("pageerror", (e) => { try { const s = String(e).slice(0, 500); if (/Handshake was canceled/i.test(s) || /handshake error/i.test(s)) return; consoleErrors.push(label + ":pageerror:" + s); } catch {} });
+    pg.on('pageerror', (e) => { try { const s = String(e).slice(0, 500); if (/handshake was canceled|handshake error|failed to start the transport/i.test(s)) { const navP = (globalThis.__navAt && globalThis.__navAt[label]) || 0; const wsP = globalThis.__wsSeenAt || 0; const wsUP = String(globalThis.__wsSeenUrl || ''); if ((Date.now() - navP < 20000) || (wsUP.indexOf('/hubs/board') >= 0 && Date.now() - wsP < 60000)) return; } consoleErrors.push(label + ':pageerror:' + s); } catch {} });
     watchResponses(pg);
   }
   await ctx.route("**/*", routeGuard);
@@ -290,9 +321,15 @@ async function main() {
   await page.waitForFunction(() => { const r = document.querySelector("#root"); return !!(r && r.innerText && r.innerText.trim().length > 0); }, null, { timeout: T.goto });
   {
     const stored = await page.evaluate(() => window.localStorage.getItem("simceo-token"));
-    ok("browser-token-bootstrapped", stored === owner, "browser storage missing owner token");
-    const me = await api("GET", "/api/auth/me", undefined, owner);
-    ok("browser-auth-me-owned", me.status === 200 && (me.json.authenticated === true || me.json.Authenticated === true), String(me.status));
+    preflight("browser-token-bootstrapped", stored === owner, "browser storage missing owner token");
+    const mountedMe = await page.evaluate(async () => {
+      const tok = window.localStorage.getItem("simceo-token");
+      const r = await fetch("/api/auth/me", { headers: { authorization: "Bearer " + tok }, redirect: "error" });
+      const t = await r.text();
+      let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = null; }
+      return { status: r.status, ok: !!(j && (j.authenticated === true || j.Authenticated === true)) };
+    });
+    preflight("browser-auth-me-mounted", mountedMe.status === 200 && mountedMe.ok === true, "mounted auth/me failed status=" + String(mountedMe.status));
   }
   const board = await api("POST", "/api/boards", { name: run + "-board", mission: run + " mission", stage: "qa" }, owner);
   preflight("seed-board", board.status === 201 && board.json.id, String(board.status));
@@ -356,9 +393,12 @@ async function main() {
     preflight("preflight-usage-ledger", u0.status === 200 && Array.isArray(u0.json), String(u0.status));
     globalThis.__usageBefore = u0.json.length;
     const sp = await api("GET", "/api/spending", undefined, owner);
-    preflight("preflight-spending-enforced", sp.status === 403, String(sp.status));
+    preflight('preflight-spending-owner-denied', sp.status === 403, String(sp.status));
+    preflight('preflight-spending-denial-not-enforcement', sp.text.includes('not granted') || sp.text.includes('Access revoked'), sp.text.slice(0, 160));
+    const spStr = await api("GET", "/api/spending", undefined, stranger);
+    preflight("preflight-spending-stranger-denied-ui", spStr.status === 403, String(spStr.status));
     const ms = await api("GET", "/api/model/status", undefined, owner);
-    preflight("preflight-model-enforced", ms.status === 403, String(ms.status));
+    preflight('preflight-model-denied-ui', ms.status === 403, String(ms.status));
   }
   const sec = await api("POST", "/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE " + run, clientNonce: crypto.randomBytes(8).toString("hex") }, owner);
   preflight("seed-secretary-note", sec.status === 200 && sec.json && sec.json.note, String(sec.status));
@@ -473,7 +513,8 @@ async function main() {
   await api("POST", "/api/records/" + sid + "/items/revise", { ...g0g, itemId: "S1", text: "Bears other-client revision" }, owner);
   const canonHeldBefore = await canonState(sid, owner);
   const ordS = await pendingOrdinals(sid, owner);
-  await page.getByRole("button", { name: "Approve decision " + ordS["S2"] }).first().click({ timeout: T.step }).catch(() => null);
+  expectConsoleError('/api/records/' + sid + '/items/approve', 409);
+  await page.getByRole("button", { name: "Approve decision " + ordS["S2"] }).first().click({ timeout: T.step });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "The record changed", { timeout: T.poll });
   ok("ui-409-guided", await bodyHas("Refresh review") && await bodyHas("The record changed"), "guided 409 missing");
   ok("held-no-state-write", (await canonState(sid, owner)) === canonHeldBefore, "held approve mutated public state");
@@ -500,133 +541,246 @@ async function main() {
   const br = await api("POST", "/api/records/" + sid + "/revise", { version: sg.json.version, hash: sg.json.hash, reviewToken: sg.json.reviewToken, watermark: sg.json.watermark, items: [{ id: "S1", text: "x" }] }, owner);
   ok("whole-revise-after-decisions-409", br.status === 409, String(br.status));
   ok("whole-revise-no-state-write", (await canonState(sid, owner)) === canonWholeBefore, "decided whole-revise mutated public state");
+  const selDraft = await api('POST', '/api/meetings/' + mid + '/record/draft', [{ id: 'SEL1', text: 'Bears selected one' }, { id: 'SEL2', text: 'Bears selected two' }], owner);
+  const selId = selDraft.json.id;
+  preflight('selected-fixture', selDraft.status === 201 && selId, String(selDraft.status));
+  await page.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + selId, { waitUntil: 'domcontentloaded', timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears selected two', { timeout: T.poll });
+  const selOrd = await pendingOrdinals(selId, owner);
+  ok('selected-ordinals', selOrd['SEL1'] > 0 && selOrd['SEL2'] > 0, JSON.stringify(selOrd));
+  await page.getByRole('checkbox', { name: 'Select decision ' + selOrd['SEL1'] }).first().check({ timeout: T.step });
+  await page.getByRole('checkbox', { name: 'Select decision ' + selOrd['SEL2'] }).first().check({ timeout: T.step });
+  await page.getByRole('button', { name: 'Approve selected' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  const selRev = await api('GET', '/api/records/' + selId + '/review', undefined, owner);
+  ok('selected-approve-both', (selRev.json.approved || []).includes('SEL1') && (selRev.json.approved || []).includes('SEL2'), JSON.stringify(selRev.json.approved));
+  ok('selected-no-controls-after', (await allApproveControls()) === 0, 'selected leaves controls');
   // Explicit reload editor stale ALL-fields race: type text+detail, stale via per-item revise, reload recovers.
 // Strengthened: external revision must succeed, whole-POST 409 proven (not client refusal),
 // non-empty detail/refs recovery, hold-while-typing, 403/transport, stateValid.
-  const r1DetailInit = "Bears initial detail one";
-  const r2DetailInit = "Bears initial detail two";
-  const r2RefsInit = [{ kind: "message", ref: mid + ":" + String(mseq) }];
-  const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one", detail: r1DetailInit }, { id: "R2", text: "Bears reload two", detail: r2DetailInit, refs: r2RefsInit }], owner);
+  const r1DetailInit = 'Bears initial detail one';
+  const r2DetailInit = 'Bears initial detail two';
+  const r2RefsInit = [{ kind: 'message', ref: mid + ':' + String(mseq), title: 'known excerpt', customRef: 'unknown-ref-R2-marker' }];
+  const rr1 = await api('POST', '/api/meetings/' + mid + '/record/draft', [{ id: 'R1', text: 'Bears reload one', detail: r1DetailInit, customMeta: 'unknown-meta-R1-marker', scope: 'meeting' }, { id: 'R2', text: 'Bears reload two', detail: r2DetailInit, refs: r2RefsInit, customMeta: 'unknown-meta-R2-marker' }], owner);
   const rid = rr1.json.id;
-  preflight("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
-  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
-  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload two", { timeout: T.poll });
-  const editorBoxes = page.locator('textarea.human-editor-text[id*="' + rid + '"]');
-  ok("reload-editor-fields", (await editorBoxes.count()) >= 4, "selected whole-editor text+detail fields missing " + String(await editorBoxes.count()));
-  for (let _w = 0; _w < 20; _w++) { try { if ((await editorBoxes.nth(0).inputValue()) === "Bears reload one") break; } catch {} await page.waitForTimeout(300); }
-  ok("reload-editor-selected-race", (await editorBoxes.nth(0).inputValue()) === "Bears reload one", "selected whole-editor not targeted (PrepareDraft leak): got " + String(await editorBoxes.nth(0).inputValue()).slice(0, 80));
-  await editorBoxes.nth(0).fill("Bears reload one STALE", { timeout: T.step });
-  await editorBoxes.nth(1).fill("Bears stale detail", { timeout: T.step });
-  const rg = await api("GET", "/api/records/" + rid, undefined, owner);
-  const extRev = await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
-  ok("reload-external-revise-200", extRev.status === 200, String(extRev.status) + " " + extRev.text.slice(0, 160));
+  preflight('reload-fixture', rr1.status === 201 && rid, String(rr1.status));
   {
-    const chk = await api("GET", "/api/records/" + rid, undefined, owner);
+    const chk0 = await api('GET', '/api/records/' + rid, undefined, owner);
+    ok('reload-unknown-seeded', chk0.status === 200 && chk0.text.includes('unknown-meta-R1-marker') && chk0.text.includes('unknown-ref-R2-marker'), 'unknown meta/refs not persisted at seed');
+  }
+  await page.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + rid, { waitUntil: 'domcontentloaded', timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears reload two', { timeout: T.poll });
+  async function sval(x) { try { return await x.inputValue(); } catch (e) { return ''; } }
+  const QS = String.fromCharCode(39);
+  const editorBoxes = page.locator('textarea.human-editor-text[id*=' + QS + rid + QS + ']');
+  ok('reload-editor-fields', (await editorBoxes.count()) >= 4, 'selected whole-editor text+detail fields missing ' + String(await editorBoxes.count()));
+  for (let _w = 0; _w < 20; _w++) { try { if ((await editorBoxes.nth(0).inputValue()) === 'Bears reload one') break; } catch {} await page.waitForTimeout(300); }
+  ok('reload-editor-selected-race', (await editorBoxes.nth(0).inputValue()) === 'Bears reload one', 'selected whole-editor not targeted');
+  await editorBoxes.nth(0).fill('Bears reload one STALE', { timeout: T.step });
+  await editorBoxes.nth(1).fill('Bears stale detail', { timeout: T.step });
+  const rg = await api('GET', '/api/records/' + rid, undefined, owner);
+  const extRev = await api('POST', '/api/records/' + rid + '/items/revise', { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: 'R2', text: 'Bears reload two revised' }, owner);
+  ok('reload-external-revise-200', extRev.status === 200, String(extRev.status) + ' ' + extRev.text.slice(0, 160));
+  {
+    const chk = await api('GET', '/api/records/' + rid, undefined, owner);
     let items = []; try { items = JSON.parse(chk.json.itemsJson); } catch {}
-    const r2 = items.find((e) => e.id === "R2") || {};
-    ok("reload-fresh-r2-detail-nonempty", typeof r2.detail === "string" && r2.detail.length > 0, JSON.stringify(r2).slice(0, 240));
-    ok("reload-fresh-r2-refs", Array.isArray(r2.refs) && r2.refs.length > 0, JSON.stringify(r2).slice(0, 240));
+    const r2 = items.find((e) => e.id === 'R2') || {};
+    ok('reload-fresh-r2-detail-nonempty', typeof r2.detail === 'string' && r2.detail.length > 0, JSON.stringify(r2).slice(0, 240));
+    ok('reload-fresh-r2-refs', Array.isArray(r2.refs) && r2.refs.length > 0, JSON.stringify(r2).slice(0, 240));
   }
   const canonReload409Before = await canonState(rid, owner);
   const postBefore = postLog.length;
-  await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
+  expectConsoleError('/api/records/' + rid + '/revise', 409);
+  await page.getByRole('button', { name: 'Request revision (new version)' }).first().click({ timeout: T.step });
   await page.waitForTimeout(1200);
   const post409 = postLog.slice(postBefore).filter((e) => /\/revise$/.test(e.url) && e.status === 409);
-  ok("reload-whole-post-409", post409.length >= 1, "no whole-POST 409 captured (client refusal?) " + JSON.stringify(postLog.slice(postBefore)).slice(0, 240));
-  ok("reload-stale-race-guided", await bodyHas("Reload editor from current review"), "reload recovery hidden after reviewError");
-  ok("reload-409-no-state-write", (await canonState(rid, owner)) === canonReload409Before, "stale whole-document submit mutated public state");
+  ok('reload-whole-post-409', post409.length >= 1, 'no whole-POST 409 captured (client refusal?) ' + JSON.stringify(postLog.slice(postBefore)).slice(0, 240));
+  ok('reload-stale-race-guided', await bodyHas('Reload editor from current review'), 'reload recovery hidden after reviewError');
+  ok('reload-409-no-state-write', (await canonState(rid, owner)) === canonReload409Before, 'stale whole-document submit mutated public state');
   {
-    const staleStill = await editorBoxes.nth(0).inputValue().catch(() => "");
-    ok("reload-stale-preserved-on-409", staleStill === "Bears reload one STALE", "stale typing lost on 409: " + staleStill.slice(0, 80));
+    const staleStill = await sval(editorBoxes.nth(0));
+    ok('reload-stale-preserved-on-409', staleStill === 'Bears reload one STALE', 'stale typing lost on 409: ' + staleStill.slice(0, 80));
   }
-  const canonReloadBefore = await canonState(rid, owner);
-  await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step });
-  await page.waitForTimeout(800);
-  const afterReloadText = await editorBoxes.nth(0).inputValue();
-  const afterReloadDetail = await editorBoxes.nth(1).inputValue();
-  ok("reload-stale-race-reset-text", afterReloadText === "Bears reload one", "stale text survived reload: " + afterReloadText.slice(0, 80));
-  ok("reload-stale-race-reset-detail", afterReloadDetail === r1DetailInit, "stale detail wrong after reload: " + afterReloadDetail.slice(0, 80));
-  const afterReloadR2 = await editorBoxes.nth(2).inputValue();
-  const afterReloadR2d = await editorBoxes.nth(3).inputValue();
-  ok("reload-fresh-r2", afterReloadR2 === "Bears reload two revised", "fresh R2 missing after Reload: " + afterReloadR2.slice(0, 80));
-  ok("reload-fresh-r2-detail", afterReloadR2d === r2DetailInit, "fresh R2 detail wrong: " + afterReloadR2d.slice(0, 80));
-  ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated public state");
-  await editorBoxes.nth(0).fill("Bears reload one HOLD", { timeout: T.step });
+  ok('reload-button-visible', (await page.getByRole('button', { name: 'Reload editor from current review' }).count()) === 1, 'Reload button not visible after conflict');
+  ok('reload-button-enabled', await page.getByRole('button', { name: 'Reload editor from current review' }).first().isEnabled(), 'Reload button disabled after conflict');
+  globalThis.__holdReview = null;
+  let holdRelease = null;
+  globalThis.__holdReview = { id: rid, armed: true, seen: false, settled: false, gate: new Promise((res) => { holdRelease = res; }) };
+  await editorBoxes.nth(0).fill('Bears reload one HOLD-BASE', { timeout: T.step });
   await page.waitForTimeout(300);
   {
-    const rg2 = await api("GET", "/api/records/" + rid, undefined, owner);
-    const ext2 = await api("POST", "/api/records/" + rid + "/items/revise", { version: rg2.json.version, hash: rg2.json.hash, reviewToken: rg2.json.reviewToken, watermark: rg2.json.watermark, itemId: "R1", text: "Bears reload one external2" }, owner);
-    ok("reload-hold-external-200", ext2.status === 200, String(ext2.status));
+    const rg2 = await api('GET', '/api/records/' + rid, undefined, owner);
+    const ext2 = await api('POST', '/api/records/' + rid + '/items/revise', { version: rg2.json.version, hash: rg2.json.hash, reviewToken: rg2.json.reviewToken, watermark: rg2.json.watermark, itemId: 'R1', text: 'Bears reload one external-held' }, owner);
+    ok('reload-hold-external-200', ext2.status === 200, String(ext2.status));
   }
-  const holdClick = page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step }).catch(() => null);
-  await page.waitForTimeout(100);
-  await editorBoxes.nth(0).fill("Bears reload one HOLD-NEW", { timeout: T.step });
-  try { await holdClick; } catch {}
-  await page.waitForTimeout(1000);
-  {
-    const held = await editorBoxes.nth(0).inputValue().catch(() => "");
-    ok("reload-hold-new-typing-wins", held === "Bears reload one HOLD-NEW", "new typing during Reload lost: " + held.slice(0, 80));
-  }
-  await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step }).catch(() => null);
+  const reloadHeldClick = page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
+  for (let _w = 0; _w < 40 && !(globalThis.__holdReview && globalThis.__holdReview.seen); _w++) await page.waitForTimeout(250);
+  ok('reload-held-get-seen', !!(globalThis.__holdReview && globalThis.__holdReview.seen), 'Reload GET was never issued/held');
+  await editorBoxes.nth(0).fill('Bears reload one HOLD-NEW', { timeout: T.step });
+  holdRelease();
+  for (let _w = 0; _w < 40 && !(globalThis.__holdReview && globalThis.__holdReview.settled); _w++) await page.waitForTimeout(250);
+  globalThis.__holdReview.armed = false;
+  try { await reloadHeldClick; } catch {}
   await page.waitForTimeout(1500);
-  const rrFinal = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "RF1", text: "Bears reload final one", detail: r1DetailInit }, { id: "RF2", text: "Bears reload final two", detail: r2DetailInit, refs: r2RefsInit }], owner);
-  preflight("reload-final-fixture", rrFinal.status === 201 && rrFinal.json.id, String(rrFinal.status));
-  const fid = rrFinal.json.id;
-  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + fid, { waitUntil: "domcontentloaded", timeout: T.goto });
-  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload final two", { timeout: T.poll });
+  {
+    const held = await sval(editorBoxes.nth(0));
+    ok('reload-hold-new-typing-wins', held === 'Bears reload one HOLD-NEW', 'new typing during held Reload lost: ' + held.slice(0, 80));
+  }
+  globalThis.__holdReview = null;
+  const canonResyncBefore = await canonState(rid, owner);
+  await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  const afterReloadText = await sval(editorBoxes.nth(0));
+  const afterReloadDetail = await sval(editorBoxes.nth(1));
+  ok('reload-settled-shows-authority', afterReloadText === 'Bears reload one external-held', 'settled Reload did not show authority: ' + afterReloadText.slice(0, 80));
+  ok('reload-resync-detail', afterReloadDetail === r1DetailInit, 'stale detail wrong after resync: ' + afterReloadDetail.slice(0, 80));
+  const afterReloadR2 = await sval(editorBoxes.nth(2));
+  const afterReloadR2d = await sval(editorBoxes.nth(3));
+  ok('reload-fresh-r2', afterReloadR2 === 'Bears reload two revised', 'fresh R2 missing after resync: ' + afterReloadR2.slice(0, 80));
+  ok('reload-fresh-r2-detail', afterReloadR2d === r2DetailInit, 'fresh R2 detail wrong: ' + afterReloadR2d.slice(0, 80));
+  ok('reload-resync-no-write', (await canonState(rid, owner)) === canonResyncBefore, 'resync mutated public state');
+  await editorBoxes.nth(0).fill('Bears reload one AFTER-SETTLEMENT', { timeout: T.step });
+  await page.waitForTimeout(500);
+  {
+    const afterNew = await sval(editorBoxes.nth(0));
+    ok('reload-new-typing-after-settlement', afterNew === 'Bears reload one AFTER-SETTLEMENT', 'NEW typing after settlement lost');
+  }
+  await editorBoxes.nth(0).fill('Bears reload one STALE-403', { timeout: T.step });
+  await editorBoxes.nth(1).fill('Bears stale detail 403', { timeout: T.step });
+  {
+    const rg403 = await api('GET', '/api/records/' + rid, undefined, owner);
+    const ext403 = await api('POST', '/api/records/' + rid + '/items/revise', { version: rg403.json.version, hash: rg403.json.hash, reviewToken: rg403.json.reviewToken, watermark: rg403.json.watermark, itemId: 'R1', text: 'Bears reload one external-403' }, owner);
+    ok('reload-403-external-200', ext403.status === 200, String(ext403.status));
+  }
+  const canonDBefore = await canonState(rid, owner);
+  const ord403 = await pendingOrdinals(rid, owner);
+  expectConsoleError('/api/records/' + rid + '/items/approve', 409);
+  await page.getByRole('button', { name: 'Approve decision ' + ord403['R1'] }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1200);
+  ok('reload-403-approve-guided', await bodyHas('Reload editor from current review'), 'per-item conflict did not guide to Reload');
+
+  ok('reload-403-approve-no-write', (await canonState(rid, owner)) === canonDBefore, 'stale per-item approve mutated public state');
+  globalThis.__stubReviewOnce = { id: rid, mode: '403' };
+  expectConsoleError('/api/records/' + rid + '/review', 403);
+  await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  {
+    const t403 = await sval(editorBoxes.nth(0));
+    const d403 = await sval(editorBoxes.nth(1));
+    const r2403 = await sval(editorBoxes.nth(2));
+    ok('reload-403-preserve-text', t403 === 'Bears reload one STALE-403', 'whole text lost on App 403: ' + t403.slice(0, 80));
+    ok('reload-403-preserve-detail', d403 === 'Bears stale detail 403', 'whole detail lost on App 403: ' + d403.slice(0, 80));
+    ok('reload-403-preserve-child', r2403 === 'Bears reload two revised', 'child edit lost on App 403: ' + r2403.slice(0, 80));
+  }
+  ok('reload-403-no-state-write', (await canonState(rid, owner)) === canonDBefore, 'App 403 mutated public state');
+  {
+    const det403 = await api('GET', '/api/records/' + rid, undefined, owner);
+    ok('reload-403-unknown-retained', det403.text.includes('unknown-meta-R1-marker') && det403.text.includes('unknown-ref-R2-marker'), 'unknown metadata/refs lost on App 403');
+  }
+  ok('reload-403-editor-intact', (await editorBoxes.count()) >= 4, 'editor unmounted after App 403');
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears reload one external-403', { timeout: T.poll });
   await page.waitForTimeout(800);
-  const holdBoxes = page.locator('textarea.human-editor-text[id*="' + fid + '"]');
-  for (let _w = 0; _w < 20; _w++) { try { if ((await holdBoxes.nth(0).inputValue()) === "Bears reload final one") break; } catch {} await page.waitForTimeout(300); }
-  await holdBoxes.nth(0).fill("Bears reload one FINAL", { timeout: T.step });
-  try { await holdBoxes.nth(1).fill(r1DetailInit, { timeout: T.step }); } catch {}
-  const postFinalBefore = postLog.length;
-  await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
-  await page.waitForTimeout(2000);
-  let finalNid = "";
   {
-    const rrAfter = await api("GET", "/api/records/" + fid + "/review", undefined, owner);
-    const succR = (rrAfter.json.successors || []);
-    const postFinal = postLog.slice(postFinalBefore).filter((e) => /\/revise$/.test(e.url));
-    ok("reload-submit-new-version", succR.length === 1, JSON.stringify(succR) + " posts=" + JSON.stringify(postFinal).slice(0, 240));
-    const rnid = succR[0] || "";
-    finalNid = rnid;
-    const rdet = await api("GET", "/api/records/" + rnid, undefined, owner);
-    let rtexts = "";
-    let rdetOk = false; let rrefsOk = false;
-    try { const arr = JSON.parse(rdet.json.itemsJson); rtexts = JSON.stringify(arr.map((e) => e.text)); const rf2 = arr.find((e) => e.id === "RF2") || {}; rdetOk = typeof rf2.detail === "string" && rf2.detail.length > 0; rrefsOk = Array.isArray(rf2.refs) && rf2.refs.length > 0; } catch { rtexts = ""; }
-    ok("reload-submit-fresh-guards", rdet.status === 200 && rtexts.includes("Bears reload one FINAL") && rtexts.includes("Bears reload final two") && rdetOk && rrefsOk, rtexts.slice(0, 240));
+    const r403 = await sval(editorBoxes.nth(0));
+    ok('reload-remount-403-text', r403 === 'Bears reload one external-403', 'remount did not show latest authority: ' + r403.slice(0, 80));  }
+  globalThis.__stubReviewOnce = { id: rid, mode: 'abort' };
+  expectConsoleError('/api/records/' + rid + '/review', 'ERR');
+  await editorBoxes.nth(0).fill('Bears reload one STALE-ABORT', { timeout: T.step });
+  await editorBoxes.nth(1).fill('Bears stale detail abort', { timeout: T.step });
+  {
+    const rgA = await api('GET', '/api/records/' + rid, undefined, owner);
+    const extA = await api('POST', '/api/records/' + rid + '/items/revise', { version: rgA.json.version, hash: rgA.json.hash, reviewToken: rgA.json.reviewToken, watermark: rgA.json.watermark, itemId: 'R1', text: 'Bears reload one external-abort' }, owner);
+    ok('reload-abort-external-200', extA.status === 200, String(extA.status));
+  }
+  const canonAbortBefore = await canonState(rid, owner);
+  const ordAb = await pendingOrdinals(rid, owner);
+  expectConsoleError('/api/records/' + rid + '/items/approve', 409);
+  await page.getByRole('button', { name: 'Approve decision ' + ordAb['R1'] }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1200);
+  ok('reload-abort-approve-guided', await bodyHas('Reload editor from current review'), 'per-item conflict did not guide to Reload');
+  await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  {
+    const tA = await sval(editorBoxes.nth(0));
+    const dA = await sval(editorBoxes.nth(1));
+    ok('reload-abort-preserve-text', tA === 'Bears reload one STALE-ABORT', 'whole text lost on App transport failure: ' + tA.slice(0, 80));
+    ok('reload-abort-preserve-detail', dA === 'Bears stale detail abort', 'whole detail lost on App transport failure: ' + dA.slice(0, 80));
+  }
+  ok('reload-abort-no-state-write', (await canonState(rid, owner)) === canonAbortBefore, 'App transport failure mutated public state');
+  {
+    const detA = await api('GET', '/api/records/' + rid, undefined, owner);
+    ok('reload-abort-unknown-retained', detA.text.includes('unknown-meta-R1-marker') && detA.text.includes('unknown-ref-R2-marker'), 'unknown metadata/refs lost on App transport failure');
+  }
+  globalThis.__stubReviewOnce = null;
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears reload one external-abort', { timeout: T.poll });
+  await page.waitForTimeout(1500);
+  {
+    const rt = await sval(editorBoxes.nth(0));
+    ok('reload-resync-text', rt === 'Bears reload one external-abort', 'resync wrong: ' + rt.slice(0, 80));
+  }
+  await editorBoxes.nth(0).fill('Bears reload one FINAL', { timeout: T.step });
+  {
+    const fin = await sval(editorBoxes.nth(0));
+    ok('reload-final-typing-after-settlement', fin === 'Bears reload one FINAL', 'FINAL typing after settlement lost');
+  }
+  const postSubmitBefore = postLog.length;
+  await page.getByRole('button', { name: 'Request revision (new version)' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(2500);
+  {
+    const revAfter = await api('GET', '/api/records/' + rid + '/review', undefined, owner);
+    const succR = revAfter.json.successors || [];
+    const postSubmit = postLog.slice(postSubmitBefore).filter((e) => /\/revise$/.test(e.url));
+    ok('reload-submit-same-record-successor', succR.length === 1, JSON.stringify(succR) + ' posts=' + JSON.stringify(postSubmit).slice(0, 240));
+    ok('reload-submit-post-201', postSubmit.some((e) => e.status === 201 || e.status === 200), 'no successful whole-POST captured: ' + JSON.stringify(postSubmit).slice(0, 240));
+    const rnid = succR[0] || '';
+    const rdet = rnid ? await api('GET', '/api/records/' + rnid, undefined, owner) : { status: 0, json: {}, text: '' };
+    let rtexts = '';
+    let rdetOk = false; let rrefsOk = false; let runknownOk = false;
+    try {
+      const arr = JSON.parse(rdet.json.itemsJson);
+      rtexts = JSON.stringify(arr.map((e) => e.text));
+      const rf2 = arr.find((e) => e.id === 'R2') || {};
+      rdetOk = rf2.detail === r2DetailInit;
+      rrefsOk = Array.isArray(rf2.refs) && rf2.refs.some((x) => x.kind === 'message' && String(x.ref) === mid + ':' + String(mseq));
+      runknownOk = JSON.stringify(arr).includes('unknown-meta-R1-marker') && JSON.stringify(arr).includes('unknown-ref-R2-marker');
+    } catch {}
+    ok('reload-submit-same-guards-text', rdet.status === 200 && rtexts.includes('Bears reload one FINAL') && rtexts.includes('Bears reload two revised') && rdetOk && rrefsOk, rtexts.slice(0, 240));
+    ok('reload-submit-unknown-retained', rdet.status === 200 && runknownOk, 'unknown metadata/refs lost on same-record submit');
   }
   {
-    preflight("reload-preserve-target", !!finalNid, "no successor for preserve test");
-    await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + finalNid, { waitUntil: "domcontentloaded", timeout: T.goto });
-    await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload one FINAL", { timeout: T.poll });
-    await page.waitForTimeout(800);
-    const finalBoxes = page.locator('textarea.human-editor-text[id*="' + finalNid + '"]');
-    for (let _w = 0; _w < 20; _w++) { try { if (((await finalBoxes.nth(0).inputValue()) || "").length > 0) break; } catch {} await page.waitForTimeout(300); }
-    await finalBoxes.nth(0).fill("Bears preserve check", { timeout: T.step });
-    const canonP = await canonState(finalNid, owner);
-    const fr = await api("POST", "/api/records/" + finalNid + "/revise", { ...(await (async () => { const g = await api("GET", "/api/records/" + finalNid, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })()), items: [{ id: "RF1", text: "x" }] }, stranger);
-    ok("reload-403-stranger-whole", fr.status === 403, String(fr.status));
-    ok("reload-403-no-write", (await canonState(finalNid, owner)) === canonP, "403 mutated state");
-    const kept = await finalBoxes.nth(0).inputValue().catch(() => "");
-    ok("reload-403-preserve-typing", kept === "Bears preserve check", "typing lost on 403: " + kept.slice(0, 80));
-    let transportFailed = false;
-    try { await fetch("http://127.0.0.1:1/__nope", { redirect: "error" }); } catch { transportFailed = true; }
-    ok("reload-transport-fails-closed", transportFailed === true, "unexpected transport success");
-    const kept2 = await finalBoxes.nth(0).inputValue().catch(() => "");
-    ok("reload-transport-preserve-typing", kept2 === "Bears preserve check", "typing lost on transport: " + kept2.slice(0, 80));
-  }
-  {
-    const guestRev = await api("GET", "/api/records/" + rid + "/review", undefined, reader);
-    ok("reload-stateValid-missing-guest", guestRev.status === 200 && !("stateValid" in (guestRev.json || {})), "guest review should omit stateValid");
-    const emptyFix = await api("POST", "/api/meetings/" + mid + "/record/draft", [], owner);
-    preflight("reload-stateValid-empty-fixture", emptyFix.status === 201 && emptyFix.json.id, String(emptyFix.status));
+    const guestRev = await api('GET', '/api/records/' + rid + '/review', undefined, reader);
+    ok('reload-stateValid-missing-guest', guestRev.status === 200 && !('stateValid' in (guestRev.json || {})), 'guest review should omit stateValid');
+    const svFix = await api('POST', '/api/meetings/' + mid + '/record/draft', [{ id: 'SV1', text: 'Bears statevalid one' }, { id: 'SV2', text: 'Bears statevalid two' }], owner);
+    preflight('reload-stateValid-sv-fixture', svFix.status === 201 && svFix.json.id, String(svFix.status));
+    const svId = svFix.json.id;
+    const mgrRev = await api('GET', '/api/records/' + svId + '/review', undefined, owner);
+    const pendCount = (mgrRev.json.pending || []).length;
+    ok('reload-stateValid-setup-nonempty', mgrRev.status === 200 && pendCount > 0 && mgrRev.json.stateValid === true, 'setup review not valid-nonempty pending=' + String(pendCount));
+    const realPayload = mgrRev.json;
+    const urlStub = WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + svId;
+    globalThis.__stubReviewJson = { id: svId, body: Object.assign({}, realPayload, { stateValid: false, stateError: 'QA forged invalid' }) };
+    await page.goto(urlStub, { waitUntil: 'domcontentloaded', timeout: T.goto });
+    await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Review version', { timeout: T.poll });
+    await page.waitForTimeout(2000);
+    ok('reload-stateValid-false-no-approve', (await allApproveControls()) === 0 && (await reviseCount()) === 0 && (await setAsideCount()) === 0, 'stateValid:false shows controls');
+    const bodyNoV = Object.assign({}, realPayload);
+    delete bodyNoV.stateValid;
+    globalThis.__stubReviewJson = { id: svId, body: bodyNoV };
+    await page.goto(urlStub, { waitUntil: 'domcontentloaded', timeout: T.goto });
+    await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Review version', { timeout: T.poll });
+    await page.waitForTimeout(2000);
+    ok('reload-stateValid-missing-no-approve', (await allApproveControls()) === 0 && (await reviseCount()) === 0 && (await setAsideCount()) === 0, 'missing validity shows controls');
+    globalThis.__stubReviewJson = null;
+    const emptyFix = await api('POST', '/api/meetings/' + mid + '/record/draft', [], owner);
+    preflight('reload-stateValid-empty-fixture', emptyFix.status === 201 && emptyFix.json.id, String(emptyFix.status));
     const emptyId = emptyFix.json.id;
-    const emptyRev = await api("GET", "/api/records/" + emptyId + "/review", undefined, owner);
-    ok("reload-stateValid-empty", emptyRev.status === 200 && Array.isArray(emptyRev.json.pending) && emptyRev.json.pending.length === 0, String(emptyRev.status));
-    await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + emptyId, { waitUntil: "domcontentloaded", timeout: T.goto });
+    const emptyRev = await api('GET', '/api/records/' + emptyId + '/review', undefined, owner);
+    ok('reload-stateValid-empty', emptyRev.status === 200 && Array.isArray(emptyRev.json.pending) && emptyRev.json.pending.length === 0, String(emptyRev.status));
+    await page.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + emptyId, { waitUntil: 'domcontentloaded', timeout: T.goto });
     await page.waitForTimeout(1500);
-    ok("reload-stateValid-empty-no-approve", (await allApproveControls()) === 0, "empty draft shows approval");
+    ok('reload-stateValid-empty-no-approve', (await allApproveControls()) === 0, 'empty draft shows approval');
   }
 const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
@@ -708,9 +862,15 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   const amAmend = await api("POST", "/api/records/" + amBaseId + "/amend", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: amA, text: "Bears inherit alpha replaced" }] }; })(), owner);
   const amV2 = amAmend.json.id;
   preflight("amend-inherit-ui-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
+  await page.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + amBaseId, { waitUntil: 'domcontentloaded', timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears inherit alpha', { timeout: T.poll });
+  await page.waitForTimeout(1500);
+  ok('ui-amend-pending-child-current', await bodyHas('Bears inherit alpha'), 'approved ancestor with pending child not current for manager');
+  ok('ui-amend-pending-child-no-historical', !(await bodyHas('is not the current effective record')), 'pending-child ancestor mislabeled historical');
   const amApV2 = await api("POST", "/api/records/" + amV2 + "/items/approve", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, itemId: amA }; })(), owner);
   preflight("amend-inherit-ui-approve-v2", amApV2.status === 200, String(amApV2.status));
-  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amBaseId, { waitUntil: "domcontentloaded", timeout: T.goto });
+  // same URL as the pending-child visit above, so remount to force a fresh fetch
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Historical", { timeout: T.poll });
   ok("ui-amend-v1-historical", await bodyHas("Historical") && await bodyHas("Bears inherit alpha"), "amended v1 missing historical");
   ok("ui-amend-v1-effective", await bodyHas("Current effective record") && await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta"), "amended v1 missing current effective");
@@ -735,6 +895,7 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
   p2 = await ctx2.newPage();
   attachCollectors(p2, "stranger");
+  expectConsoleError('/api/records/' + nid, 403);
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(2000);
   const sBody = await p2.locator("body").innerText();
@@ -744,6 +905,7 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   ok("stranger-no-revise", !sBody.includes("Revise decision") && !sBody.includes("Revised text for decision"), "stranger sees revise");
   ok("stranger-no-setaside", !sBody.includes("Set aside decision"), "stranger sees set-aside");
   ok("stranger-no-protocol", !sBody.includes("reviewToken") && !sBody.includes("evidenceSnapshot") && !sBody.includes("reviewRevision"), "stranger sees protocol");
+  expectConsoleError('/api/records/' + rid, 403);
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(1500);
   const rBody = await p2.locator("body").innerText();
@@ -779,6 +941,11 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     ok("guest-amend-versions", aBody.includes("approved in version 2") && aBody.includes("approved in version 1"), "guest misses inherited approving versions");
     ok("guest-amend-no-historical-label", !aBody.includes("is not the current effective record"), "guest v2 mislabeled historical");
     ok("guest-amend-no-protocol", !aBody.includes("reviewToken") && !aBody.includes("evidenceSnapshot") && !aBody.includes("reviewRevision"), "guest sees protocol on amendment");
+    await p3.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + amBaseId, { waitUntil: 'domcontentloaded', timeout: T.goto });
+    await p3.waitForTimeout(2000);
+    const hBody = await p3.locator('body').innerText().catch(() => '');
+    ok('guest-amend-v1-historical', hBody.includes('Historical') && hBody.includes('Bears inherit alpha'), 'guest misses historical v1');
+    ok('guest-amend-v1-effective', hBody.includes('Bears inherit alpha replaced') && hBody.includes('Bears inherit beta'), 'guest misses current effective on v1');
     await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + pid, { waitUntil: "domcontentloaded", timeout: T.goto });
     await p3.waitForTimeout(2000);
     const pBody = await p3.locator("body").innerText().catch(() => "");
@@ -786,6 +953,18 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     ok("guest-partial-hides-pending", !pBody.includes("Bears partial UI pending"), "guest sees withheld pending text");
     ok("guest-partial-version", pBody.includes("approved in version 1"), "guest misses partial approving version");
     ok("guest-partial-no-protocol", !pBody.includes("reviewToken") && !pBody.includes("evidenceSnapshot") && !pBody.includes("reviewRevision"), "guest sees protocol on partial");
+    const qA = crypto.randomUUID(); const qB = crypto.randomUUID();
+    const qBase = await api('POST', '/api/meetings/' + mid + '/record/draft', [{ id: qA, text: 'Bears guestmatrix alpha' }, { id: qB, text: 'Bears guestmatrix beta' }], owner);
+    const qBaseId = qBase.json.id;
+    preflight('guestmatrix-base', qBase.status === 201 && qBaseId, String(qBase.status));
+    const qAp = await api('POST', '/api/records/' + qBaseId + '/approve-all', await (async () => { const g = await api('GET', '/api/records/' + qBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
+    preflight('guestmatrix-approve', qAp.status === 200, String(qAp.status));
+    const qAm = await api('POST', '/api/records/' + qBaseId + '/amend', await (async () => { const g = await api('GET', '/api/records/' + qBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: qA, text: 'Bears guestmatrix alpha replaced' }] }; })(), owner);
+    preflight('guestmatrix-v2-pending', (qAm.status === 201 || qAm.status === 200) && qAm.json.id, String(qAm.status));
+    await p3.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + qBaseId, { waitUntil: 'domcontentloaded', timeout: T.goto });
+    await p3.waitForTimeout(2000);
+    const qBody = await p3.locator('body').innerText().catch(() => '');
+    ok('guest-pending-child-current', qBody.includes('Bears guestmatrix alpha') && !qBody.includes('is not the current effective record'), 'guest pending-child ancestor mislabeled');
 
   }
   // Beyond-50 chain with singular navigation (owned disposable chain).
