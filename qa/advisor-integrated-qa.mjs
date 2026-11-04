@@ -1462,9 +1462,8 @@ async function stepMeeting() {
   await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId));
   try { await page.reload({ waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch {}
   await wft(Math.min(1500, Math.max(1, remainingMs())));
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/meetings/" + meetingId && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/advisors" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/activity" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
+  // The DOM barriers below prove readiness. Registering response listeners
+  // after reload misses cached/completed reads and adds three empty waits.
   try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const seats = rail.querySelectorAll("li.mp-seat"); if (seats.length !== 4) return false; const names = Array.from(rail.querySelectorAll(".mp-name")).map((e) => e.textContent || ""); const idx = names.findIndex((n) => String(n).indexOf("Tide Watcher") >= 0); if (idx < 0) return false; const cls = seats[idx] ? seats[idx].className : ""; if (cls.indexOf("act-excluded") < 0) return false; return true; }, undefined, { timeout: boundedTimeout(20000, 8000) }); } catch {}
   try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const imgs = rail.querySelectorAll('img[alt^="Portrait of "]'); if (imgs.length !== 2) return false; let okN = 0; for (const im of imgs) { const el = im; if (el && el.complete && (el.naturalWidth || 0) > 0) okN++; } return okN === 2; }, undefined, { timeout: boundedTimeout(25000, 8000) }); } catch {}
   // F6+F7: toolbar search (ACTUAL labelled textbox), EXACT Meeting settings
@@ -1619,6 +1618,12 @@ async function stepMeeting() {
   try {
   await raceCap(box.press("Enter", { timeout: boundedTimeout(8000, 8000) }), 8000, "meeting-press");
   try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadRespUrl = new URL(_mr.url()).pathname; } catch { savedLeadRespUrl = ""; } try { savedLeadResp = await respJson(_mr, "lead-post"); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
+  if (savedLeadStatus !== 201) {
+    pollStop = true;
+    const sendDiag = await ev(() => ({ text: document.body.innerText.slice(-2200), draft: document.querySelector('.composer-bar textarea')?.value, hash: location.hash })).catch(() => ({}));
+    console.log("SEND-DIAGNOSTIC " + redact(JSON.stringify({ status: savedLeadStatus, response: savedLeadResp, view: sendDiag, errors: pageErrors.slice(-3), posts: netPosts.messages.length })));
+    failExit("Send did not save a question; refusing activity sampling without a successful message POST.");
+  }
   // pairedOk lives at function scope (ReferenceError fix); serial paced sampling below reuses it.
   // Concurrent sampling starts immediately after Enter (no pre-wait); progress is observed inside samples.
   let progressSeen = "";
