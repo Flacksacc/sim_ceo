@@ -7779,7 +7779,7 @@ const testModel = useMutation({
                       </div>{" "}
                       {selRow && (
                         <RosterChatPanel
-                          key={selRow.entry.id}
+                          key={'roster-chat-' + selRow.entry.id}
                           rosterId={selRow.entry.id}
                           identity={canonicalUser()}
                           advisorName={selRow.entry.name}
@@ -7792,7 +7792,7 @@ const testModel = useMutation({
                       )}{" "}
                       {selRow && (
                         <CharacterEditor
-                          key={selRow.entry.id}
+                          key={'character-editor-' + selRow.entry.id}
                           entry={{ researchJson: "", researchJobId: "", researchBaseVersion: 0, ...selRow.entry } as any}
                           get={get}
                           post={post}
