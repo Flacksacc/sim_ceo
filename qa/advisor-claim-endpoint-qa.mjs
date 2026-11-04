@@ -47,6 +47,21 @@ function ok(name, cond, extra = "") {
   if (cond) { pass++; results.push("PASS " + name); }
   else { fail++; results.push("FAIL " + name + (extra ? " :: " + String(extra).slice(0, 500) : "")); }
 }
+// Safe JSON truncation for diagnostics: JSON.stringify(undefined) returns
+// undefined (not a string), so eager JSON.stringify(x).slice throws
+// Cannot read properties of undefined (reading slice) and masks the real
+// FAIL as FATAL. truncJson never throws and preserves assertion conditions.
+function safeJson(v) {
+  try {
+    if (typeof v === "undefined") return "undefined";
+    const s = JSON.stringify(v);
+    if (typeof s === "string") return s;
+    return String(s);
+  } catch { try { return String(v); } catch { return "unstringifiable"; } }
+}
+function truncJson(v, n) {
+  try { return safeJson(v).slice(0, n); } catch { return "untruncatable"; }
+}
 function remainingMs() { return deadline - Date.now(); }
 function assertDeadline(where) { if (remainingMs() <= 0) throw new Error("deadline exceeded at " + where); }
 function exactOrigin(u) {
@@ -123,18 +138,21 @@ function buildChildEnv() {
 function ensureProvenanceBeforeMutation() {
   const head = gitHead();
   const dllSha = shaFile(PUBLISH_DLL);
-  ok("provenance-source-head-present", /^[0-9a-f]{40}$/.test(head), head.slice(0, 12));
-  ok("provenance-dll-present", dllSha.length === 64, dllSha.slice(0, 12));
-  const fresh = process.env.QA_FRESH_BUILD === "1";
+  ok("provenance-source-head-present", /^[0-9a-f]{40}$/.test(head), String(head || "").slice(0, 12));
+  ok("provenance-dll-present", dllSha.length === 64, String(dllSha || "").slice(0, 12));
+  // Honest provenance: QA_FRESH_BUILD never built; old bypass removed.
   const expRev = String(process.env.QA_EXPECTED_SOURCE_REV || "").trim();
   const expSha = String(process.env.QA_EXPECTED_DLL_SHA || "").trim().toLowerCase();
-  if (fresh) { ok("provenance-fresh-build-requested", true); return { head, dllSha, fresh: true }; }
-  if (!expRev || !expSha) {
-    ok("provenance-pinned-required", false, "set QA_FRESH_BUILD=1 or QA_EXPECTED_SOURCE_REV+QA_EXPECTED_DLL_SHA");
-    throw new Error("provenance not pinned and no fresh build requested");
+  if (process.env.QA_FRESH_BUILD === "1") {
+    ok("provenance-fresh-build-removed", false, "QA_FRESH_BUILD bypass removed; use primary fresh publish + pinned REV+SHA");
+    throw new Error("QA_FRESH_BUILD=1 removed: set QA_EXPECTED_SOURCE_REV+QA_EXPECTED_DLL_SHA from primary fresh publish");
   }
-  ok("provenance-source-pinned", head.toLowerCase() === expRev.toLowerCase(), "head=" + head.slice(0, 12));
-  ok("provenance-dll-pinned", dllSha.toLowerCase() === expSha, "dll=" + dllSha.slice(0, 12));
+  if (!expRev || !expSha) {
+    ok("provenance-pinned-required", false, "set QA_EXPECTED_SOURCE_REV+QA_EXPECTED_DLL_SHA from primary fresh publish");
+    throw new Error("provenance not pinned: set QA_EXPECTED_SOURCE_REV+QA_EXPECTED_DLL_SHA");
+  }
+  ok("provenance-source-pinned", head.toLowerCase() === expRev.toLowerCase(), "head=" + String(head || "").slice(0, 12));
+  ok("provenance-dll-pinned", dllSha.toLowerCase() === expSha, "dll=" + String(dllSha || "").slice(0, 12));
   if (head.toLowerCase() !== expRev.toLowerCase() || dllSha.toLowerCase() !== expSha) throw new Error("provenance mismatch");
   return { head, dllSha, fresh: false };
 }
@@ -239,9 +257,9 @@ async function main() {
   const uEntry = pick(uDraft.json, "entry") || {};
   const uId = String(pick(uEntry, "id") || pick(uDraft.json, "id") || "");
   ok("unsupported-has-id", uId.length > 10, "id=" + uId.slice(0, 20));
-  ok("unsupported-researched-false", pick(uDraft.json, "researched") === false, JSON.stringify(uDraft.json).slice(0, 200));
-  ok("unsupported-status", String(pick(uDraft.json, "draftStatus") || "").toLowerCase() === "unsupported", JSON.stringify(uDraft.json).slice(0, 200));
-  ok("unsupported-count0", Number(pick(uDraft.json, "evidenceCount")) === 0, JSON.stringify(uDraft.json).slice(0, 200));
+  ok("unsupported-researched-false", pick(uDraft.json, "researched") === false, truncJson(uDraft.json, 200));
+  ok("unsupported-status", String(pick(uDraft.json, "draftStatus") || "").toLowerCase() === "unsupported", truncJson(uDraft.json, 200));
+  ok("unsupported-count0", Number(pick(uDraft.json, "evidenceCount")) === 0, truncJson(uDraft.json, 200));
   const uRes = await aget(WEB + "/api/roster/" + uId + "/research", 15000);
   ok("unsupported-get-200", uRes.status === 200, "status=" + uRes.status);
   ok("unsupported-stage", String(pick(uRes.json, "stage") || "") === "unsupported", "stage=" + pick(uRes.json, "stage"));
@@ -249,10 +267,10 @@ async function main() {
   ok("unsupported-researchedAt-null", pick(uRes.json, "researchedAt") == null, "at=" + pick(uRes.json, "researchedAt"));
   const uRj = parseResearchJson(pick(uRes.json, "researchJson"));
   const uRespIds = (uRj.json && uRj.json.responseIds) || [];
-  ok("unsupported-responseid-marker", Array.isArray(uRespIds) && uRespIds.some((x) => String(x).includes(MARK_U)), JSON.stringify(uRespIds).slice(0, 200));
+  ok("unsupported-responseid-marker", Array.isArray(uRespIds) && uRespIds.some((x) => String(x).includes(MARK_U)), truncJson(uRespIds, 200));
   const uClaims = (uRj.json && uRj.json.claims) || [];
   const uUn = claimByText(uClaims, "unsupported speculation");
-  ok("unsupported-claim-unverified-empty-refs", !!uUn && pick(uUn, "verified") === false && Array.isArray(pick(uUn, "refs")) && pick(uUn, "refs").length === 0, JSON.stringify(uUn).slice(0, 300));
+  ok("unsupported-claim-unverified-empty-refs", !!uUn && pick(uUn, "verified") === false && Array.isArray(pick(uUn, "refs")) && pick(uUn, "refs").length === 0, truncJson(uUn, 300));
   const canon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const rows = Array.isArray(canon.json) ? canon.json : [];
   const found = rows.find((x) => String(pick(x, "id") || "").toLowerCase() === uId.toLowerCase());
@@ -265,7 +283,7 @@ async function main() {
   const uCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const uFound2 = (Array.isArray(uCanon2.json) ? uCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === uId.toLowerCase());
   const uRj2 = parseResearchJson(pick(uFound2, "researchJson"));
-  ok("unsupported-behavior-preserved", uRj2.json && String(pick(uRj2.json, "draftStatus") || "").toLowerCase() === "unsupported", JSON.stringify(uRj2.json).slice(0, 300));
+  ok("unsupported-behavior-preserved", uRj2.json && String(pick(uRj2.json, "draftStatus") || "").toLowerCase() === "unsupported", truncJson(uRj2.json, 300));
   ok("unsupported-version-bumped", Number(pick(uFound2, "version") || 0) === uVer0 + 1, "v0=" + uVer0);
   ok("unsupported-inputs-pinned", String(pick(uFound2, "researchInputsJson") || "") === uInputs0, "inputs changed");
   ok("unsupported-saved-hash", !!pick(uRj2.json, "savedProfileHash"), "no savedProfileHash");
@@ -291,7 +309,7 @@ async function main() {
   const sDraft = await apost(WEB + "/api/roster/ai-draft", { accountId: ACCT, name: "S-" + run, role: "Harbor Strategist", focus: maxFocus }, 90000);
   const sElapsed = Date.now() - tS;
   ok("supported-draft-201", sDraft.status === 201, "status=" + sDraft.status);
-  ok("supported-researched-true", pick(sDraft.json, "researched") === true && String(pick(sDraft.json, "draftStatus") || "").toLowerCase() === "done", JSON.stringify(sDraft.json).slice(0, 200));
+  ok("supported-researched-true", pick(sDraft.json, "researched") === true && String(pick(sDraft.json, "draftStatus") || "").toLowerCase() === "done", truncJson(sDraft.json, 200));
   ok("supported-count5-distinct", Number(pick(sDraft.json, "evidenceCount")) === 5, "count=" + pick(sDraft.json, "evidenceCount"));
   ok("supported-elapsed-bounded", sElapsed < 120000, "elapsed=" + sElapsed);
   const sEntry = pick(sDraft.json, "entry") || {};
@@ -300,7 +318,7 @@ async function main() {
   ok("supported-stage-done", String(pick(sRes.json, "stage") || "") === "done", "stage=" + pick(sRes.json, "stage"));
   const sRj = parseResearchJson(pick(sRes.json, "researchJson"));
   const sRespIds = (sRj.json && sRj.json.responseIds) || [];
-  ok("supported-responseid-marker", Array.isArray(sRespIds) && sRespIds.some((x) => String(x).includes(MARK_S)), JSON.stringify(sRespIds).slice(0, 200));
+  ok("supported-responseid-marker", Array.isArray(sRespIds) && sRespIds.some((x) => String(x).includes(MARK_S)), truncJson(sRespIds, 200));
   const sClaims = (sRj.json && sRj.json.claims) || [];
   const sFact = claimByText(sClaims, "harbor fact alpha");
   const sFact2 = claimByText(sClaims, "second harbor fact gamma");
@@ -318,17 +336,17 @@ async function main() {
     if (!Array.isArray(refs) || refs.length === 0) return false;
     return !!refs.find((r) => refUrl(r) === url && refQuote(r) === quote);
   }
-  ok("supported-fact-alpha-exact", exactClaim(sFact, FACT_URL, FACT_QUOTE, "fact"), JSON.stringify(sFact).slice(0, 300));
-  ok("supported-fact-gamma-exact", exactClaim(sFact2, FACT_URL, FACT_QUOTE2, "fact"), JSON.stringify(sFact2).slice(0, 300));
-  ok("supported-interp-exact", exactClaim(sInterp, INTERP_URL, INTERP_QUOTE, "interpretation"), JSON.stringify(sInterp).slice(0, 300));
-  ok("supported-wrongpath-distinct", exactClaim(sWrong, WRONG_PATH_URL, WRONG_PATH_QUOTE, "fact"), JSON.stringify(sWrong).slice(0, 300));
-  ok("supported-slash-distinct", exactClaim(sSlash, SLASH_URL, SLASH_QUOTE, "fact"), JSON.stringify(sSlash).slice(0, 300));
-  ok("supported-querycase-distinct", exactClaim(sQuery, QUERYCASE_URL, QUERYCASE_QUOTE, "interpretation"), JSON.stringify(sQuery).slice(0, 300));
-  ok("supported-hostcase-canonical-retain", !!sHost && pick(sHost, "verified") === true && (() => { const rs = pick(sHost, "refs") || []; return rs.length > 0 && refUrl(rs[0]) === FACT_URL && refQuote(rs[0]) === FACT_QUOTE; })(), JSON.stringify(sHost).slice(0, 300));
-  ok("supported-unverified-empty-refs", !!sUn && pick(sUn, "verified") === false && Array.isArray(pick(sUn, "refs")) && pick(sUn, "refs").length === 0, JSON.stringify(sUn).slice(0, 300));
+  ok("supported-fact-alpha-exact", exactClaim(sFact, FACT_URL, FACT_QUOTE, "fact"), truncJson(sFact, 300));
+  ok("supported-fact-gamma-exact", exactClaim(sFact2, FACT_URL, FACT_QUOTE2, "fact"), truncJson(sFact2, 300));
+  ok("supported-interp-exact", exactClaim(sInterp, INTERP_URL, INTERP_QUOTE, "interpretation"), truncJson(sInterp, 300));
+  ok("supported-wrongpath-distinct", exactClaim(sWrong, WRONG_PATH_URL, WRONG_PATH_QUOTE, "fact"), truncJson(sWrong, 300));
+  ok("supported-slash-distinct", exactClaim(sSlash, SLASH_URL, SLASH_QUOTE, "fact"), truncJson(sSlash, 300));
+  ok("supported-querycase-distinct", exactClaim(sQuery, QUERYCASE_URL, QUERYCASE_QUOTE, "interpretation"), truncJson(sQuery, 300));
+  ok("supported-hostcase-canonical-retain", !!sHost && pick(sHost, "verified") === true && (() => { const rs = pick(sHost, "refs") || []; return rs.length > 0 && refUrl(rs[0]) === FACT_URL && refQuote(rs[0]) === FACT_QUOTE; })(), truncJson(sHost, 300));
+  ok("supported-unverified-empty-refs", !!sUn && pick(sUn, "verified") === false && Array.isArray(pick(sUn, "refs")) && pick(sUn, "refs").length === 0, truncJson(sUn, 300));
   ok("supported-no-conflation", (() => { const a = sFact ? refQuote((pick(sFact, "refs") || [])[0] || {}) : ""; const w = sWrong ? refQuote((pick(sWrong, "refs") || [])[0] || {}) : ""; return a === FACT_QUOTE && w === WRONG_PATH_QUOTE && a !== w; })(), "quotes swapped?");
   const sRefs = Array.isArray(pick(sRes.json, "sources")) ? pick(sRes.json, "sources") : [];
-  ok("supported-refs-provider-unfetched", sRefs.length >= 5 && sRefs.every((x) => pick(x, "fetched") === false && String(pick(x, "origin") || "") === "provider-search"), JSON.stringify(sRefs).slice(0, 400));
+  ok("supported-refs-provider-unfetched", sRefs.length >= 5 && sRefs.every((x) => pick(x, "fetched") === false && String(pick(x, "origin") || "") === "provider-search"), truncJson(sRefs, 400));
   const sCanon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const sFound = (Array.isArray(sCanon.json) ? sCanon.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
   const sVer0 = Number(pick(sFound, "version") || 0);
@@ -339,7 +357,7 @@ async function main() {
   const sCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const sFound2 = (Array.isArray(sCanon2.json) ? sCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
   const sRj2 = parseResearchJson(pick(sFound2, "researchJson"));
-  ok("supported-behavior-saved", sRj2.json && String(pick(sRj2.json, "draftStatus") || "").toLowerCase() === "saved", JSON.stringify(sRj2.json).slice(0, 300));
+  ok("supported-behavior-saved", sRj2.json && String(pick(sRj2.json, "draftStatus") || "").toLowerCase() === "saved", truncJson(sRj2.json, 300));
   ok("supported-version-bumped", Number(pick(sFound2, "version") || 0) === sVer0 + 1, "v0=" + sVer0);
   ok("supported-inputs-pinned", String(pick(sFound2, "researchInputsJson") || "") === sInputs0, "inputs changed");
   const cName = ("C-" + run + "-" + MARK_C + "-").padEnd(MAX_NAME, "n").slice(0, MAX_NAME);
@@ -374,7 +392,7 @@ async function main() {
   const cRj = parseResearchJson(pick(cGet.json, "researchJson"));
   const cRespRaw = (cRj.json && (cRj.json.responseIds || cRj.json.responseId)) || [];
   const cRespArr = Array.isArray(cRespRaw) ? cRespRaw : [cRespRaw];
-  ok("character-responseid-marker", cRespArr.some((x) => String(x).includes(MARK_C)), JSON.stringify(cRespArr).slice(0, 200));
+  ok("character-responseid-marker", cRespArr.some((x) => String(x).includes(MARK_C)), truncJson(cRespArr, 200));
   const cClaims = (cRj.json && cRj.json.claims) || [];
   let sidAll = true;
   for (let i = 1; i <= 5; i++) {
@@ -390,7 +408,7 @@ async function main() {
   }
   ok("character-sid-full-url-exact", sidAll, "sid claims=" + cClaims.length);
   const cUn = claimByText(cClaims, "unsupported speculation");
-  ok("character-unverified-empty-refs", !!cUn && pick(cUn, "verified") === false && Array.isArray(pick(cUn, "refs")) && pick(cUn, "refs").length === 0, JSON.stringify(cUn).slice(0, 300));
+  ok("character-unverified-empty-refs", !!cUn && pick(cUn, "verified") === false && Array.isArray(pick(cUn, "refs")) && pick(cUn, "refs").length === 0, truncJson(cUn, 300));
   const cCanon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const cFound = (Array.isArray(cCanon.json) ? cCanon.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
   const cVer0 = Number(pick(cFound, "version") || 0);
@@ -401,7 +419,7 @@ async function main() {
   const cCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
   const cFound2 = (Array.isArray(cCanon2.json) ? cCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
   const cRj2 = parseResearchJson(pick(cFound2, "researchJson"));
-  ok("character-behavior-saved-pinned", cRj2.json && ["saved", "done"].includes(String(pick(cRj2.json, "draftStatus") || "").toLowerCase()), JSON.stringify(cRj2.json).slice(0, 300));
+  ok("character-behavior-saved-pinned", cRj2.json && ["saved", "done"].includes(String(pick(cRj2.json, "draftStatus") || "").toLowerCase()), truncJson(cRj2.json, 300));
   ok("character-version-bumped", Number(pick(cFound2, "version") || 0) === cVer0 + 1, "v0=" + cVer0);
   ok("character-inputs-pinned", String(pick(cFound2, "researchInputsJson") || "") === cInputs0, "inputs changed");
   const logs = await get(FAKE + "/__log", 10000);
@@ -446,6 +464,20 @@ async function main() {
 }
 let code = 1;
 let cleanupDone = false;
-try { code = await main(); cleanupDone = true; } catch (e) { console.log("FATAL " + String((e && e.message) || e).slice(0, 300)); code = 2; }
-if (!cleanupDone) { try { await cleanupAndVerify(); } catch {} }
+try {
+  code = await main();
+  cleanupDone = true;
+} catch (e) {
+  try {
+    console.log("FATAL " + String((e && e.message) || e).slice(0, 500));
+    try { console.log("FATAL-stack " + String((e && e.stack) || "no-stack").slice(0, 2000)); } catch {}
+    try {
+      console.log("FATAL-results pass=" + pass + " fail=" + fail + " total=" + results.length);
+      console.log(results.slice(-25).join("\n").slice(0, 4000));
+    } catch {}
+  } catch {}
+  code = 2;
+} finally {
+  if (!cleanupDone) { try { await cleanupAndVerify(); } catch (ce) { try { console.log("FATAL-cleanup " + String((ce && ce.message) || ce).slice(0, 300)); } catch {} } }
+}
 process.exit(code);
