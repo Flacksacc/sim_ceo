@@ -172,3 +172,34 @@ The remaining advisor/meeting update is not yet deployed:
 - Final frontend integration is active in `.tmp/advisor-final-frontend`: accepted editor, meeting controls, roster-only chat, Profile, Send, portraits, and per-member/Secretary progress must work together against the final backend. Whole-app navigation, real advisor creation/edit/use, human roster reconciliation without duplicates, final review, preserved-data cutover, and post-deployment checks remain required.
 
 No human roster reconciliation has been applied during these isolated checks. Every code, test, and script change remains Muse-authored; primary performs orchestration, exact patch transfer, inspection, execution, and independent review. The phase checkboxes above retain their historical scope: this feedback checkpoint does not complete full parity, and phases 4–10 plus the complete final audit remain open.
+
+## Joined advisor FINAL candidate — pending primary verification (not acceptance)
+
+Candidate root `muse/advisor-final-candidate` joined from MAIN `f452171`:
+
+- `server/` byte-identical to `.tmp/advisor-final-backend` `dbb698c`.
+- `web/` byte-identical to `.tmp/advisor-final-frontend` `604d9f9`.
+- QA/docs union: backend probes + frontend behavioral/build QA preserved;
+  conflicting precursor scope contracts kept under explicit
+  `-backend-scope` / `-frontend-scope` names with scope notes; no assertions
+  deleted to force green; no branch-ownership checks used as functional gates.
+- `qa/advisor-integrated-qa.mjs` + `docs/advisor-integrated-qa-contract.md`
+  included exactly as-authored from `.tmp/advisor-integration-qa` `be958dc`
+  (725 lines, UNEXECUTED in this join; requires primary-owned compiled API+SPA
+  at 15300 and fakeMeta at 15302, all API real, no stubs, no new own-account
+  rows; primary already reviewing possible fixture/selector assumptions; no
+  production changed to satisfy stale QA).
+- MAIN Send/Profile barriers preserved: `qa/meeting-send-pipeline-qa.mjs`,
+  `qa/meeting-send-stack-smoke.mjs`, and
+  `qa/meeting-send-state-guard-regression.mjs` kept at MAIN `f452171`
+  (= frontend `604d9f9`) bytes; backend stale reverts not taken.
+  `web/src/App.tsx` kept at frontend `604d9f9` bytes (includes MAIN Send/Profile
+  fixes through `8ecd414`); backend stale `App.tsx` not taken.
+- Backend `NEW Activity hook actual DTO must checked independent review`;
+  no source invented elsewhere.
+
+Remaining gates (primary owns): full compiled publish + tsc/vite/behavioral
+proof in this tree, actual whole-diff review, `advisor-integrated-qa` execution
+on primary-owned ports, roster/human reconciliation decisions, final audit.
+Phases 4-10 and the complete final audit remain open. No deployment performed
+by this join.

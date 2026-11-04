@@ -1,0 +1,22 @@
+.roster-chat .roster-chat-log {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.roster-chat textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--panel);
+  color: var(--ink);
+}
+.roster-chat textarea:focus-visible,
+.roster-chat button:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 2px;
+}

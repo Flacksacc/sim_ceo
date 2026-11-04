@@ -393,4 +393,59 @@ public sealed class BoardHub : Hub
       catch { }
     }
   }
+  // Private delivery: same meeting-group + per-recipient auth as PublishMeeting,
+  // additionally restricted to one user key. Used for requester-scoped activity
+  // (secretary) that must never leak to other users or meeting-only guests.
+  public static async System.Threading.Tasks.Task PublishPrivateMeeting(
+    Microsoft.AspNetCore.SignalR.IHubContext<BoardHub> hub,
+    SimCEO.Api.Data.InMemoryStore s, Guid meetingId, string userKey, string method, object payload)
+  {
+    if (string.IsNullOrWhiteSpace(userKey)) return;
+    if (!s.Meetings.TryGetValue(meetingId, out var mtg) || mtg is null) return;
+    var grp = $"meeting:{Canonical(meetingId)}";
+    System.Collections.Generic.List<(string id, string user, string token)> targets;
+    bool secure;
+    try { secure = SimCEO.Api.PeopleOps.IsSecure(s); }
+    catch { secure = false; }
+    await HubGate.WaitAsync();
+    try
+    {
+      targets = new System.Collections.Generic.List<(string, string, string)>();
+      foreach (var kv in Conns.ToList())
+      {
+        var c = kv.Value;
+        bool inGroup = false;
+        if (JoinedGroups.TryGetValue(kv.Key, out var gs))
+        { lock (gs) { inGroup = gs.Contains(grp); } }
+        if (!inGroup) continue;
+        if (!string.Equals(c.UserKey ?? "", userKey, System.StringComparison.OrdinalIgnoreCase)) continue;
+        targets.Add((kv.Key, c.UserKey ?? "", c.SessionToken ?? ""));
+      }
+    }
+    finally { try { HubGate.Release(); } catch { } }
+    foreach (var (id, user, token) in targets)
+    {
+      try
+      {
+        var ok = false;
+        if (!string.IsNullOrEmpty(token))
+        {
+          if (RevokedTokens.ContainsKey(token)) continue;
+          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) continue;
+          var liveUser = sess.Email ?? "";
+          if (!string.Equals(liveUser, userKey, System.StringComparison.OrdinalIgnoreCase)) continue;
+          if (!CanForUser(s, liveUser, mtg.BoardId, meetingId, "read")) continue;
+          ok = true;
+        }
+        else if (!secure)
+        {
+          if (!CanForUser(s, user, mtg.BoardId, meetingId, "read")) continue;
+          ok = true;
+        }
+        if (!ok) continue;
+        await hub.Clients.Client(id).SendAsync(method, payload);
+      }
+      catch { }
+    }
+  }
 }

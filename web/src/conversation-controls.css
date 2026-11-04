@@ -1,0 +1,22 @@
+/* Conversation-layout pass: unified room, no left control block.
+   Tokens reuse web/src/styles.css vars (--panel, --line, --accent, ...). */
+.conv-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:8px}
+.conv-title{min-width:min(320px,100%);flex:1}
+.conv-brief{margin:4px 0 0}
+.conv-status{margin:8px 0 0}
+.conv-actions{display:flex;flex-direction:column;gap:8px;align-items:flex-end;min-width:min(360px,100%)}
+.conv-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.conv-request{border-top:1px solid var(--line);padding-top:8px}
+.conv-hint{font-size:.8rem}
+.conv-search{display:flex;gap:8px;align-items:center;margin:4px 0 8px}
+.conv-search input{flex:1;display:block;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);min-height:40px}
+.conv-settings::backdrop{background:rgba(10,15,25,.55)}
+.conv-settings{max-width:560px;width:calc(100% - 32px);border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel);color:var(--ink)}
+.conv-settings input,.conv-settings select,.conv-settings textarea{width:100%}
+.conv-picks{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:12px 0}
+.conv-picks legend{font-size:.85rem;font-weight:650;padding:0 6px}
+@media(max-width:760px){.conv-actions{align-items:stretch}.conv-group{justify-content:flex-start}}
+
+
+.conv-decisions{border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
+.conv-decisions h4{margin:0 0 4px}

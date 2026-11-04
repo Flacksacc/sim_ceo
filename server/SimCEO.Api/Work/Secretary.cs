@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.SignalR;
+using SimCEO.Api.Hubs;
 using System.Text;
 using System.Text.Json;
 using SimCEO.Api.Data;
@@ -907,10 +909,47 @@ public static class SecretaryEndpoints
     try { SecretaryTransitions.MarkTerminal(s, reqId, attempt, true, "needs-clarification", err); return true; }
     catch { try { UncertainTerminal[reqId] = attempt; } catch { } return false; }
   }
+  // Captures ONE live authenticated principal for private-activity
+  // attribution: exactly one session lookup, then scope is checked for THAT
+  // key. In secure mode a dead session denies WITHOUT any X-User fallback
+  // (wall-clock expiry between two lookups cannot reattribute); insecure
+  // mode keeps the X-User/owner identity. Never throws: failures map to
+  // deny/503 results like the surrounding checks.
+  public static bool TryCaptureContributor(InMemoryStore s, HttpRequest req, Guid boardId, Guid? meetingId, out string requesterKey, out IResult? deny)
+  {
+    requesterKey = ""; deny = null;
+    bool secure;
+    try { secure = PeopleOps.IsSecure(s); }
+    catch (InvalidOperationException) { deny = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+    if (secure)
+    {
+      string who;
+      try
+      {
+        if (!AuthOps.TrySession(s, req, out who) || string.IsNullOrWhiteSpace(who)) { deny = PeopleOps.Denied(); return false; }
+      }
+      catch (InvalidOperationException) { deny = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+      string have;
+      try { have = PeopleOps.AccessFor(s, boardId, meetingId, who); }
+      catch (InvalidOperationException) { deny = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+      if (have is not ("contribute" or "manage")) { deny = PeopleOps.Denied(); return false; }
+      requesterKey = who;
+      return true;
+    }
+    string openWho = "";
+    try { openWho = PeopleOps.UserOf(s, req); } catch { }
+    bool openOk = false;
+    try { openOk = PeopleOps.Can(s, req, boardId, meetingId, "contribute"); }
+    catch (InvalidOperationException) { deny = Results.Json(new { error = "Security state unavailable." }, statusCode: 503); return false; }
+    if (!openOk) { deny = PeopleOps.Denied(); return false; }
+    requesterKey = openWho;
+    return true;
+  }
+
   public static void MapSecretary(this WebApplication app)
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
-    app.MapPost("/api/meetings/{id:guid}/secretary", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
+    app.MapPost("/api/meetings/{id:guid}/secretary", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m0)) return Results.NotFound("meeting");
       if (!PeopleOps.Can(s, req, m0.BoardId, id, "read")) return PeopleOps.Denied();
@@ -930,6 +969,7 @@ public static class SecretaryEndpoints
       if (string.IsNullOrWhiteSpace(normalized)) return Results.BadRequest("input is required.");
       var rawCaller = new List<EvidenceRef>();
       if (body.ValueKind == JsonValueKind.Object) rawCaller = EvidenceRef.ParseList(body, "evidence");
+      string __secRequester = ""; Guid __secEpoch = Guid.Empty;
       SecretaryRequest? reserved = null;
       string reservedPrompt = "";
       List<EvidenceRef> reservedDelivered = new();
@@ -1021,8 +1061,9 @@ public static class SecretaryEndpoints
               staleSupersede = true;
             }
           }
-          bool canContrib = PeopleOps.Can(s, req, cur0.BoardId, id, "contribute");
-          if (!canContrib) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+          if (!TryCaptureContributor(s, req, cur0.BoardId, id, out __secRequester, out var __secDeny) || string.IsNullOrEmpty(__secRequester)) return __secDeny ?? PeopleOps.Denied();
+
+          __secEpoch = s.RestoreEpochId;
           var setupFixes = new List<string>();
           { var __sb = s.Boards.TryGetValue(cur0.BoardId, out var __sbb) ? __sbb : null; var __sl = __sb is null ? LeadSetup.ResolveLeadFor(s, cur0.BoardId) : LeadSetup.ResolveLeadForBoard(s, __sb); if (__sl is null) setupFixes.Add("Save the board-lead profile."); }
           if (!s.Advisors.Values.Any(a => a.BoardId == cur0.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");
@@ -1171,13 +1212,16 @@ return null;
       var myReq = reserved; var myAttempt = myReq.AttemptId;
       // Global restore identity pin: a restore between reservation and
       // publication must discard the stale reply even if snapshots coincide.
-      var restoreBeforeS = s.RestoreEpochId;
+      var restoreBeforeS = __secEpoch != Guid.Empty ? __secEpoch : s.RestoreEpochId;
       var delivered = reservedDelivered;
       string prompt = reservedPrompt;
+      try { MeetingActivity.SecretaryStarted(s, id, myReq.BoardId, myReq.Id, myAttempt, __secRequester, myReq.ClientNonce, myReq.Generation, __secEpoch, "inflight", "initial"); _ = MeetingActivity.PublishSecretaryAsync(hub, s, id, myReq.Id); } catch { }
+      try
+      {
       LiveAttempts[myAttempt] = 1;
       string modelText;
       try { modelText = await gw.CompleteAsync(ModelPolicy.SparkFor(s, myReq.BoardId), "secretary", prompt, SecretaryDirect.InputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), boardId: myReq.BoardId, meetingId: id, truncatePrompt: false); }
-      catch (Exception ex) when (ex is ProviderException or CapExceededException)
+      catch (Exception ex) when (ex is ProviderException or CapExceededException or TaskCanceledException)
       {
         if (!FailBound(s, myReq.Id, myAttempt, ex.Message))
           return Results.Json(new { error = "Provider failed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying with the same nonce." }, statusCode: 503);
@@ -1270,8 +1314,10 @@ return null;
         }
         return pubResult;
       } }
+      }
+      finally { try { MeetingActivity.SyncSecretaryExit(s, hub, id, myReq.Id, myAttempt); } catch { } }
     });
-    app.MapPost("/api/meetings/{id:guid}/secretary/answer", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
+    app.MapPost("/api/meetings/{id:guid}/secretary/answer", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m0)) return Results.NotFound("meeting");
       if (!PeopleOps.Can(s, req, m0.BoardId, id, "read")) return PeopleOps.Denied();
@@ -1281,6 +1327,7 @@ return null;
       if (reqId == Guid.Empty) return Results.BadRequest("requestId is required.");
       if (string.IsNullOrWhiteSpace(answer)) return Results.BadRequest("answer is required.");
       var cleanAnswer = answer.Trim();
+      string __secRequester2 = ""; Guid __secEpoch2 = Guid.Empty;
       SecretaryRequest? reservedAns = null; Guid myAnsAttempt = Guid.Empty;
       string reservedAnsPrompt = "";
       List<EvidenceRef> reservedAnsDelivered = new();
@@ -1364,7 +1411,8 @@ return null;
             return Results.Json(new { error = "Request is not awaiting clarification." }, statusCode: 409);
           if (!ansSupersede && reqRow.Status != "needs-clarification" && !IsRetryableStatus(reqRow.Status))
             return Results.Json(new { error = "Request is not awaiting clarification." }, statusCode: 409);
-          if (!PeopleOps.Can(s, req, cur0.BoardId, id, "contribute")) return Results.Json(new { error = "Access revoked or not granted for this scope." }, statusCode: 403);
+          if (!TryCaptureContributor(s, req, cur0.BoardId, id, out __secRequester2, out var __secDeny2) || string.IsNullOrEmpty(__secRequester2)) return __secDeny2 ?? PeopleOps.Denied();
+          __secEpoch2 = s.RestoreEpochId;
           if (PeopleOps.Guard(gw, req) is { } capped) return capped;
           if (cur0.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) return Results.Json(new { error = "Meeting is not active." }, statusCode: 409);
           var attempt = Guid.NewGuid();
@@ -1465,13 +1513,16 @@ return null;
       }
       if (reservedAns is null || string.IsNullOrEmpty(reservedAnsPrompt)) return Results.Json(new { error = "Continuation reservation failed; retry." }, statusCode: 409);
       var myReq2 = reservedAns;
-      var restoreBeforeA = s.RestoreEpochId;
+      var restoreBeforeA = __secEpoch2 != Guid.Empty ? __secEpoch2 : s.RestoreEpochId;
       var autoEvidence = reservedAnsDelivered;
       string prompt2 = reservedAnsPrompt;
+      try { MeetingActivity.SecretaryStarted(s, id, myReq2.BoardId, myReq2.Id, myAnsAttempt, __secRequester2, myReq2.ClientNonce, myReq2.Generation, __secEpoch2, "answering", "continuation"); _ = MeetingActivity.PublishSecretaryAsync(hub, s, id, myReq2.Id); } catch { }
+      try
+      {
       LiveAttempts[myAnsAttempt] = 1;
       string modelText2;
       try { modelText2 = await gw.CompleteAsync(ModelPolicy.SparkFor(s, myReq2.BoardId), "secretary", prompt2, SecretaryDirect.InputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), boardId: myReq2.BoardId, meetingId: id, truncatePrompt: false); }
-      catch (Exception ex) when (ex is ProviderException or CapExceededException)
+      catch (Exception ex) when (ex is ProviderException or CapExceededException or TaskCanceledException)
       {
         if (!FailBoundAnswer(s, myReq2.Id, myAnsAttempt, ex.Message))
           return Results.Json(new { error = "Provider failed and recovery state could not be persisted; do not retry blindly. Re-read the request before retrying." }, statusCode: 503);
@@ -1563,6 +1614,8 @@ return null;
         }
         return pubResult2;
       } }
+      }
+      finally { try { MeetingActivity.SyncSecretaryExit(s, hub, id, myReq2.Id, myAnsAttempt); } catch { } }
     });
     app.MapGet("/api/meetings/{id:guid}/secretary/requests", (InMemoryStore s, HttpRequest req, Guid id) =>
     {

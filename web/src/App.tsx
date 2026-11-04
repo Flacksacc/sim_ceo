@@ -1,7 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
-import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr"; import SourcesGovernance from "./sources-governance";
+import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
+import SourcesGovernance from "./sources-governance";
+import { CreateAdvisor, CharacterEditor } from "./advisor-creation";
+import { useMeetingActivity } from "./meeting-activity";
+import {
+  ConversationHeader,
+  ConversationSearchField,
+  MeetingSettingsDialog,
+  useConversationSettings,
+} from "./conversation-controls";
+import "./conversation-controls.css";
+import { RosterChatPanel } from "./roster-chat";
+import "./roster-chat.css";
+import { BoardAdvisorLinkPanel, RosterLinkBadge } from "./roster-integrity";
+import { MeetingParticipants } from "./meeting-participants";
+import "./meeting-participants.css";
+import { buildPresence, provenanceParts, resolveProvenanceImage } from "./meeting-presence";
+import "./roster-integrity.css";
+import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
+import { RecordComparison, RecordItemEditor, RecordItemList, RecordVersionRow } from "./human-record-items";
+import { friendlyError, friendlyRecordStatus, humanizeOmission, parseRecordItems } from "./human-format";
+import "./human-feedback.css";
 import { convertRecordedBlobToWav } from "./voiceCodec";
 import WikiResources from "./wiki-resources";
 type Board = { id: string; name: string; mission: string; archived?: boolean };
@@ -163,7 +184,8 @@ type AdvisorFull = Advisor & {
   rosterVersion: number;
   imageProvenance: string;
 };
-type MeetingFull = Meeting & { brief: string; boardId: string };
+type MeetingFull = Meeting & { brief: string; boardId: string; participantIdsJson?: string };
+const DEFAULT_COMM_PREFS = "Be clear and direct. Explain unfamiliar terms, use practical examples, and finish with actionable next steps.";
 const MEETING_STATES = [
   "Awaiting brief",
   "Active",
@@ -177,7 +199,43 @@ const MEETING_STATES = [
 function meetingStateLabel(state: number): string {
   return MEETING_STATES[state] ?? String(state);
 }
-function meetingSendOpen(state: unknown): boolean { return state === 0 || state === 1; } function meetingIsOpen(state: number): boolean {
+function ReviewAlert({ message }: { message: string }) {
+  const plain = friendlyError(message);
+  return plain ? (
+    <FriendlyError friendly={plain} technical={message} />
+  ) : (
+    <p role="alert">{message}</p>
+  );
+}
+function humanWhen(v: string): string {
+  try {
+    const d = new Date(v);
+    if (!isNaN(d.getTime())) return d.toLocaleString();
+  } catch { /* noop */ }
+  return "";
+}
+function humanAuditAction(action: string): string {
+  const a = (action ?? "").toLowerCase();
+  if (a.indexOf("backup") >= 0) return "Backup";
+  if (a.indexOf("restore") >= 0) return "Restore";
+  if (a.indexOf("roster") >= 0 && a.indexOf("research") >= 0) return "Advisor research";
+  if (a.indexOf("roster") >= 0) return "Roster change";
+  if (a.indexOf("approve") >= 0) return "Approval";
+  if (a.indexOf("record") >= 0) return "Record change";
+  if (a.indexOf("meeting") >= 0) return "Meeting change";
+  if (a.indexOf("spending") >= 0 || a.indexOf("cap") >= 0) return "Spending control";
+  if (a.indexOf("invite") >= 0 || a.indexOf("grant") >= 0) return "Access change";
+  if (a.indexOf("source") >= 0 || a.indexOf("wiki") >= 0) return "Source change";
+  const words = (action ?? "").replace(/[._-]+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Activity";
+}
+function toastErr(e: unknown): void {
+  try {
+    alert(friendlyError(String(e)) || "Something went wrong. Please try again.");
+  } catch { /* noop */ }
+}
+function meetingSendOpen(state: unknown): boolean { return state === 0 || state === 1; }
+function meetingIsOpen(state: number): boolean {
   return (
     state === 0 ||
     state === 1 ||
@@ -510,10 +568,14 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
   const url = URL.createObjectURL(b);
   // Track for late revocation even if unmounted.
   try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = [...(((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs) ?? []), url]; setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 60000); } catch {}
-  return { url, epoch: myEpoch, token: myToken, user: myToken ? (myUser || "owner") : canonicalUser() };
+  return { url, epoch: myEpoch, token: myToken, user: myUser };
 };
+// Identity triple uses the raw stored values (token + simceo-user), never the
+// canonical display label: comparing canonicalUser() ("owner" fallback) against
+// currentUser() ("") made every logged-out blob look stale, so portraits never
+// loaded in demo mode. Raw-to-raw keeps the guard exact in all modes.
 const blobStale = (b: { epoch: number; token: string; user: string }) =>
-  epochNow() !== b.epoch || currentToken() !== b.token || canonicalUser() !== b.user;
+  epochNow() !== b.epoch || currentToken() !== b.token || currentUser() !== b.user;
 const authedDownload = async (u: string, filename: string, isLive?: () => boolean): Promise<void> => {
   const b = await authedBlobUrl(u);
   // Re-verify the originating identity AT click time: an account switch
@@ -877,7 +939,7 @@ function DossierView({ raw }: { raw: string }) {
         {claims.map((c, ci) => {
           const cobj = (c && typeof c === "object" && !Array.isArray(c) ? c as Record<string, unknown> : {});
           const ctextPicked = dossierPick(cobj, "text", "Text");
-          const ctext = ctextPicked ? ctextPicked : JSON.stringify(c);
+          const ctext = ctextPicked ? ctextPicked : "(details unavailable)";
           const angle = dossierPick(cobj, "angle", "Angle");
           const srcs: unknown[] = Array.isArray(cobj.sources) ? (cobj.sources as unknown[]) : (Array.isArray(cobj.Sources) ? (cobj.Sources as unknown[]) : []);
           const refs: unknown[] = Array.isArray(cobj.refs) ? (cobj.refs as unknown[]) : (Array.isArray(cobj.Refs) ? (cobj.Refs as unknown[]) : []);
@@ -999,7 +1061,7 @@ function AuthPanel() {
         <div>
           <h4>My meetings</h4>
           {(mine.data ?? []).map((m) => (
-            <div key={m.id} className="row"><span>{m.meetingId}</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button></div>
+            <div key={m.id} className="row"><span>An assigned meeting</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button></div>
           ))}
         </div>
       )}
@@ -1017,6 +1079,83 @@ function AuthedImg({ id, alt, className }: { id: string; alt: string; className?
   }, [id]);
   if (!url) return <span className="muted">loading portrait�</span>;
   return <img src={url} alt={alt} className={className} />;
+}
+// Presence portraits: resolve ACCEPTED selected-image metadata first, then
+// load bytes through the existing authorized image path (authed blob URLs),
+// identity-scoped with unmount cleanup. Reject/revoke (even with an unchanged
+// selection id) clears the blob and falls back to initials, because the
+// metadata review is part of the resolution key. Legacy 8-char selections
+// resolve only on a single same-entry prefix match, never by guessing.
+// Images from any other roster entry are never used (no wrong identity).
+// Focus/visibility and advisor-query refresh revalidate accepted metadata even
+// load bytes through the existing authorized image path (authed blob URLs),
+// identity-scoped with unmount cleanup. Reject/revoke (even with an unchanged
+// selection id) clears the blob and falls back to initials: the caller bumps
+// rev on every review/selection change and rev is part of the resolution key,
+// and the auth epoch is in the key so a demo Apply-identity (raw token/user
+// unchanged) still re-resolves. Legacy 8-char selections resolve only on a
+// single same-entry prefix match, never by guessing. Images from any other
+// roster entry are never used (no wrong identity).
+function usePresencePortraits(entries: { key: string; rosterEntryId: string; provenance: string | null | undefined }[], rev: number, queryTick: number = 0): Map<string, string> {
+  const [urls, setUrls] = useState<Map<string, string>>(() => new Map());
+  const ownedRef = useRef<string[]>([]);
+  const [focusTick, setFocusTick] = useState(0);
+  useEffect(() => {
+    let dead = false;
+    const bump = () => { if (!dead) setFocusTick((v) => v + 1); };
+    const onVis = () => { try { if (!document.hidden) bump(); } catch {} };
+    try { window.addEventListener("focus", bump); } catch {}
+    try { document.addEventListener("visibilitychange", onVis); } catch {}
+    return () => {
+      dead = true;
+      try { window.removeEventListener("focus", bump); } catch {}
+      try { document.removeEventListener("visibilitychange", onVis); } catch {}
+    };
+  }, []);
+  const key = currentToken() + "\n" + currentUser() + "\n" + String(epochNow()) + "\n" + String(rev) + "\n" + String(queryTick) + "\n" + String(focusTick) + "\n" + entries.map((e) => e.key + "=" + e.rosterEntryId + "=" + (e.provenance ?? "")).join("|");
+  useEffect(() => {
+    let live = true;
+    const myEpoch = epochNow();
+    const myToken = currentToken();
+    const myUser = currentUser();
+    // Immediate clear: revoke owned blobs and fall back to initials while
+    // re-resolving, so a revoke/auth change never leaves a stale portrait up.
+    for (const u of ownedRef.current) { try { URL.revokeObjectURL(u); } catch { /* noop */ } }
+    ownedRef.current = [];
+    setUrls(new Map());
+    const retired = () => !live || epochNow() !== myEpoch || currentToken() !== myToken || currentUser() !== myUser;
+    const made: string[] = [];
+    (async () => {
+      const next = new Map<string, string>();
+      for (const e of entries) {
+        if (!live) return;
+        try {
+          const parts = provenanceParts(e.provenance);
+          if (!parts.guid && !parts.legacy8) continue;
+          if (!e.rosterEntryId) continue;
+          const list = await get<{ id: string; review?: string }[]>(`/api/roster/${e.rosterEntryId}/images`);
+          if (!live) return;
+          if (retired()) return;
+          const id = resolveProvenanceImage(parts, list ?? []);
+          if (!id) continue;
+          const b = await authedBlobUrl("/api/images/" + id);
+          if (!live || blobStale(b)) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } continue; }
+          if (retired()) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } return; }
+          made.push(b.url);
+          next.set(e.key, b.url);
+        } catch { /* unaccepted/absent portrait: fallback avatar stays */ }
+      }
+      if (retired()) { for (const u of made) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } return; }
+      ownedRef.current = made.slice();
+      setUrls(next);
+    })();
+    // Intentionally keyed on the derived string: identity, epoch, review
+    // generation, entry, and provenance changes all re-resolve from accepted
+    // metadata.
+    return () => { live = false; };
+  }, [key]);
+  useEffect(() => () => { for (const u of ownedRef.current) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } ownedRef.current = []; }, []);
+  return urls;
 }
 function InviteClaim() {
   const qcInvite = useQueryClient();
@@ -1106,10 +1245,6 @@ export default function App() {
   const resetBoardOwnedState = () => {
     setMeetPicks([]);
     setSelAdv("");
-    setChatAdv("");
-    setChatHist([]);
-    setChatMsg("");
-    setChatErr("");
     setExcerpts([]);
   };
   // Meeting-owned UI state (composer reply target, note/briefing/direction
@@ -1206,9 +1341,23 @@ export default function App() {
     }
   }, [draft]);
   const [policy, setPolicy] = useState("balanced");
+  const { open: settingsOpen, openSettings, closeSettings } = useConversationSettings(false);
+  // Meeting settings are bound to the meeting they were opened for: a
+  // meeting change (including browser-back navigation while the modal is
+  // open) closes the dialog and resets the participant draft, so a draft
+  // from A can never be saved onto B.
+  const settingsMeetingRef = useRef("");
+  const closeMeetingSettings = () => {
+    setMeetPartKey("");
+    closeSettings();
+  };
+  useEffect(() => {
+    if (!settingsOpen) { settingsMeetingRef.current = ""; return; }
+    if (settingsMeetingRef.current === "") { settingsMeetingRef.current = meetingId; return; }
+    if (settingsMeetingRef.current !== meetingId) closeMeetingSettings();
+  }, [settingsOpen, meetingId]);
   const [presetKey, setPresetKey] = useState("strategy");
   type WizardSeat = { role: string; name: string };
-  const DEFAULT_COMM_PREFS = "Be clear and direct. Explain unfamiliar terms, use practical examples, and finish with actionable next steps.";
   const [wizard, setWizard] = useState({
     name: "",
     mission: "",
@@ -1242,6 +1391,12 @@ export default function App() {
   // Initialized from the module transport so a remount keeps the same applied identity.
   const [appliedActAs, setAppliedActAs] = useState(() => { try { return typeof actAs === "string" ? actAs : ""; } catch { return ""; } });
   const [mq, setMq] = useState("");
+  // Meeting selector starts collapsed on narrow viewports so the toolbar,
+  // first messages, and composer are visible on load; desktop starts open.
+  // One collection only: filters + agenda nav stay inside, expandable.
+  const [meetNavOpen, setMeetNavOpen] = useState<boolean>(() => {
+    try { return !window.matchMedia("(max-width: 820px)").matches; } catch { return true; }
+  });
   const [mstate, setMstate] = useState("");
   const [uday, setUday] = useState("");
   const [ufrom, setUfrom] = useState("");
@@ -1535,6 +1690,24 @@ export default function App() {
     };
     conn.on("message", onMsg);
     conn.on("run-complete", onRun);
+    const onActivity = (payload: any) => {
+      try {
+        const mid = (payload as any)?.meetingId ?? "";
+        const bid = (payload as any)?.boardId ?? "";
+        if (mid && mid !== meetingId) return;
+        if (bid && bid !== boardId) return;
+        try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
+      } catch {}
+    };
+    const onSecretaryActivity = (payload: any) => {
+      try {
+        const mid = (payload as any)?.meetingId ?? "";
+        if (mid && mid !== meetingId) return;
+        try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
+      } catch {}
+    };
+    conn.on("meeting-activity", onActivity);
+    conn.on("secretary-activity", onSecretaryActivity);
     conn.on("access-revoked", onRevoked);
     conn
       .start()
@@ -2213,7 +2386,7 @@ export default function App() {
       refresh("setup", "boards");
       notify("Configuration activated.");
     },
-    onError: (e) => alert(`Activation blocked: ${String(e)}`),
+    onError: (e) => toastErr(`Activation blocked. ${String(e)}`),
   });
   const saveBoardOpts = useMutation({
     mutationFn: (b: unknown) => patch<Board>(`/api/boards/${boardId}`, b),
@@ -2342,7 +2515,7 @@ export default function App() {
       refresh("wizreview");
     },
     onError: (e) => {
-      alert(String(e));
+      toastErr(e);
       // Never auto-hydrate fields/step after a rejected save: that would
       // silently overwrite the unsaved inputs the user just typed.
       wizLastSentRef.current = { step: -1, presetKey: "\0", fields: "\0" };
@@ -2389,7 +2562,7 @@ export default function App() {
           }
         ).fields,
       }),
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const [ianswer, setIanswer] = useState("");
   const [iturns, setIturns] = useState<{ question: string; answer: string; analysis: string }[]>([]);
@@ -2506,7 +2679,7 @@ export default function App() {
       refresh("wizreview");
     },
     onError: (e) => {
-      alert(String(e));
+      toastErr(e);
       // Same 409 protection as wizSave: adopt the fresh version only, never
       // overwrite unsaved inputs with a conflicting hydration.
       wizLastSentRef.current = { step: -1, presetKey: "\0", fields: "\0" };
@@ -2576,7 +2749,7 @@ export default function App() {
           background: "",
           familiarTopics: "",
           simplerTopics: "",
-          commPrefs: DEFAULT_COMM_PREFS,
+          commPrefs: "",
         },
       });
       setSeatRole("");
@@ -2590,7 +2763,7 @@ export default function App() {
       setTab("advisors");
       notify("Board created. Accept a portrait for each advisor, then approve.");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const [rq, setRq] = useState("");
   const [rtype, setRtype] = useState("");
@@ -2613,11 +2786,12 @@ export default function App() {
   });
   const [createOpen, setCreateOpen] = useState(false);
   const closeCreate = () => setCreateOpen(false);
+  const [portraitRev, setPortraitRev] = useState(0);
   const reviewImg = useMutation({
     mutationFn: (args: { id: string; decision: string }) =>
       post<unknown>(`/api/images/${args.id}/review`, { decision: args.decision }),
-    onSuccess: () => refresh("roster-images", "roster", "roster-names", "advisors"),
-    onError: (e) => alert(String(e)),
+    onSuccess: () => { try { setPortraitRev((v) => v + 1); } catch {} refresh("roster-images", "roster", "roster-names", "advisors"); },
+    onError: (e) => toastErr(e),
   });
   const selectRoster = (id: string) => {
     setSelRoster(id);
@@ -2676,7 +2850,7 @@ const tabCount = (k: Tab): number | null => {
     onSuccess: () => {
       refresh("roster", "roster-count", "roster-names", "advisors");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const archiveRoster = useMutation({
     mutationFn: (row: RosterRow) =>
@@ -2685,93 +2859,39 @@ const tabCount = (k: Tab): number | null => {
       }),
     onSuccess: () => refresh("roster", "roster-count", "roster-names"),
   });
-  const [cname, setCname] = useState("");
   const createNameRef = useRef<HTMLInputElement | null>(null);
-  const focusCreateForm = () => {
-    setCnewId("");
-    setCreateOpen(true);
-    window.setTimeout(() => createNameRef.current?.focus(), 100);
-  };
-  const [cdesc, setCdesc] = useState("");
-  const [cnewId, setCnewId] = useState("");
-  const [cportraitUrl, setCportraitUrl] = useState("");
-  const [cportraitMsg, setCportraitMsg] = useState("");
-  const createChar = useMutation({
-    mutationFn: () =>
-      post<{ id: string }>("/api/roster/quick", {
-        accountId,
-        name: cname,
-        description: cdesc,
-      }),
-    onSuccess: (r) => {
-      setCnewId(r.id);
-      setCportraitMsg("");
-      refresh("roster", "roster-count", "roster-names");
-    },
-    onError: (e) => alert(String(e)),
-  });
-  const uploadNewPortrait = async (f: File | undefined) => {
-    if (!f || !cnewId) return;
+  const [portraitUrl, setPortraitUrl] = useState("");
+  const [portraitMsg, setPortraitMsg] = useState("");
+  const uploadPortrait = async (f: File | undefined) => {
+    if (!f || !selRow) return;
     const fd = new FormData();
     fd.append("file", f);
     try {
-      await upload<unknown>(`/api/roster/${cnewId}/image/upload`, fd);
-      setCportraitMsg("Portrait added.");
+      await upload<unknown>(`/api/roster/${selRow.entry.id}/image/upload`, fd);
+      setPortraitMsg("Portrait added.");
       refresh("roster", "roster-images");
     } catch (e) {
-      setCportraitMsg(String(e));
+      setPortraitMsg(String(e));
     }
   };
-  const urlNewPortrait = useMutation({
-    mutationFn: () =>
-      post<unknown>(`/api/roster/${cnewId}/image/url`, { url: cportraitUrl, source: "owner-provided" }),
+  const urlPortrait = useMutation({
+    mutationFn: (url: string) =>
+      post<unknown>(`/api/roster/${selRow?.entry.id}/image/url`, { url, source: "owner-provided" }),
     onSuccess: () => {
-      setCportraitUrl("");
-      setCportraitMsg("Portrait added.");
+      setPortraitUrl("");
+      setPortraitMsg("Portrait added.");
       refresh("roster", "roster-images");
     },
-    onError: (e) => setCportraitMsg(String(e)),
+    onError: (e) => setPortraitMsg(String(e)),
   });
-  const genNewPortrait = useMutation({
-    mutationFn: () => post<unknown>(`/api/roster/${cnewId}/image/generate`, { count: 1 }),
+  const genPortrait = useMutation({
+    mutationFn: () =>
+      post<unknown>(`/api/roster/${selRow?.entry.id}/image/generate`, { count: 1 }),
     onSuccess: () => {
-      setCportraitMsg("Portrait generated.");
+      setPortraitMsg("Portrait generated.");
       refresh("roster", "roster-images");
     },
-    onError: (e) => setCportraitMsg(String(e)),
-  });
-  const finishNewEntry = () => {
-    const doneId = cnewId;
-    setCnewId("");
-    setCname("");
-    setCdesc("");
-    setCportraitMsg("");
-    setCportraitUrl("");
-    refresh("roster", "roster-count", "roster-names");
-    setCreateOpen(false);
-    if (doneId) { setSelRoster(doneId); setAudId(doneId); }
-  };
-  const [ainame, setAiname] = useState("");
-  const [airole, setAirole] = useState("");
-  const [aifocus, setAifocus] = useState("");
-  const [aiMsg, setAiMsg] = useState("");
-  const aiDraft = useMutation({
-    mutationFn: () =>
-      post<{ entry: { id: string }; researched: boolean; citations: number; note: string }>("/api/roster/ai-draft", {
-        accountId,
-        name: ainame,
-        role: airole,
-        focus: aifocus,
-      }),
-    onSuccess: (r) => {
-      setCnewId(r.entry.id);
-      setAiMsg(`Drafted. ${r.note}`);
-      setAiname("");
-      setAirole("");
-      setAifocus("");
-      refresh("roster", "roster-count", "roster-names");
-    },
-    onError: (e) => setAiMsg(String(e)),
+    onError: (e) => setPortraitMsg(String(e)),
   });
   const [audId, setAudId] = useState("");
   const [aq, setAq] = useState("");
@@ -2783,44 +2903,15 @@ const tabCount = (k: Tab): number | null => {
         question: aq,
       }),
     onSuccess: (r) => setAudResult(r.answer),
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const syncRoster = useMutation({
     mutationFn: (a: AdvisorFull) =>
       post<unknown>(`/api/boards/${boardId}/advisors/${a.id}/sync-roster`, {}),
     onSuccess: () => refresh("advisors"),
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const [selAdv, setSelAdv] = useState("");
-  const [chatAdv, setChatAdv] = useState("");
-  const [chatMsg, setChatMsg] = useState("");
-  const [chatHist, setChatHist] = useState<{ role: string; content: string }[]>([]);
-  const [chatBusy, setChatBusy] = useState(false);
-  const [chatErr, setChatErr] = useState("");
-  const chatSelAdvisor = (advisors.data ?? []).find((a) => a.id === chatAdv);
-  const chatSelRoster = chatSelAdvisor ? (rosterNames.data ?? []).find((r) => r.entry.id === chatSelAdvisor.rosterEntryId) : undefined;
-  const chatBlocked = !!chatSelAdvisor && chatSelRoster !== undefined && !chatSelRoster.complete;
-  const sendChat = async () => {
-    if (!boardId || !chatAdv || !chatMsg.trim() || chatBusy) return;
-    setChatBusy(true);
-    setChatErr("");
-    const msg = chatMsg.trim();
-    setChatMsg("");
-    const hist = [...chatHist, { role: "lead", content: msg }];
-    setChatHist(hist);
-    try {
-      const r = await post<{ answer: string }>(
-        `/api/boards/${boardId}/advisors/${chatAdv}/chat`,
-        { message: msg, history: hist.slice(-10) },
-      );
-      setChatHist([...hist, { role: "advisor", content: r.answer }]);
-    } catch (e) {
-      setChatErr(String(e));
-      setChatHist(hist);
-    } finally {
-      setChatBusy(false);
-    }
-  };
   const [imgUrl, setImgUrl] = useState("");
   const [imgMsg, setImgMsg] = useState("");
   const selAdvisor = (advisors.data as AdvisorFull[] | undefined)?.find(
@@ -2878,7 +2969,7 @@ const tabCount = (k: Tab): number | null => {
       post<unknown>(`/api/images/${imgId}/select`, { boardAdvisorId: selAdv }),
     onSuccess: () => {
       refresh("advisors");
-      setImgMsg("Selected for this board copy.");
+      try { setPortraitRev((v) => v + 1); } catch {} setImgMsg("Selected for this board copy.");
     },
     onError: (e) => setImgMsg(String(e)),
   });
@@ -2892,12 +2983,13 @@ const tabCount = (k: Tab): number | null => {
     (allMeetings.data ?? []).find((m) => m.id === meetingId) ??
     (meetings.data ?? []).find((m) => m.id === meetingId);
   useEffect(() => {
+    if (settingsOpen) return;
     if (curMeeting && mLoaded !== curMeeting.id + curMeeting.brief) {
       setMtitle(curMeeting.title);
       setMbrief(curMeeting.brief ?? "");
       setMLoaded(curMeeting.id + curMeeting.brief);
     }
-  }, [curMeeting, mLoaded]);
+  }, [curMeeting, mLoaded, settingsOpen]);
   const briefText = curMeeting?.brief ?? "";
   useEffect(() => {
     if (tab !== "meet" || !meetingId || !boardId || !briefText.trim()) return;
@@ -2923,6 +3015,7 @@ const tabCount = (k: Tab): number | null => {
       patch<MeetingFull>(`/api/meetings/${meetingId}`, {
         title: mtitle,
         brief: mbrief,
+        participantIds: meetPartDraft,
       }),
     onMutate: () => ({ originBoardId: boardId, originMeetingId: meetingId }),
     onSuccess: (r, _v, ctx) => {
@@ -2973,7 +3066,20 @@ const tabCount = (k: Tab): number | null => {
       excerpt: string;
     }[]
   >([]);
-  const searchMsgs = () =>
+  const searchGenRef = useRef(0);
+  // Live selection snapshot. The request captures its own board/meeting/
+  // query, but resolution compares against THESE current refs (not the
+  // captured render copies, which always equal themselves). Navigation
+  // retires outstanding searches even when no new search is issued.
+  const searchLiveRef = useRef({ board: "", meeting: "", q: "" });
+  searchLiveRef.current = { board: boardId, meeting: meetingId, q: sq };
+  const searchMsgs = () => {
+    const origin = originIdentity();
+    const board = boardId;
+    const meeting = meetingId;
+    const q = sq;
+    const gen = searchGenRef.current + 1;
+    searchGenRef.current = gen;
     get<
       {
         sequence: number;
@@ -2982,8 +3088,26 @@ const tabCount = (k: Tab): number | null => {
         excerpt: string;
       }[]
     >(`/api/meetings/${meetingId}/messages/search?q=${encodeURIComponent(sq)}`)
-      .then(setHits)
-      .catch((e) => alert(String(e)));
+      .then((r) => {
+        if (originStale(origin)) return;
+        if (searchGenRef.current !== gen) return;
+        const live = searchLiveRef.current;
+        if (live.board !== board || live.meeting !== meeting) return;
+        if (live.q !== q) return;
+        setHits(r);
+      })
+      .catch((e) => {
+        if (originStale(origin)) return;
+        if (searchGenRef.current !== gen) return;
+        const live = searchLiveRef.current;
+        if (live.board !== board || live.meeting !== meeting) return;
+        toastErr(e);
+      });
+  };
+  // Any board/meeting navigation retires outstanding searches, even when
+  // no new search is issued: a held A response released after switching
+  // to B must never populate B.
+  useEffect(() => { searchGenRef.current++; }, [boardId, meetingId]);
   const notes = useQuery({
     queryKey: ["notes", meetingId],
     queryFn: () => get<Note[]>(`/api/meetings/${meetingId}/notes`),
@@ -3011,7 +3135,7 @@ const tabCount = (k: Tab): number | null => {
       }),
     onMutate: () => ({ oB: boardId, oM: meetingId, origin: originIdentity(), title: ntitle, body: nbody, visit: noteVisitRef.current, drev: noteDraftRev.current }),
     onSuccess: (_r: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (!o || !o.origin || originStale(o.origin)) return; const live = liveSelRef.current; if (live.boardId !== o.oB || live.meetingId !== o.oM) return; if (o.visit !== noteVisitRef.current || o.drev !== noteDraftRev.current) return; if (ntitle === o.title && nbody === o.body) { setNtitle(""); setNbody(""); } refresh("notes"); notify("Note saved."); },
-    onError: (e, _v, ctx) => { const o = ctx as any; if (!o || !o.origin || originStale(o.origin)) return; const live = liveSelRef.current; if (live.boardId !== o.oB || live.meetingId !== o.oM) return; if (o.visit !== noteVisitRef.current) return; alert(String(e)); },
+    onError: (e, _v, ctx) => { const o = ctx as any; if (!o || !o.origin || originStale(o.origin)) return; const live = liveSelRef.current; if (live.boardId !== o.oB || live.meetingId !== o.oM) return; if (o.visit !== noteVisitRef.current) return; toastErr(e); },
   });
   const [btopic, setBtopic] = useState("");
   const askBriefing = useMutation({
@@ -3044,7 +3168,7 @@ const tabCount = (k: Tab): number | null => {
       if (!o || !o.opId || secPendingRef.current?.id !== o.opId) return;
       if (o.visit !== briefVisitRef.current) return;
       if (btopic !== o.submitted) return;
-      alert(String(e));
+      toastErr(e);
     },
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
@@ -3077,7 +3201,7 @@ const tabCount = (k: Tab): number | null => {
       const o = ctx as { boardId: string; meetingId: string; recId: string; visit: number; epoch: number; token: string; user: string } | undefined;
       if (!o || !recOriginLive(o)) return;
       if ((o as any)?.optVisit !== optVisitRef.current) return;
-      alert(String(e));
+      toastErr(e);
     },
   });
   const fromDirection = useMutation({
@@ -3142,7 +3266,7 @@ const tabCount = (k: Tab): number | null => {
       await upload<unknown>(`/api/boards/${boardId}/sources/upload`, fd);
       refresh("sources");
     } catch (e) {
-      alert(String(e));
+      toastErr(e);
     }
   };
   const savePolicy = useMutation({
@@ -3166,7 +3290,7 @@ const tabCount = (k: Tab): number | null => {
         scopeDlg.current?.close();
         refresh("sources");
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   };
   const [cmpVer, setCmpVer] = useState("");
   function diffItems(
@@ -3224,6 +3348,22 @@ const tabCount = (k: Tab): number | null => {
   });
   const originStale = (o: { epoch: number; token: string; user: string }) =>
     epochNow() !== o.epoch || currentToken() !== o.token || canonicalUser() !== o.user;
+  const originRevision = () => String(epochNow()) + "|" + currentToken() + "|" + canonicalUser();
+  const resolveCanonicalEntry = async (id: string) => {
+    try {
+      const all = ([] as any[]).concat(((rosterList as any)?.data ?? []) as any[]).concat(((rosterNames as any)?.data ?? []) as any[]);
+      for (const r of all) {
+        const e = (r as any)?.entry ?? r;
+        if (e && (e as any).id === id) return e;
+      }
+    } catch {}
+    try {
+      const single = await get<any>("/api/roster/" + id);
+      if (single && (single as any).entry && (single as any).entry.id) return (single as any).entry;
+      if (single && (single as any).id) return single;
+    } catch {}
+    return null;
+  };
   useEffect(() => {
     const key = latestDraft
       ? `${latestDraft.id}:${latestDraft.decided}:${latestDraft.status}`
@@ -3705,7 +3845,7 @@ const tabCount = (k: Tab): number | null => {
       setIemail("");
       refresh("invites");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const [guser, setGuser] = useState("");
   const [gaccess, setGaccess] = useState("read");
@@ -3720,7 +3860,7 @@ const tabCount = (k: Tab): number | null => {
       setGuser("");
       refresh("grants");
     },
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
   const audit = useQuery({
     queryKey: ["audit"],
@@ -3747,7 +3887,7 @@ const tabCount = (k: Tab): number | null => {
   const retryJob = (j: Job) =>
     post<Job>(`/api/jobs/${j.id}/retry`, {})
       .then(() => refresh("jobs"))
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const spending = useQuery({
     queryKey: ["spending"],
     queryFn: () => get<Spending>("/api/spending"),
@@ -3773,7 +3913,7 @@ const tabCount = (k: Tab): number | null => {
         mode: capMode,
       }),
     onSuccess: () => refresh("spending"),
-    onError: (e) => alert(String(e)),
+    onError: (e) => toastErr(e),
   });
 const modelStatus = useQuery({
   queryKey: ["model-status"],
@@ -4178,7 +4318,7 @@ const testModel = useMutation({
         setDossier(JSON.stringify(r, null, 1));
         refresh("roster", "roster-names");
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const [recallQ, setRecallQ] = useState("");
   const [recallHits, setRecallHits] = useState<
     { kind: string; ref: string; text: string; score: number }[]
@@ -4188,7 +4328,7 @@ const testModel = useMutation({
       `/api/boards/${boardId}/recall?q=${encodeURIComponent(recallQ)}`,
     )
       .then(setRecallHits)
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const [expText, setExpText] = useState("");
   const [expHash, setExpHash] = useState("");
   const doExport = () =>
@@ -4197,14 +4337,14 @@ const testModel = useMutation({
         setExpText(r.snapshot);
         setExpHash(r.hash);
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const doImport = () =>
     post<unknown>("/api/boards/import", { snapshot: expText, hash: expHash, accountId })
       .then(() => {
         refresh("boards");
         notify("Imported as a new board; advisors need re-approval.");
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const [bakText, setBakText] = useState("");
   const [bakHash, setBakHash] = useState("");
   const doBackup = () =>
@@ -4213,7 +4353,7 @@ const testModel = useMutation({
         setBakText(r.snapshot);
         setBakHash(r.hash);
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   // Central UI/domain-generation boundary for a CONFIRMED successful restore:
   // invalidates outstanding transport callbacks (global epoch), query/media/
   // voice/hub state, and Secretary pending/hydration/envelope intent, then
@@ -4267,7 +4407,7 @@ const testModel = useMutation({
         try { qc.invalidateQueries(); } catch {}
         notify("Backup restored and hash-verified.");
       })
-      .catch((e) => alert(String(e)));
+      .catch((e) => toastErr(e));
   const refresh = (...keys: string[]) =>
     keys.forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
   const toggleBoardAdvisor = async (row: RosterRow) => {
@@ -4280,7 +4420,7 @@ const testModel = useMutation({
       }
       refresh("advisors", "roster", "roster-names", "setup");
     } catch (e) {
-      alert(String(e));
+      toastErr(e);
     }
   };
   const [meetPicks, setMeetPicks] = useState<string[]>([]);
@@ -4290,6 +4430,68 @@ const testModel = useMutation({
     else if (meetPicks.includes(id)) setMeetPicks(meetPicks.filter((x) => x !== id));
     else setMeetPicks([...meetPicks, id]);
   };
+  // Selected-meeting participant draft: hydrated from the meeting stored
+  // participantIdsJson and reset whenever the meeting (or its stored list)
+  // changes. Empty means everyone, matching the server convention. This is
+  // separate from meetPicks, which only seeds newly created meetings.
+  const [meetPartDraft, setMeetPartDraft] = useState<string[]>([]);
+  const [meetPartKey, setMeetPartKey] = useState("");
+  useEffect(() => {
+    const rawIds = (curMeeting as MeetingFull | undefined)?.participantIdsJson ?? "";
+    const key = meetingId + ":" + rawIds;
+    if (key === meetPartKey) return;
+    setMeetPartKey(key);
+    try {
+      const arr = JSON.parse(rawIds || "[]");
+      setMeetPartDraft(Array.isArray(arr) ? arr.map((x) => String(x)) : []);
+    } catch {
+      setMeetPartDraft([]);
+    }
+  }, [meetingId, curMeeting, meetPartKey]);
+  // Never silently revert to everyone: refusing the uncheck that would
+  // empty the list (an empty list means unrestricted, server convention).
+  const toggleMeetPart = (id: string) => {
+    const all = (advisors.data ?? []).map((a) => a.id);
+    if (meetPartDraft.length === 0) {
+      const next = all.filter((x) => x !== id);
+      if (next.length === 0) return;
+      setMeetPartDraft(next);
+    }
+    else if (meetPartDraft.includes(id)) {
+      if (meetPartDraft.length === 1) return;
+      setMeetPartDraft(meetPartDraft.filter((x) => x !== id));
+    }
+    else setMeetPartDraft([...meetPartDraft, id]);
+  };
+  const { advisorSnapshot, secretaryActivity } = useMeetingActivity({
+    boardId: boardId,
+    meetingId: meetingId,
+    boardValid: boardValid,
+    meetingValid: meetingValid,
+    sessGate: sessGate,
+    tab: tab,
+    get: get,
+    isOriginStale: originStale,
+    originOf: originIdentity,
+  });
+  // Meeting presence rail data: every board seat (included and excluded) plus
+  // the secretary seat, from data App already owns. Per-seat activity is
+  // idle/excluded until the backend activity snapshot/events land; approval
+  // is never shown as responding and no global pending flag is consulted.
+  const presenceEntries = useMemo(() => tab === "meet" ? (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ key: a.id, rosterEntryId: a.rosterEntryId, provenance: (a.imageProvenance ?? null) as string | null }))) : [], [tab, advisors.data]);
+  const advisorsTick = (advisors as unknown as { dataUpdatedAt?: number })?.dataUpdatedAt ?? 0;
+  const presenceUrls = usePresencePortraits(presenceEntries, portraitRev, advisorsTick);
+  const presence = useMemo(() => buildPresence({
+    leadName: lead.data?.name ?? "",
+    leadRoleLabel: lead.data ? lead.data.roleLabel + " \u00B7 You" : "Board lead",
+    advisors: (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ id: a.id, boardRole: a.boardRole, approved: a.approved, portraitUrl: presenceUrls.get(a.id) ?? null }))),
+    includedIds: meetPartDraft,
+    snapshot: advisorSnapshot as any,
+  }), [lead.data, advisors.data, meetPartDraft, presenceUrls, advisorSnapshot]);
+  const presenceWithSecretary = useMemo(() => {
+    if (!secretaryActivity) return presence;
+    return presence.map((p: any) => ((p as any)?.isSecretary ? { ...(p as any), activity: secretaryActivity } : p));
+  }, [presence, secretaryActivity]);
   const createMeeting = useMutation({
     mutationFn: () =>
       post<Meeting>(`/api/boards/${boardId}/meetings`, {
@@ -5259,7 +5461,7 @@ const testModel = useMutation({
       if (o.view !== noteVisitRef.current) return;
       if (!o.opId || secPendingRef.current?.id !== o.opId) return;
       // Error must not touch history/storage of another selection.
-      alert(String(e));
+      toastErr(e);
     },
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
@@ -5284,7 +5486,7 @@ const testModel = useMutation({
       if (live.boardId !== o.oB || live.meetingId !== o.oM || liveUser !== o.oU || o.oEp !== secEpoch.current) return;
       if (!o.opId || secPendingRef.current?.id !== o.opId) return;
       if (o.view !== noteVisitRef.current || o.editVisit !== secEditVisit.current) return;
-      alert(String(e));
+      toastErr(e);
     },
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
@@ -5308,7 +5510,7 @@ const testModel = useMutation({
       const live = liveSelRef.current;
       let liveUser = secIdentity();
       if (live.boardId !== oB || live.meetingId !== oM || liveUser !== oU || oEp !== secEpoch.current || originStale(oOrigin)) return;
-      alert(String(e));
+      toastErr(e);
     });
   };
   const meetingCtl = (op: string) => {
@@ -5486,7 +5688,7 @@ const testModel = useMutation({
     };
   });
   return (
-    <div className={"shell" + (navOpen ? " nav-open" : "") + (tab === "boards" || tab === "roster" || tab === "meet" ? "" : " no-panel")}>
+    <div className={"shell" + (navOpen ? " nav-open" : "") + (tab === "boards" || tab === "roster" ? "" : " no-panel")}>
       {" "}
       <nav
         className="rail"
@@ -5628,7 +5830,7 @@ const testModel = useMutation({
         </div>{" "}
       </nav>{" "}
 
-      {(tab === "boards" || tab === "roster" || tab === "meet") && (
+      {(tab === "boards" || tab === "roster") && (
         <aside
           className="listpanel"
           aria-label={tab === "boards" ? "Boards" : tab === "roster" ? "Roster" : "Meetings"}
@@ -5713,24 +5915,6 @@ const testModel = useMutation({
                 <span className="lprow-name">+ Create new Advisor</span>{" "}
               </button>
             )}{" "}
-            {tab === "meet" && !boardId && (
-              <div className="sub-empty">Select a board first</div>
-            )}{" "}
-            {tab === "meet" &&
-              (meetings.data ?? []).map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  role="listitem"
-                  className={m.id === meetingId ? "lprow active" : "lprow"}
-                  title={m.title}
-                  onClick={() => setMeetingId(m.id)}
-                >
-                  {" "}
-                  <span className="lprow-name">{m.title}</span>{" "}
-                  <span className="lprow-sub">{meetingStateLabel(m.state)}</span>{" "}
-                </button>
-              ))}{" "}
           </div>{" "}
         </aside>
       )}{" "}
@@ -5787,7 +5971,7 @@ const testModel = useMutation({
           {boardId ? (
             <span className="boardname">
               {" "}
-              {boardDenied ? "Not authorized for this board." : (<>Open board: {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? boardId.slice(0, 8)}</>)}{" "}
+              {boardDenied ? "Not authorized for this board." : (<>Open board: {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? "board"}</>)}{" "}
               <button
                 type="button"
                 className="btn ghost"
@@ -5852,7 +6036,7 @@ const testModel = useMutation({
                     Open board:{" "}
                     {boardDetail.data?.name ??
                       (boards.data ?? []).find((b) => b.id === boardId)?.name ??
-                      boardId.slice(0, 8)}{" "}
+                      "board"}{" "}
                   </h3>{" "}
                   {(boardDetail.data as Board | undefined)?.archived === true && (
                     <p role="status">
@@ -5997,8 +6181,7 @@ const testModel = useMutation({
                       </ul>{" "}
                       <p>
                         {" "}
-                        Reviewed draft hash:{" "}
-                        <code>{setup.data.draftHash}</code>{" "}
+                        Reviewed draft on file — activation checks it automatically.{" "}
                       </p>{" "}
                       {canManageBoard && (<button onClick={() => activate.mutate(setup.data.draftHash)}>
                         {" "}
@@ -6012,13 +6195,12 @@ const testModel = useMutation({
                       {expText && (
                         <p role="status">
                           {" "}
-                          Hash <code>{expHash}</code> · {expText.length} chars —
-                          paste into a new board import for re-review.{" "}
+                          Export ready — {expText.length} characters. Paste into a new board import for re-review. The file carries its own check code.{" "}
                         </p>
                       )}{" "}
                       <label>
                         {" "}
-                        Snapshot JSON{" "}
+                        Configuration snapshot{" "}
                         <input
                           value={expText}
                           onChange={(e) => setExpText(e.target.value)}
@@ -6027,7 +6209,7 @@ const testModel = useMutation({
                       </label>{" "}
                       <label>
                         {" "}
-                        Snapshot hash{" "}
+                        Snapshot check code{" "}
                         <input
                           value={expHash}
                           onChange={(e) => setExpHash(e.target.value)}
@@ -6522,7 +6704,8 @@ const testModel = useMutation({
                     {" "}
                     Background{" "}
                     <textarea
-                      rows={3}
+                      rows={4}
+                      className="profile-area"
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.background}
                       onChange={(e) =>
@@ -6538,7 +6721,8 @@ const testModel = useMutation({
                     {" "}
                     Subjects already familiar{" "}
                     <textarea
-                      rows={3}
+                      rows={4}
+                      className="profile-area"
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.familiarTopics}
                       onChange={(e) =>
@@ -6556,7 +6740,8 @@ const testModel = useMutation({
                     {" "}
                     Subjects needing simpler explanation{" "}
                     <textarea
-                      rows={3}
+                      rows={4}
+                      className="profile-area"
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.simplerTopics}
                       onChange={(e) =>
@@ -6574,7 +6759,8 @@ const testModel = useMutation({
                     {" "}
                     Communication preferences{" "}
                     <textarea
-                      rows={4}
+                      rows={5}
+                      className="profile-area"
                       disabled={!!wizId && wizVersion == null}
                       value={wizard.lead.commPrefs}
                       onChange={(e) =>
@@ -6925,7 +7111,7 @@ const testModel = useMutation({
               </div>{" "}
 
                             <p>
-                Your account default — shared by all your boards unless a board saves its own override.
+                Your account default: shared by all your boards unless a board saves its own override.
               </p>
               <>
                 {" "}
@@ -7122,9 +7308,12 @@ const testModel = useMutation({
                     {modelStatus.data.lastTestAt
                       ? modelStatus.data.lastTestOk
                         ? `Tested OK ${modelStatus.data.lastTestAt}`
-                        : `Test failed: ${modelStatus.data.lastTestError}`
+                        : "Connection test failed"
                       : "Not tested yet"}{" "}
                   </p>
+                )}{" "}
+                {modelStatus.data && modelStatus.data.lastTestAt && !modelStatus.data.lastTestOk && !!modelStatus.data.lastTestError && (
+                  <ReviewAlert message={String(modelStatus.data.lastTestError)} />
                 )}{" "}
                 <label>
                   {" "}
@@ -7218,10 +7407,10 @@ const testModel = useMutation({
                                 <AuthedImg id={im.id} alt="Portrait option" className="portrait-thumb" />
                                 <div>
                                   <div>
-                                    <span className="badge">{im.kind}</span>
+                                    <span className="badge">{im.kind === "generated" ? "Generated" : im.kind === "url" ? "Link" : "Uploaded"}</span>
                                     <span className={status === "accepted" ? "badge ok" : status === "pending" ? "badge live" : "badge warn"}>{status === "pending" ? "needs review" : status === "rejected" ? "needs replacement" : "accepted"}</span>
                                   </div>
-                                  <p className="muted">Source: {im.provenance || "owner-provided"}</p>
+                                  <p className="muted">{im.kind === "generated" ? "Generated for this advisor" : im.kind === "url" ? "Imported from a link" : "Uploaded by the owner"}</p>
                                   {status !== "accepted" && (
                                     <div className="meetctl">
                                       <button disabled={reviewImg.isPending} onClick={() => reviewImg.mutate({ id: im.id, decision: "accept" })}>Accept portrait</button>
@@ -7240,7 +7429,7 @@ const testModel = useMutation({
                         {" "}
                         <button disabled={!boardId || !canManageBoard || !selRow.complete} title={!boardId ? "Pick a board first" : selRow.complete ? "Attach to current board" : "Complete this entry first: " + selRow.missing.join(", ")} onClick={() => copyAdv.mutate(selRow)}>{" "}Add to current board{" "}</button>{" "}
                         <button onClick={() => { archiveRoster.mutate(selRow); setSelRoster(""); }}>{" "}Archive{" "}</button>{" "}
-                        <button onClick={() => { setCnewId(selRow.entry.id); setCportraitMsg(""); setCreateOpen(true); }}>{" "}Add portrait{" "}</button>{" "}
+                        <button onClick={() => { try { document.getElementById("roster-portrait")?.scrollIntoView({ block: "nearest" }); } catch { /* noop */ } }}>{" "}Add portrait{" "}</button>{" "}
                       </div>{" "}
                       <h4>{" "}Audition (never a meeting message){" "}</h4>{" "}
                       <label>{" "}Sample question{" "}
@@ -7250,6 +7439,49 @@ const testModel = useMutation({
                       <h4>{" "}Research dossier{" "}</h4>{" "}
                       <button onClick={() => research(selRow.entry.id)}>{" "}Research dossier{" "}</button>{" "}
                       <DossierView raw={dossier} />{" "}
+                      <div className="card" id="roster-portrait">{" "}
+                        <h4>{" "}Add a portrait{" "}</h4>{" "}
+                        <p className="muted">{" "}Portraits are explicit choices only — nothing generates automatically.{" "}</p>{" "}
+                        <label>{" "}Upload image{" "}
+                          <input type="file" accept="image/*" onChange={(e) => uploadPortrait(e.target.files?.[0])} />{" "}</label>{" "}
+                        <label>{" "}Use image URL{" "}
+                          <input value={portraitUrl} onChange={(e) => setPortraitUrl(e.target.value)} placeholder="https://..." />{" "}</label>{" "}
+                        <div className="meetctl">{" "}
+                          <button disabled={!portraitUrl || urlPortrait.isPending} onClick={() => urlPortrait.mutate(portraitUrl)}>{" "}Import URL{" "}</button>{" "}
+                          <button disabled={genPortrait.isPending} onClick={() => genPortrait.mutate()}>{" "}Generate portrait{" "}</button>{" "}
+                        </div>{" "}
+                        {portraitMsg && <p role="status">{portraitMsg}</p>}{" "}
+                      </div>{" "}
+                      {selRow && (
+                        <RosterChatPanel
+                          key={selRow.entry.id}
+                          rosterId={selRow.entry.id}
+                          identity={canonicalUser()}
+                          advisorName={selRow.entry.name}
+                          rosterVersion={selRow.entry.version}
+                          complete={selRow.complete}
+                          missing={selRow.missing}
+                          canChat={!!selRow}
+                          api={{ post }}
+                        />
+                      )}{" "}
+                      {selRow && (
+                        <CharacterEditor
+                          key={selRow.entry.id}
+                          entry={{ researchJson: "", researchJobId: "", researchBaseVersion: 0, ...selRow.entry } as any}
+                          get={get}
+                          post={post}
+                          put={put}
+                          originIdentity={originIdentity}
+                          originStale={originStale}
+                          originRevision={originRevision()}
+                          resolveCanonicalEntry={resolveCanonicalEntry}
+                          freshCreation={false}
+                          onSaved={() => {
+                            refresh("roster", "roster-count", "roster-names");
+                          }}
+                        />
+                      )}{" "}
                     </div>
                   ) : (
                   <p className="muted">Select an advisor from the list to see their record.</p>
@@ -7258,52 +7490,27 @@ const testModel = useMutation({
               {createOpen && (
                 <div className="modal-backdrop" onClick={closeCreate}>
                   {" "}
-                  <div className="modal" role="dialog" aria-modal="true" aria-label="Create new advisor" onClick={(e) => e.stopPropagation()}>
+                  <div className="modal" role="dialog" aria-modal="true" aria-label="Create advisor" onClick={(e) => e.stopPropagation()}>
                     {" "}
                     <div className="meetctl">
                       {" "}
-                      <h3>{" "}Create new advisor{" "}</h3>{" "}
-                      <button type="button" className="btn ghost" onClick={closeCreate} aria-label="Close">{" "}✕{" "}</button>{" "}
+                      <button type="button" className="btn ghost" onClick={closeCreate} aria-label="Close">{" "}X{" "}</button>{" "}
                     </div>{" "}
-                    {!cnewId && (
-                      <>
-                      {" "}
-                      <label>
-                        {" "}
-                        Name{" "}
-                        <input ref={createNameRef} value={cname} onChange={(e) => setCname(e.target.value)} />{" "}
-                      </label>{" "}
-                      <label>{" "}Description (required){" "}
-                        <textarea value={cdesc} onChange={(e) => setCdesc(e.target.value)} rows={3} placeholder="A sentence or more about this advisor" />{" "}</label>{" "}
-                      <button disabled={!cname.trim() || cdesc.trim().length < 5 || createChar.isPending} onClick={() => createChar.mutate()}>{" "}Create advisor{" "}</button>{" "}
-                      <div className="card">{" "}
-                        <h3>{" "}AI-guided advisor{" "}</h3>{" "}
-                        <p>{" "}The model researches the role and drafts a full profile. Add a portrait after to complete the entry.{" "}</p>{" "}
-                        <label>{" "}Name{" "}
-                          <input value={ainame} onChange={(e) => setAiname(e.target.value)} />{" "}</label>{" "}
-                        <label>{" "}Role{" "}
-                          <input value={airole} onChange={(e) => setAirole(e.target.value)} placeholder="e.g. Growth Hacker" />{" "}</label>{" "}
-                        <label>{" "}Focus{" "}
-                          <input value={aifocus} onChange={(e) => setAifocus(e.target.value)} placeholder="What should it research?" />{" "}</label>{" "}
-                        <button disabled={!ainame.trim() || !airole.trim() || aiDraft.isPending} onClick={() => aiDraft.mutate()}>{" "}{aiDraft.isPending ? "Researching…" : "Research and draft"}{" "}</button>{" "}
-                        {aiMsg && <p role="status">{aiMsg}</p>}{" "}
-                      </div>{" "}
-                      </>
-                    )}{" "}
-                    {cnewId && (
-                      <div className="card">{" "}
-                        <h3>{" "}Add a portrait — required{" "}</h3>{" "}
-                        <p>{" "}Draft saved. Add a portrait to complete this advisor so it can join a board and be approved.{" "}</p>{" "}
-                        <label>{" "}Upload image{" "}
-                          <input type="file" accept="image/*" onChange={(e) => uploadNewPortrait(e.target.files?.[0])} />{" "}</label>{" "}
-                        <label>{" "}Use image URL{" "}
-                          <input value={cportraitUrl} onChange={(e) => setCportraitUrl(e.target.value)} placeholder="https://…" />{" "}</label>{" "}
-                        <button disabled={!cportraitUrl || urlNewPortrait.isPending} onClick={() => urlNewPortrait.mutate()}>{" "}Import URL{" "}</button>{" "}
-                        <button disabled={genNewPortrait.isPending} onClick={() => genNewPortrait.mutate()}>{" "}Generate portrait{" "}</button>{" "}
-                        {cportraitMsg && <p role="status">{cportraitMsg}</p>}{" "}
-                        <button onClick={finishNewEntry}>{" "}Done{" "}</button>{" "}
-                      </div>
-                    )}{" "}
+                    <CreateAdvisor
+                      accountId={accountId}
+                      get={get}
+                      post={post}
+                      put={put}
+                      originIdentity={originIdentity}
+                      originStale={originStale}
+                      originRevision={originRevision()}
+                      resolveCanonicalEntry={resolveCanonicalEntry}
+                      onCreated={(entry) => {
+                        refresh("roster", "roster-count", "roster-names");
+                        try { setSelRoster(entry.id); setAudId(entry.id); } catch { /* noop */ }
+                      }}
+                      onClose={closeCreate}
+                    />{" "}
                   </div>{" "}
                 </div>
               )}{" "}
@@ -7347,20 +7554,29 @@ const testModel = useMutation({
                   {a.boardRole}{" "}
                   <span className="badge">
                     {" "}
-                    {a.approved ? "approved" : "pending"}{" "}
+                    {a.approved ? "approved" : "pending"} · roster v{a.rosterVersion}{" "}
                   </span>{" "}
-                  <span className="badge">
-                    {" "}
-                    roster v{a.rosterVersion} · {a.imageProvenance}{" "}
-                  {(() => { const re = (rosterNames.data ?? []).find((r) => r.entry.id === a.rosterEntryId); return re && re.entry.version > a.rosterVersion ? (<span className="badge">{" "}roster updated — sync first{" "}</span>) : null; })()}
-                  </span>{" "}
+                  {(() => {
+                    const re = (rosterNames.data ?? []).find((r) => r.entry.id === a.rosterEntryId);
+                    const current = re ? re.entry.version : a.rosterVersion;
+                    const stale = current > a.rosterVersion;
+                    const link = { advisorId: a.id, boardId, rosterEntryId: a.rosterEntryId, pinnedVersion: a.rosterVersion, currentVersion: current, stale, name: a.boardRole, boardRole: a.boardRole, approved: a.approved, portraitFingerprint: a.imageProvenance, behaviorFingerprint: "roster v" + current };
+                    return (
+                      <>
+                        {" "}
+                        <RosterLinkBadge advisor={link} />{" "}
+                        <BoardAdvisorLinkPanel advisor={link} />{" "}
+                        {stale && (<p role="status">{" "}The roster profile changed since this board copy was pinned — update from the roster and re-review before approving.{" "}</p>)}{" "}
+                      </>
+                    );
+                  })()}{" "}
                   {!a.approved && canManageBoard && (
                     <button
                       onClick={() =>
                         post<unknown>(
                           `/api/boards/${boardId}/advisors/${a.id}/approve`,
                           {},
-                        ).then(() => refresh("advisors", "setup")).catch((e) => alert(String(e)))
+                        ).then(() => refresh("advisors", "setup")).catch((e) => toastErr(e))
                       }
                     >
                       {" "}
@@ -7376,39 +7592,6 @@ const testModel = useMutation({
                   </button>{" "}
                 </div>
               ))}{" "}
-                            <div className="card">
-                {" "}
-                <h3>{" "}Chat directly with an advisor{" "}</h3>{" "}
-                <p>{" "}<span className="badge">fictional advisor</span>{" "}Isolated test chat — never creates meeting messages, records, or memory.{" "}</p>{" "}
-                <label>{" "}Board advisor{" "}
-                  <select value={chatAdv} onChange={(e) => { setChatAdv(e.target.value); setChatHist([]); setChatErr(""); }}>{" "}
-                    <option value="">—</option>{" "}
-                    {(advisors.data ?? []).map((a) => (<option key={a.id} value={a.id}>{" "}{a.boardRole}{" "}</option>))}{" "}
-                  </select>{" "}</label>{" "}
-                {chatSelAdvisor && chatBlocked ? (
-                  <p role="alert">{" "}Finish creating this advisor ({chatSelRoster?.missing.join(", ")}) before chatting.{" "}</p>
-                ) : (
-                  <div className="chatwrap">{" "}
-                    <div>{" "}
-                      {chatHist.map((t, idx) => {
-                        const adv = t.role !== "lead";
-                        return (
-                          <div key={idx} className={"msg-row " + (adv ? "advisor" : "lead")}>
-                            <div className="bubble">
-                              <div className="bhead"><b>{adv ? (chatSelAdvisor?.boardRole ?? "Advisor") : "You"}</b></div>
-                              <div className="btext">{t.content}</div>
-                            </div>
-                          </div>
-                        );
-                      })}{" "}
-                    </div>{" "}
-                  </div>
-                )}{" "}
-                <label>{" "}Message{" "}
-                  <input disabled={chatBlocked} value={chatMsg} onChange={(e) => setChatMsg(e.target.value)} placeholder="Ask this advisor directly" onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }} />{" "}</label>{" "}
-                <button disabled={!boardId || !canActMeeting || !chatAdv || !chatMsg.trim() || chatBusy || chatBlocked} onClick={sendChat}>{" "}{chatBusy ? "Sending…" : "Send"}{" "}</button>{" "}
-                {chatErr && <p role="alert">{chatErr}</p>}{" "}
-              </div>{" "}
 <div className="card">
                 {" "}
                 <h3>
@@ -7469,8 +7652,8 @@ const testModel = useMutation({
                     {(imgList.data ?? []).map((img) => (
                       <div key={img.id}>
                         {" "}
-                        <span className="badge">{img.kind}</span>{" "}
-                        {img.provenance.slice(0, 80)}{" "}
+                        <span className="badge">{img.kind === "generated" ? "Generated" : img.kind === "url" ? "Link" : "Uploaded"}</span>{" "}
+                        <span className="muted">{img.kind === "generated" ? "Generated for this advisor" : img.kind === "url" ? "Imported from a link" : "Uploaded by the owner"}</span>{" "}
                         <button onClick={() => selectImg.mutate(img.id)}>
                           {" "}
                           Use this image{" "}
@@ -7512,29 +7695,9 @@ const testModel = useMutation({
                   ) : (
                     <>
                   {" "}
-                  <div className="meet-left">
+                  <details className="meet-left" open={meetNavOpen} onToggle={(e) => { try { setMeetNavOpen((e.target as HTMLDetailsElement).open); } catch {} }}>
                     {" "}
-                    <div className="meetctl">
-                      {" "}
-                      {canManageBoard && (<button
-                        type="button"
-                        className="primary"
-                        onClick={() => createMeeting.mutate()}
-                      >
-                        {" "}
-                        New meeting{" "}
-                      </button>)}{" "}
-                    {canManageBoard && (<div className="muted">Starts a new separate conversation.</div>)}{" "}
-                    {canManageBoard && (<div className="card">{" "}
-                      Advisors for the next meeting (all when untouched){" "}
-                      {(advisors.data ?? []).map((a) => (
-                        <label key={a.id} className="checkline">{" "}
-                          <input type="checkbox" disabled={!boardId} checked={meetPicks.length === 0 || meetPicks.includes(a.id)} onChange={() => toggleMeetPick(a.id)} />{" "}
-                          {a.boardRole}{" "}
-                        </label>
-                      ))}{" "}
-                    </div>)}{" "}
-                    </div>{" "}
+                    <summary>Meetings ({(meetings.data ?? []).length}) — {curMeeting?.title ?? "Select a meeting"}</summary>{" "}
                     <input
                       aria-label="Search meetings"
                       placeholder="Search title or brief"
@@ -7598,7 +7761,7 @@ const testModel = useMutation({
                           stays selected below.
                         </p>
                       )}{" "}
-                  </div>{" "}
+                  </details>{" "}
                   {meetingDenied ? (
                     <div className="card" role="alert">
                       {" "}
@@ -7615,238 +7778,354 @@ const testModel = useMutation({
                       </button>{" "}
                     </div>
                   ) : (
-                    meetingId && (
+                    meetingId ? (
                       <>
                         {" "}
                         <div className="meet-center">
                         {" "}
-                        <div className="meet-head">
-                          {" "}
-                          <div>
-                            {" "}
-                            {isGuest && guestSettings.data && (<p role="status">Read-only guest settings: {guestSettings.data.name} &middot; {guestSettings.data.mission} &middot; {guestSettings.data.discussionPolicy}{guestSettings.data.lead ? ` \u00b7 Lead ${guestSettings.data.lead.name} (${guestSettings.data.lead.roleLabel})` : ""}</p>)}
-                            <div className="eyebrow">Discussion</div>{" "}
-                            <h2>{curMeeting?.title ?? "Meeting"}</h2>{" "}
-                            {curMeeting?.brief && (
-                              <p className="muted">{curMeeting.brief}</p>
+                        <ConversationHeader
+                          meetingTitle={curMeeting?.title ?? "Meeting"}
+                          meetingBrief={curMeeting?.brief ?? ""}
+                          stateLabel={curMeeting ? meetingStateLabel(curMeeting.state) : "No meeting"}
+                          live={live}
+                          messageCount={delivery.data?.messages ?? null}
+                          canManageMeeting={canManageMeeting}
+                          canCreateMeeting={canManageBoard}
+                          canDiscussMeeting={canDiscussMeeting}
+                          pauseAvailable={curMeeting?.state === 1}
+                          resumeAvailable={curMeeting?.state === 3}
+                          endAvailable={curMeeting != null && meetingIsOpen(curMeeting.state)}
+                          briefReady={!!briefText.trim()}
+                          requestPending={runDiscussion.isPending}
+                          requestAvailable={canDiscussMeeting && !!briefText.trim() && curMeeting != null && (curMeeting.state === 0 || curMeeting.state === 1)}
+                          onNewMeeting={() => createMeeting.mutate()}
+                          onOpenSettings={openSettings}
+                          onPause={() => meetingCtl("pause")}
+                          onResume={() => meetingCtl("resume")}
+                          onEnd={() => meetingCtl("end")}
+                          onRequestResponses={() => {
+                            if (!(canDiscussMeeting && !!briefText.trim() && curMeeting != null && (curMeeting.state === 0 || curMeeting.state === 1))) {
+                              toastErr("Request advisor responses is available while the meeting is awaiting a brief or active, with a brief and discuss access. Paused or closed meetings stay untouched — the composer draft is preserved.");
+                              return;
+                            }
+                            const rc = sendRetryCtx; if (rc && (rc as any).meetingId === meetingId) { retryResponses(rc); return; } requestFreshResponses();
+                          }}
+                        />{" "}
+                        <MeetingSettingsDialog
+                          open={settingsOpen}
+                          title={mtitle}
+                          brief={mbrief}
+                          policy={policy}
+                          participants={(advisors.data ?? []).map((a) => {
+                            const included = meetPartDraft.length === 0 || meetPartDraft.includes(a.id);
+                            const wouldEmpty = meetPartDraft.length === 0
+                              ? (advisors.data ?? []).length <= 1
+                              : (meetPartDraft.length === 1 && meetPartDraft.includes(a.id));
+                            return { id: a.id, role: a.boardRole, included, locked: included && wouldEmpty };
+                          })}
+                          canManageMeeting={canManageMeeting}
+                          meetingSelected={!!meetingId}
+                          meetingOpen={curMeeting != null && meetingIsOpen(curMeeting.state)}
+                          meetingClosed={curMeeting != null && !meetingIsOpen(curMeeting.state)}
+                          onClose={closeMeetingSettings}
+                          onTitle={setMtitle}
+                          onBrief={setMbrief}
+                          onPolicy={setPolicy}
+                          onToggleParticipant={toggleMeetPart}
+                          onSelectAll={() => setMeetPartDraft([])}
+                          onSave={() => saveMeeting.mutate()}
+                          onCloseWithRecord={() => closeMeeting(true)}
+                          onCloseWithoutPublication={() => closeMeeting(false)}
+                          onReopen={reopenMeeting}
+                        >
+                          <div className="card key">
+                            <h3>Decision state</h3>{" "}
+                            {latestDraft ? (
+                              <>
+                                {" "}
+                                <p>
+                                  {" "}
+                                  Draft v{latestDraft.version} ·{" "}
+                                  {latestDraft.status}{" "}
+                                  {latestDraft.decided ? " · decided" : ""}{" "}
+                                </p>{" "}
+
+                                <button
+                                  type="button"
+                                  className="primary"
+                                  onClick={() => {
+                                    closeMeetingSettings(); if (latestDraft) setRecId(latestDraft.id);
+                                    setTab("records");
+                                  }}
+                                >
+                                  {" "}
+                                  Review and approve in Records{" "}
+                                </button>{" "}
+                              </>
+                            ) : (
+                              <p>
+                                {" "}
+                                No record draft yet. End the discussion to
+                                prepare one.{" "}
+                              </p>
                             )}{" "}
-                          </div>{" "}
-                          <div className="meetctl">
+                          </div>
+                          <div className="card">
                             {" "}
-                            {canManageMeeting && (<button
-                              type="button"
-                              onClick={() => meetingCtl("pause")}
-                              disabled={curMeeting?.state !== 1}
-                              title={
-                                curMeeting?.state !== 1
-                                  ? "Pause is available while the meeting is Active"
-                                  : undefined
-                              }
-                            >
+                            <h3>Options on the table</h3>{" "}
+                            <p>
                               {" "}
-                              Pause{" "}
-                            </button>)}{" "}
-                            {canManageMeeting && (<button
-                              type="button"
-                              onClick={() => meetingCtl("resume")}
-                              disabled={curMeeting?.state !== 3}
-                              title={
-                                curMeeting?.state !== 3
-                                  ? "Resume is available while the meeting is Paused"
-                                  : undefined
-                              }
-                            >
+                              Adopted directions narrow what advisors argue for.
+                              Only exact shown text is adopted.{" "}
+                            </p>{" "}
+                            {(directions.data ?? []).map((n) => (
+                              <div key={n.id} className="takenote">
+                                {" "}
+                                <b>
+                                  {" "}
+                                  [{n.scope}] {n.title}:{" "}
+                                </b>{" "}
+                                {n.body.length > 200 ? (
+                                  <details>
+                                    {" "}
+                                    <summary>Show full text</summary>{" "}
+                                    <div>{n.body}</div>{" "}
+                                  </details>
+                                ) : (
+                                  <span> {n.body}</span>
+                                )}{" "}
+                                {canActMeeting && (<button
+                                  type="button"
+                                  className="btn ghost"
+                                  disabled={!meetingId || fromDirection.isPending}
+                                  onClick={() => fromDirection.mutate(n.id)}
+                                  title="Stage this exact direction text for record review"
+                                >
+                                  {" "}
+                                  Record this direction{" "}
+                                </button>)}{" "}
+                              </div>
+                            ))}{" "}
+                            {(directions.data ?? []).length === 0 && (
+                              <p>No directions adopted yet.</p>
+                            )}{" "}
+                            {canActMeeting && (<>
+                            <label>
                               {" "}
-                              Resume{" "}
-                            </button>)}{" "}
-                            {canManageMeeting && (<button
-                              type="button"
-                              onClick={() => meetingCtl("end")}
-                              disabled={
-                                curMeeting == null ||
-                                !meetingIsOpen(curMeeting.state)
-                              }
-                            >
+                              Exact text{" "}
+                              <textarea
+                                rows={4}
+                                value={dtext}
+                                onChange={(e) => { dtextRev.current++; setDtext(e.target.value); }}
+                              />{" "}
+                            </label>{" "}
+                            <label>
                               {" "}
-                              End discussion{" "}
-                            </button>)}{" "}
-                            (<button
+                              Scope{" "}
+                              <select
+                                value={dscope}
+                                onChange={(e) => setDscope(e.target.value)}
+                              >
+                                {" "}
+                                <option value="meeting">
+                                  {" "}
+                                  Adopt for this meeting{" "}
+                                </option>{" "}
+                                <option value="board">
+                                  {" "}
+                                  Adopt board-wide{" "}
+                                </option>{" "}
+                              </select>{" "}
+                            </label>{" "}
+                            <button
                               type="button"
                               className="primary"
-                              onClick={() => { const rc = sendRetryCtx; if (rc && rc.meetingId === meetingId) { retryResponses(rc); return; } requestFreshResponses(); }}
-                              disabled={
-                                runDiscussion.isPending ||
-                                send.isPending ||
-                                sendPhase === "sending" ||
-                                sendPhase === "working" ||
-                                !canDiscussMeeting ||
-                                !briefText.trim() ||
-                                (curMeeting != null &&
-                                  !meetingIsOpen(curMeeting.state))
-                              }
-                              title={
-                                !briefText.trim()
-                                  ? "Add a brief before running the discussion"
-                                  : undefined
-                              }
+                              disabled={!canActMeeting || !dtext.trim()}
+                              onClick={() => adopt.mutate()}
                             >
                               {" "}
-                              {runDiscussion.isPending
-                                ? "Requesting advisor responses..."
-                                : ((sendRetryCtx && sendRetryCtx.meetingId === meetingId) ? "Retry advisor responses (same lead)" : "Request advisor responses")}{" "}
-                            </button>{" "}
-                            <div className="muted">Asks the advisors in the current meeting to respond.</div>{" "}
-                          </div>{" "}
-                        </div>{" "}
-                        {delivery.data && curMeeting && (
-                          <p
-                            role="status"
-                            className="status-line"
-                            title={`Revision ${delivery.data.deliveredRevision}`}
-                          >
-                            {" "}
-                            <span className="badge">
-                              {" "}
-                              {meetingStateLabel(curMeeting.state)}{" "}
-                            </span>{" "}
-                            <span>{delivery.data.messages} messages</span>{" "}
-                            {live && (
-                              <span className="badge live">live</span>
-                            )}{" "}
-                          </p>
-                        )}{" "}
-                        {canManageMeeting && (<details className="setup">
-                          {" "}
-                          <summary>Meeting setup</summary>{" "}
-                          <label>
-                            {" "}
-                            Title{" "}
-                            <input
-                              value={mtitle}
-                              onChange={(e) => setMtitle(e.target.value)}
-                            />{" "}
-                          </label>{" "}
-                          <label>
-                            {" "}
-                            Brief (a meeting needs a brief before discussion){" "}
-                            <input
-                              value={mbrief}
-                              onChange={(e) => setMbrief(e.target.value)}
-                            />{" "}
-                          </label>{" "}
-                          <label>
-                            {" "}
-                            Policy{" "}
-                            <select
-                              value={policy}
-                              onChange={(e) => setPolicy(e.target.value)}
-                            >
-                              {" "}
-                              <option value="focused">
-                                {" "}
-                                Focused (3,2 · max 5){" "}
-                              </option>{" "}
-                              <option value="balanced">
-                                {" "}
-                                Balanced (4,4,2 · max 10){" "}
-                              </option>{" "}
-                              <option value="open">
-                                {" "}
-                                Open (4s · max 10){" "}
-                              </option>{" "}
-                            </select>{" "}
-                          </label>{" "}
-                          <div className="meetctl">
-                            {" "}
-                            <button
-                              type="button"
-                              onClick={() => saveMeeting.mutate()}
-                            >
-                              {" "}
-                              Save title + brief{" "}
-                            </button>{" "}
-                            <button
-                              type="button"
-                              onClick={() => closeMeeting(true)}
-                            >
-                              {" "}
-                              Close with record{" "}
-                            </button>{" "}
-                            <button
-                              type="button"
-                              onClick={() => closeMeeting(false)}
-                            >
-                              {" "}
-                              Close without publication{" "}
-                            </button>{" "}
-                            <button type="button" onClick={reopenMeeting}>
-                              {" "}
-                              Reopen (history intact){" "}
-                            </button>{" "}
-                          </div>{" "}
-                        </details>)} {" "}
-                        <div
-                          className="ctabs"
-                          role="tablist"
-                          aria-label="Meeting views"
-                        >
-                          {" "}
-                          {(
-                            [
-                              "chat",
-                              "takeaways",
-                              "options",
-                              "decision",
-                            ] as const
-                          ).map((t) => (
-                            <button
-                              key={t}
-                              type="button"
-                              role="tab"
-                              aria-selected={meetTab === t}
-                              className={meetTab === t ? "active" : ""}
-                              onClick={() => setMeetTab(t)}
-                              onKeyDown={(e) => {
-                                if (
-                                  e.key !== "ArrowRight" &&
-                                  e.key !== "ArrowLeft"
-                                )
-                                  return;
-                                e.preventDefault();
-                                const order = [
-                                  "chat",
-                                  "takeaways",
-                                  "options",
-                                  "decision",
-                                ] as const;
-                                const i = order.indexOf(t);
-                                const n =
-                                  e.key === "ArrowRight"
-                                    ? (i + 1) % order.length
-                                    : (i + order.length - 1) % order.length;
-                                setMeetTab(order[n]);
-                                const sibs = Array.from(
-                                  e.currentTarget.parentElement?.querySelectorAll(
-                                    "[role=tab]",
-                                  ) ?? [],
-                                );
-                                (sibs[n] as HTMLElement | undefined)?.focus();
-                              }}
-                            >
-                              {" "}
-                              {t === "chat"
-                                ? "Discussion"
-                                : t === "takeaways"
-                                  ? "Key takeaways"
-                                  : t === "options"
-                                    ? "Options"
-                                    : "Decision"}{" "}
+                              Adopt exact text{" "}
                             </button>
-                          ))}{" "}
-                        </div>{" "}
-                        {meetTab === "chat" && (
-                          <>
+                            </>)}{" "}
+                          </div>
+                          <div className="card">
                             {" "}
+                            <h3>
+                              {" "}
+                              Key takeaways (provisional — never decisions){" "}
+                            </h3>{" "}
+                            {(notes.data ?? [])
+                              .filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing")
+                              .map((n) => {
+                                let exs: any[] = [];
+                                try { exs = JSON.parse(n.evidenceJson ?? "[]"); } catch { exs = []; }
+                                return (
+                                <div key={n.id} className="takenote">
+                                  {" "}
+                                  <b>{n.title}</b>{" "}
+                                  <span className="muted">Provisional</span>{" "}
+                                  {n.body.length > 400 ? (
+                                    <details>
+                                      {" "}
+                                      <summary>Show full briefing</summary>{" "}
+                                      <div>{n.body}</div>{" "}
+                                    </details>
+                                  ) : (
+                                    <div>{n.body}</div>
+                                  )}{" "}
+                                  {exs.length > 0 && (
+                                    <div className="excerpts">{exs.slice(0, 6).map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? (e.kind === "record" ? "Record excerpt" : "Source excerpt")}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind === "record" ? "Record" : "Source"}{e.version ? " · version " + e.version : ""}</div></div>))}</div>
+                                  )}{" "}
+                                  {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
+                                </div>
+                                );
+                              })}{" "}
+                            {(notes.data ?? []).filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing").length === 0 && <p>No briefings yet.</p>}{" "}
+                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => { try { briefVisitRef.current++; } catch { /* noop */ } setBtopic(e.target.value); }} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate(); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
+                            {secQuestion && (
+                              <div className="card" role="status">
+                                <b>Secretary clarification</b>
+                                <div>{secQuestion}</div>
+                                {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {humanizeOmission(secOmitted)}</div>)}
+                                <label>Answer<input value={secAnswer} onChange={(e) => { try { secComposerTouched.current = true; } catch { } try { secAnsVer.current++; } catch { /* noop */ } try { secAnsOwnerReq.current = secRequestId; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecAnswer(e.target.value); }} /></label>{" "}
+                                <button type="button" onClick={() => { if (!answerSecretary.isPending) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>{answerSecretary.isPending ? "Sending..." : "Send answer"}</button>{" "}
+                              </div>
+                            )}{" "}
+                            {secError && (<div className="card" role="alert"><b>Secretary error</b><FriendlyError friendly={friendlyError(secError) || "The secretary request did not complete. Check the setup guidance above, then retry."} technical={secError} />{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) { const uRet = secIdentity(); try { secEnvelopeRev.current++; } catch { } try { secHydRef.current++; } catch { } retrySecretary.mutate({ opId: "retry-" + (++opSeq.current), boardId, meetingId, user: uRet, epoch: secEpoch.current, origin: originIdentity(), envRevCap: secEnvelopeRev.current, hydRevCap: secHydRef.current, env: readEnvelope(secEnvelopeKey(uRet, boardId, meetingId)) }); } }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
+                            {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {humanizeOmission(secOmitted)}</div>)}
+                            <h3>Secretary provisional notes</h3>{" "}
+                            {(notes.data ?? [])
+                              .filter((n) => (n.kind === "secretary-note" || n.kind === "secretary-briefing" || n.kind === "note" || n.kind === "briefing") && !(n.kind ?? "").startsWith("run-") )
+                              .map((n) => {
+                                let exs2: any[] = [];
+                                try { exs2 = JSON.parse(n.evidenceJson ?? "[]"); } catch { exs2 = []; }
+                                const rev = (n as any).revision ?? 1;
+                                const st = (n as any).noteStatus ?? "current";
+                                const isCur = st === "current";
+                                return (
+                                <div key={n.id} className="takenote">
+                                  <b>{n.title}</b>{" "}
+                                  <span className="muted">Provisional rev {rev} {st}{isCur ? "" : " (read-only)"}</span>{" "}
+                                  {n.body.length > 400 ? (<details open={false}><summary>Show full note (rev {rev})</summary><div>{n.body}</div></details>) : (<div>{n.body}</div>)}{" "}
+                                  {exs2.length > 0 && (<div className="excerpts">{exs2.map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? (e.kind === "record" ? "Record excerpt" : "Source excerpt")}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind === "record" ? "Record" : "Source"}{e.version ? " · version " + e.version : ""}{e.location ? " " + e.location : ""}{e.indexGeneration != null ? " snapshot " + e.indexGeneration : ""}</div><div className="muted">Historical quote; current availability is resolved in History view per reference.</div></div>))}</div>)}{" "}
+                                  {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
+                                  <button type="button" onClick={() => { try { secHistSel.current = n.id; } catch { } loadHistory(n.id); }}>History</button>{" "}
+                                  {isCur && canActMeeting ? (<><button type="button" onClick={() => { setSecEditId(n.id); setSecEditBody(n.body); try { secEditSess.current++; } catch { } try { secHistSel.current = n.id; } catch { } try { secEditVisit.current++; } catch { } }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted">{isCur ? " Requires contribute access to edit." : " Superseded/reversed: read-only; open History for full text."}</span>)}{" "}
+                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => { setSecEditBody(e.target.value); try { secEditSess.current++; } catch { } }} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody })}>Save revision</button><button type="button" className="btn ghost" onClick={() => { setSecEditId(""); try { secEditVisit.current++; } catch { } try { secEditSess.current++; } catch { } }}>Cancel</button></div>)}{" "}
+                                </div>
+                                );
+                              })}{" "}
+                            <h3>All note history (including reversed)</h3>{" "}
+                            {((notesHistoryAll.data ?? []) as any[]).length === 0 && <p className="muted">No note history yet. Reversed notes remain discoverable here after reload.</p>}{" "}
+                            {((notesHistoryAll.data ?? []) as any[]).map((g: any) => (
+                              <div key={g.root} className="takenote">
+                                {" "}<b>Record group</b>{" "}
+                                <span className="muted">{(g.current && (g.current.noteStatus || g.current.NoteStatus)) || ""} rev {(g.current && (g.current.revision ?? g.current.Revision)) ?? ""}</span>{" "}
+                                <div>{(g.current && (g.current.title || g.current.Title)) || ""}</div>{" "}
+                                <button type="button" onClick={() => loadHistory(g.current.id || g.current.Id)}>History</button>{" "}
+                              </div>
+                            ))}{" "}
+                            {secHistory && (<div className="card"><b>History</b><div>Record group</div>{((secHistory as any).availability ?? []).length > 0 && (<div className="excerpts">{((secHistory as any).availability ?? []).map((a: any, i: number) => (<div key={i} className="excerpt-card"><b>{a.title ?? (a.kind === "record" ? "Record excerpt" : "Source excerpt")}</b><div className="muted">{a.kind === "record" ? "Record" : "Source"} current availability: {a.available ? "available" : "unavailable"} ({a.reason})</div></div>))}</div>)}{((secHistory as any).revisions ?? []).map((r: any) => (<details key={r.id}><summary>rev {r.revision} {r.noteStatus}: {r.title}</summary><div>{r.body}</div></details>))}{((secHistory as any).history ?? []).map((h: any) => (<details key={h.id}><summary>{h.action} rev {h.revision}</summary><div>{h.body}</div></details>))}<button type="button" onClick={() => { setSecHistory(null); try { secHistSel.current = ""; } catch { } try { secHistRef.current++; } catch { } }}>Close</button></div>)}{" "}
+                            <label>
+                              {" "}
+                              Note title{" "}
+                              <input
+                                value={ntitle}
+                                onChange={(e) => { try { noteVisitRef.current++; noteDraftRev.current++; } catch { /* noop */ } setNtitle(e.target.value); }}
+                              />{" "}
+                            </label>{" "}
+                            <label>
+                              {" "}
+                              Note body{" "}
+                              <input
+                                value={nbody}
+                                onChange={(e) => { try { noteVisitRef.current++; noteDraftRev.current++; } catch { /* noop */ } setNbody(e.target.value); }}
+                              />{" "}
+                            </label>{" "}
+                            {canActMeeting && (<button
+                              type="button"
+                              onClick={() => addNote.mutate()}
+                            >
+                              {" "}
+                              Save note{" "}
+                            </button>)}{" "}
+                          </div>
+                                <div className="card">
+                                  {" "}
+                                  <h3>Evidence</h3>{" "}
+                                  {excerpts.length === 0 && (
+                                    <p>No excerpts for this brief yet.</p>
+                                  )}{" "}
+                                  {excerpts.map((h, i) => (
+                                    <div key={i} className="excerpt">
+                                      {" "}
+                                      <span className="badge">
+                                        {" "}
+                                        {h.kind}{" "}
+                                      </span>{" "}
+                                      <b>{h.kind === "record" ? "Record excerpt" : "Source excerpt"}</b> <div>{h.text}</div>{" "}
+                                    </div>
+                                  ))}{" "}
+                                  <button
+                                    type="button"
+                                    className="btn ghost"
+                                    onClick={() => { closeMeetingSettings(); setTab("sources"); }}
+                                  >
+                                    {" "}
+                                    Open sources{" "}
+                                  </button>{" "}
+                                </div>{" "}
+                                {" "}
+                                <div
+                                  className={
+                                    recordFlash ? "card flash-accent" : "card"
+                                  }
+                                >
+                                  {" "}
+                                  <h3>Record</h3>{" "}
+                                  {latestDraft ? (
+                                    <p>
+                                      {" "}
+                                      v{latestDraft.version} ·{" "}
+                                      {latestDraft.status}{" "}
+                                      {latestDraft.decided
+                                        ? " · decided"
+                                        : ""}{" "}
+                                    </p>
+                                  ) : (
+                                    <p className="muted">No draft.</p>
+                                  )}{" "}
+                                  <button
+                                    type="button"
+                                    className="btn ghost"
+                                    onClick={() => {
+                                      closeMeetingSettings();
+                                      if (latestDraft) setRecId(latestDraft.id);
+                                      setTab("records");
+                                    }}
+                                  >
+                                    {" "}
+                                    Open records{" "}
+                                  </button>{" "}
+                                </div>{" "}
+                        </MeetingSettingsDialog>{" "}
+
+
+                            <ConversationSearchField value={sq} onChange={setSq} onSearch={searchMsgs} resultCount={hits.length > 0 ? hits.length : null} />{" "}
+                            {hits.length > 0 && (
+                              <ul className="search-hits" aria-label="Conversation search results">
+                                {" "}
+                                {hits.map((h) => (
+                                  <li key={h.sequence}>
+                                    {" "}
+                                    <button type="button" className="btn ghost" onClick={() => jumpToMessage(h.sequence)}>
+                                      {" "}
+                                      Message from {h.advisorName || (h.sender === "lead" ? (lead.data?.name ?? "Board lead") : h.sender)}{" "}
+                                    </button>{": "}{h.excerpt}{" "}
+                                  </li>
+                                ))}{" "}
+                              </ul>
+                            )}{" "}
                             <div className="chatwrap">
                               {" "}
                               {newCount > 0 && (
@@ -8064,7 +8343,7 @@ const testModel = useMutation({
                                   ✦
                                 </span>
                                 <span>
-                                  Requesting advisor responses
+                                  Advisors are drafting
                                   <span
                                     className="thinking-dots"
                                     aria-hidden="true"
@@ -8227,252 +8506,7 @@ const testModel = useMutation({
                                 </div>
                               )}{" "}
                             </div>{" "}
-                            <details className="setup">
-                              {" "}
-                              <summary>Search this conversation</summary>{" "}
-                              <input
-                                aria-label="Search messages"
-                                value={sq}
-                                onChange={(e) => setSq(e.target.value)}
-                                placeholder="Server-side search"
-                              />{" "}
-                              <button type="button" onClick={searchMsgs}>
-                                {" "}
-                                Search{" "}
-                              </button>{" "}
-                              {hits.map((h) => (
-                                <div key={h.sequence}>
-                                  {" "}
-                                  #{h.sequence} {h.sender}{" "}
-                                  {h.advisorName ? ` · ${h.advisorName}` : ""}:{" "}
-                                  {h.excerpt}{" "}
-                                </div>
-                              ))}{" "}
-                            </details>{" "}
-                          </>
-                        )}{" "}
-                        {meetTab === "takeaways" && (
-                          <div className="card">
-                            {" "}
-                            <h3>
-                              {" "}
-                              Key takeaways (provisional — never decisions){" "}
-                            </h3>{" "}
-                            {(notes.data ?? [])
-                              .filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing")
-                              .map((n) => {
-                                let exs: any[] = [];
-                                try { exs = JSON.parse(n.evidenceJson ?? "[]"); } catch { exs = []; }
-                                return (
-                                <div key={n.id} className="takenote">
-                                  {" "}
-                                  <b>{n.title}</b>{" "}
-                                  <span className="muted">Provisional</span>{" "}
-                                  {n.body.length > 400 ? (
-                                    <details>
-                                      {" "}
-                                      <summary>Show full briefing</summary>{" "}
-                                      <div>{n.body}</div>{" "}
-                                    </details>
-                                  ) : (
-                                    <div>{n.body}</div>
-                                  )}{" "}
-                                  {exs.length > 0 && (
-                                    <div className="excerpts">{exs.slice(0, 6).map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? e.ref}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind}:{e.ref}{e.version ? " v" + e.version : ""}</div></div>))}</div>
-                                  )}{" "}
-                                  {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
-                                </div>
-                                );
-                              })}{" "}
-                            {(notes.data ?? []).filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing").length === 0 && <p>No briefings yet.</p>}{" "}
-                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => { try { briefVisitRef.current++; } catch { /* noop */ } setBtopic(e.target.value); }} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate(); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
-                            {secQuestion && (
-                              <div className="card" role="status">
-                                <b>Secretary clarification</b>
-                                <div>{secQuestion}</div>
-                                {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {secOmitted.join("; ")}</div>)}
-                                <label>Answer<input value={secAnswer} onChange={(e) => { try { secComposerTouched.current = true; } catch { } try { secAnsVer.current++; } catch { /* noop */ } try { secAnsOwnerReq.current = secRequestId; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecAnswer(e.target.value); }} /></label>{" "}
-                                <button type="button" onClick={() => { if (!answerSecretary.isPending) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>{answerSecretary.isPending ? "Sending..." : "Send answer"}</button>{" "}
-                              </div>
-                            )}{" "}
-                            {secError && (<div className="card" role="alert">{(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) && (<div role="status" className="status-line"><span className="badge live">Secretary</span><span>Secretary working...</span></div>)}{" "}<b>Secretary error</b><div>{secError}</div>{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) { const uRet = secIdentity(); try { secEnvelopeRev.current++; } catch { } try { secHydRef.current++; } catch { } retrySecretary.mutate({ opId: "retry-" + (++opSeq.current), boardId, meetingId, user: uRet, epoch: secEpoch.current, origin: originIdentity(), envRevCap: secEnvelopeRev.current, hydRevCap: secHydRef.current, env: readEnvelope(secEnvelopeKey(uRet, boardId, meetingId)) }); } }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
-                            {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {secOmitted.join("; ")}</div>)}
-                            <h3>Secretary provisional notes</h3>{" "}
-                            {(notes.data ?? [])
-                              .filter((n) => (n.kind === "secretary-note" || n.kind === "secretary-briefing" || n.kind === "note" || n.kind === "briefing") && !(n.kind ?? "").startsWith("run-") )
-                              .map((n) => {
-                                let exs2: any[] = [];
-                                try { exs2 = JSON.parse(n.evidenceJson ?? "[]"); } catch { exs2 = []; }
-                                const rev = (n as any).revision ?? 1;
-                                const st = (n as any).noteStatus ?? "current";
-                                const isCur = st === "current";
-                                return (
-                                <div key={n.id} className="takenote">
-                                  <b>{n.title}</b>{" "}
-                                  <span className="muted">Provisional rev {rev} {st}{isCur ? "" : " (read-only)"}</span>{" "}
-                                  {n.body.length > 400 ? (<details open={false}><summary>Show full note (rev {rev})</summary><div>{n.body}</div></details>) : (<div>{n.body}</div>)}{" "}
-                                  {exs2.length > 0 && (<div className="excerpts">{exs2.map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? e.ref}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind}:{e.ref}{e.version ? " v" + e.version : ""}{e.sectionId ? " sec:" + String(e.sectionId).slice(0,8) : ""}{e.location ? " " + e.location : ""}{e.indexGeneration != null ? " g" + e.indexGeneration : ""}</div><div className="muted">Historical quote; current availability is resolved in History view per reference.</div></div>))}</div>)}{" "}
-                                  {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
-                                  <button type="button" onClick={() => { try { secHistSel.current = n.id; } catch { } loadHistory(n.id); }}>History</button>{" "}
-                                  {isCur && canActMeeting ? (<><button type="button" onClick={() => { setSecEditId(n.id); setSecEditBody(n.body); try { secEditSess.current++; } catch { } try { secHistSel.current = n.id; } catch { } try { secEditVisit.current++; } catch { } }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted">{isCur ? " Requires contribute access to edit." : " Superseded/reversed: read-only; open History for full text."}</span>)}{" "}
-                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => { setSecEditBody(e.target.value); try { secEditSess.current++; } catch { } }} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody })}>Save revision</button><button type="button" className="btn ghost" onClick={() => { setSecEditId(""); try { secEditVisit.current++; } catch { } try { secEditSess.current++; } catch { } }}>Cancel</button></div>)}{" "}
-                                </div>
-                                );
-                              })}{" "}
-                            <h3>All note history (including reversed)</h3>{" "}
-                            {((notesHistoryAll.data ?? []) as any[]).length === 0 && <p className="muted">No note history yet. Reversed notes remain discoverable here after reload.</p>}{" "}
-                            {((notesHistoryAll.data ?? []) as any[]).map((g: any) => (
-                              <div key={g.root} className="takenote">
-                                {" "}<b>Root {String(g.root).slice(0, 8)}</b>{" "}
-                                <span className="muted">{(g.current && (g.current.noteStatus || g.current.NoteStatus)) || ""} rev {(g.current && (g.current.revision ?? g.current.Revision)) ?? ""}</span>{" "}
-                                <div>{(g.current && (g.current.title || g.current.Title)) || ""}</div>{" "}
-                                <button type="button" onClick={() => loadHistory(g.current.id || g.current.Id)}>History</button>{" "}
-                              </div>
-                            ))}{" "}
-                            {secHistory && (<div className="card"><b>History</b><div>Root {(secHistory as any).root}</div><div className="muted">Current: {((secHistory as any).current && ((secHistory as any).current.id || (secHistory as any).current.Id)) || ""}</div>{((secHistory as any).availability ?? []).length > 0 && (<div className="excerpts">{((secHistory as any).availability ?? []).map((a: any, i: number) => (<div key={i} className="excerpt-card"><b>{a.ref}</b><div className="muted">{a.kind} current availability: {a.available ? "available" : "unavailable"} ({a.reason})</div></div>))}</div>)}{((secHistory as any).revisions ?? []).map((r: any) => (<details key={r.id}><summary>rev {r.revision} {r.noteStatus}: {r.title}</summary><div>{r.body}</div></details>))}{((secHistory as any).history ?? []).map((h: any) => (<details key={h.id}><summary>{h.action} rev {h.revision}</summary><div>{h.body}</div><div className="muted">{h.evidenceJson ?? h.EvidenceJson ?? ""}</div></details>))}<button type="button" onClick={() => { setSecHistory(null); try { secHistSel.current = ""; } catch { } try { secHistRef.current++; } catch { } }}>Close</button></div>)}{" "}
-                            <label>
-                              {" "}
-                              Note title{" "}
-                              <input
-                                value={ntitle}
-                                onChange={(e) => { try { noteVisitRef.current++; noteDraftRev.current++; } catch { /* noop */ } setNtitle(e.target.value); }}
-                              />{" "}
-                            </label>{" "}
-                            <label>
-                              {" "}
-                              Note body{" "}
-                              <input
-                                value={nbody}
-                                onChange={(e) => { try { noteVisitRef.current++; noteDraftRev.current++; } catch { /* noop */ } setNbody(e.target.value); }}
-                              />{" "}
-                            </label>{" "}
-                            {canActMeeting && (<button
-                              type="button"
-                              onClick={() => addNote.mutate()}
-                            >
-                              {" "}
-                              Save note{" "}
-                            </button>)}{" "}
-                          </div>
-                        )}{" "}
-                        {meetTab === "options" && (
-                          <div className="card">
-                            {" "}
-                            <h3>Options on the table</h3>{" "}
-                            <p>
-                              {" "}
-                              Adopted directions narrow what advisors argue for.
-                              Only exact shown text is adopted.{" "}
-                            </p>{" "}
-                            {(directions.data ?? []).map((n) => (
-                              <div key={n.id} className="takenote">
-                                {" "}
-                                <b>
-                                  {" "}
-                                  [{n.scope}] {n.title}:{" "}
-                                </b>{" "}
-                                {n.body.length > 200 ? (
-                                  <details>
-                                    {" "}
-                                    <summary>Show full text</summary>{" "}
-                                    <div>{n.body}</div>{" "}
-                                  </details>
-                                ) : (
-                                  <span> {n.body}</span>
-                                )}{" "}
-                                {canActMeeting && (<button
-                                  type="button"
-                                  className="btn ghost"
-                                  disabled={!meetingId || fromDirection.isPending}
-                                  onClick={() => fromDirection.mutate(n.id)}
-                                  title="Stage this exact direction text for record review"
-                                >
-                                  {" "}
-                                  Record this direction{" "}
-                                </button>)}{" "}
-                              </div>
-                            ))}{" "}
-                            {(directions.data ?? []).length === 0 && (
-                              <p>No directions adopted yet.</p>
-                            )}{" "}
-                            {canActMeeting && (<>
-                            <label>
-                              {" "}
-                              Exact text{" "}
-                              <textarea
-                                rows={4}
-                                value={dtext}
-                                onChange={(e) => { dtextRev.current++; setDtext(e.target.value); }}
-                              />{" "}
-                            </label>{" "}
-                            <label>
-                              {" "}
-                              Scope{" "}
-                              <select
-                                value={dscope}
-                                onChange={(e) => setDscope(e.target.value)}
-                              >
-                                {" "}
-                                <option value="meeting">
-                                  {" "}
-                                  Adopt for this meeting{" "}
-                                </option>{" "}
-                                <option value="board">
-                                  {" "}
-                                  Adopt board-wide{" "}
-                                </option>{" "}
-                              </select>{" "}
-                            </label>{" "}
-                            <button
-                              type="button"
-                              className="primary"
-                              disabled={!canActMeeting || !dtext.trim()}
-                              onClick={() => adopt.mutate()}
-                            >
-                              {" "}
-                              Adopt exact text{" "}
-                            </button>
-                            </>)}{" "}
-                          </div>
-                        )}{" "}
-                        {meetTab === "decision" && (
-                          <div className="card key">
-                            <h3>Decision state</h3>{" "}
-                            {latestDraft ? (
-                              <>
-                                {" "}
-                                <p>
-                                  {" "}
-                                  Draft v{latestDraft.version} ·{" "}
-                                  {latestDraft.status}{" "}
-                                  {latestDraft.decided ? " · decided" : ""}{" "}
-                                </p>{" "}
-                                <p className="muted">
-                                  {" "}
-                                  Hash <code>{latestDraft.hash}</code> ·
-                                  watermark {latestDraft.watermark}{" "}
-                                </p>{" "}
-                                <button
-                                  type="button"
-                                  className="primary"
-                                  onClick={() => {
-                                    setRecId(latestDraft.id);
-                                    setTab("records");
-                                  }}
-                                >
-                                  {" "}
-                                  Review and approve in Records{" "}
-                                </button>{" "}
-                              </>
-                            ) : (
-                              <p>
-                                {" "}
-                                No record draft yet. End the discussion to
-                                prepare one.{" "}
-                              </p>
-                            )}{" "}
-                          </div>
-                        )}{" "}
+
                       </div>{" "}
                       <div
                         className={
@@ -8482,33 +8516,11 @@ const testModel = useMutation({
                         }
                       >
                         {" "}
+                        <MeetingParticipants participants={presenceWithSecretary} live={live} />
+                        {" "}
                         <div className="context-bar">
                           {" "}
-                          <div
-                            className="ctabs"
-                            role="tablist"
-                            aria-label="Meeting context"
-                          >
-                            {" "}
-                            {(["members", "context", "decisions"] as const).map(
-                              (t) => (
-                                <button
-                                  key={t}
-                                  type="button"
-                                  role="tab"
-                                  aria-selected={contextTab === t}
-                                  onClick={() => setContextTab(t)}
-                                >
-                                  {" "}
-                                  {t === "members"
-                                    ? "Board members"
-                                    : t === "context"
-                                      ? "Context"
-                                      : "Decisions"}{" "}
-                                </button>
-                              ),
-                            )}{" "}
-                          </div>{" "}
+                          <span className="muted">Meeting context</span>{" "}
                           <button
                             type="button"
                             className="btn ghost icon"
@@ -8522,83 +8534,8 @@ const testModel = useMutation({
                         {!contextCollapsed && (
                           <div className="context-body">
                             {" "}
-                            {contextTab === "members" && (
-                              <>
-                                {" "}
-                                <h3>
-                                  {" "}
-                                  Board members ({(advisors.data ?? []).length}
-                                  ){" "}
-                                </h3>{" "}
-                                <ul className="members">
-                                  {" "}
-                                  {lead.data && (
-                                    <li>
-                                      {" "}
-                                      <span
-                                        className="avatar"
-                                        style={{
-                                          backgroundColor: `hsl(${hue(lead.data.name)} 30% 32%)`,
-                                        }}
-                                        aria-hidden="true"
-                                      >
-                                        {" "}
-                                        {initials(lead.data.name)}{" "}
-                                      </span>{" "}
-                                      <span className="member-n">
-                                        {" "}
-                                        {lead.data.name}{" "}
-                                        <span className="member-r">
-                                          {" "}
-                                          {lead.data.roleLabel} · You{" "}
-                                        </span>{" "}
-                                      </span>{" "}
-                                      <span
-                                        className="dot on"
-                                        role="img"
-                                        aria-label="present"
-                                      />{" "}
-                                    </li>
-                                  )}{" "}
-                                  {(advisors.data ?? []).map((a) => (
-                                    <li key={a.id}>
-                                      {" "}
-                                      <span
-                                        className="avatar"
-                                        style={{
-                                          backgroundColor: `hsl(${hue(a.boardRole)} 30% 32%)`,
-                                        }}
-                                        aria-hidden="true"
-                                      >
-                                        {" "}
-                                        {initials(a.boardRole)}{" "}
-                                      </span>{" "}
-                                      <span className="member-n">
-                                        {" "}
-                                        {a.boardRole}{" "}
-                                        <span className="member-r">
-                                          {" "}
-                                          {a.approved
-                                            ? "approved"
-                                            : "pending"}{" "}
-                                        </span>{" "}
-                                      </span>{" "}
-                                      <span
-                                        className={
-                                          a.approved ? "dot on" : "dot idle"
-                                        }
-                                        role="img"
-                                        aria-label={
-                                          a.approved ? "approved" : "pending"
-                                        }
-                                      />{" "}
-                                    </li>
-                                  ))}{" "}
-                                </ul>{" "}
-                              </>
-                            )}{" "}
-                            {contextTab === "context" && (
-                              <>
+
+                            {" "}
                                 {" "}
                                 <div className="card">
                                   {" "}
@@ -8608,69 +8545,6 @@ const testModel = useMutation({
                                     {curMeeting?.brief || "No brief yet."}{" "}
                                   </p>{" "}
                                 </div>{" "}
-                                <div className="card">
-                                  {" "}
-                                  <h3>Evidence</h3>{" "}
-                                  {excerpts.length === 0 && (
-                                    <p>No excerpts for this brief yet.</p>
-                                  )}{" "}
-                                  {excerpts.map((h, i) => (
-                                    <div key={i} className="excerpt">
-                                      {" "}
-                                      <span className="badge">
-                                        {" "}
-                                        {h.kind}{" "}
-                                      </span>{" "}
-                                      <b>{h.ref}</b> <div>{h.text}</div>{" "}
-                                    </div>
-                                  ))}{" "}
-                                  <button
-                                    type="button"
-                                    className="btn ghost"
-                                    onClick={() => setTab("sources")}
-                                  >
-                                    {" "}
-                                    Open sources{" "}
-                                  </button>{" "}
-                                </div>{" "}
-                              </>
-                            )}{" "}
-                            {contextTab === "decisions" && (
-                              <>
-                                {" "}
-                                <div
-                                  className={
-                                    recordFlash ? "card flash-accent" : "card"
-                                  }
-                                >
-                                  {" "}
-                                  <h3>Record</h3>{" "}
-                                  {latestDraft ? (
-                                    <p>
-                                      {" "}
-                                      v{latestDraft.version} ·{" "}
-                                      {latestDraft.status}{" "}
-                                      {latestDraft.decided
-                                        ? " · decided"
-                                        : ""}{" "}
-                                    </p>
-                                  ) : (
-                                    <p className="muted">No draft.</p>
-                                  )}{" "}
-                                  <button
-                                    type="button"
-                                    className="btn ghost"
-                                    onClick={() => {
-                                      if (latestDraft) setRecId(latestDraft.id);
-                                      setTab("records");
-                                    }}
-                                  >
-                                    {" "}
-                                    Open records{" "}
-                                  </button>{" "}
-                                </div>{" "}
-                              </>
-                            )}{" "}
                           </div>
                         )}{" "}
                       </div>{" "}
@@ -8685,6 +8559,23 @@ const testModel = useMutation({
                         </button>
                       )}{" "}
                     </>
+                    ) : (
+                      <div className="meet-center">
+                        {" "}
+                        <div className="card" aria-label="No meeting selected">
+                          {" "}
+                          <h2>No meeting selected</h2>{" "}
+                          <p className="muted">{" "}New meetings start a separate conversation. Pick a meeting from the list, or start one.{" "}</p>{" "}
+                          {canManageBoard ? (
+                            <button type="button" className="primary" onClick={() => createMeeting.mutate()} disabled={createMeeting.isPending}>
+                              {" "}
+                              {createMeeting.isPending ? "Creating…" : "New meeting"}{" "}
+                            </button>
+                          ) : (
+                            <p role="status">{" "}Ask a board manager to start a meeting, or pick one from the list.{" "}</p>
+                          )}{" "}
+                        </div>{" "}
+                      </div>
                     )
                   )}{" "}
                     </>)}
@@ -8755,30 +8646,27 @@ const testModel = useMutation({
                   <div className="card">
                     {" "}
                     <h3>Prepare draft</h3>{" "}
-                    <label>
+                    <RecordItemEditor
+                      draftKey="new-draft"
+                      initialJson={draftItems}
+                      onChange={(json) => setDraftItems(json)}
+                    />{" "}
+                    {canActMeeting && (<button onClick={prepareDraft} disabled={!parseRecordItems(draftItems).items.length}>
                       {" "}
-                      Items JSON{" "}
-                      <input
-                        value={draftItems}
-                        onChange={(e) => setDraftItems(e.target.value)}
-                      />{" "}
-                    </label>{" "}
-                    {canActMeeting && (<button onClick={prepareDraft}>
-                      {" "}
-                      Prepare draft from items{" "}
+                      Prepare draft from the list above{" "}
                     </button>)}{" "}
                   </div>{" "}
                   {(recs.data ?? []).map((r) => (
                     <div className="card" key={r.id}>
                       {" "}
-                      <button onClick={() => setRecId(r.id)}>
-                        {" "}
-                        v{r.version} · {r.status}{r.decided ? " · decided" : ""}{" "}
-                      </button>{" "}
-                      <span className="badge">
-                        {" "}
-                        {r.hash} @ {r.watermark}{" "}
-                      </span>{" "}
+                      <RecordVersionRow
+                        version={r.version}
+                        statusLabel={friendlyRecordStatus(r.status, r.decided).label}
+                        tone={friendlyRecordStatus(r.status, r.decided).tone}
+                        decided={r.decided}
+                        selected={r.id === recId}
+                        onSelect={() => setRecId(r.id)}
+                      />{" "}
                     </div>
                   ))}{" "}
                   {recOk && recDetail.data && (
@@ -8786,53 +8674,29 @@ const testModel = useMutation({
                       {" "}
                       <h3>
                         {" "}
-                        Review v{recDetail.data.version} ({" "}
-                        {recDetail.data.status}){" "}
+                        Review version {recDetail.data.version}{" "}
                       </h3>{" "}
-                      <p>
-                        {" "}
-                        Hash <code>{recDetail.data.hash}</code> · watermark{" "}
-                        {recDetail.data.watermark}{" "}
-                      </p>{" "}
-                      {showReviewError && reviewError && (<p role="alert">Review error: {reviewError.message}</p>)}{" "}
-                      {recOk && recDetail.data && !!recReview.data && !recReview.isError && !showReviewError && canManageMeeting && stateValid !== true && (<p role="alert">{recReview.data.stateValid !== true && recReview.data.stateError ? "Review state invalid: " + recReview.data.stateError : (reviewPendingCount === 0 ? "No pending items; nothing to approve." : "Review state invalid: explicit repair required; approval disabled")}</p>)}{" "}
+                      <StatusChip
+                        label={friendlyRecordStatus(recDetail.data.status, recDetail.data.decided).label}
+                        tone={friendlyRecordStatus(recDetail.data.status, recDetail.data.decided).tone}
+                      />{" "}
+
+                      {showReviewError && reviewError && (<ReviewAlert message={reviewError.message} />)}{" "}
+                      {recOk && recDetail.data && !!recReview.data && !recReview.isError && !showReviewError && canManageMeeting && stateValid !== true && (<ReviewAlert message={recReview.data.stateValid !== true && recReview.data.stateError ? "Review state invalid: " + recReview.data.stateError : (reviewPendingCount === 0 ? "No pending items; nothing to approve." : "Review state invalid: explicit repair required; approval disabled")} />)}{" "}
                       {canActMeeting && (<button type="button" onClick={() => { void refreshReview(); }}>
                         {" "}
                         Refresh review{" "}
                       </button>)}{" "}
-                      {(() => {
-                        try {
-                          return (
-                            JSON.parse(recDetail.data.itemsJson) as {
-                              id?: string;
-                              text?: string;
-                            }[]
-                          ).map((it) => (
-                            <label key={it.id ?? it.text} className="checkline">
-                              {" "}
-                              {canApproveRecord && (
-                              <input
-                                type="checkbox"
-                                aria-label={"Select item " + (it.id ?? it.text ?? "")}
-                                checked={selItems.includes(it.id ?? "")}
-                                onChange={(e) =>
-                                  setSelItems(
-                                    e.target.checked
-                                      ? [...selItems, it.id ?? ""]
-                                      : selItems.filter(
-                                          (x) => x !== (it.id ?? ""),
-                                        ),
-                                  )
-                                }
-                              />)}{" "}
-                              [{it.id}] {it.text}{" "}
-                            </label>
-                          ));
-                        } catch {
-                          const restricted = !recDetail.data.itemsJson;
-                          return <p>{restricted && !canManageMeeting ? "Draft item text is restricted." : "Unparseable items."}</p>;
+                      <RecordItemList
+                        itemsJson={recDetail.data.itemsJson}
+                        selectable={canApproveRecord}
+                        selected={selItems}
+                        onToggle={(key, checked) =>
+                          setSelItems(
+                            checked ? [...selItems, key] : selItems.filter((x) => x !== key),
+                          )
                         }
-                      })()}{" "}
+                      />{" "}
                       <div className="card">
                         {" "}
                         <h3>Compare with another version</h3>{" "}
@@ -8850,41 +8714,24 @@ const testModel = useMutation({
                               .map((r) => (
                                 <option key={r.id} value={r.id}>
                                   {" "}
-                                  v{r.version} · {r.status}{" "}
+                                  Version {r.version} · {friendlyRecordStatus(r.status, r.decided).label}{" "}
                                 </option>
                               ))}{" "}
                           </select>{" "}
                         </label>{" "}
-                        {cmpVer &&
+                          {cmpVer && (
                           (() => {
-                            const other = (recs.data ?? []).find(
-                              (r) => r.id === cmpVer,
+                            const other = (recs.data ?? []).find((r) => r.id === cmpVer);
+                          if (!other) return null;
+                            const olderFirst = recDetail.data.version >= other.version;
+                            return (
+                              <RecordComparison
+                                prevJson={olderFirst ? other.itemsJson : recDetail.data.itemsJson}
+                                curJson={olderFirst ? recDetail.data.itemsJson : other.itemsJson}
+                              />
                             );
-                            if (!other) return null;
-                            const rows =
-                              recDetail.data.version >= other.version
-                                ? diffItems(
-                                    other.itemsJson,
-                                    recDetail.data.itemsJson,
-                                  )
-                                : diffItems(
-                                    recDetail.data.itemsJson,
-                                    other.itemsJson,
-                                  );
-                            return rows.length === 0 ? (
-                              <p>Identical item sets.</p>
-                            ) : (
-                              <ul>
-                                {" "}
-                                {rows.map((d, i) => (
-                                  <li key={i}>
-                                    {" "}
-                                    <b>{d.mark}</b> [{d.key}] {d.text}{" "}
-                                  </li>
-                                ))}{" "}
-                              </ul>
-                            );
-                          })()}{" "}
+                          })()
+                        )}{" "}
                       </div>{" "}
                       <div>
                         {" "}
@@ -8907,21 +8754,18 @@ const testModel = useMutation({
                           Export detailed{" "}
                         </button>)}{" "}
                       </div>{" "}
-                      <label>
-                        {" "}
-                        Revised items JSON{" "}
-                        <input
-                          value={revText}
-                          onChange={(e) => { try { revTextRev.current++; } catch { /* noop */ } setRevText(e.target.value); }}
-                        />{" "}
-                      </label>{" "}
+                      <RecordItemEditor
+                        draftKey={recDetail.data.id + "-v" + recDetail.data.version}
+                        initialJson={revText}
+                        onChange={(json) => { try { revTextRev.current++; } catch { /* noop */ } setRevText(json); }}
+                      />{" "}
                       {canActMeeting && (<button onClick={() => reviseRec(false)}>
                         {" "}
                         Request revision (new version){" "}
                       </button>)}{" "}
                       {canApproveRecord && (<button onClick={() => reviseRec(true)}>
                         {" "}
-                        Amend (name superseded IDs){" "}
+                        Amend approved record{" "}
                       </button>)}{" "}
                       {canActMeeting && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
@@ -8960,7 +8804,8 @@ const testModel = useMutation({
                   {" "}
                   <div className="card">
                     {" "}
-                    <h3>Act as (demo identity for grant checks)</h3>{" "}
+                    <h3>Preview access as</h3>{" "}
+                    <p>{" "}Type a name to preview what that person can see. This never changes their real access.{" "}</p>{" "}
                     <input
                       aria-label="Act as user"
                       value={actAsState}
@@ -8981,7 +8826,6 @@ const testModel = useMutation({
                         try { setProfileReloading(false); } catch {}
                         try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
                         try { secEpoch.current++; } catch {}
-                        try { retirePipeline(submitOpRef.current); } catch {}
                         try { qc.clear(); } catch {}
                         qc.invalidateQueries();
                       }}
@@ -9019,11 +8863,11 @@ const testModel = useMutation({
                       </select>{" "}
                     </label>{" "}
                     {canManageBoard && (<button onClick={() => invite.mutate()}>Invite</button>)}{" "}
-                    {(invites.data ?? []).map((i) => (
-                      <div key={i.id}>
-                        {" "}
-                        {i.email} · {i.role} ·{" "}
-                        <span className="badge">{i.state}</span>{" "}
+                      {(invites.data ?? []).map((i) => (
+                        <div key={i.id}>
+                          {" "}
+                          {i.email} · {i.role} ·{" "}
+                          <StatusChip label={i.state === "pending" ? "Waiting for reply" : (i.state === "accepted" || i.state === "joined") ? "Joined" : (i.state === "revoked" || i.state === "expired") ? "Closed" : i.state} tone={i.state === "pending" ? "open" : (i.state === "accepted" || i.state === "joined") ? "done" : "muted"} />{" "}
                         {i.state === "pending" && canManageBoard && (
                           <button
                             onClick={() =>
@@ -9073,18 +8917,18 @@ const testModel = useMutation({
                       {" "}
                       Scope:{" "}
                       {meetingId
-                        ? `this meeting (${meetingId.slice(0, 8)})`
-                        : "whole board"}{" "}
+                        ? (meetings.data ?? []).find((m) => m.id === meetingId)?.title ?? "One meeting"
+                        : "Whole board"}{" "}
                       . Pick a meeting in Meetings to scope a grant to it.{" "}
                     </p>{" "}
                     {canManageBoard && (<button onClick={() => grant.mutate()}>Set grant</button>)}{" "}
                     {(grants.data ?? []).map((g) => (
                       <div key={g.id}>
                         {" "}
-                        {g.userKey} · {g.access}{" "}
+                        {g.userKey} · {g.access === "read" ? "Can read" : g.access === "contribute" ? "Can contribute" : g.access === "manage" ? "Can manage" : g.access}{" "}
                         {g.meetingId
-                          ? ` · meeting ${g.meetingId.slice(0, 8)}`
-                          : " · board"}{" "}
+                          ? <span> · {(meetings.data ?? []).find((m) => m.id === g.meetingId)?.title ?? "One meeting"}</span>
+                          : " · Whole board"}{" "}
                         {canManageBoard && (<button
                           onClick={() =>
                             del<unknown>(`/api/grants/${g.id}`).then(() => refresh("grants"))
@@ -9157,7 +9001,7 @@ const testModel = useMutation({
               {(jobs.data ?? []).map((j) => (
                 <div key={j.id}>
                   {" "}
-                  {j.kind} · <span className="badge">{j.state}</span>{" "}
+                  {j.kind} · <StatusChip label={j.state === "queued" ? "Waiting" : j.state === "running" ? "Working" : j.state === "failed" ? "Needs attention" : j.state === "done" ? "Finished" : j.state} tone={j.state === "failed" ? "progress" : j.state === "done" ? "done" : (j.state === "queued" || j.state === "running") ? "open" : "muted"} />{" "}
                   {j.state === "failed" && (
                     <button onClick={() => retryJob(j)}>
                       {" "}
@@ -9226,7 +9070,7 @@ const testModel = useMutation({
                 <table className="grid">
                   <thead>
                     <tr>
-                      <th>Kind</th><th>Model</th><th className="num">In</th>
+                      <th>Used for</th><th>Model</th><th className="num">Words in (approx. words)</th>
                       <th>Note</th>
                     </tr>
                   </thead>
@@ -9249,7 +9093,7 @@ const testModel = useMutation({
                     <tr>
                       <th>Model</th><th>Purpose</th>
                       <th className="num">In/out</th>
-                      <th className="num">Latency</th><th>Search</th>
+                      <th className="num">Wait</th><th>Web lookup</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -9319,13 +9163,13 @@ const testModel = useMutation({
                 {bakText && (
                   <p role="status">
                     {" "}
-                    Hash <code>{bakHash}</code> · {bakText.length} chars
-                    including originals and images.{" "}
+                    Backup ready — {bakText.length} characters saved, originals and images included.{" "}
                   </p>
                 )}{" "}
+
                 <label>
                   {" "}
-                  Backup snapshot{" "}
+                  Paste a backup snapshot{" "}
                   <input
                     value={bakText}
                     onChange={(e) => setBakText(e.target.value)}
@@ -9334,7 +9178,7 @@ const testModel = useMutation({
                 </label>{" "}
                 <label>
                   {" "}
-                  Backup hash{" "}
+                  Paste its check code{" "}
                   <input
                     value={bakHash}
                     onChange={(e) => setBakHash(e.target.value)}
@@ -9352,14 +9196,13 @@ const testModel = useMutation({
                 <table className="grid">
                   <thead>
                     <tr>
-                      <th>Action</th><th>Detail</th>
+                      <th>Activity</th>
                     </tr>
                   </thead>
                   <tbody>
                     {(audit.data ?? []).slice(0, 50).map((a, i) => (
                       <tr key={i}>
-                        <td>{a.action}</td>
-                        <td title={a.detail}>{a.detail.slice(0, 140)}</td>
+                        <td>{humanAuditAction(a.action)}{humanWhen(a.createdAt) ? " · " + humanWhen(a.createdAt) : ""}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -9404,7 +9247,7 @@ const testModel = useMutation({
                 .map((c, i) => (
                   <div className="card" key={i}>
                     {" "}
-                    <b>{c.command}</b> → {c.view}: {c.action}{" "}
+                    <span>{c.action}</span> <span className="muted">in {c.view}</span>{" "}
                   </div>
                 ))}{" "}
             </section>

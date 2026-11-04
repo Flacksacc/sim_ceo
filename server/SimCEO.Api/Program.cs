@@ -139,8 +139,10 @@ if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
       Console.WriteLine("POSTGRES: connected.");
       var recovered = SimCEO.Api.Work.SecretaryRecovery.RecoverInterrupted(pgStore);
       var recoveredJobs = SimCEO.Api.Work.JobWorker.RecoverInterrupted(pgStore);
+      var recoveredActivity = SimCEO.Api.Work.MeetingActivity.RecoverInterrupted();
       Console.WriteLine($"POSTGRES: secretary recovery marked {recovered} interrupted request(s).");
       Console.WriteLine($"POSTGRES: job recovery marked {recoveredJobs} interrupted job(s).");
+      Console.WriteLine($"POSTGRES: activity recovery marked {recoveredActivity} interrupted operation(s).");
     }
     catch (Exception ex)
     {
@@ -397,8 +399,690 @@ if (args.Contains("--selftest"))
     if (!RosterEndpoints.CanReadRoster(store, SecReq("leg-sec-owner"), secEntry)) failures.Add("leg-sec-owner-read");
     if (RosterEndpoints.CanReadRoster(store, SecReq("leg-sec-bob"), secEntry)) failures.Add("leg-sec-stranger-read-denied");
   }
+  // Roster reconciliation store fixture (isolated, no HTTP, no human data).
+  // Covers orphan classes unreachable through guarded HTTP paths (restore/import
+  // lineage checks rightly refuse to CREATE dangling links): stale re-pin, duplicate
+  // removal with history re-point, missing-link RECOVERY (reconstruct canonical entry
+  // under the stable id; advisors preserved, never detached), shared missing ref
+  // across boards (one entry), distinct empty links (never grouped), owner-mismatch
+  // refusal, archived flag-only, plan determinism, hash-guard refusal, replay.
+  {
+    var rb = new Board { Id = Guid.NewGuid(), Name = "ReconBoard", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[rb.Id] = rb;
+    var rb2 = new Board { Id = Guid.NewGuid(), Name = "ReconBoard2", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[rb2.Id] = rb2;
+    var rbX = new Board { Id = Guid.NewGuid(), Name = "ReconForeign", OwnerKey = "external-owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[rbX.Id] = rbX;
+    var re = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "SelfRecon", Description = "selftest reconciliation entry", ProfileJson = "{selftest:ok}", Version = 5, UpdatedAt = DateTime.UtcNow };
+    store.Roster[re.Id] = re;
+    store.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = re.Id, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 7 } };
+    var staleAdv = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = re.Id, RosterVersion = 3, BoardRole = "Stale", Approved = true, CreatedAt = DateTime.UtcNow };
+    store.Advisors[staleAdv.Id] = staleAdv;
+    var re2 = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "SelfReconDup", Description = "selftest duplicate-link entry", ProfileJson = "{dup:ok}", Version = 2, UpdatedAt = DateTime.UtcNow };
+    store.Roster[re2.Id] = re2;
+    store.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = re2.Id, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 8 } };
+    var dupOld = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = re2.Id, RosterVersion = 2, BoardRole = "Dup", CreatedAt = DateTime.UtcNow.AddMinutes(-5) };
+    var dupNew = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = re2.Id, RosterVersion = 2, BoardRole = "Dup", CreatedAt = DateTime.UtcNow };
+    store.Advisors[dupOld.Id] = dupOld;
+    store.Advisors[dupNew.Id] = dupNew;
+    var mm = new Meeting { Id = Guid.NewGuid(), BoardId = rb.Id };
+    store.Meetings[mm.Id] = mm;
+    store.Messages[mm.Id] = MessageList.Detached(mm.Id, new List<Message> { new Message { BoardId = rb.Id, MeetingId = mm.Id, Sequence = 1, AdvisorId = dupNew.Id, Sender = "advisor", AdvisorName = "Dup", Content = "legacy reply", Status = "committed", CreatedAt = DateTime.UtcNow } });
+    var sharedMissing = Guid.NewGuid();
+    var missA = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = sharedMissing, RosterVersion = 1, BoardRole = "Shared Sage", Approved = true, CreatedAt = DateTime.UtcNow.AddMinutes(-2) };
+    var missB = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb2.Id, RosterEntryId = sharedMissing, RosterVersion = 1, BoardRole = "Shared Sage", CreatedAt = DateTime.UtcNow };
+    store.Advisors[missA.Id] = missA;
+    store.Advisors[missB.Id] = missB;
+    var missImg = new AdvisorImage { RosterEntryId = null, BoardAdvisorId = missB.Id, Kind = "upload", Review = "pending", Provenance = "legacy:board-local", ContentType = "image/png", Data = new byte[] { 9 } };
+    store.Images[missImg.Id] = missImg;
+    var emptyA = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink One", CreatedAt = DateTime.UtcNow };
+    var emptyB = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Two", CreatedAt = DateTime.UtcNow };
+    var rb3 = new Board { Id = Guid.NewGuid(), Name = "ReconBoard3", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[rb3.Id] = rb3;
+    var emptyE = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb3.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Scoped3", CreatedAt = DateTime.UtcNow };
+    store.Advisors[emptyE.Id] = emptyE;
+    var rbO = new Board { Id = Guid.NewGuid(), Name = "ReconOwnerless", OwnerKey = "", CreatedAt = DateTime.UtcNow };
+    store.Boards[rbO.Id] = rbO;
+    var emptyC = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rbO.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Ownerless", CreatedAt = DateTime.UtcNow };
+    var emptyD = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb2.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Scoped", CreatedAt = DateTime.UtcNow };
+    store.Advisors[emptyD.Id] = emptyD;
+    store.Advisors[emptyC.Id] = emptyC;
+    store.Advisors[emptyA.Id] = emptyA;
+    store.Advisors[emptyB.Id] = emptyB;
+    var foreignMissing = Guid.NewGuid();
+    var missF = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rbX.Id, RosterEntryId = foreignMissing, RosterVersion = 1, BoardRole = "Foreign Sage", CreatedAt = DateTime.UtcNow };
+    var missF2 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = foreignMissing, RosterVersion = 1, BoardRole = "Foreign Sage", CreatedAt = DateTime.UtcNow };
+    store.Advisors[missF2.Id] = missF2;
+    store.Advisors[missF.Id] = missF;
+    var archEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "Arch", Description = "archived entry", ProfileJson = "{selftest:archived}", Version = 1, Archived = true, UpdatedAt = DateTime.UtcNow };
+    store.Roster[archEntry.Id] = archEntry;
+    var archLink = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = archEntry.Id, RosterVersion = 1, BoardRole = "Arch", CreatedAt = DateTime.UtcNow };
+    store.Advisors[archLink.Id] = archLink;
+    var plan0 = RosterReconciliation.Plan(store, "selftest-key", null);
+    bool Mine(Guid b) => b == rb.Id || b == rb2.Id || b == rbX.Id || b == rbO.Id || b == rb3.Id;
+    var mine0 = plan0.Orphans.Where(o => Mine(o.BoardId)).ToList();
+    if (mine0.Count(o => o.Reason == "stale-version") != 1) failures.Add("recon-scan-stale");
+    if (mine0.Count(o => o.Reason == "duplicate-link") != 1) failures.Add("recon-scan-dup");
+    if (mine0.Count(o => o.Reason == "missing-roster") != 4) failures.Add("recon-scan-missing");
+    if (mine0.Count(o => o.Reason == "empty-link") != 5) failures.Add("recon-scan-empty");
+    if (mine0.Count(o => o.Reason == "archived-roster") != 1) failures.Add("recon-scan-archived");
+    if (RosterReconciliation.Plan(store, "selftest-key", null).PlanHash != plan0.PlanHash) failures.Add("recon-plan-deterministic");
+    var badApply = RosterReconcileApply.Apply(store, "wrong-hash", "selftest-key", null, out _, out var badCode);
+    if (badApply.Ok || badCode != 409) failures.Add("recon-apply-hash-guard");
+    var emptyDId = RosterLegacyAccess.StableEmptyLinkId(rb2.Id, emptyD.Id);
+    var scopePlan = RosterReconciliation.Plan(store, "selftest-scope", rb2.Id);
+    if (scopePlan.Orphans.Count(o => o.Reason == "empty-link") != 1) failures.Add("recon-scope-scan");
+    // Cross-board sharing: PGMISS-style shared targets must refuse scoped repair with an
+    // explicit global-required reason instead of silently leaving the other board behind.
+    var scopeRefused = RosterReconcileApply.Apply(store, scopePlan.PlanHash, "selftest-scope", rb2.Id, out var scopeRefErr, out var scopeRefCode);
+    if (scopeRefused.Ok || scopeRefCode != 409 || !(scopeRefErr ?? "").Contains("global")) failures.Add("recon-scope-refuses-shared:" + scopeRefErr);
+    if (store.Roster.ContainsKey(sharedMissing)) failures.Add("recon-scope-no-partial-entry");
+    if (!store.Advisors.TryGetValue(missB.Id, out var missBUntouched) || missBUntouched.Removed || missBUntouched.RosterEntryId != sharedMissing || missBUntouched.RosterVersion != 1) failures.Add("recon-scope-outofscope-approval");
+    if (!store.Images.TryGetValue(missImg.Id, out var missImgUntouched) || missImgUntouched.RosterEntryId.HasValue) failures.Add("recon-scope-outofscope-image");
+    if (!store.Advisors.TryGetValue(emptyD.Id, out var emptyDUntouched) || emptyDUntouched.RosterEntryId != Guid.Empty) failures.Add("recon-scope-nothing-applied");
+    var scopePlanAfter = RosterReconciliation.Plan(store, "selftest-scope", rb2.Id);
+    if (!scopePlanAfter.Orphans.Any(o => o.Reason == "missing-roster" && o.RosterEntryId == sharedMissing)) failures.Add("recon-scope-still-reports-shared");
+    var globalAfterScope = RosterReconciliation.Plan(store, "selftest-scope", null);
+    if (!globalAfterScope.Orphans.Any(o => o.Reason == "missing-roster" && o.RosterEntryId == sharedMissing)) failures.Add("recon-scope-global-still-reports-shared");
+    var scopeSharedActs = scopePlan.Actions.Where(a => a.RosterEntryId == sharedMissing).ToList();
+    if (!scopeSharedActs.Any(a => a.Kind == "RequiresGlobalScope")) failures.Add("recon-scope-plan-marks-global");
+    if (!scopeSharedActs.All(a => (a.Summary ?? "").Contains("global"))) failures.Add("recon-scope-plan-message");
+    // Contained scope (single board, no cross-board sharing) still applies cleanly.
+    var emptyEId = RosterLegacyAccess.StableEmptyLinkId(rb3.Id, emptyE.Id);
+    var scopePlan3 = RosterReconciliation.Plan(store, "selftest-scope3", rb3.Id);
+    if (scopePlan3.Orphans.Count(o => o.Reason == "empty-link") != 1) failures.Add("recon-scope3-scan");
+    var scopeApplied3 = RosterReconcileApply.Apply(store, scopePlan3.PlanHash, "selftest-scope3", rb3.Id, out var scopeErr3, out _);
+    if (!scopeApplied3.Ok) failures.Add("recon-scope3-apply:" + scopeErr3);
+    if (!scopeApplied3.Applied.Any(s => s.StartsWith("recover-empty:"))) failures.Add("recon-scope3-no-recover-empty");
+    if (!store.Roster.TryGetValue(emptyEId, out var emptyERec) || emptyERec is null || emptyERec.Name != "NoLink Scoped3") failures.Add("recon-scope3-entry");
+    if (!store.Advisors.TryGetValue(emptyE.Id, out var emptyEAfter) || emptyEAfter.Removed || emptyEAfter.RosterEntryId != emptyEId || emptyEAfter.Approved) failures.Add("recon-scope3-relink");
+    if (!store.Advisors.TryGetValue(emptyA.Id, out var emptyAUntouched) || emptyAUntouched.RosterEntryId != Guid.Empty) failures.Add("recon-scope-untouched");
+    var plan1 = RosterReconciliation.Plan(store, "selftest-key", null);
+    if (plan1.PlanHash == plan0.PlanHash) failures.Add("recon-plan-hash-moves");
+    var appliedOnce = RosterReconcileApply.Apply(store, plan1.PlanHash, "selftest-key", null, out var applyErr, out _);
+    if (!appliedOnce.Ok) failures.Add("recon-apply:" + applyErr);
+    if (!appliedOnce.Applied.Any(s => s.StartsWith("recover-empty:"))) failures.Add("recon-apply-no-recover-empty");
+    if (!appliedOnce.Applied.Any(s => s.StartsWith("recover-empty:"))) failures.Add("recon-apply-no-recover-empty");
+    if (!store.Advisors.TryGetValue(staleAdv.Id, out var staleAfter) || staleAfter.RosterVersion != 5 || staleAfter.Approved) failures.Add("recon-repin");
+    if (!store.Advisors.TryGetValue(dupNew.Id, out var dupNewAfter) || !dupNewAfter.Removed) failures.Add("recon-dedupe-removed");
+    if (!store.Advisors.TryGetValue(dupOld.Id, out var dupOldAfter) || dupOldAfter.Removed) failures.Add("recon-dedupe-survivor");
+    if (!store.Messages.TryGetValue(mm.Id, out var mlist) || !mlist.Any(m => m.AdvisorId == dupOld.Id && m.Content == "legacy reply")) failures.Add("recon-history-repoint");
+    if (!store.Roster.TryGetValue(sharedMissing, out var recovered) || recovered is null) failures.Add("recon-recover-created");
+    else
+    {
+      if (recovered.OwnerKey != "owner") failures.Add("recon-recover-owner");
+      if (recovered.Name != "Shared Sage") failures.Add("recon-recover-name:" + recovered.Name);
+      if (!(recovered.Tags ?? "").Contains("recovered")) failures.Add("recon-recover-tag");
+      if (!(recovered.ProfileJson ?? "").Contains("No credentials")) failures.Add("recon-recover-honest");
+      if (recovered.AccountId == Guid.Empty) failures.Add("recon-recover-account");
+      var (recComplete, recMissing) = RosterOps.Completeness(store, sharedMissing);
+      if (recComplete) failures.Add("recon-recovered-not-complete");
+      if (!recMissing.Any(m => m.Contains("recovered placeholder"))) failures.Add("recon-recovered-missing-actionable");
+      var (recDataComplete, _) = RosterOps.DataCompleteness(store, sharedMissing);
+      if (recDataComplete) failures.Add("recon-recovered-data-not-complete");
+      recovered.Tags = "";
+      var (recFixed, _) = RosterOps.Completeness(store, sharedMissing);
+      if (!recFixed) failures.Add("recon-recovered-tagstrip-complete");
+      recovered.Tags = "recovered";
+    }
+    if (!store.Advisors.TryGetValue(missA.Id, out var missAAfter) || missAAfter.Removed || missAAfter.RosterVersion != 1 || missAAfter.BoardRole != "Shared Sage") failures.Add("recon-membership-kept-A");
+    if (!store.Advisors.TryGetValue(missB.Id, out var missBAfter) || missBAfter.Removed || missBAfter.RosterVersion != 1 || missBAfter.Approved) failures.Add("recon-membership-kept-B");
+    if (!store.Advisors.TryGetValue(missF2.Id, out var missF2After) || missF2After.Removed) failures.Add("recon-foreign-preserved-2");
+    if (!store.Images.TryGetValue(missImg.Id, out var missImgAfter) || missImgAfter.RosterEntryId != sharedMissing) failures.Add("recon-image-relink");
+    if (!store.Advisors.TryGetValue(emptyA.Id, out var emptyAAfter) || emptyAAfter.Removed) failures.Add("recon-empty-preserved-A");
+    if (!store.Advisors.TryGetValue(emptyB.Id, out var emptyBAfter) || emptyBAfter.Removed) failures.Add("recon-empty-preserved-B");
+    if (store.Roster.ContainsKey(foreignMissing)) failures.Add("recon-foreign-no-entry");
+    if (!store.Advisors.TryGetValue(missF.Id, out var missFAfter) || missFAfter.Removed) failures.Add("recon-foreign-preserved");
+    if (!appliedOnce.Flagged.Any(s => s.Contains("owner-mismatch"))) failures.Add("recon-foreign-flagged");
+    if (!appliedOnce.Flagged.Any(s => s.StartsWith("empty-link:") && s.Contains(emptyC.Id.ToString("N")))) failures.Add("recon-empty-flagged");
+    var emptyAId = RosterLegacyAccess.StableEmptyLinkId(rb.Id, emptyA.Id);
+    var emptyBId = RosterLegacyAccess.StableEmptyLinkId(rb.Id, emptyB.Id);
+    if (!store.Roster.TryGetValue(emptyAId, out var emptyARec) || emptyARec is null || emptyARec.Name != "NoLink One" || !(emptyARec.Tags ?? "").Contains("recovered")) failures.Add("recon-empty-recover-A");
+    if (!store.Roster.TryGetValue(emptyBId, out var emptyBRec) || emptyBRec is null || emptyBRec.Name != "NoLink Two") failures.Add("recon-empty-recover-B");
+    if (emptyAId == emptyBId) failures.Add("recon-empty-distinct");
+    if (!store.Advisors.TryGetValue(emptyA.Id, out var emptyAAfter2) || emptyAAfter2.Removed || emptyAAfter2.RosterEntryId != emptyAId || emptyAAfter2.RosterVersion != 1 || emptyAAfter2.Approved) failures.Add("recon-empty-relink-A");
+    if (!store.Advisors.TryGetValue(emptyB.Id, out var emptyBAfter2) || emptyBAfter2.Removed || emptyBAfter2.RosterEntryId != emptyBId) failures.Add("recon-empty-relink-B");
+    if (!store.Advisors.TryGetValue(archLink.Id, out var archAfter) || archAfter.Removed) failures.Add("recon-archived-flag-only");
+    var cleanPlan = RosterReconciliation.Plan(store, "selftest-key", null);
+    var mineClean = cleanPlan.Orphans.Where(o => o.BoardId == rb.Id || o.BoardId == rb2.Id || o.BoardId == rbX.Id || o.BoardId == rbO.Id).ToList();
+    if (mineClean.Any(o => o.Reason == "stale-version" || o.Reason == "duplicate-link")) failures.Add("recon-plan-clean");
+    if (mineClean.Any(o => o.Reason == "missing-roster" && o.RosterEntryId != foreignMissing)) failures.Add("recon-plan-clean-missing");
+    if (!store.Advisors.TryGetValue(emptyC.Id, out var emptyCAfter) || emptyCAfter.Removed || emptyCAfter.RosterEntryId != Guid.Empty) failures.Add("recon-empty-ownerless-preserved");
+    var emptyClean = mineClean.Where(o => o.Reason == "empty-link").ToList();
+    if (emptyClean.Count != 1 || emptyClean[0].AdvisorId != emptyC.Id) failures.Add("recon-plan-clean-empty");
+    var replayed = RosterReconcileApply.Apply(store, plan1.PlanHash, "selftest-key", null, out var replayErr, out _);
+    if (!replayed.Ok) failures.Add("recon-replay:" + replayErr);
+    // Finding 5 regression: a NEW recoverable empty link after a clean replay must NOT
+    // replay-ok; the changed actionable state forces 409/re-plan.
+    var emptyNew = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Late", CreatedAt = DateTime.UtcNow };
+    store.Advisors[emptyNew.Id] = emptyNew;
+    var replayStale = RosterReconcileApply.Apply(store, plan1.PlanHash, "selftest-key", null, out var replayStaleErr, out var replayStaleCode);
+    if (replayStale.Ok || replayStaleCode != 409) failures.Add("recon-replay-new-empty:" + replayStaleErr);
+    store.Advisors.TryRemove(emptyNew.Id, out _);
+    var emptyNew2 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Late Target", CreatedAt = DateTime.UtcNow };
+    store.Advisors[emptyNew2.Id] = emptyNew2;
+    var preMade = RosterLegacyAccess.StableEmptyLinkId(rb.Id, emptyNew2.Id);
+    store.Roster[preMade] = new RosterEntry { Id = preMade, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "NoLink Late Target", Description = "pre-existing deterministic target with length", ProfileJson = "{pre:made-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    var replayPreMade = RosterReconcileApply.Apply(store, plan1.PlanHash, "selftest-key", null, out var replayPreMadeErr, out var replayPreMadeCode);
+    if (replayPreMade.Ok || replayPreMadeCode != 409) failures.Add("recon-replay-existing-empty-target:" + replayPreMadeErr);
+    store.Roster.TryRemove(preMade, out _);
+    store.Advisors.TryRemove(emptyNew2.Id, out _);
+    // Typed-hash repros: roster-owner change under a duplicate, count-preserving
+    // history-row replacement, and unknown historical ownership on duplicates.
+    {
+      var pbD = new Board { Id = Guid.NewGuid(), Name = "PerturbDup", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+      store.Boards[pbD.Id] = pbD;
+      var peD = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "Perturb Dup Own", Description = "perturbation dup owner entry", ProfileJson = "{perturb:dup-owner-ok}", Version = 1, UpdatedAt = DateTime.UtcNow };
+      store.Roster[peD.Id] = peD;
+      var pdo = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pbD.Id, RosterEntryId = peD.Id, RosterVersion = 1, BoardRole = "Perturb Dup", CreatedAt = DateTime.UtcNow.AddMinutes(-3) };
+      var pdn = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pbD.Id, RosterEntryId = peD.Id, RosterVersion = 1, BoardRole = "Perturb Dup", CreatedAt = DateTime.UtcNow };
+      store.Advisors[pdo.Id] = pdo;
+      store.Advisors[pdn.Id] = pdn;
+      var pmm = new Meeting { Id = Guid.NewGuid(), BoardId = pbD.Id };
+      store.Meetings[pmm.Id] = pmm;
+      store.Messages[pmm.Id] = MessageList.Detached(pmm.Id, new List<Message> { new Message { BoardId = pbD.Id, MeetingId = pmm.Id, Sequence = 1, AdvisorId = pdn.Id, Sender = "advisor", AdvisorName = "Perturb Dup", Content = "perturb dup reply", Status = "committed", CreatedAt = DateTime.UtcNow } });
+      var pimgX = new AdvisorImage { Id = Guid.NewGuid(), BoardAdvisorId = pdn.Id, RosterEntryId = null, Kind = "upload", Review = "accepted", Provenance = "perturb:x", ContentType = "image/png", Data = new byte[] { 11 } };
+      store.Images[pimgX.Id] = pimgX;
+      pmm.ParticipantIdsJson = System.Text.Json.JsonSerializer.Serialize(new[] { pdn.Id });
+      string DupHash() => RosterReconciliation.Plan(store, "perturb-dup", null).PlanHash;
+      var dh0 = DupHash();
+      peD.OwnerKey = "external-owner";
+      if (DupHash() == dh0) failures.Add("perturb-dup-owner-static");
+      var dhPlan = RosterReconciliation.Plan(store, "perturb-dup", null);
+      if (dhPlan.Actions.Any(a => a.Kind == "RemoveDuplicateLink" && a.RosterEntryId == peD.Id)) failures.Add("perturb-dup-owner-still-removes");
+      if (!dhPlan.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == pdn.Id)) failures.Add("perturb-dup-owner-no-flag");
+      var dhStale = RosterReconcileApply.Apply(store, dh0, "perturb-dup", null, out _, out var dhCode);
+      if (dhStale.Ok || dhCode != 409) failures.Add("perturb-dup-owner-accepted");
+      peD.OwnerKey = "owner";
+      if (DupHash() != dh0) failures.Add("perturb-dup-owner-restore-drift");
+      var dhMsg = store.Messages[pmm.Id].First(m => m.AdvisorId == pdn.Id);
+      var dhSeq = dhMsg.Sequence;
+      dhMsg.Sequence = dhSeq + 1;
+      if (DupHash() == dh0) failures.Add("perturb-dup-row-static");
+      var dhMsgStale = RosterReconcileApply.Apply(store, dh0, "perturb-dup", null, out _, out var dhMsgCode);
+      if (dhMsgStale.Ok || dhMsgCode != 409) failures.Add("perturb-dup-row-accepted");
+      dhMsg.Sequence = dhSeq;
+      if (DupHash() != dh0) failures.Add("perturb-dup-row-restore-drift");
+      store.Images.TryRemove(pimgX.Id, out _);
+      var pimgY = new AdvisorImage { Id = Guid.NewGuid(), BoardAdvisorId = pdn.Id, RosterEntryId = null, Kind = "upload", Review = "accepted", Provenance = "perturb:y", ContentType = "image/png", Data = new byte[] { 12 } };
+      store.Images[pimgY.Id] = pimgY;
+      if (DupHash() == dh0) failures.Add("perturb-dup-img-static");
+      var dhImgStale = RosterReconcileApply.Apply(store, dh0, "perturb-dup", null, out _, out var dhImgCode);
+      if (dhImgStale.Ok || dhImgCode != 409) failures.Add("perturb-dup-img-accepted");
+      store.Images.TryRemove(pimgY.Id, out _);
+      store.Images[pimgX.Id] = pimgX;
+      if (DupHash() != dh0) failures.Add("perturb-dup-img-restore-drift");
+      var dhParts = pmm.ParticipantIdsJson;
+      pmm.ParticipantIdsJson = System.Text.Json.JsonSerializer.Serialize(new[] { pdo.Id });
+      if (DupHash() == dh0) failures.Add("perturb-dup-parts-static");
+      var dhPartsStale = RosterReconcileApply.Apply(store, dh0, "perturb-dup", null, out _, out var dhPartsCode);
+      if (dhPartsStale.Ok || dhPartsCode != 409) failures.Add("perturb-dup-parts-accepted");
+      pmm.ParticipantIdsJson = dhParts;
+      if (DupHash() != dh0) failures.Add("perturb-dup-parts-restore-drift");
+      peD.Description = "D;name=Alice"; peD.Name = "Bob";
+      var dhDelim1 = DupHash();
+      if (dhDelim1 == dh0) failures.Add("perturb-dup-delim-static");
+      peD.Description = "D"; peD.Name = "Alice;name=Bob";
+      if (DupHash() == dhDelim1) failures.Add("perturb-dup-delim-collision");
+      var dhDelimStale = RosterReconcileApply.Apply(store, dhDelim1, "perturb-dup", null, out _, out var dhDelimCode);
+      if (dhDelimStale.Ok || dhDelimCode != 409) failures.Add("perturb-dup-delim-accepted");
+      peD.Description = "perturbation dup owner entry"; peD.Name = "Perturb Dup Own";
+      if (DupHash() != dh0) failures.Add("perturb-dup-delim-restore-drift");
+      var rbU = new Board { Id = Guid.NewGuid(), Name = "PerturbUnknown", OwnerKey = "", CreatedAt = DateTime.UtcNow };
+      store.Boards[rbU.Id] = rbU;
+      var uMiss = Guid.NewGuid();
+      var rU0 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = Guid.NewGuid(), RosterEntryId = uMiss, RosterVersion = 1, BoardRole = "Unknown Gone", Removed = true, CreatedAt = DateTime.UtcNow.AddMinutes(-9) };
+      store.Advisors[rU0.Id] = rU0;
+      var rU1 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rbU.Id, RosterEntryId = uMiss, RosterVersion = 1, BoardRole = "Unknown Dup", CreatedAt = DateTime.UtcNow.AddMinutes(-2) };
+      var rU2 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rbU.Id, RosterEntryId = uMiss, RosterVersion = 1, BoardRole = "Unknown Dup", CreatedAt = DateTime.UtcNow };
+      store.Advisors[rU1.Id] = rU1;
+      store.Advisors[rU2.Id] = rU2;
+      var umm = new Meeting { Id = Guid.NewGuid(), BoardId = rbU.Id };
+      store.Meetings[umm.Id] = umm;
+      store.Messages[umm.Id] = MessageList.Detached(umm.Id, new List<Message> { new Message { BoardId = rbU.Id, MeetingId = umm.Id, Sequence = 1, AdvisorId = rU2.Id, Sender = "advisor", AdvisorName = "Unknown Dup", Content = "unknown dup reply", Status = "committed", CreatedAt = DateTime.UtcNow } });
+      var uPlan = RosterReconciliation.Plan(store, "perturb-unknown", rbU.Id);
+      if (uPlan.Actions.Any(a => a.Kind == "RemoveDuplicateLink")) failures.Add("perturb-unknown-plans-removal");
+      if (!uPlan.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == rU2.Id)) failures.Add("perturb-unknown-no-flag");
+      var uApplied = RosterReconcileApply.Apply(store, uPlan.PlanHash, "perturb-unknown", rbU.Id, out var uErr, out _);
+      if (!uApplied.Ok) failures.Add("perturb-unknown-apply:" + uErr);
+      if (uApplied.Applied.Any(s => s.StartsWith("dedupe:"))) failures.Add("perturb-unknown-mutated");
+      if (uApplied.Applied.Any(s => s.StartsWith("recover:"))) failures.Add("perturb-unknown-recovered");
+      if (!store.Advisors.TryGetValue(rU2.Id, out var rU2After) || rU2After.Removed) failures.Add("perturb-unknown-removed");
+      if (!store.Messages.TryGetValue(umm.Id, out var uml) || !uml.Any(m => m.AdvisorId == rU2.Id && m.Content == "unknown dup reply")) failures.Add("perturb-unknown-history-moved");
+      store.Messages[umm.Id] = MessageList.Detached(umm.Id, new List<Message>());
+      store.Meetings.TryRemove(umm.Id, out _);
+      store.Advisors.TryRemove(rU0.Id, out _);
+      store.Advisors.TryRemove(rU1.Id, out _);
+      store.Advisors.TryRemove(rU2.Id, out _);
+      store.Boards.TryRemove(rbU.Id, out _);
+      store.Messages[pmm.Id] = MessageList.Detached(pmm.Id, new List<Message>());
+      store.Meetings.TryRemove(pmm.Id, out _);
+      store.Images.TryRemove(pimgX.Id, out _);
+      store.Advisors.TryRemove(pdo.Id, out _);
+      store.Advisors.TryRemove(pdn.Id, out _);
+      store.Roster.TryRemove(peD.Id, out _);
+      store.Boards.TryRemove(pbD.Id, out _);
+    }
+    // Existing deterministic empty-link target: owner/archive/version changes
+    // move the hash; the dry-run describes relink (not create v1); apply never
+    // attaches a foreign or archived target.
+    {
+      var emptyT = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = rb.Id, RosterEntryId = Guid.Empty, BoardRole = "NoLink Target", CreatedAt = DateTime.UtcNow };
+      store.Advisors[emptyT.Id] = emptyT;
+      var preT = RosterLegacyAccess.StableEmptyLinkId(rb.Id, emptyT.Id);
+      store.Roster[preT] = new RosterEntry { Id = preT, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "NoLink Target", Description = "pre-existing deterministic target", ProfileJson = "{pre:target-profile-with-length}", Version = 3, UpdatedAt = DateTime.UtcNow };
+      string TargetHash() => RosterReconciliation.Plan(store, "perturb-target", null).PlanHash;
+      var th0 = TargetHash();
+      var thPlan = RosterReconciliation.Plan(store, "perturb-target", null);
+      if (!thPlan.Actions.Any(a => a.Kind == "RecoverEmptyLink" && a.AdvisorId == emptyT.Id && (a.Summary ?? "").Contains("EXISTING"))) failures.Add("perturb-target-no-relink-desc");
+      store.Roster.TryGetValue(preT, out var thEntry);
+      thEntry!.OwnerKey = "foreign-owner";
+      if (TargetHash() == th0) failures.Add("perturb-target-owner-static");
+      var thPlanF = RosterReconciliation.Plan(store, "perturb-target", null);
+      if (thPlanF.Actions.Any(a => a.Kind == "RecoverEmptyLink" && a.AdvisorId == emptyT.Id)) failures.Add("perturb-target-foreign-still-recovers");
+      if (!thPlanF.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == emptyT.Id)) failures.Add("perturb-target-foreign-no-flag");
+      var thApplyF = RosterReconcileApply.Apply(store, thPlanF.PlanHash, "perturb-target", null, out var thErrF, out _);
+      if (!thApplyF.Ok) failures.Add("perturb-target-foreign-apply:" + thErrF);
+      if (thApplyF.Applied.Any(s => s.Contains("relink") || s.Contains("recover-empty"))) failures.Add("perturb-target-foreign-attached");
+      if (!store.Advisors.TryGetValue(emptyT.Id, out var emptyTAfterF) || emptyTAfterF.RosterEntryId != Guid.Empty) failures.Add("perturb-target-foreign-linked");
+      thEntry.OwnerKey = "owner";
+      thEntry.Archived = true;
+      if (TargetHash() == th0) failures.Add("perturb-target-archive-static");
+      var thPlanA = RosterReconciliation.Plan(store, "perturb-target", null);
+      if (!thPlanA.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == emptyT.Id)) failures.Add("perturb-target-archive-no-flag");
+      thEntry.Archived = false;
+      thEntry.Version = 4;
+      if (TargetHash() == th0) failures.Add("perturb-target-version-static");
+      var thStale = RosterReconcileApply.Apply(store, th0, "perturb-target", null, out _, out var thCode);
+      if (thStale.Ok || thCode != 409) failures.Add("perturb-target-version-accepted");
+      thEntry.Version = 3;
+      if (TargetHash() != th0) failures.Add("perturb-target-restore-drift");
+      store.Roster.TryRemove(preT, out _);
+      store.Advisors.TryRemove(emptyT.Id, out _);
+    }
+  }
+  // Plan-hash perturbation fixture: every mutation input (roles, board owner,
+  // account, image provenance, board name) is bound into the hash, so an author
+  // change between review and apply forces 409/re-plan instead of a stale repair.
+  {
+    var pb = new Board { Id = Guid.NewGuid(), Name = "PerturbBoard", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[pb.Id] = pb;
+    var pb2 = new Board { Id = Guid.NewGuid(), Name = "PerturbBoard2", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    store.Boards[pb2.Id] = pb2;
+    var pMiss = Guid.NewGuid();
+    var pma = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb.Id, RosterEntryId = pMiss, RosterVersion = 1, BoardRole = "Perturb Sage", CreatedAt = DateTime.UtcNow };
+    var pmb = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb2.Id, RosterEntryId = pMiss, RosterVersion = 1, BoardRole = "Perturb Sage", CreatedAt = DateTime.UtcNow };
+    store.Advisors[pma.Id] = pma;
+    store.Advisors[pmb.Id] = pmb;
+    var pimg = new AdvisorImage { Id = Guid.NewGuid(), BoardAdvisorId = pmb.Id, RosterEntryId = null, Kind = "upload", Review = "pending", Provenance = "legacy:board-local", ContentType = "image/png", Data = new byte[] { 9 } };
+    store.Images[pimg.Id] = pimg;
+    var pe = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "Perturb Stale", Description = "perturbation stale entry", ProfileJson = "{perturb:stale-profile-ok}", Version = 2, UpdatedAt = DateTime.UtcNow };
+    store.Roster[pe.Id] = pe;
+    var pstale = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb.Id, RosterEntryId = pe.Id, RosterVersion = 1, BoardRole = "Perturb Stale Seat", Approved = true, CreatedAt = DateTime.UtcNow };
+    store.Advisors[pstale.Id] = pstale;
+    var pd = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "Perturb Dup", Description = "perturbation dup entry", ProfileJson = "{perturb:dup-profile-ok}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[pd.Id] = pd;
+    var pdo = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb.Id, RosterEntryId = pd.Id, RosterVersion = 1, BoardRole = "Perturb Dup", CreatedAt = DateTime.UtcNow.AddMinutes(-3) };
+    var pdn = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb.Id, RosterEntryId = pd.Id, RosterVersion = 1, BoardRole = "Perturb Dup", CreatedAt = DateTime.UtcNow };
+    store.Advisors[pdo.Id] = pdo;
+    store.Advisors[pdn.Id] = pdn;
+    var pen = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = pb.Id, RosterEntryId = Guid.Empty, BoardRole = "Perturb Empty", CreatedAt = DateTime.UtcNow };
+    store.Advisors[pen.Id] = pen;
+    var pimg2 = new AdvisorImage { Id = Guid.NewGuid(), BoardAdvisorId = pen.Id, RosterEntryId = null, Kind = "upload", Review = "pending", Provenance = "legacy:empty-local", ContentType = "image/png", Data = new byte[] { 10 } };
+    store.Images[pimg2.Id] = pimg2;
+    string PerturbHash() => RosterReconciliation.Plan(store, "perturb", null).PlanHash;
+    var ph0 = PerturbHash();
+    void PerturbCheck(string name, Action mutate, Action restore)
+    {
+      mutate();
+      if (PerturbHash() == ph0) failures.Add("perturb-hash-static:" + name);
+      var stale = RosterReconcileApply.Apply(store, ph0, "perturb", null, out _, out var pcode);
+      if (stale.Ok || pcode != 409) failures.Add("perturb-old-plan-accepted:" + name);
+      restore();
+      if (PerturbHash() != ph0) failures.Add("perturb-restore-drift:" + name);
+    }
+    PerturbCheck("role", () => { pma.BoardRole = "Perturb Sage Renamed"; }, () => { pma.BoardRole = "Perturb Sage"; });
+    PerturbCheck("board-owner", () => { pb2.OwnerKey = "someone-else"; }, () => { pb2.OwnerKey = "owner"; });
+    var pacc = new global::SimCEO.Api.Account { Id = Guid.NewGuid(), Email = "owner", Salt = "", Hash = "", CreatedAt = DateTime.UtcNow };
+    PerturbCheck("account", () => { store.Accounts[pacc.Id] = pacc; }, () => { store.Accounts.TryRemove(pacc.Id, out _); });
+    PerturbCheck("provenance", () => { pimg.Provenance = "legacy:board-local-changed"; }, () => { pimg.Provenance = "legacy:board-local"; });
+    PerturbCheck("board-name", () => { pb.Name = "PerturbBoard Renamed"; }, () => { pb.Name = "PerturbBoard"; });
+    PerturbCheck("stale-role", () => { pstale.BoardRole = "Perturb Stale Seat 2"; }, () => { pstale.BoardRole = "Perturb Stale Seat"; });
+    PerturbCheck("dup-roles", () => { pdn.BoardRole = "Perturb Dup 2"; }, () => { pdn.BoardRole = "Perturb Dup"; });
+    foreach (var aid in new[] { pma.Id, pmb.Id, pstale.Id, pdo.Id, pdn.Id, pen.Id }) store.Advisors.TryRemove(aid, out _);
+    foreach (var iid in new[] { pimg.Id, pimg2.Id }) store.Images.TryRemove(iid, out _);
+    foreach (var rid in new[] { pe.Id, pd.Id }) store.Roster.TryRemove(rid, out _);
+    foreach (var bid in new[] { pb.Id, pb2.Id }) store.Boards.TryRemove(bid, out _);
+  }
+  // Secure-mode ownership fixture: legacy blank-owner entry on an unambiguously
+  // owned board. Owner writes via effective ownership (no grant needed);
+  // strangers are denied read and write (secure defaults deny).
+  {
+    var secBoard = new Board { Id = Guid.NewGuid(), Name = "SecBoard", OwnerKey = "owner@x.test", CreatedAt = DateTime.UtcNow };
+    store.Boards[secBoard.Id] = secBoard;
+    var secEntry = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "", Name = "Sec Legacy", Description = "secure legacy entry", ProfileJson = "{sec:legacy-profile-with-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[secEntry.Id] = secEntry;
+    var secAdv = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = secBoard.Id, RosterEntryId = secEntry.Id, RosterVersion = 1, BoardRole = "Sec Seat", CreatedAt = DateTime.UtcNow };
+    store.Advisors[secAdv.Id] = secAdv;
+    store.Security[Guid.NewGuid()] = new SecurityState { AuthRequired = true };
+    var ownerAcct = new global::SimCEO.Api.Account { Id = Guid.NewGuid(), Email = "owner@x.test", Salt = "", Hash = "", CreatedAt = DateTime.UtcNow };
+    store.Accounts[ownerAcct.Id] = ownerAcct;
+    store.Sessions["sec-owner"] = new global::SimCEO.Api.Session { Token = "sec-owner", AccountId = ownerAcct.Id, Email = "owner@x.test", ExpiresAt = DateTime.UtcNow.AddHours(1) };
+    store.Sessions["sec-bob"] = new global::SimCEO.Api.Session { Token = "sec-bob", AccountId = Guid.NewGuid(), Email = "bob@x.test", ExpiresAt = DateTime.UtcNow.AddHours(1) };
+    HttpRequest SecReq(string tok)
+    {
+      var ctx = new DefaultHttpContext();
+      ctx.Request.Headers["Authorization"] = "Bearer " + tok;
+      return ctx.Request;
+    }
+    if (!PeopleOps.IsSecure(store)) failures.Add("sec-mode-on");
+    if (RosterLegacyAccess.EffectiveOwnerKey(store, secEntry) != "owner@x.test") failures.Add("sec-effective-owner");
+    if (!RosterOps.CanWriteRoster(store, SecReq("sec-owner"), secEntry)) failures.Add("sec-owner-write");
+    if (RosterOps.CanWriteRoster(store, SecReq("sec-bob"), secEntry)) failures.Add("sec-stranger-write-denied");
+    if (!RosterEndpoints.CanReadRoster(store, SecReq("sec-owner"), secEntry)) failures.Add("sec-owner-read");
+    if (RosterEndpoints.CanReadRoster(store, SecReq("sec-bob"), secEntry)) failures.Add("sec-stranger-read-denied");
+    var secHist = new RosterEntry { Id = Guid.NewGuid(), AccountId = Guid.NewGuid(), OwnerKey = "", Name = "Sec Historical", Description = "secure removed-only legacy entry", ProfileJson = "{sec:historical-profile-length}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    store.Roster[secHist.Id] = secHist;
+    var secHAdv = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = secBoard.Id, RosterEntryId = secHist.Id, RosterVersion = 1, BoardRole = "Sec Gone", Removed = true, CreatedAt = DateTime.UtcNow };
+    store.Advisors[secHAdv.Id] = secHAdv;
+    if (!RosterEndpoints.CanReadRoster(store, SecReq("sec-owner"), secHist)) failures.Add("sec-removed-history-read");
+    if (RosterEndpoints.CanReadRoster(store, SecReq("sec-bob"), secHist)) failures.Add("sec-removed-history-stranger");
+    if (!RosterOps.CanWriteRoster(store, SecReq("sec-owner"), secHist)) failures.Add("sec-removed-history-write");
+    if (!RosterLegacyAccess.OwnerMatches(store, secHist, "owner@x.test")) failures.Add("sec-removed-history-match");
+    if (RosterLegacyAccess.OwnerMatches(store, secHist, "bob@x.test")) failures.Add("sec-removed-history-mismatch");
+  }
     Console.WriteLine(failures.Count == 0 ? "SELFTEST PASS: advisor-cap, sequence, record-hash, policy, budgets, challenge, lead-version, setup-activate, roster-copy, same-role, approval-gate, record-export, record-export-refs, evidence-ref, grants, spend-cap, model-policy, provider-guard" : "SELFTEST FAIL: " + string.Join(";", failures));
   Environment.Exit(failures.Count == 0 ? 0 : 1);
+}
+if (args.Contains("--selftest-pg"))
+{
+  var pgFailures = new List<string>();
+  var pgArgs = args.ToList();
+  var pgPhase = pgArgs.Count > pgArgs.IndexOf("--selftest-pg") + 1 ? pgArgs[pgArgs.IndexOf("--selftest-pg") + 1] : "seed";
+  var pgPriorHash = pgArgs.Count > pgArgs.IndexOf("--selftest-pg") + 2 ? pgArgs[pgArgs.IndexOf("--selftest-pg") + 2] : "";
+  var pgConn = Environment.GetEnvironmentVariable("SIMCEO_PG_CONN") ?? "";
+  if (string.IsNullOrWhiteSpace(pgConn)) { Console.WriteLine("PGSELFTEST FAIL: SIMCEO_PG_CONN is required."); Environment.Exit(2); }
+  try
+  {
+    var asm = System.Reflection.Assembly.LoadFrom(Path.Combine(AppContext.BaseDirectory, "SimCEO.Postgres.dll"));
+    var boot = asm.GetType("SimCEO.Postgres.PgBoot");
+    var argv = new object?[] { pgConn, "" };
+    if (!(bool)boot!.GetMethod("TryWire")!.Invoke(null, argv)!) throw new InvalidOperationException("wire: " + argv[1]);
+  }
+  catch (Exception ex) { Console.WriteLine("PGSELFTEST FAIL wire: " + ex.GetBaseException().Message); Environment.Exit(2); }
+  var pstore = new InMemoryStore();
+  var PGB = Guid.Parse("11111111-1111-1111-1111-111111111111");
+  var PGB2 = Guid.Parse("22222222-2222-2222-2222-222222222222");
+  var PGBX = Guid.Parse("33333333-3333-3333-3333-333333333333");
+  var PGE = Guid.Parse("44444444-4444-4444-4444-444444444444");
+  var PGSTALE = Guid.Parse("55555555-5555-5555-5555-555555555555");
+  var PGD = Guid.Parse("66666666-6666-6666-6666-666666666666");
+  var PGDUPOLD = Guid.Parse("77777777-7777-7777-7777-777777777777");
+  var PGDUPNEW = Guid.Parse("88888888-8888-8888-8888-888888888888");
+  var PGMTG = Guid.Parse("99999999-9999-9999-9999-999999999999");
+  var PGMISS = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  var PGMA = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  var PGMB = Guid.Parse("cccccccc-cccc-cccc-cccc-cccccccccccc");
+  var PGMIMG = Guid.Parse("dddddddd-dddd-dddd-dddd-dddddddddddd");
+  var PGEA = Guid.Parse("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+  var PGEB = Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff");
+  var PGF = Guid.Parse("12345678-1234-1234-1234-123456789012");
+  var PGFF = Guid.Parse("23456789-2345-2345-2345-234567890123");
+  var PGFF2 = Guid.Parse("34567890-3456-3456-3456-345678901234");
+  var PGARCH = Guid.Parse("87654321-8765-8765-8765-876543218765");
+  var PGARCHL = Guid.Parse("98765432-9876-9876-9876-987654329876");
+  var PGBO = Guid.Parse("aaaa1111-2222-3333-4444-555555555555");
+  var PGB3 = Guid.Parse("dddd1111-2222-3333-4444-555555555555");
+  var PGENE = Guid.Parse("eeee3333-4444-5555-6666-777777777777");
+  var PGEC = Guid.Parse("bbbb2222-3333-4444-5555-666666666666");
+  var PGEX = Guid.Parse("eeee5555-5555-5555-5555-555555555555");
+  var PGBU = Guid.Parse("eeee1111-2222-3333-4444-555555555555");
+  var PGBUD0 = Guid.Parse("eeee2222-2222-2222-2222-222222222222");
+  var PGBUD1 = Guid.Parse("eeee3333-3333-3333-3333-333333333333");
+  var PGBUD2 = Guid.Parse("eeee4444-4444-4444-4444-444444444444");
+  var PGBUMM = Guid.Parse("eeee6666-6666-6666-6666-666666666666");
+  var PGUMISS = Guid.Parse("eeee7777-7777-7777-7777-777777777777");
+  if (pgPhase == "seed")
+  {
+    pstore.Boards[PGB] = new Board { Id = PGB, Name = "PG Board", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    pstore.Boards[PGB2] = new Board { Id = PGB2, Name = "PG Board 2", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    pstore.Boards[PGBX] = new Board { Id = PGBX, Name = "PG Foreign", OwnerKey = "external-owner", CreatedAt = DateTime.UtcNow };
+    pstore.Boards[PGBO] = new Board { Id = PGBO, Name = "PG Ownerless", OwnerKey = "", CreatedAt = DateTime.UtcNow };
+    pstore.Boards[PGB3] = new Board { Id = PGB3, Name = "PG Board 3", OwnerKey = "owner", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGENE] = new BoardAdvisor { Id = PGENE, BoardId = PGB3, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink Scoped3", CreatedAt = DateTime.UtcNow };
+    pstore.Roster[PGE] = new RosterEntry { Id = PGE, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "PG Advisor", Description = "pg selftest entry", ProfileJson = "{pg:selftest-profile-for-behavior}", Version = 3, UpdatedAt = DateTime.UtcNow };
+    pstore.Images[Guid.NewGuid()] = new AdvisorImage { RosterEntryId = PGE, Kind = "upload", Review = "accepted", Provenance = "selftest", ContentType = "image/png", Data = new byte[] { 7 } };
+    pstore.Advisors[PGSTALE] = new BoardAdvisor { Id = PGSTALE, BoardId = PGB, RosterEntryId = PGE, RosterVersion = 1, BoardRole = "PG Stale", CreatedAt = DateTime.UtcNow };
+    pstore.Roster[PGD] = new RosterEntry { Id = PGD, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "PG Dup", Description = "pg dup entry", ProfileJson = "{pg:dup-profile}", Version = 1, UpdatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGDUPOLD] = new BoardAdvisor { Id = PGDUPOLD, BoardId = PGB, RosterEntryId = PGD, RosterVersion = 1, BoardRole = "PG Dup", CreatedAt = DateTime.UtcNow.AddMinutes(-5) };
+    pstore.Advisors[PGDUPNEW] = new BoardAdvisor { Id = PGDUPNEW, BoardId = PGB, RosterEntryId = PGD, RosterVersion = 1, BoardRole = "PG Dup", CreatedAt = DateTime.UtcNow };
+    pstore.Meetings[PGMTG] = new Meeting { Id = PGMTG, BoardId = PGB };
+    pstore.Messages[PGMTG] = MessageList.Detached(PGMTG, new List<Message> { new Message { BoardId = PGB, MeetingId = PGMTG, Sequence = 1, AdvisorId = PGDUPNEW, Sender = "advisor", AdvisorName = "PG Dup", Content = "pg legacy reply", Status = "committed", CreatedAt = DateTime.UtcNow } });
+    pstore.Advisors[PGMA] = new BoardAdvisor { Id = PGMA, BoardId = PGB, RosterEntryId = PGMISS, RosterVersion = 1, BoardRole = "PG Sage", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGMB] = new BoardAdvisor { Id = PGMB, BoardId = PGB2, RosterEntryId = PGMISS, RosterVersion = 1, BoardRole = "PG Sage", CreatedAt = DateTime.UtcNow };
+    pstore.Images[PGMIMG] = new AdvisorImage { Id = PGMIMG, RosterEntryId = null, BoardAdvisorId = PGMB, Kind = "upload", Review = "pending", Provenance = "legacy:board-local", ContentType = "image/png", Data = new byte[] { 9 } };
+    pstore.Advisors[PGEA] = new BoardAdvisor { Id = PGEA, BoardId = PGB, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink A", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGEB] = new BoardAdvisor { Id = PGEB, BoardId = PGB, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink B", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGEC] = new BoardAdvisor { Id = PGEC, BoardId = PGBO, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink Ownerless", CreatedAt = DateTime.UtcNow };
+    var PGED = Guid.Parse("cccc3333-4444-5555-6666-777777777777");
+    pstore.Advisors[PGED] = new BoardAdvisor { Id = PGED, BoardId = PGB2, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink Scoped", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGFF] = new BoardAdvisor { Id = PGFF, BoardId = PGBX, RosterEntryId = PGF, RosterVersion = 1, BoardRole = "PG Foreign", CreatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGFF2] = new BoardAdvisor { Id = PGFF2, BoardId = PGB, RosterEntryId = PGF, RosterVersion = 1, BoardRole = "PG Foreign", CreatedAt = DateTime.UtcNow };
+    pstore.Roster[PGARCH] = new RosterEntry { Id = PGARCH, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "PG Arch", Description = "pg archived", ProfileJson = "{pg:archived}", Version = 1, Archived = true, UpdatedAt = DateTime.UtcNow };
+    pstore.Advisors[PGARCHL] = new BoardAdvisor { Id = PGARCHL, BoardId = PGB, RosterEntryId = PGARCH, RosterVersion = 1, BoardRole = "PG Arch", CreatedAt = DateTime.UtcNow };
+    try
+    {
+      var plan = RosterReconciliation.Plan(pstore, "pg-seed-key", null);
+      var mine = plan.Orphans.Where(o => o.BoardId == PGB || o.BoardId == PGB2 || o.BoardId == PGBX || o.BoardId == PGBO).ToList();
+      if (mine.Count(o => o.Reason == "stale-version") != 1) pgFailures.Add("pg-scan-stale");
+      if (mine.Count(o => o.Reason == "duplicate-link") != 1) pgFailures.Add("pg-scan-dup");
+      if (mine.Count(o => o.Reason == "missing-roster") != 4) pgFailures.Add("pg-scan-missing");
+      if (mine.Count(o => o.Reason == "empty-link") != 4) pgFailures.Add("pg-scan-empty");
+      var scopePlan = RosterReconciliation.Plan(pstore, "pg-seed-scope", PGB2);
+      if (scopePlan.Orphans.Count(o => o.Reason == "empty-link") != 1) pgFailures.Add("pg-scope-scan");
+      var scopeRefused = RosterReconcileApply.Apply(pstore, scopePlan.PlanHash, "pg-seed-scope", PGB2, out var scopeRefErr, out var scopeRefCode);
+      if (scopeRefused.Ok || scopeRefCode != 409 || !(scopeRefErr ?? "").Contains("global")) pgFailures.Add("pg-scope-refuses-shared:" + scopeRefErr);
+      if (pstore.Roster.ContainsKey(PGMISS)) pgFailures.Add("pg-scope-no-partial-entry");
+      if (!pstore.Advisors.TryGetValue(PGMB, out var pgmbUntouched) || pgmbUntouched.Removed || pgmbUntouched.RosterEntryId != PGMISS || pgmbUntouched.RosterVersion != 1) pgFailures.Add("pg-scope-outofscope-approval");
+      if (!pstore.Images.TryGetValue(PGMIMG, out var pgmimgUntouched) || pgmimgUntouched.RosterEntryId.HasValue) pgFailures.Add("pg-scope-outofscope-image");
+      if (!pstore.Advisors.TryGetValue(PGED, out var pgedUntouched) || pgedUntouched.RosterEntryId != Guid.Empty) pgFailures.Add("pg-scope-nothing-applied");
+      var scopePlanAfter = RosterReconciliation.Plan(pstore, "pg-seed-scope", PGB2);
+      if (!scopePlanAfter.Orphans.Any(o => o.Reason == "missing-roster" && o.RosterEntryId == PGMISS)) pgFailures.Add("pg-scope-still-reports-shared");
+      var scopePlanGlobal = RosterReconciliation.Plan(pstore, "pg-seed-scope", null);
+      if (!scopePlanGlobal.Orphans.Any(o => o.Reason == "missing-roster" && o.RosterEntryId == PGMISS)) pgFailures.Add("pg-scope-global-still-reports-shared");
+      if (!scopePlan.Actions.Any(a => a.Kind == "RequiresGlobalScope" && a.RosterEntryId == PGMISS)) pgFailures.Add("pg-scope-plan-marks-global");
+      var pgEmpty3 = RosterLegacyAccess.StableEmptyLinkId(PGB3, PGENE);
+      var scopePlan3 = RosterReconciliation.Plan(pstore, "pg-seed-scope3", PGB3);
+      if (scopePlan3.Orphans.Count(o => o.Reason == "empty-link") != 1) pgFailures.Add("pg-scope3-scan");
+      var scopeApplied3 = RosterReconcileApply.Apply(pstore, scopePlan3.PlanHash, "pg-seed-scope3", PGB3, out var scopeErr3, out _);
+      if (!scopeApplied3.Ok) pgFailures.Add("pg-scope3-apply:" + scopeErr3);
+      if (!scopeApplied3.Applied.Any(s => s.StartsWith("recover-empty:"))) pgFailures.Add("pg-scope3-no-recover-empty");
+      if (!pstore.Roster.TryGetValue(pgEmpty3, out var pge3) || pge3 is null || pge3.Name != "PG NoLink Scoped3") pgFailures.Add("pg-scope3-entry");
+      if (!pstore.Advisors.TryGetValue(PGENE, out var pge3Adv) || pge3Adv.Removed || pge3Adv.RosterEntryId != pgEmpty3) pgFailures.Add("pg-scope3-relink");
+      if (!pstore.Advisors.TryGetValue(PGEA, out var pgeaUntouched) || pgeaUntouched.RosterEntryId != Guid.Empty) pgFailures.Add("pg-scope-untouched");
+      pstore.Advisors[PGEX] = new BoardAdvisor { Id = PGEX, BoardId = PGB, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink Target", CreatedAt = DateTime.UtcNow };
+      var pgext = RosterLegacyAccess.StableEmptyLinkId(PGB, PGEX);
+      pstore.Roster[pgext] = new RosterEntry { Id = pgext, AccountId = Guid.NewGuid(), OwnerKey = "owner", Name = "PG NoLink Target", Description = "pg pre-existing deterministic target", ProfileJson = "{pg:target-profile-ok}", Version = 2, UpdatedAt = DateTime.UtcNow };
+      pstore.Boards[PGBU] = new Board { Id = PGBU, Name = "PG Unknown Board", OwnerKey = "", CreatedAt = DateTime.UtcNow };
+      pstore.Advisors[PGBUD0] = new BoardAdvisor { Id = PGBUD0, BoardId = Guid.NewGuid(), RosterEntryId = PGUMISS, RosterVersion = 1, BoardRole = "PG Gone", Removed = true, CreatedAt = DateTime.UtcNow };
+      pstore.Advisors[PGBUD1] = new BoardAdvisor { Id = PGBUD1, BoardId = PGBU, RosterEntryId = PGUMISS, RosterVersion = 1, BoardRole = "PG Unknown", CreatedAt = DateTime.UtcNow.AddMinutes(-2) };
+      pstore.Advisors[PGBUD2] = new BoardAdvisor { Id = PGBUD2, BoardId = PGBU, RosterEntryId = PGUMISS, RosterVersion = 1, BoardRole = "PG Unknown", CreatedAt = DateTime.UtcNow };
+      pstore.Meetings[PGBUMM] = new Meeting { Id = PGBUMM, BoardId = PGBU };
+      pstore.Messages[PGBUMM] = MessageList.Detached(PGBUMM, new List<Message> { new Message { BoardId = PGBU, MeetingId = PGBUMM, Sequence = 1, AdvisorId = PGBUD2, Sender = "advisor", AdvisorName = "PG Unknown", Content = "pg unknown reply", Status = "committed", CreatedAt = DateTime.UtcNow } });
+      string PgDupHash() => RosterReconciliation.Plan(pstore, "pg-perturb-dup", null).PlanHash;
+      var pgh0 = PgDupHash();
+      pstore.Roster.TryGetValue(PGD, out var pgdEntry);
+      var pgdOwner = pgdEntry is null ? "" : pgdEntry.OwnerKey;
+      if (pgdEntry is not null) { pgdEntry.OwnerKey = "external-owner"; pstore.Roster[pgdEntry.Id] = pgdEntry; }
+      if (PgDupHash() == pgh0) pgFailures.Add("pg-dup-owner-static");
+      var pghPlan = RosterReconciliation.Plan(pstore, "pg-perturb-dup", null);
+      if (pghPlan.Actions.Any(a => a.Kind == "RemoveDuplicateLink" && a.RosterEntryId == PGD)) pgFailures.Add("pg-dup-owner-still-removes");
+      if (!pghPlan.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == PGDUPNEW)) pgFailures.Add("pg-dup-owner-no-flag");
+      var pghStale = RosterReconcileApply.Apply(pstore, pgh0, "pg-perturb-dup", null, out _, out var pghCode);
+      if (pghStale.Ok || pghCode != 409) pgFailures.Add("pg-dup-owner-accepted");
+      if (pgdEntry is not null) { pgdEntry.OwnerKey = pgdOwner; pstore.Roster[pgdEntry.Id] = pgdEntry; }
+      if (PgDupHash() != pgh0) pgFailures.Add("pg-dup-owner-restore-drift");
+      var pgMsg0 = pstore.Messages[PGMTG].First(m => m.AdvisorId == PGDUPNEW);
+      var pgSeq = pgMsg0.Sequence;
+      System.Func<long, List<Message>> pgMsgRows = (seq) => new List<Message> { new Message { BoardId = PGB, MeetingId = PGMTG, Sequence = seq, AdvisorId = PGDUPNEW, Sender = pgMsg0.Sender, AdvisorName = pgMsg0.AdvisorName, Content = pgMsg0.Content, ParentSequence = pgMsg0.ParentSequence, Stance = pgMsg0.Stance, Status = pgMsg0.Status, CreatedAt = pgMsg0.CreatedAt } };
+      pstore.Messages[PGMTG] = MessageList.Detached(PGMTG, pgMsgRows(pgSeq + 1));
+      if (PgDupHash() == pgh0) pgFailures.Add("pg-dup-row-static");
+      var pgMsgStale = RosterReconcileApply.Apply(pstore, pgh0, "pg-perturb-dup", null, out _, out var pgMsgCode);
+      if (pgMsgStale.Ok || pgMsgCode != 409) pgFailures.Add("pg-dup-row-accepted");
+      pstore.Messages[PGMTG] = MessageList.Detached(PGMTG, pgMsgRows(pgSeq));
+      if (PgDupHash() != pgh0) pgFailures.Add("pg-dup-row-restore-drift");
+      var pgMtg0 = pstore.Meetings[PGMTG];
+      System.Func<string, Meeting> pgMtgRows = (parts) => new Meeting { Id = PGMTG, BoardId = pgMtg0.BoardId, Title = pgMtg0.Title, State = pgMtg0.State, Brief = pgMtg0.Brief, ParticipantIdsJson = parts, DeliveredRevision = pgMtg0.DeliveredRevision, Generation = pgMtg0.Generation, CreatedAt = pgMtg0.CreatedAt };
+      pstore.Meetings[PGMTG] = pgMtgRows(System.Text.Json.JsonSerializer.Serialize(new[] { PGDUPNEW }));
+      var pgh0p = PgDupHash();
+      if (pgh0p == pgh0) pgFailures.Add("pg-dup-parts-baseline-static");
+      pstore.Meetings[PGMTG] = pgMtgRows(System.Text.Json.JsonSerializer.Serialize(new[] { PGDUPOLD }));
+      if (PgDupHash() == pgh0p) pgFailures.Add("pg-dup-parts-swap-static");
+      var pgPartsStale = RosterReconcileApply.Apply(pstore, pgh0p, "pg-perturb-dup", null, out _, out var pgPartsCode);
+      if (pgPartsStale.Ok || pgPartsCode != 409) pgFailures.Add("pg-dup-parts-accepted");
+      pstore.Meetings[PGMTG] = pgMtgRows(System.Text.Json.JsonSerializer.Serialize(new[] { PGDUPNEW }));
+      if (PgDupHash() != pgh0p) pgFailures.Add("pg-dup-parts-restore-drift");
+      var pgh0d = PgDupHash();
+      if (pgdEntry is not null) { pgdEntry.Description = "D;name=Alice"; pgdEntry.Name = "Bob"; pstore.Roster[pgdEntry.Id] = pgdEntry; }
+      var pgDelim1 = PgDupHash();
+      if (pgDelim1 == pgh0d) pgFailures.Add("pg-dup-delim-static");
+      if (pgdEntry is not null) { pgdEntry.Description = "D"; pgdEntry.Name = "Alice;name=Bob"; pstore.Roster[pgdEntry.Id] = pgdEntry; }
+      if (PgDupHash() == pgDelim1) pgFailures.Add("pg-dup-delim-collision");
+      var pgDelimStale = RosterReconcileApply.Apply(pstore, pgDelim1, "pg-perturb-dup", null, out _, out var pgDelimCode);
+      if (pgDelimStale.Ok || pgDelimCode != 409) pgFailures.Add("pg-dup-delim-accepted");
+      if (pgdEntry is not null) { pgdEntry.Description = "pg dup entry"; pgdEntry.Name = "PG Dup"; pstore.Roster[pgdEntry.Id] = pgdEntry; }
+      if (PgDupHash() != pgh0d) pgFailures.Add("pg-dup-delim-restore-drift");
+      string PgTargetHash() => RosterReconciliation.Plan(pstore, "pg-perturb-target", null).PlanHash;
+      var pgt0 = PgTargetHash();
+      var pgtPlan = RosterReconciliation.Plan(pstore, "pg-perturb-target", null);
+      if (!pgtPlan.Actions.Any(a => a.Kind == "RecoverEmptyLink" && a.AdvisorId == PGEX && (a.Summary ?? "").Contains("EXISTING"))) pgFailures.Add("pg-target-no-relink-desc");
+      pstore.Roster.TryGetValue(pgext, out var pgtEntry);
+      var pgtOwner = pgtEntry is null ? "" : pgtEntry.OwnerKey;
+      if (pgtEntry is not null) { pgtEntry.OwnerKey = "foreign-owner"; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() == pgt0) pgFailures.Add("pg-target-owner-static");
+      var pgtPlanF = RosterReconciliation.Plan(pstore, "pg-perturb-target", null);
+      if (pgtPlanF.Actions.Any(a => a.Kind == "RecoverEmptyLink" && a.AdvisorId == PGEX)) pgFailures.Add("pg-target-foreign-still-recovers");
+      if (!pgtPlanF.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == PGEX)) pgFailures.Add("pg-target-foreign-no-flag");
+      var pgtOldApply = RosterReconcileApply.Apply(pstore, pgt0, "pg-perturb-target", null, out _, out var pgtOldCode);
+      if (pgtOldApply.Ok || pgtOldCode != 409) pgFailures.Add("pg-target-old-accepted");
+      if (pgtEntry is not null) { pgtEntry.OwnerKey = pgtOwner; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() != pgt0) pgFailures.Add("pg-target-restore-drift");
+      if (pgtEntry is not null) { pgtEntry.Archived = true; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() == pgt0) pgFailures.Add("pg-target-archive-static");
+      var pgtPlanA = RosterReconciliation.Plan(pstore, "pg-perturb-target", null);
+      if (!pgtPlanA.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == PGEX)) pgFailures.Add("pg-target-archive-no-flag");
+      if (pgtEntry is not null) { pgtEntry.Archived = false; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() != pgt0) pgFailures.Add("pg-target-archive-drift");
+      var pgtVer = pgtEntry is null ? 0 : pgtEntry.Version;
+      if (pgtEntry is not null) { pgtEntry.Version = pgtVer + 1; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() == pgt0) pgFailures.Add("pg-target-version-static");
+      var pgtVerApply = RosterReconcileApply.Apply(pstore, pgt0, "pg-perturb-target", null, out _, out var pgtVerCode);
+      if (pgtVerApply.Ok || pgtVerCode != 409) pgFailures.Add("pg-target-version-accepted");
+      if (pgtEntry is not null) { pgtEntry.Version = pgtVer; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() != pgt0) pgFailures.Add("pg-target-version-drift");
+      if (pgtEntry is not null) { pgtEntry.OwnerKey = pgtOwner; pstore.Roster[pgtEntry.Id] = pgtEntry; }
+      if (PgTargetHash() != pgt0) pgFailures.Add("pg-target-foreign-drift");
+      var pgUScope = RosterReconciliation.Plan(pstore, "pg-perturb-unknown", PGBU);
+      if (pgUScope.Actions.Any(a => a.Kind == "RemoveDuplicateLink")) pgFailures.Add("pg-unknown-plans-removal");
+      if (!pgUScope.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == PGBUD2)) pgFailures.Add("pg-unknown-no-flag");
+      var pgUApplied = RosterReconcileApply.Apply(pstore, pgUScope.PlanHash, "pg-perturb-unknown", PGBU, out var pgUErr, out _);
+      if (!pgUApplied.Ok) pgFailures.Add("pg-unknown-apply:" + pgUErr);
+      if (pgUApplied.Applied.Any(s => s.StartsWith("dedupe:") || s.StartsWith("recover:"))) pgFailures.Add("pg-unknown-mutated");
+      if (!pstore.Advisors.TryGetValue(PGBUD2, out var pgUD2) || pgUD2.Removed) pgFailures.Add("pg-unknown-removed");
+      if (!pstore.Messages.TryGetValue(PGBUMM, out var pgUM) || !pgUM.Any(m => m.AdvisorId == PGBUD2 && m.Content == "pg unknown reply")) pgFailures.Add("pg-unknown-history-moved");
+      plan = RosterReconciliation.Plan(pstore, "pg-seed-key", null);
+      if (mine.Count(o => o.Reason == "archived-roster") != 1) pgFailures.Add("pg-scan-archived");
+      var applied = RosterReconcileApply.Apply(pstore, plan.PlanHash, "pg-seed-key", null, out var applyErr, out _);
+      if (!applied.Ok) pgFailures.Add("pg-apply:" + applyErr);
+      if (!applied.Applied.Any(s => s.StartsWith("recover-empty:"))) pgFailures.Add("pg-apply-no-recover-empty");
+      if (!pstore.Roster.TryGetValue(PGMISS, out var rec) || rec is null || rec.Name != "PG Sage" || !(rec.Tags ?? "").Contains("recovered")) pgFailures.Add("pg-recover-entry");
+      if (!pstore.Advisors.TryGetValue(PGMA, out var ma) || ma.Removed || ma.RosterVersion != 1 || ma.Approved) pgFailures.Add("pg-membership-A");
+      if (!pstore.Advisors.TryGetValue(PGMB, out var mb) || mb.Removed || mb.RosterVersion != 1) pgFailures.Add("pg-membership-B");
+      if (!pstore.Images.TryGetValue(PGMIMG, out var mim) || mim.RosterEntryId != PGMISS) pgFailures.Add("pg-image-relink");
+      if (ma is not null && SimCEO.Api.RosterOps.ApprovalGate(pstore, ma) != "recovered-incomplete") pgFailures.Add("pg-gate-recovered-blocked");
+      var (pgRecComplete, pgRecMissing) = SimCEO.Api.RosterOps.Completeness(pstore, PGMISS);
+      if (pgRecComplete) pgFailures.Add("pg-recovered-not-complete");
+      if (!pgRecMissing.Any(m => m.Contains("recovered placeholder"))) pgFailures.Add("pg-recovered-missing-actionable");
+      rec.Tags = "";
+      pstore.Roster[rec.Id] = rec;
+      if (ma is not null && SimCEO.Api.RosterOps.ApprovalGate(pstore, ma) == "recovered-incomplete") pgFailures.Add("pg-gate-tag-clear-unblocks");
+      var (pgRecFixed, _) = SimCEO.Api.RosterOps.Completeness(pstore, PGMISS);
+      if (!pgRecFixed) pgFailures.Add("pg-recovered-tagstrip-complete");
+      rec.Tags = "recovered";
+      pstore.Roster[rec.Id] = rec;
+      var pgEmptyA = RosterLegacyAccess.StableEmptyLinkId(PGB, PGEA);
+      var pgEmptyB = RosterLegacyAccess.StableEmptyLinkId(PGB, PGEB);
+      if (!applied.Applied.Any(s => s.StartsWith("recover-empty:"))) pgFailures.Add("pg-apply-no-recover-empty");
+      if (pgEmptyA == pgEmptyB) pgFailures.Add("pg-empty-distinct");
+      if (!pstore.Roster.TryGetValue(pgEmptyA, out var pgea) || pgea is null || pgea.Name != "PG NoLink A") pgFailures.Add("pg-empty-recover-A");
+      if (!pstore.Roster.TryGetValue(pgEmptyB, out var pgeb) || pgeb is null || pgeb.Name != "PG NoLink B") pgFailures.Add("pg-empty-recover-B");
+      if (!pstore.Advisors.TryGetValue(PGEA, out var pea) || pea.Removed || pea.RosterEntryId != pgEmptyA || pea.Approved) pgFailures.Add("pg-empty-relink-A");
+      if (!pstore.Advisors.TryGetValue(PGEB, out var peb) || peb.Removed || peb.RosterEntryId != pgEmptyB) pgFailures.Add("pg-empty-relink-B");
+      if (!pstore.Advisors.TryGetValue(PGEC, out var pec) || pec.Removed || pec.RosterEntryId != Guid.Empty) pgFailures.Add("pg-empty-ownerless-preserved");
+      if (!applied.Flagged.Any(s => s.StartsWith("empty-link:") && s.Contains(PGEC.ToString("N")))) pgFailures.Add("pg-empty-ownerless-flagged");
+      if (pstore.Roster.ContainsKey(PGF)) pgFailures.Add("pg-foreign-no-entry");
+      if (!pstore.Messages.TryGetValue(PGMTG, out var ml) || !ml.Any(m => m.AdvisorId == PGDUPOLD)) pgFailures.Add("pg-history-repoint");
+      var pgMutPlan = RosterReconciliation.Plan(pstore, "pg-mut-key", null);
+      pstore.Roster.TryGetValue(PGE, out var pgMutEntry);
+      var pgMutDesc = pgMutEntry is null ? "" : pgMutEntry.Description;
+      var pgMutVer = pgMutEntry is null ? 0 : pgMutEntry.Version;
+      if (pgMutEntry is not null) { pgMutEntry.Description = "PG mutation-after-plan bump with sufficient length."; pgMutEntry.Version += 1; pstore.Roster[pgMutEntry.Id] = pgMutEntry; }
+      var pgMutApply = RosterReconcileApply.Apply(pstore, pgMutPlan.PlanHash, "pg-mut-key", null, out _, out var pgMutCode);
+      if (pgMutApply.Ok || pgMutCode != 409) pgFailures.Add("pg-mutated-plan-accepted");
+      if (pgMutEntry is not null) { pgMutEntry.Description = pgMutDesc; pgMutEntry.Version = pgMutVer; pstore.Roster[pgMutEntry.Id] = pgMutEntry; }
+      var pgReApply = RosterReconcileApply.Apply(pstore, plan.PlanHash, "pg-seed-key", null, out var pgReErr, out _);
+      if (!pgReApply.Ok) pgFailures.Add("pg-reapply-idempotent:" + pgReErr);
+      var pgEx2 = new BoardAdvisor { Id = Guid.NewGuid(), BoardId = PGB, RosterEntryId = Guid.Empty, BoardRole = "PG NoLink Foreign", CreatedAt = DateTime.UtcNow };
+      pstore.Advisors[pgEx2.Id] = pgEx2;
+      var pgExt2 = RosterLegacyAccess.StableEmptyLinkId(PGB, pgEx2.Id);
+      pstore.Roster[pgExt2] = new RosterEntry { Id = pgExt2, AccountId = Guid.NewGuid(), OwnerKey = "foreign-owner", Name = "PG Foreign Target", Description = "pg foreign deterministic target", ProfileJson = "{pg:foreign-target-ok}", Version = 1, UpdatedAt = DateTime.UtcNow };
+      var pgPlanF2 = RosterReconciliation.Plan(pstore, "pg-perturb-target2", null);
+      if (pgPlanF2.Actions.Any(a => a.Kind == "RecoverEmptyLink" && a.AdvisorId == pgEx2.Id)) pgFailures.Add("pg-target2-still-recovers");
+      if (!pgPlanF2.Actions.Any(a => a.Kind == "FlagForOwnerReview" && a.AdvisorId == pgEx2.Id)) pgFailures.Add("pg-target2-no-flag");
+      var pgApplyF2 = RosterReconcileApply.Apply(pstore, pgPlanF2.PlanHash, "pg-perturb-target2", null, out var pgErrF2, out _);
+      if (!pgApplyF2.Ok) pgFailures.Add("pg-target2-apply:" + pgErrF2);
+      if (pgApplyF2.Applied.Any(s => s.Contains(pgEx2.Id.ToString("N")[..8]))) pgFailures.Add("pg-target2-attached");
+      if (!pstore.Advisors.TryGetValue(pgEx2.Id, out var pgEx2After) || pgEx2After.RosterEntryId != Guid.Empty) pgFailures.Add("pg-target2-linked");
+      pstore.Advisors.TryRemove(pgEx2.Id, out _);
+      pstore.Roster.TryRemove(pgExt2, out _);
+      if (pgFailures.Count == 0) Console.WriteLine("PGSEED OK planHash=" + plan.PlanHash);
+    }
+    catch (Exception ex) { pgFailures.Add("pg-seed-ex:" + ex.GetBaseException().Message); }
+  }
+  else if (pgPhase == "verify")
+  {
+    try
+    {
+      if (!pstore.Roster.TryGetValue(PGMISS, out var rec) || rec is null || rec.Name != "PG Sage") pgFailures.Add("pg-persist-entry");
+      if (!pstore.Advisors.TryGetValue(PGMA, out var ma) || ma.Removed || ma.RosterVersion != 1 || ma.BoardRole != "PG Sage") pgFailures.Add("pg-persist-link-A");
+      if (!pstore.Advisors.TryGetValue(PGMB, out var mb) || mb.Removed) pgFailures.Add("pg-persist-link-B");
+      if (!pstore.Messages.TryGetValue(PGMTG, out var ml) || !ml.Any(m => m.AdvisorId == PGDUPOLD && m.Content == "pg legacy reply")) pgFailures.Add("pg-persist-history");
+      if (!pstore.Images.TryGetValue(PGMIMG, out var mim) || mim.RosterEntryId != PGMISS) pgFailures.Add("pg-persist-image");
+      if (pstore.Roster.ContainsKey(PGF)) pgFailures.Add("pg-persist-foreign");
+      if (!pstore.Jobs.Values.Any(j => j.Kind == "roster-reconcile" && (j.IdempotencyKey ?? "").StartsWith("reconcile:pg-seed-key:", StringComparison.Ordinal))) pgFailures.Add("pg-persist-marker");
+      var plan = RosterReconciliation.Plan(pstore, "pg-seed-key", null);
+      var mine = plan.Orphans.Where(o => o.BoardId == PGB || o.BoardId == PGB2 || o.BoardId == PGBX || o.BoardId == PGBO).ToList();
+      if (mine.Any(o => o.Reason == "stale-version" || o.Reason == "duplicate-link")) pgFailures.Add("pg-verify-dirty");
+      var pgEmptyA = RosterLegacyAccess.StableEmptyLinkId(PGB, PGEA);
+      if (!pstore.Roster.TryGetValue(pgEmptyA, out var pgvEA) || pgvEA is null || pgvEA.Name != "PG NoLink A") pgFailures.Add("pg-persist-empty-A");
+      if (!pstore.Advisors.TryGetValue(PGEA, out var pgvLA) || pgvLA.RosterEntryId != pgEmptyA) pgFailures.Add("pg-persist-emptylink-A");
+      var pgvEXT = RosterLegacyAccess.StableEmptyLinkId(PGB, PGEX);
+      if (!pstore.Advisors.TryGetValue(PGEX, out var pgvEX) || pgvEX.Removed || pgvEX.RosterEntryId != pgvEXT) pgFailures.Add("pg-persist-emptylink-target");
+      if (!pstore.Roster.TryGetValue(pgvEXT, out var pgvER) || pgvER is null || pgvER.Archived) pgFailures.Add("pg-persist-target-entry");
+      if (!pstore.Advisors.TryGetValue(PGBUD2, out var pgvUD) || pgvUD.Removed) pgFailures.Add("pg-persist-unknown-dup");
+      if (!pstore.Messages.TryGetValue(PGBUMM, out var pgvUM) || !pgvUM.Any(m => m.AdvisorId == PGBUD2 && m.Content == "pg unknown reply")) pgFailures.Add("pg-persist-unknown-history");
+      var emptyMine = mine.Where(o => o.Reason == "empty-link").ToList();
+      if (emptyMine.Count != 1 || emptyMine[0].AdvisorId != PGEC) pgFailures.Add("pg-verify-empty-left");
+      if (mine.Any(o => o.Reason == "missing-roster" && o.RosterEntryId != PGF)) pgFailures.Add("pg-verify-missing-left");
+      var replayed = RosterReconcileApply.Apply(pstore, pgPriorHash, "pg-seed-key", null, out var replayErr, out _);
+      if (!replayed.Ok) pgFailures.Add("pg-replay:" + replayErr);
+      if (pgFailures.Count == 0) Console.WriteLine("PGVERIFY OK");
+    }
+    catch (Exception ex) { pgFailures.Add("pg-verify-ex:" + ex.GetBaseException().Message); }
+  }
+  else pgFailures.Add("unknown pg phase");
+  Console.WriteLine(pgFailures.Count == 0 ? "PGSELFTEST PASS" : "PGSELFTEST FAIL: " + string.Join(";", pgFailures));
+  Environment.Exit(pgFailures.Count == 0 ? 0 : 1);
 }
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "simceo-api", time = DateTime.UtcNow, instance = Environment.GetEnvironmentVariable("SIMCEO_INSTANCE") ?? "dev" }));
@@ -606,16 +1290,15 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
   // Meeting-only guests see only their own templates here; their discussion needs are served
   // by the approved-participant board-advisors projection, not the template collection.
   if (PeopleOps.IsSecure(s) && !isAdmin)
-    list0 = list0.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
-      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
-      || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
+    list0 = list0.Where(r => RosterLegacyAccess.OwnerMatches(s, r, me)
+      || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read")));
   else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty)
     list0 = list0.Where(r => r.AccountId == accountId
       // Canonical visibility (demo mode): a random browser-local account filter must not
       // hide existing attached entries. Attached-to-a-readable-board and unambiguous
       // legacy-owner entries stay visible; unattached foreign entries stay hidden.
       || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
-      || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
+      || RosterLegacyAccess.OwnerMatches(s, r, me));
   var list = list0;
   if (!string.IsNullOrWhiteSpace(q))
     list = list.Where(r => r.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
@@ -631,8 +1314,7 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
       var __readBoards = RosterOps.BoardsFor(s, r.Id);
       try { __readBoards = s.Advisors.Values.Where(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
         .Select(a => new { boardId = a.BoardId, board = s.Boards.TryGetValue(a.BoardId, out var __bb) ? __bb.Name : "?", role = a.BoardRole, approved = a.Approved }).ToList<object>(); } catch {}
-      var __isFull = isAdmin || string.Equals(r.OwnerKey ?? "", me, System.StringComparison.OrdinalIgnoreCase)
-        || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, System.StringComparison.OrdinalIgnoreCase)
+      var __isFull = isAdmin || RosterLegacyAccess.OwnerMatches(s, r, me)
         || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
       object __entry = __isFull ? r : new { r.Id, r.Name, r.Description, r.Version, r.UpdatedAt };
       var __imgs = __isFull ? s.Images.Values.Count(i => i.RosterEntryId == r.Id) : s.Images.Values.Count(i => i.RosterEntryId == r.Id && i.Review == "accepted");
@@ -647,12 +1329,11 @@ app.MapGet("/api/roster/count", (InMemoryStore s, HttpRequest req, Guid accountI
   var admin = PeopleOps.AdminEmail(s);
   var isAdmin = !string.IsNullOrWhiteSpace(admin) && string.Equals(admin, me, StringComparison.OrdinalIgnoreCase);
   var q = s.Roster.Values.Where(r => !r.Archived);
-  if (PeopleOps.IsSecure(s) && !isAdmin) q = q.Where(r => string.Equals(r.OwnerKey, me, StringComparison.OrdinalIgnoreCase)
-    || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
-    || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
+  if (PeopleOps.IsSecure(s) && !isAdmin) q = q.Where(r => RosterLegacyAccess.OwnerMatches(s, r, me)
+    || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read")));
   else if (!PeopleOps.IsSecure(s) && accountId != Guid.Empty) q = q.Where(r => r.AccountId == accountId
     || s.Advisors.Values.Any(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))
-    || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, r) ?? "", me, StringComparison.OrdinalIgnoreCase));
+    || RosterLegacyAccess.OwnerMatches(s, r, me));
   return Results.Ok(new { total = q.Count() });
 });
 
@@ -664,6 +1345,29 @@ app.MapPost("/api/roster", (InMemoryStore s, HttpRequest req, RosterEntry input)
   if (string.IsNullOrWhiteSpace(input.Name)) return Results.BadRequest("Name is required.");
   if (string.IsNullOrWhiteSpace(input.Description)) return Results.BadRequest("Description is required.");
   if (string.IsNullOrWhiteSpace(input.ProfileJson) || input.ProfileJson.Trim().Length < 20) return Results.BadRequest("Profile is required (describe background, strengths, and limits).");
+  if (input.Name.Trim().Length > 120) return Results.BadRequest("Name must be 120 chars or fewer.");
+  if (input.Description.Trim().Length > CharacterBehavior.MaxBackgroundChars) return Results.BadRequest("Description must be 4000 chars or fewer.");
+  // Always enforce shared profile bounds, including legacy-shaped JSON without
+  // behavior keys (the validator permits legacy objects while enforcing the
+  // universal 20k JSON / 4k background limits). Plain-text legacy profiles
+  // (non-JSON) remain accepted within the 20k bound to preserve compat, so
+  // oversize can never be accepted here and rejected later at chat/audition.
+  try
+  {
+    using var legacyDoc = JsonDocument.Parse(input.ProfileJson);
+    if (legacyDoc.RootElement.ValueKind == JsonValueKind.Object)
+    {
+      var (lvok, lverr, _) = CharacterBehavior.ValidateSavedProfile(input.ProfileJson);
+      if (!lvok) return Results.BadRequest(lverr);
+    }
+    else if (input.ProfileJson.Length > CharacterBehavior.MaxProfileJsonChars)
+      return Results.BadRequest("Profile must be " + CharacterBehavior.MaxProfileJsonChars + " chars or fewer (got " + input.ProfileJson.Length + "). Shorten paragraphs instead of embedding documents.");
+  }
+  catch (JsonException)
+  {
+    if (input.ProfileJson.Length > CharacterBehavior.MaxProfileJsonChars)
+      return Results.BadRequest("Profile must be " + CharacterBehavior.MaxProfileJsonChars + " chars or fewer (got " + input.ProfileJson.Length + "). Shorten paragraphs instead of embedding documents.");
+  }
   IResult gateErrRoster = null;
   Atomic.Run(s, () =>
   {
@@ -686,7 +1390,22 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
   if (!s.Boards.ContainsKey(boardId)) return Results.NotFound();
   if (PeopleOps.Can(s, req, boardId, null, "read"))
-    return Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).ToList());
+    // Canonical read projection: every attached advisor renders the CURRENT roster entry.
+    // Roster edits (name/profile/research/version) are reflected here immediately; stale pins
+    // surface explicitly so boards never render a forked copy. Additive fields only.
+    return Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).Select(a =>
+    {
+      var view = SimCEO.Api.Work.RosterIntegrity.ResolveCanonicalView(s, a);
+      return new
+      {
+        a.Id, a.BoardId, a.RosterEntryId, a.RosterVersion, a.BoardRole, a.Approved, a.Removed, a.ImageProvenance, a.CreatedAt,
+        rosterName = view is null ? (string?)null : view.Name,
+        rosterVersionCurrent = view is null ? (int?)null : view.CurrentVersion,
+        stale = view is null || view.Stale,
+        unlinked = view is null,
+        behaviorFingerprint = view is null ? ("missing:" + a.RosterEntryId) : view.BehaviorFingerprint,
+      };
+    }).ToList());
   var user = PeopleOps.UserOf(s, req);
   var meetings = PeopleOps.GuestMeetingIds(s, user, boardId);
   if (meetings.Count == 0) return PeopleOps.Denied();
@@ -708,13 +1427,14 @@ app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest
     && Guid.TryParse(re.GetString(), out var rg) ? rg : Guid.Empty;
   if (rosterId == Guid.Empty) return Results.BadRequest("Advisors must be created in the roster first: supply a rosterEntryId.");
   if (!s.Roster.TryGetValue(rosterId, out var __src) || __src.Archived) return Results.NotFound("Roster entry not found.");
+  bool __canSrcAttach = false;
   { var __me2 = PeopleOps.UserOf(s, req); var __adm2 = PeopleOps.AdminEmail(s); var __isAdm2 = !string.IsNullOrWhiteSpace(__adm2) && string.Equals(__adm2, __me2, StringComparison.OrdinalIgnoreCase);
-    var __canSrc = __isAdm2 || string.Equals(__src.OwnerKey ?? "", __me2, StringComparison.OrdinalIgnoreCase)
+    __canSrcAttach = __isAdm2 || string.Equals(__src.OwnerKey ?? "", __me2, StringComparison.OrdinalIgnoreCase)
       || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, __src) ?? "", __me2, StringComparison.OrdinalIgnoreCase)
       || s.Advisors.Values.Any(a => a.RosterEntryId == rosterId && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
-    if (!__canSrc) return PeopleOps.Denied(); }
+    if (!__canSrcAttach) return PeopleOps.Denied(); }
   var role = body.TryGetProperty("boardRole", out var br) ? (br.GetString() ?? "") : "";
-  var (copy, error, status) = RosterOps.TryCopy(s, rosterId, boardId, role);
+  var (copy, error, status) = RosterOps.TryCopy(s, rosterId, boardId, role, callerCanReadRoster: __canSrcAttach, canAttachBoard: true);
   return copy is not null ? Results.Created($"/api/boards/{boardId}/advisors/{copy.Id}", copy)
     : status == 409 ? Results.Conflict(error ?? "Attach rejected.") : Results.Json(new { error }, statusCode: status);
 });
@@ -749,9 +1469,13 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
   {
     "stale-version" => "Roster changed since this copy; update from roster, review, then approve.",
     "research-pending" => "Research is still running for this advisor.",
+    "research-failed" => "Research failed for this advisor; rerun research, then review and approve.",
+    "research-interrupted" => "Research was interrupted for this advisor; rerun research, then review and approve.",
+    "research-unsupported" => "Research completed without grounded evidence; rerun research with better inputs to ground it before approval.",
     "no-evidence" => "No supporting evidence yet; run research again or add sources first.",
     "portrait-pending" => "An accepted portrait is required before approving (upload one, then accept it).",
     "archived-entry" => "Roster entry is archived.",
+    "recovered-incomplete" => "Recovered entry is an incomplete placeholder: complete the profile (or run research to evidence) before approving.",
     _ => "Advisor is not eligible for approval.",
   } }, statusCode: 409);
   // ONE durable unit: recheck CURRENT authority + eligibility inside the commit so a

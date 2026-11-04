@@ -1,0 +1,199 @@
+{
+  "startedAt": "2026-11-04T02:46:51.412Z",
+  "skipped": 0,
+  "finishedAt": "2026-11-04T02:48:47.348Z",
+  "pass": true,
+  "steps": [
+    {
+      "name": "setup: board + seated approved advisor",
+      "pass": true,
+      "ms": 174,
+      "evidence": "board ready, Strategist approved, Observer pending approval"
+    },
+    {
+      "name": "profile: save creates version 1",
+      "pass": true,
+      "ms": 3193,
+      "evidence": "version 1 saved"
+    },
+    {
+      "name": "profile: typing survives post-save refetch (stale-cache guard)",
+      "pass": true,
+      "ms": 4029,
+      "evidence": "typed text intact after refetch"
+    },
+    {
+      "name": "profile: stale base save conflicts friendly, edits preserved",
+      "pass": true,
+      "ms": 4294,
+      "evidence": "409 mapped friendly, typed name kept, save frozen until reload"
+    },
+    {
+      "name": "meet: no-meeting shell offers New meeting",
+      "pass": true,
+      "ms": 594,
+      "evidence": "first meeting created with zero model calls"
+    },
+    {
+      "name": "meet: settings brief textarea saves + gating copy shown",
+      "pass": true,
+      "ms": 129,
+      "evidence": "brief saved and shown"
+    },
+    {
+      "name": "meet: participant exclusion persists, last uncheck blocked",
+      "pass": true,
+      "ms": 3433,
+      "evidence": "single exclusion persisted; silent-everyone prevented; include-everyone is explicit"
+    },
+    {
+      "name": "meet: settings dialog focus and Escape restore",
+      "pass": true,
+      "ms": 58,
+      "evidence": "focus in, Escape out, focus restored"
+    },
+    {
+      "name": "meet: presence rail always visible with every seat",
+      "pass": true,
+      "ms": 401,
+      "evidence": "all seats plus secretary visible, independent of context collapse"
+    },
+    {
+      "name": "meet: request enabled with brief, second meeting disabled",
+      "pass": true,
+      "ms": 103,
+      "evidence": "gating correct, creation is model-free"
+    },
+    {
+      "name": "meet: settings stay with the meeting they were opened for",
+      "pass": true,
+      "ms": 211,
+      "evidence": "settings closed on navigation; B untouched: Meeting"
+    },
+    {
+      "name": "meet: explicit request produces advisor replies",
+      "pass": true,
+      "ms": 197,
+      "evidence": "1 advisor message(s) after one explicit request"
+    },
+    {
+      "name": "meet: request disabled while paused, draft preserved",
+      "pass": true,
+      "ms": 1665,
+      "evidence": "paused blocks request, draft kept, resume restores, zero model calls"
+    },
+    {
+      "name": "meet: search results stay with their meeting",
+      "pass": true,
+      "ms": 6165,
+      "evidence": "late A response discarded, B keeps only its own results"
+    },
+    {
+      "name": "meet: held search released after moving without a new search stays away",
+      "pass": true,
+      "ms": 8447,
+      "evidence": "same-document A held, B clean without B search, positive B search works"
+    },
+    {
+      "name": "meet: settings and people surfaces show no raw identifiers",
+      "pass": true,
+      "ms": 1053,
+      "evidence": "expanded settings and people show human labels only"
+    },
+    {
+      "name": "records: structured editor preserves content, revision keeps ids + metadata",
+      "pass": true,
+      "ms": 522,
+      "evidence": "v1 ids 1,n-mw1inpsl-p1o,n-mw1inpu0-zm stable into v2, multiline intact"
+    },
+    {
+      "name": "records: expanded record surfaces show no raw identifiers",
+      "pass": true,
+      "ms": 850,
+      "evidence": "expanded records show human labels only"
+    },
+    {
+      "name": "roster: chat success, preceding-only history, retry without duplicates",
+      "pass": true,
+      "ms": 7866,
+      "evidence": "drafts isolated; preceding-only history; single pending turn incl retry; friendly failure"
+    },
+    {
+      "name": "roster: pending retired on version change, chat stays usable",
+      "pass": true,
+      "ms": 19468,
+      "evidence": "stale reply discarded, composer intact, chat usable after retire"
+    },
+    {
+      "name": "profile: identity switch drops previous account editor",
+      "pass": true,
+      "ms": 8807,
+      "evidence": "editor reset on switch, nothing submitted, per-account versions"
+    },
+    {
+      "name": "profile: base advances after own save, next save succeeds",
+      "pass": true,
+      "ms": 3822,
+      "evidence": "base advanced; newer typing applied on the next save"
+    },
+    {
+      "name": "visual: presence rail 1440px light, every seat with honest portraits",
+      "pass": true,
+      "ms": 2011,
+      "evidence": "rail visible, 3 seats, portraits+fallbacks honest, shots/presence-1440-light.png"
+    },
+    {
+      "name": "visual: hiding context cannot hide the rail",
+      "pass": true,
+      "ms": 3315,
+      "evidence": "rail independent of context collapse, shots/presence-1440-light-context-hidden.png"
+    },
+    {
+      "name": "visual: settings dialog shows decisions and evidence in place",
+      "pass": true,
+      "ms": 2080,
+      "evidence": "settings owns decisions+evidence in place, shots/settings-1440-light.png"
+    },
+    {
+      "name": "visual: 390px mobile rail precedes conversation and sticks",
+      "pass": true,
+      "ms": 7394,
+      "evidence": "390px dark: rail first+sticky+horizontal, shots/presence-390-dark.png + shots/settings-390-dark.png"
+    },
+    {
+      "name": "visual: presence rail 1440px dark, every seat with honest portraits",
+      "pass": true,
+      "ms": 2044,
+      "evidence": "rail visible dark 1440, center 740px, shots/presence-1440-dark.png"
+    },
+    {
+      "name": "visual: 390px mobile light rail precedes conversation and sticks",
+      "pass": true,
+      "ms": 5097,
+      "evidence": "390px light: rail first+sticky, toolbar+composer+message geometry+tap, settings opaque, shots/presence-390-light.png + shots/settings-390-light.png"
+    },
+    {
+      "name": "meet: only accepted portraits render; reject clears the rail image",
+      "pass": true,
+      "ms": 11778,
+      "evidence": "pending never renders; accept/reject/re-accept resolve same-page without reload"
+    },
+    {
+      "name": "meet: external rejection clears a mounted portrait without reload",
+      "pass": true,
+      "ms": 787,
+      "evidence": "two-tab reject clears mounted blob without reload, fallback kept"
+    },
+    {
+      "name": "roster: bearer A and B on one browser keep drafts private per identity",
+      "pass": true,
+      "ms": 914,
+      "evidence": "bearer A/B same browser: drafts isolated by identity, restored per identity"
+    }
+  ],
+  "stack": {
+    "api": "127.0.0.1:5181",
+    "web": "127.0.0.1:5191",
+    "fakeModel": "127.0.0.1:5259"
+  }
+}

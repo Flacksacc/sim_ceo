@@ -1,0 +1,246 @@
+// human-format.ts — plain-language helpers for record review and review inbox copy.
+//
+// Pure module: no imports, no DOM access. It is intentionally dependency-free
+// so it can be type-checked with the web app and unit-checked standalone.
+// Server identifiers (item ids, hashes, watermarks, versions) are preserved in
+// the data protocol; these helpers only change how they are *displayed*.
+
+export type HumanRecordItem = {
+  // Stable server-side identifier. Preserved round-trip; never shown as a title.
+  key: string;
+  text: string;
+};
+
+export type ItemsProblem = "empty" | "not-a-list" | "unreadable" | null;
+
+export type ParsedRecordItems = {
+  items: HumanRecordItem[];
+  problem: ItemsProblem;
+};
+
+// Parse a draft items payload without throwing. Anything the server would
+// reject as unreadable becomes a plain-language problem, never raw JSON.
+export function parseRecordItems(json: string): ParsedRecordItems {
+  let raw: unknown = null;
+  try {
+    raw = JSON.parse(json ?? "[]");
+  } catch {
+    return { items: [], problem: "unreadable" };
+  }
+  if (!Array.isArray(raw)) return { items: [], problem: "not-a-list" };
+  if (raw.length === 0) return { items: [], problem: "empty" };
+  const items: HumanRecordItem[] = [];
+  for (const entry of raw) {
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+      const rec = entry as Record<string, unknown>;
+      const key = typeof rec.id === "string" ? rec.id : "";
+      const text = typeof rec.text === "string" ? rec.text : "";
+      items.push({ key, text });
+    } else if (typeof entry === "string") {
+      items.push({ key: "", text: entry });
+    }
+  }
+  return { items, problem: null };
+}
+
+// Serialize back to the exact wire shape the record endpoints validate:
+// an array of { id, text } objects. Keys are preserved; only display changes.
+export function itemsToJson(items: HumanRecordItem[]): string {
+  return JSON.stringify(items.map((it) => ({ id: it.key, text: it.text })));
+}
+
+// One decision per line, numbered for people. Reference codes stay out.
+export function itemsToEditableText(items: HumanRecordItem[]): string {
+  return items.map((it, i) => String(i + 1) + ". " + it.text).join("\n");
+}
+
+
+// Mint a well-formed id for a newly added row. The server requires every item
+// to carry a non-empty unique string id; it accepts ids it has not seen
+// before on revise/amend, so a clearly-prefixed client id is safe. The server
+// remains the authority: anything it rejects is reported back verbatim in the
+// technical details disclosure.
+export function newItemKey(): string {
+  const rand = Math.floor(Math.random() * 46656).toString(36);
+  return "n-" + Date.now().toString(36) + "-" + rand;
+}
+
+function stripLineMarker(line: string): string {
+  const m = line.match(/^\s*(?:\d+[.)]\s+|[-*]\s+|\u2022\s+)/);
+  return m ? line.slice(m[0].length) : line.trim();
+}
+
+export type TextRoundTrip = {
+  items: HumanRecordItem[];
+  added: number;
+  removed: number;
+};
+
+// Convert edited plain text back to items. Keys follow their text when a line
+// still matches a previous item, so reordering or rewording nearby lines does
+// not scramble identities. Brand-new lines receive fresh keys; dropped lines
+// count as removed.
+export function editableTextToItems(
+  text: string,
+  previous: HumanRecordItem[],
+): TextRoundTrip {
+  const byText = new Map<string, HumanRecordItem[]>();
+  for (const p of previous) {
+    const list = byText.get(p.text) ?? [];
+    list.push(p);
+    byText.set(p.text, list);
+  }
+  const used = new Set<HumanRecordItem>();
+  const items: HumanRecordItem[] = [];
+  let added = 0;
+  for (const rawLine of (text ?? "").split(/\r?\n/)) {
+    const line = stripLineMarker(rawLine);
+    if (line === "") continue;
+    const candidates = byText.get(line) ?? [];
+    const reuse = candidates.find((c) => !used.has(c));
+    if (reuse) {
+      used.add(reuse);
+      items.push({ key: reuse.key, text: line });
+    } else {
+      added += 1;
+      items.push({ key: newItemKey(), text: line });
+    }
+  }
+  const removed = previous.filter((p) => !used.has(p)).length;
+  return { items, added, removed };
+}
+
+// Short on-demand reference, e.g. for a details disclosure or support note.
+// Never used as a title.
+export function shortRef(key: string): string {
+  const k = key ?? "";
+  return k.length <= 8 ? k : k.slice(0, 8);
+}
+
+export type RecordStatusTone = "open" | "progress" | "done" | "muted";
+
+export type FriendlyStatus = { label: string; tone: RecordStatusTone };
+
+const STATUS_COPY: Record<string, FriendlyStatus> = {
+  open: { label: "Open for review", tone: "open" },
+  "partially-approved": { label: "Partly approved", tone: "progress" },
+  approved: { label: "Approved", tone: "done" },
+  discarded: { label: "Not kept", tone: "muted" },
+  superseded: { label: "Replaced by a newer version", tone: "muted" },
+};
+
+export function friendlyRecordStatus(status: string, decided: boolean): FriendlyStatus {
+  const known = STATUS_COPY[(status ?? "").toLowerCase()];
+  if (known) return known;
+  if (decided) return { label: "Decided", tone: "done" };
+  return { label: "In review", tone: "open" };
+}
+
+export type ItemChange = {
+  kind: "added" | "removed" | "updated";
+  headline: string;
+  detail: string;
+  key: string;
+};
+
+// Plain-language version comparison. Titles are decision text; reference
+// codes appear only inside detail strings and only when needed to tell two
+// similar items apart.
+export function describeItemChanges(prevJson: string, curJson: string): ItemChange[] {
+  const prev = parseRecordItems(prevJson).items;
+  const cur = parseRecordItems(curJson).items;
+  const prevByKey = new Map(prev.map((i) => [i.key === "" ? i.text : i.key, i]));
+  const curByKey = new Map(cur.map((i) => [i.key === "" ? i.text : i.key, i]));
+  const out: ItemChange[] = [];
+  for (const [k, p] of prevByKey) {
+    const c = curByKey.get(k);
+    if (!c) {
+      out.push({ kind: "removed", headline: "Removed", detail: p.text, key: k });
+    } else if (c.text !== p.text) {
+      out.push({
+        kind: "updated",
+        headline: "Updated",
+        detail: "Was: " + p.text + " Now: " + c.text,
+        key: k,
+      });
+    }
+  }
+  for (const [k, c] of curByKey) {
+    if (!prevByKey.has(k)) out.push({ kind: "added", headline: "Added", detail: c.text, key: k });
+  }
+  return out;
+}
+
+
+// Translate technical review failures into actionable plain language.
+// Returns an empty string when no friendly mapping applies, so callers can
+// fall back to the original message inside a technical-details disclosure.
+export function friendlyError(message: string): string {
+  if ((message ?? "").toLowerCase().indexOf("already in progress") >= 0) {
+    return "A discussion run is already in progress for this meeting; wait for it to finish.";
+  }
+  if ((message ?? "").toLowerCase().indexOf("account changed") >= 0) {
+    return "The account changed while you were editing. Review the profile, then save again.";
+  }
+  const m = (message ?? "").toLowerCase();
+  if (m.indexOf("revision body must be json") >= 0 || m.indexOf("must be a json array") >= 0) {
+    return "That edit could not be read as a list. Use the text editor below — one decision per line — and try again.";
+  }
+  if (m.indexOf("must carry a non-empty string id") >= 0 || m.indexOf("duplicate draft item id") >= 0) {
+    return "One row is missing its reference or two rows share one. The editor repairs this automatically — retype the row and try again.";
+  }
+  if (m.indexOf("must carry non-empty string text") >= 0 || m.indexOf("exceeds 8000") >= 0) {
+    return "One decision is empty or too long. Keep each decision under a short paragraph and try again.";
+  }
+  if (m.indexOf("superseded") >= 0 || m.indexOf("successor") >= 0 || m.indexOf("current version instead") >= 0) {
+    return "A newer version already exists. Open the newest version in the list and work from there — this one is kept for history.";
+  }
+  if (m.indexOf("already decided") >= 0 || m.indexOf("per-item decisions") >= 0) {
+    return "This version is already decided. Continue on the newest open version instead of rewriting this one.";
+  }
+  if (m.indexOf("hash") >= 0 || m.indexOf("watermark") >= 0 || m.indexOf("review token") >= 0 || m.indexOf("stale") >= 0 || m.indexOf("guard") >= 0) {
+    return "The record changed while you were reviewing it. Refresh the review and try again — your text is kept.";
+  }
+  if (m.indexOf("manage grant") >= 0 || m.indexOf("manage") >= 0 && m.indexOf("approv") >= 0) {
+    return "Approving needs a manager role for this board. Ask a board manager to approve, or to grant you approval access.";
+  }
+  if (m.indexOf("explicit repair") >= 0 || m.indexOf("valid review") >= 0 || m.indexOf("no pending items") >= 0) {
+    return "There is nothing ready to approve right now. Request a fresh revision, or wait for the next draft version.";
+  }
+  if (m.indexOf("contribute") >= 0 || m.indexOf("not authorized") >= 0 || m.indexOf("denied") >= 0) {
+    return "You do not have access to change this. Ask a board manager to invite you or adjust your access.";
+  }
+  if (m.indexOf("unparseable") >= 0 || m.indexOf("unreadable") >= 0) {
+    return "This draft could not be displayed. Request a fresh revision to continue from a clean copy.";
+  }
+  return "";
+}
+
+export function pluralize(count: number, one: string, many: string): string {
+  return count === 1 ? one : many;
+}
+
+export function countLine(count: number, one: string, many: string): string {
+  return String(count) + " " + pluralize(count, one, many);
+}
+
+
+// Humanize a secretary packet-omission manifest. Server entries look like
+// direction:<GUID>, record:<GUID>:v<N>, or source:<GUID>:<GUID>. Raw
+// identifiers are never user-meaningful: render what was left out and why
+// it matters, never the raw reference. Unknown shapes become a neutral
+// label rather than leaking internals.
+export function humanizeOmission(omitted: string[]): string {
+  const parts: string[] = [];
+  for (const raw of omitted) {
+    const o = (raw ?? "").trim();
+    if (!o) continue;
+    const mv = o.match(/^record:[0-9a-fA-F-]{8,}:[vV](\d+)\s*$/);
+    if (mv) { parts.push("approved record (version " + mv[1] + ")"); continue; }
+    if (/^record:/i.test(o)) { parts.push("an approved record"); continue; }
+    if (/^direction:/i.test(o)) { parts.push("an adopted direction"); continue; }
+    if (/^source:/i.test(o)) { parts.push("a source excerpt"); continue; }
+    parts.push("an item");
+  }
+  return parts.join("; ");
+}

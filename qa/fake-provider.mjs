@@ -10,7 +10,7 @@ const counts = { chat: 0, responses: 0, transcribe: 0, images: 0 };
 const promptLog = [];
 const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
 function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
-function gateWait(text) { const w = sleepMsOf(text); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
+function gateWait(text, kind) { const w = sleepMsOf(text, kind); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
 function logPrompt(path, text) {
   try {
     promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length, full: (text || "").slice(0, 200000) });
@@ -25,8 +25,10 @@ function readRaw(req) {
   });
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function sleepMsOf(text) {
-  const m = /QA-SLEEP:(\d+)/.exec(text || "");
+function sleepMsOf(text, kind) {
+  const t = text || "";
+  if (kind) { const km = new RegExp("QA-SLEEP-" + kind + ":([0-9]+)").exec(t); if (km) return Math.min(Number(km[1]), 15000); }
+  const m = /QA-SLEEP:([0-9]+)/.exec(t);
   return m ? Math.min(Number(m[1]), 15000) : 0;
 }
 function chatContent(prompt) {
@@ -56,6 +58,18 @@ function chatContent(prompt) {
     return {
       content: JSON.stringify({ suggestion: "QA suggestion.", nextQuestion: "QA next?", fields: {} }),
     };
+  }
+  // Character-advisor compile: deterministic 3-paragraph JSON echoing the
+  // researched name so QA can prove the draft round-trips into storage.
+  if (prompt.includes("COMPILE-CHARACTER-PARAGRAPHS")) {
+    if (prompt.includes("QA-COMPILEERR")) return { status: 500, body: "qa compile failure" };
+    const nm = /character "([^"]+)"/.exec(prompt || "") || [];
+    const who = nm[1] || "QA character";
+    return { content: JSON.stringify({
+      contributionCriteria: "QA-CRITERIA for " + who + ": contributes fleet logistics and port risk; abstains without port data.",
+      reasoningApproach: "QA-REASON for " + who + ": compares options against port evidence; agrees when supported, challenges unsupported premises; never invents credentials.",
+      responseStyle: "QA-STYLE for " + who + ": blunt about port risk, diplomatic with crew; detailed when evidence allows.",
+    }) };
   }
   if (prompt.includes("Reply with exactly: OK")) return { content: "OK" };
   return { content: "QA provisional text." };
@@ -184,7 +198,7 @@ const server = http.createServer(async (req, res) => {
     const msgs = Array.isArray(body?.messages) ? body.messages : [];
     const prompt = msgs.map((m) => m.content).join("\n") || "";
     logPrompt("chat", prompt);
-    const wait = gateWait(prompt);
+    const wait = gateWait(prompt, "C");
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
     if (out.envelope) {
@@ -218,7 +232,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     logPrompt("responses", input);
-    if (input.includes("QA-SLEEP")) await sleep(gateWait(input));
+    if (/QA-SLEEP(-R)?:/.test(input)) await sleep(gateWait(input, "R"));
     seq++;
     const noSearch = input.includes("QA-NOSEARCH");
     const output = [
