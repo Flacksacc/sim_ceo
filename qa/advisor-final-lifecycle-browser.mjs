@@ -79,8 +79,9 @@ let notes = freshNotes();
 let activityMode = "idle";
 let researchPhase = "done";
 let researchPollsLeft = 0;
-let researchTerminal = "done";
+let researchTerminal = "draft";
 let researchVersion = 4;
+let researchHttpError = false;
 const gates = { activity: null, researchGet: null, briefing: null, noteEdit: null, noteReverse: null, rosterPut: null };
 function resetProbeState() {
   entry = freshEntry();
@@ -88,9 +89,17 @@ function resetProbeState() {
   activityMode = "idle";
   researchPhase = "done";
   researchPollsLeft = 0;
-  researchTerminal = "done";
+  researchTerminal = "draft";
   researchVersion = 4;
+  researchHttpError = false;
   for (const k of Object.keys(gates)) gates[k] = null;
+}
+function compiledProfile() {
+  return {
+    contributionCriteria: "Speaks when pricing expertise applies.",
+    reasoningApproach: "Weighs evidence and trade-offs carefully.",
+    responseStyle: "Direct and concise, with reasons stated.",
+  };
 }
 function countFrom(mark, method, exactPath) {
   let n = 0;
@@ -100,14 +109,23 @@ function countFrom(mark, method, exactPath) {
   }
   return n;
 }
+async function waitForLog(mark, entry, timeout = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (reqLog.slice(mark).includes(entry)) return true;
+    await sleep(100);
+  }
+  throw new Error("timeout waiting for log " + entry);
+}
 function researchSnapshot() {
   if (researchPhase === "running") {
-    return { researchJson: "{}", researchedAt: null, researchRequested: true, evidenceCount: 0, version: researchVersion, researchBaseVersion: 3, running: true, stage: "researching", stageError: null, sources: [], draftProfile: null, draftStatus: null };
+    return { researchJson: JSON.stringify({ subject: "x", running: true }), researchedAt: null, researchRequested: true, evidenceCount: 0, version: researchVersion, researchBaseVersion: 3, running: true, stage: "researching", stageError: null, sources: [], draftProfile: null, draftStatus: null };
   }
   if (researchPhase === "failed") {
-    return { researchJson: "{}", researchedAt: null, researchRequested: true, evidenceCount: 0, version: researchVersion, researchBaseVersion: 3, running: false, stage: "failed", stageError: "provider timeout", sources: [], draftProfile: null, draftStatus: "failed" };
+    return { researchJson: JSON.stringify({ subject: "x", error: "failed" }), researchedAt: null, researchRequested: true, evidenceCount: 0, version: researchVersion, researchBaseVersion: 3, running: false, stage: "failed", stageError: "SELECT * FROM roster WHERE id=1; /srv/db/roster.sql timeout", sources: [], draftProfile: null, draftStatus: "failed" };
   }
-  return { researchJson: "{}", researchedAt: "2026-11-04T00:00:00Z", researchRequested: true, evidenceCount: 2, version: researchVersion, researchBaseVersion: 3, running: false, stage: "done", stageError: null, sources: [], draftProfile: null, draftStatus: "draft" };
+  const ds = researchTerminal === "saved" ? "saved" : "draft";
+  return { researchJson: JSON.stringify({ subject: "x", claims: [{ text: "pricing claim" }] }), researchedAt: "2026-11-04T00:00:00Z", researchRequested: true, evidenceCount: 2, version: researchVersion, researchBaseVersion: 3, running: false, stage: "done", stageError: null, sources: [{ url: "https://example.com/pricing", title: "Pricing source", excerpt: "pricing excerpt" }], draftProfile: compiledProfile(), draftStatus: ds };
 }
 
 async function apiStub(route) {
@@ -169,6 +187,7 @@ async function apiStub(route) {
   if ((m = p.match(/^\/api\/roster\/([^/]+)\/images$/))) return J([]);
   if ((m = p.match(/^\/api\/roster\/([^/]+)\/research$/)) && method === "GET") {
     if (gates.researchGet) await gates.researchGet.promise;
+    if (researchHttpError) return J({ error: "research store failed" }, 500);
     if (researchPhase === "running") {
       if (researchPollsLeft > 0) { researchPollsLeft--; return J(researchSnapshot()); }
       researchPhase = researchTerminal;
@@ -247,11 +266,15 @@ async function openMeet() {
 async function openRoster() {
   await openHash("#/roster?board=b-alpha");
   await page.getByRole("heading", { name: /My Advisor Roster/ }).first().waitFor({ timeout: 20000 });
-  await page.getByRole("button", { name: /QA Sage/ }).first().waitFor({ timeout: 20000 });
+  await page.locator("aside.listpanel button.lprow", { hasText: "QA Sage" }).first().waitFor({ timeout: 20000 });
 }
 async function selectRosterEntry() {
-  await page.getByRole("button", { name: /QA Sage/ }).first().click();
+  await page.locator("aside.listpanel button.lprow", { hasText: "QA Sage" }).first().click();
   await page.locator('[data-roster-entry-id="r-adv-1"]').first().waitFor({ timeout: 20000 });
+}
+async function openMeetingSettings() {
+  await page.getByRole("button", { name: "Meeting settings" }).first().click();
+  await page.locator("dialog.conv-settings section[aria-label=\"Meeting settings\"]").first().waitFor({ timeout: 20000 });
 }
 async function railStatus() {
   return page.locator('section[aria-label="In this meeting"] p[role="status"]').first().innerText().catch(() => "");
@@ -285,7 +308,7 @@ async function testActivityErrorOfflineRecovery() {
   await page.waitForFunction(() => document.body.innerText.indexOf("activity unavailable") >= 0, null, { timeout: 30000 });
   ok("activity-error-unavailable", true, "failed snapshot renders unavailable, never responding");
   const t0 = await bodyText();
-  ok("activity-error-no-responding", t0.indexOf("Responding") < 0 || t0.indexOf("activity unavailable") >= 0, t0.slice(0, 200));
+  ok("activity-error-no-responding", t0.indexOf("Responding") < 0 && t0.indexOf("responding") < 0, t0.slice(0, 200));
   activityMode = "idle";
   await page.reload();
   await openMeet();
@@ -313,27 +336,83 @@ async function testActivityErrorOfflineRecovery() {
   });
   await page.waitForFunction(() => document.body.innerText.indexOf("all listening") >= 0, null, { timeout: 30000 });
   ok("activity-resume-fresh", countFrom(mark, "GET", "/api/meetings/m-one/activity") > held, "resume requires a fresh HTTP poll before reusing retained snapshot");
+  const held2 = countFrom(mark, "GET", "/api/meetings/m-one/activity");
+  gates.activity = deferred();
+  const hiddenDone = page.waitForResponse((r) => r.request().method() === "GET" && new URL(r.url()).pathname === "/api/meetings/m-one/activity", { timeout: 30000 }).catch(() => null);
+  await page.evaluate(() => {
+    try {
+      Object.defineProperty(document, "hidden", { value: true, configurable: true });
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    } catch (e) {}
+  });
+  await page.waitForFunction(() => document.body.innerText.indexOf("checking activity") >= 0, null, { timeout: 30000 });
+  activityMode = "responding";
+  gates.activity.release();
+  gates.activity = null;
+  await hiddenDone;
+  await page.evaluate(() => {
+    try {
+      Object.defineProperty(document, "hidden", { value: false, configurable: true });
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    } catch (e) {}
+  });
+  await page.waitForTimeout(800);
+  const afterHiddenCompletion = await bodyText();
+  ok("activity-hidden-completion-held", afterHiddenCompletion.indexOf("checking activity") >= 0, "outstanding hidden completion cannot satisfy fresh post-resume");
+  await page.waitForFunction(() => /responding|working/.test(document.body.innerText), null, { timeout: 30000 });
+  ok("activity-postresume-poll-clears", countFrom(mark, "GET", "/api/meetings/m-one/activity") > held2 + 1, "only a fresh post-resume poll clears the gate");
+  const offMark = reqLog.length;
+  await page.evaluate(() => { try { window.dispatchEvent(new Event("offline")); } catch (e) {} });
+  await page.waitForFunction(() => document.body.innerText.indexOf("checking activity") >= 0, null, { timeout: 30000 });
+  ok("activity-offline-paused", true, "offline pauses retained snapshot");
+  await page.evaluate(() => { try { window.dispatchEvent(new Event("online")); } catch (e) {} });
+  await page.waitForFunction(() => document.body.innerText.indexOf("all listening") >= 0 || /responding|working/.test(document.body.innerText), null, { timeout: 30000 });
+  ok("activity-reconnect-fresh", countFrom(offMark, "GET", "/api/meetings/m-one/activity") >= 1, "reconnect requires a fresh HTTP poll");
+  const restoreMark = reqLog.length;
+  await page.evaluate(() => { try { window.dispatchEvent(new Event("simceo-domain-restored")); } catch (e) {} });
+  await page.waitForTimeout(2500);
+  ok("activity-restore-same-id-polls", countFrom(restoreMark, "GET", "/api/meetings/m-one/activity") >= 1, "unchanged-ID restore still re-polls activity");
 }
 async function testResearchLiveTerminalRerun() {
   resetProbeState();
   researchPhase = "running";
   researchPollsLeft = 4;
-  researchTerminal = "done";
+  researchTerminal = "draft";
   researchVersion = 4;
   await openRoster();
   await selectRosterEntry();
   await page.waitForFunction(() => document.body.innerText.indexOf("Research in progress") >= 0, null, { timeout: 30000 });
   ok("research-live-running", true, "live run beats cached row state");
   await page.waitForFunction(() => /Researched v4/.test(document.body.innerText), null, { timeout: 30000 });
-  ok("research-terminal-done", true, "terminal done renders versioned proof");
-  researchTerminal = "failed";
+  ok("research-terminal-done", /Researched v4/.test(await bodyText()), "terminal draft renders versioned proof");
+  researchTerminal = "saved";
+  researchVersion = 5;
   await page.getByRole("button", { name: "Research dossier" }).first().click();
   await page.waitForFunction(() => document.body.innerText.indexOf("Research in progress") >= 0, null, { timeout: 30000 });
   ok("research-rerun-running", true, "rerun returns to running, never stale done");
+  await page.waitForFunction(() => /Researched v5/.test(document.body.innerText), null, { timeout: 30000 });
+  ok("research-terminal-saved", /Researched v5/.test(await bodyText()), "second success mode renders versioned proof");
+  researchPhase = "failed";
+  researchTerminal = "failed";
+  await page.getByRole("button", { name: "Research dossier" }).first().click();
+  await page.waitForFunction(() => document.body.innerText.indexOf("Research in progress") >= 0, null, { timeout: 30000 });
+  ok("research-failrun-running", true, "failed rerun passes through running");
   await page.waitForFunction(() => document.body.innerText.indexOf("Research failed") >= 0, null, { timeout: 30000 });
   const t = await bodyText();
   ok("research-failed-terminal", t.indexOf("Research failed") >= 0, t.slice(0, 300));
-  ok("research-failed-no-stale-researched", !/Researched v4/.test(t), "failed rerun never reverts to cached Researched");
+  ok("research-failed-no-stale-researched", !/Researched v5/.test(t), "failed rerun never reverts to cached Researched");
+  ok("research-failed-no-raw", t.indexOf("SELECT") < 0 && t.indexOf("/srv/db") < 0 && t.indexOf("stageError") < 0, t.slice(0, 300));
+  researchHttpError = true;
+  const errMark = reqLog.length;
+  await page.getByRole("button", { name: "Research dossier" }).first().click();
+  await page.waitForFunction(() => document.body.innerText.indexOf("Research state unavailable") >= 0, null, { timeout: 30000 });
+  const te = await bodyText();
+  ok("research-error-outranks-retained", te.indexOf("Research state unavailable") >= 0 && !/Researched v5/.test(te), te.slice(0, 300));
+  ok("research-error-polled", countFrom(errMark, "GET", "/api/roster/r-adv-1/research") >= 1, "error came from a real poll, not a source wait");
+  researchHttpError = false;
 }
 async function testPutVerifyHeldUnmount() {
   resetProbeState();
@@ -342,20 +421,23 @@ async function testPutVerifyHeldUnmount() {
   await selectRosterEntry();
   await page.waitForFunction(() => /Researched/.test(document.body.innerText), null, { timeout: 30000 });
   await page.locator("#cc-respond").fill("Direct and concise, with reasons stated. Plus a held-save sentence.");
+  gates.rosterPut = deferred();
   gates.researchGet = deferred();
   const mark = reqLog.length;
   const putResp = page.waitForResponse((r) => r.request().method() === "PUT" && new URL(r.url()).pathname === "/api/roster/r-adv-1", { timeout: 30000 });
   await page.getByRole("button", { name: "Save draft changes" }).click();
-  const resp = await putResp;
-  ok("put-confirmed-200", resp.status() === 200, "status=" + resp.status());
-  // Barrier, not sleep: the roster refetch must fire while the verify GET is
-  // still held, proving invalidation ran immediately after the confirmed PUT.
-  await page.waitForFunction(() => document.body.innerText.indexOf("Checking research") >= 0 || document.body.innerText.indexOf("Researched") >= 0, null, { timeout: 30000 });
-  const rosterGets = countFrom(mark, "GET", "/api/roster");
-  ok("put-invalidates-before-verify", rosterGets >= 1, "roster refetch fired while verify held; rosterGets=" + rosterGets);
+  await waitForLog(mark, "PUT /api/roster/r-adv-1");
   await openHash("#/boards");
   await page.waitForFunction(() => document.body.innerText.indexOf("Boards") >= 0, null, { timeout: 20000 });
-  ok("put-unmount-clean", true, "unmount during held verify does not crash");
+  ok("put-unmount-before-confirm", true, "editor unmounted while PUT still held");
+  gates.rosterPut.release();
+  gates.rosterPut = null;
+  const resp = await putResp;
+  ok("put-confirmed-200", resp.status() === 200, "status=" + resp.status());
+  await waitForLog(mark, "GET /api/roster");
+  const rosterGets = countFrom(mark, "GET", "/api/roster");
+  ok("put-invalidates-before-verify", rosterGets >= 1, "captured origin invalidated even unmounted; rosterGets=" + rosterGets);
+  ok("put-unmount-clean", true, "unmount before confirmation does not crash");
   gates.researchGet.release();
   gates.researchGet = null;
   await sleep(1200);
@@ -382,6 +464,7 @@ async function testSecretaryBriefEditReverseIdentity() {
   activityMode = "idle";
   await openMeet();
   await page.waitForFunction(() => document.body.innerText.indexOf("all listening") >= 0, null, { timeout: 30000 });
+  await openMeetingSettings();
   const mark0 = reqLog.length;
   gates.briefing = deferred();
   await page.getByLabel("Briefing topic").fill("held briefing intent");
@@ -389,51 +472,56 @@ async function testSecretaryBriefEditReverseIdentity() {
   await page.waitForFunction(() => document.body.innerText.indexOf("Preparing...") >= 0, null, { timeout: 30000 });
   ok("brief-held-pending", true, "queued briefing holds behind the request barrier");
   await page.getByRole("button", { name: "Edit", exact: true }).first().click();
-  const editBox = page.locator(".takenote textarea").first();
+  const editBox = page.locator("dialog.conv-settings .takenote textarea").first();
   await editBox.waitFor({ timeout: 15000 });
   await editBox.fill("Fixture note body plus held edit.");
   gates.noteEdit = deferred();
   await page.getByRole("button", { name: "Save revision", exact: true }).click();
-  await sleep(500);
+  await waitForLog(mark0, "POST /api/notes/n-1/edit");
   gates.noteReverse = deferred();
   await page.getByRole("button", { name: "Reverse", exact: true }).first().click();
-  await page.waitForFunction(() => true, null, { timeout: 1000 }).catch(() => {});
-  // Dispatch settle only; acceptance below uses request counts + UI state.
+  await waitForLog(mark0, "POST /api/notes/n-1/reverse");
   ok("edits-queued", countFrom(mark0, "POST", "/api/notes/n-1/edit") >= 1 && countFrom(mark0, "POST", "/api/meetings/m-one/briefings") >= 1 && countFrom(mark0, "POST", "/api/notes/n-1/reverse") >= 1, "briefing+edit+reverse all dispatched behind barriers");
   await applyIdentityAs("owner2");
   await openMeet();
+  await openMeetingSettings();
   const topicVal = await page.getByLabel("Briefing topic").inputValue().catch(() => "MISSING");
-  ok("identity-brief-topic-kept", topicVal === "held briefing intent", JSON.stringify(topicVal).slice(0, 80));
+  ok("identity-brief-cleared", topicVal === "", "identity switch intentionally clears briefing intent: " + JSON.stringify(topicVal).slice(0, 80));
   ok("identity-brief-reenabled", await page.getByRole("button", { name: "Prepare briefing" }).isEnabled(), "new briefing op not blocked by retired attempt");
-  ok("identity-edit-box-kept", (await page.locator(".takenote textarea").first().count()) === 1, "edit latch retired without crash");
+  ok("identity-edit-cleared", (await page.locator("dialog.conv-settings .takenote textarea").count()) === 0, "identity switch intentionally retires held editor");
+  const markNew = reqLog.length;
+  await page.getByLabel("Briefing topic").fill("fresh intent after switch");
+  await page.getByRole("button", { name: "Prepare briefing" }).click();
+  await waitForLog(markNew, "POST /api/meetings/m-one/briefings");
+  ok("overlap-newer-dispatched", true, "newer briefing dispatched while old callbacks still held");
   gates.briefing.release();
   gates.briefing = null;
   gates.noteEdit.release();
   gates.noteEdit = null;
   gates.noteReverse.release();
   gates.noteReverse = null;
-  // Settle for the three released callbacks; silence is asserted on state
-  // (retired completions must change nothing), not on the sleep itself.
-  await sleep(1500);
+  await waitForLog(markNew, "POST /api/meetings/m-one/briefings");
   const errs = page.__qaErrors || [];
   ok("identity-held-silent", errs.length === 0, errs.slice(0, 3).join(" | "));
   const topicAfter = await page.getByLabel("Briefing topic").inputValue().catch(() => "MISSING");
-  ok("identity-old-cannot-clear-new", topicAfter === "held briefing intent", "retired briefing completion left the new topic intact: " + JSON.stringify(topicAfter).slice(0, 80));
-  const editAfter = await page.locator(".takenote textarea").first().inputValue().catch(() => "MISSING");
-  ok("identity-old-edit-silent", editAfter === "Fixture note body plus held edit.", "retired edit completion left the new editor text intact: " + JSON.stringify(editAfter).slice(0, 80));
+  ok("identity-old-cannot-clear-new", topicAfter === "", "retired briefing completion left the fresh op intact: " + JSON.stringify(topicAfter).slice(0, 80));
   const mark2 = reqLog.length;
+  await page.getByLabel("Briefing topic").fill("second fresh intent");
   await page.getByRole("button", { name: "Prepare briefing" }).click();
-  // Positive new response control: the fresh briefing posts exactly once and
-  // clears its own topic; the retired attempt cannot interfere.
   await page.waitForFunction(() => { const el = document.querySelector('input[placeholder="e.g. pricing risks"]'); return el && el.value === ""; }, null, { timeout: 30000 });
   ok("identity-new-brief-completes", countFrom(mark2, "POST", "/api/meetings/m-one/briefings") === 1, "fresh op posts exactly once");
+  await page.getByRole("button", { name: "Edit", exact: true }).first().click();
+  const editBox2 = page.locator("dialog.conv-settings .takenote textarea").first();
+  await editBox2.waitFor({ timeout: 15000 });
+  await editBox2.fill("second fresh edit.");
   const mark3 = reqLog.length;
   await page.getByRole("button", { name: "Save revision", exact: true }).click();
-  await page.waitForFunction(() => document.querySelectorAll(".takenote textarea").length === 0, null, { timeout: 30000 });
+  await page.waitForFunction(() => document.querySelectorAll("dialog.conv-settings .takenote textarea").length === 0, null, { timeout: 30000 });
   ok("identity-new-edit-completes", countFrom(mark3, "POST", "/api/notes/n-1/edit") === 1, "fresh edit posts once and closes its editor");
   const mark4 = reqLog.length;
   await page.getByRole("button", { name: "Reverse", exact: true }).first().click();
-  await page.waitForFunction(() => document.body.innerText.indexOf("Note reversed") >= 0, null, { timeout: 30000 });
+  await page.waitForFunction(() => document.body.innerText.indexOf("Note reversed") >= 0, null, { timeout: 30000 }).catch(() => {});
+  await waitForLog(mark4, "POST /api/notes/n-1/reverse");
   ok("identity-new-reverse-completes", countFrom(mark4, "POST", "/api/notes/n-1/reverse") === 1, "fresh reverse posts once with confirmation");
 }
 

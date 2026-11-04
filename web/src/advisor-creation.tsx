@@ -1611,6 +1611,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
     // Captured at click: invalidation refreshes caches only and must not
     // select roster rows or close modals (App handlers only refresh).
     const capturedInvalidated = props.onInvalidated;
+    const capturedOrigin = opOrigins.current.get(myOp) ?? null;
     setBusy(true);
     setError(null);
     try {
@@ -1650,15 +1651,17 @@ export function CharacterEditor(props: CharacterEditorProps) {
       observeCanon(opId, entry.version);
       const normCleanPre = normLinks(clean);
       const updated = await put<RosterEntryDto>("/api/roster/" + entry.id, { profileJson: nextProfile, sourceUrls: normCleanPre });
-      // Immediate canonical invalidation on the confirmed PUT: refresh
-      // caches now when the captured auth origin is still valid, BEFORE the
+      // Immediate canonical invalidation on the confirmed PUT: the origin is
+      // captured LOCAL before await alongside the callback, so a confirmed same-
+      // identity commit invalidates even when unmounted; op ownership gates only
+      // editor-state adoption below. Refresh caches now when the captured auth
+      // origin is still valid, BEFORE the
       // held verification GET and before op-ownership/unmount checks. A held
       // verify, a superseding edit, or an unmount can therefore never delay
       // or drop the invalidation for a write the server confirmed; adoption
       // of text below stays independently ownership-gated.
       try {
-        const originAtSave = opOrigins.current.get(myOp) ?? null;
-        if (!originDead(props, originAtSave)) {
+        if (!originDead(props, capturedOrigin)) {
           try { capturedInvalidated?.(); } catch {}
         }
       } catch {}

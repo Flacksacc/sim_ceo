@@ -218,32 +218,37 @@ export function useMeetingActivity(inp: MeetingActivityInput) {
       };
     } catch { return undefined; }
   }, []);
-  // Post-resume freshness gate: entering a paused state arms the gate; it
-  // clears only when a strictly newer HTTP snapshot lands after resume.
+  // Post-resume freshness gate: the boundary is established at RESUME, not
+  // when hiding starts. A snapshot that completes while hidden shares the
+  // resume-time timestamp, so it cannot satisfy the fresh post-resume poll.
   const pauseAtRef = useRef<number>(0);
+  const prevPausedRef = useRef<boolean>(false);
   const [awaitingFresh, setAwaitingFresh] = useState(false);
   const pausedNow = !!(isPaused || pagePaused);
   const dataUpdatedAt = (q as any)?.dataUpdatedAt ?? 0;
   useEffect(() => {
     try {
       if (pausedNow) {
-        try { pauseAtRef.current = dataUpdatedAt ?? pauseAtRef.current; } catch {}
+        prevPausedRef.current = true;
         if (hasData) setAwaitingFresh(true);
+        return;
       }
-    } catch {}
-  }, [pausedNow, hasData]);
-  useEffect(() => {
-    try {
-      if (!pausedNow) {
-        if (dataUpdatedAt && dataUpdatedAt !== pauseAtRef.current) {
-          pauseAtRef.current = dataUpdatedAt;
-          setAwaitingFresh(false);
-        } else if (!hasData) {
+      if (prevPausedRef.current) {
+        prevPausedRef.current = false;
+        try { pauseAtRef.current = dataUpdatedAt ?? 0; } catch {}
+        if (hasData) setAwaitingFresh(true);
+        else setAwaitingFresh(false);
+        return;
+      }
+      if (awaitingFresh) {
+        if (!hasData) setAwaitingFresh(false);
+        else if (dataUpdatedAt && dataUpdatedAt > pauseAtRef.current) {
+          try { pauseAtRef.current = dataUpdatedAt; } catch {}
           setAwaitingFresh(false);
         }
       }
     } catch {}
-  }, [dataUpdatedAt, pausedNow, hasData]);
+  }, [pausedNow, dataUpdatedAt, hasData, awaitingFresh]);
   void ((inp as any)?.live);
   const activityAvailability = resolveActivityAvailability({ reqStale, fetchFailed, queryEnabled, hasData, isPaused, liveOff: false, isLoading, pagePaused, awaitingFresh });
   const snapshotUsable = activityAvailability === "available" && shouldUseActivitySnapshot({ reqStale, fetchFailed });

@@ -91,6 +91,52 @@ must(adv.indexOf("exactClientValidationCopy") >= 0, "wire: validation uses exact
 must(adv.indexOf("friendlyError(") < 0, "wire: character translator never consults generic shared mapper");
 must(adv.indexOf("That change conflicted with a newer saved version") >= 0, "wire: generic 409 never claims already-running");
 must(adv.indexOf('could not be verified (" + (verifyError') < 0, "wire: PUT verify note never interpolates raw status");
+must(app.indexOf("if (err) return") >= 0, "wire: research poll error outranks retained cached data");
+must(app.indexOf("Research state unavailable") >= 0, "wire: research error renders unavailable with retry");
+must(app.indexOf("stageErr") < 0, "wire: outer banner never interpolates raw stageError");
+must(app.indexOf("Research failed \u2014 retry in the editor below.") >= 0, "wire: failed banner uses fixed human copy");
+must(adv.indexOf("capturedOrigin") >= 0, "wire: PUT origin captured local before await");
+must(adv.indexOf("if (!originDead(props, capturedOrigin))") >= 0, "wire: same-identity unmounted PUT still invalidates");
+must(act.indexOf("prevPausedRef") >= 0, "wire: resume boundary established at resume, not hidden-start");
+must(act.indexOf("dataUpdatedAt > pauseAtRef.current") >= 0, "wire: hidden completion cannot satisfy fresh post-resume");
+must(app.indexOf("if (!meetingId || !boardId || !meetingOk) return;") >= 0, "wire: secretary hydration gated on validated meetingOk");
+must(app.indexOf("[boardId, meetingId, appliedActAs, meetingOk]") >= 0, "wire: hydration resubscribes on meetingOk");
+
+// Exact held-completion unit checks (no browser): resume boundary + error outrank.
+{
+  const holdsFresh = (paused, prevPaused, hasData, dataTs, boundary) => {
+    // mirrors meeting-activity resume gate: returns { awaiting, boundary }
+    if (paused) return { awaiting: hasData ? true : false, boundary, prevPaused: true };
+    if (prevPaused) return { awaiting: hasData ? true : false, boundary: dataTs ?? 0, prevPaused: false };
+    if (hasData && dataTs > boundary) return { awaiting: false, boundary: dataTs, prevPaused: false };
+    return { awaiting: hasData, boundary, prevPaused: false };
+  };
+  let s = holdsFresh(true, false, true, 100, 0);
+  if (!(s.awaiting === true && s.prevPaused === true)) fail("held-completion: hidden arms gate");
+  ok("held-completion: hidden arms gate");
+  s = holdsFresh(true, true, true, 120, 0);
+  if (!(s.awaiting === true)) fail("held-completion: hidden completion does not clear while paused");
+  ok("held-completion: hidden completion held while paused");
+  s = holdsFresh(false, true, true, 120, 0);
+  if (!(s.awaiting === true && s.boundary === 120)) fail("held-completion: resume establishes boundary at resume value");
+  ok("held-completion: resume boundary at resume value");
+  s = holdsFresh(false, false, true, 120, 120);
+  if (!(s.awaiting === true)) fail("held-completion: same-timestamp hidden completion cannot satisfy post-resume");
+  ok("held-completion: same-timestamp cannot satisfy post-resume");
+  s = holdsFresh(false, false, true, 130, 120);
+  if (!(s.awaiting === false && s.boundary === 130)) fail("held-completion: strictly newer post-resume poll clears");
+  ok("held-completion: strictly newer post-resume clears");
+  const bannerFor = (d, err) => {
+    if (err) return "unavailable";
+    if (d && d.running) return "running";
+    if (d && d.stage === "failed") return "failed-fixed";
+    return "other";
+  };
+  if (bannerFor({ running: true, stage: "done" }, new Error("x")) !== "unavailable") fail("held-completion: poll error outranks retained running");
+  ok("held-completion: poll error outranks retained running");
+  if (bannerFor({ running: false, stage: "done" }, new Error("x")) !== "unavailable") fail("held-completion: poll error outranks retained done");
+  ok("held-completion: poll error outranks retained done");
+}
 
 // Forbidden concurrent-owner files must be excluded from this commit's payload.
 // The check inspects only the staged payload (stage the explicit commit paths

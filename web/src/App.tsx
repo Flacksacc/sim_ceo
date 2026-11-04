@@ -4940,7 +4940,7 @@ const testModel = useMutation({
     }
   }, [boardId, meetingId, appliedActAs]);
   useEffect(() => {
-    if (!meetingId || !boardId) return;
+    if (!meetingId || !boardId || !meetingOk) return;
     const u = secIdentity();
     const oEp = secEpoch.current;
     const hk = u + "|" + boardId + "|" + meetingId + "|" + oEp;
@@ -5158,7 +5158,7 @@ const testModel = useMutation({
         if (raw) { const pend = JSON.parse(raw); if (pend && pend.requestId) { setSecQuestion(pend.question || ""); setSecRequestId(pend.requestId || ""); } }
       } catch { }
     }).catch(() => {});
-  }, [boardId, meetingId, appliedActAs]);
+  }, [boardId, meetingId, appliedActAs, meetingOk]);
   const submitDraft = () => {
     if (!draft.trim()) return;
     // Synchronous pending guard: React pending flags flip a render later, so
@@ -7513,7 +7513,7 @@ const testModel = useMutation({
                         const d = selResearchData as any;
                         const err = selResearchDataError;
                         if (selResearchLoading) return (<p role="status">{" "}Checking research\u2026{" "}</p>);
-                        if (err && !d) return (<p className="muted">{" "}Research state unavailable \u2014 use Check again in the editor below.{" "}</p>);
+                        if (err) return (<p className="muted">{" "}Research state unavailable \u2014 use Check again in the editor below.{" "}</p>);
                         const running = isRosterResearchRunning(d);
                         if (running) {
                           const ev = typeof d?.evidenceCount === "number" ? d.evidenceCount : selRow.entry.evidenceCount;
@@ -7524,10 +7524,9 @@ const testModel = useMutation({
                           const ev = typeof d?.evidenceCount === "number" ? d.evidenceCount : 0;
                           const ds = String(d?.draftStatus ?? "");
                           const st = String(d?.stage ?? "");
-                          const stageErr = String((d as any)?.stageError ?? "");
                           const verLabel = typeof d?.version === "number" ? " v" + d.version : " v" + selRow.entry.version;
                           if (d?.researchedAt && (ds === "draft" || ds === "done" || ds === "saved") && ev > 0) return (<p className="muted">{" "}Researched{verLabel} \u00b7 {ev} evidence claims{" "}</p>);
-                          if (st === "failed" || ds === "failed") return (<p className="muted">{" "}Research failed{stageErr ? " \u2014 " + stageErr : ""} \u2014 retry in the editor below.{" "}</p>);
+                          if (st === "failed" || ds === "failed") return (<p className="muted">{" "}Research failed — retry in the editor below.{" "}</p>);
                           if (st === "unsupported" || ds === "unsupported") return (<p className="muted">{" "}Research incomplete \u2014 no grounded evidence. Editable below.{" "}</p>);
                           if (st === "superseded" || ds === "superseded") return (<p className="muted">{" "}A newer version won on the server \u2014 review, then run research again if needed.{" "}</p>);
                           if (st === "interrupted" || ds === "interrupted") return (<p className="muted">{" "}Research interrupted \u2014 use Check again.{" "}</p>);

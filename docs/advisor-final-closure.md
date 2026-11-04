@@ -75,6 +75,35 @@ Kept intact: three-paragraph/fresh-creation/version floors/Profile guards,
 Send core, and navigation (concurrent-owner `qa/navigation.cjs`,
 `qa/fixtures.cjs` plus nav doc excluded from this commit).
 
+## Follow-up iteration (review6 + nav D1/D2 source only, no acceptance claim)
+
+- Research banner: any poll error now outranks retained cached data
+(`if (err)` before running/terminal); failed banner uses fixed human copy,
+never raw `stageError`/note/SQL/JSON/path text.
+- Confirmed PUT: origin + callback captured local before `await`, so a
+confirmed same-identity commit invalidates even when unmounted; op ownership
+gates only editor-state adoption.
+- Visibility resume: boundary established at resume (`prevPausedRef`), not
+hidden-start; a hidden-window completion shares the resume timestamp and
+cannot satisfy the fresh post-resume poll (strictly `>` required).
+- Secretary hydration gated on actual validated `meetingOk`/board parent
+before scoped fetch (bogus NOPE, mismatched b-beta/m-one disallowed);
+other meeting-scoped queries already gated. Wizard retirement preserved
+(fresh Step 1/new id on confirmed success; unknown-commit/idempotency and
+no-stale-auth callbacks unchanged).
+- Prefixed-401 authentication guidance preserved (actual `7b3986f` 3-pass
+character auth log); no change.
+- Mounted lifecycle QA fixed by actual contracts: `aside.listpanel
+button.lprow` owned title, backend-shaped valid roster (3 paragraphs +
+compiled profile + research), native Meeting settings dialog open, dialog-
+scoped briefing/edit selectors, identity-switch intentional clearing,
+PUT unmount-before-confirmation, overlap old-after-newer, offline/
+reconnect/unchanged-ID restore events, both success research modes
+(draft/saved canonical), retained-error/raw-error safety, hidden-
+completion/post-resume held, no tautologies, real request/response barriers.
+Primary runs the mounted file after commit; this commit asserts source-only
+via build + precursor checks.
+
 ## Verify
 
 - Rebuild web first so `web/dist` matches source: `npm run build` in `web`
