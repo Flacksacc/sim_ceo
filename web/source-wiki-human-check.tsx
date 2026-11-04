@@ -81,6 +81,19 @@ const dupB = "Team handbook for onboarding new engineers across every department
 check("helper: duplicate descriptions stay unique", resourceLabel(dupA, "https://wiki.example.com", "board", null, 1, 2) !== resourceLabel(dupB, "https://wiki.example.com", "board", null, 2, 2));
 check("helper: ordinals carried", resourceLabel(dupA, "https://wiki.example.com", "board", null, 1, 2).indexOf("1 of 2") >= 0 && resourceLabel(dupB, "https://wiki.example.com", "board", null, 2, 2).indexOf("2 of 2") >= 0);
 check("helper: source action unique", sourceActionLabel("Approve", "Evidence.txt", 2, 1, 3) !== sourceActionLabel("Approve", "Evidence.txt", 2, 2, 3));
+check("helper: actual permission exact maps to access", safeRequestMessage("Access revoked or not granted for this scope.") === "You do not have access to do that. Ask a board manager for access.");
+check("helper: actual permission 403 envelope keeps access", safeRequestMessage("403 {\"error\":\"Access revoked or not granted for this scope.\"}") === "You do not have access to do that. Ask a board manager for access.");
+check("helper: actual permission 403 plain keeps access", safeRequestMessage("403 Access revoked or not granted for this scope.") === "You do not have access to do that. Ask a board manager for access.");
+check("helper: actual permission no keyword echo", safeRequestMessage("Access revoked or not granted for this scope.").indexOf("revoked") < 0 && safeRequestMessage("Access revoked or not granted for this scope.").indexOf("scope.") < 0);
+check("helper: quoted credential string unwrapped", safeRequestMessage("400 \"Token is malformed.\"") === "That credential does not look complete. Check it and try again.");
+check("helper: quoted envelope credential unwrapped", safeRequestMessage("400 {\"error\":\"Token is malformed.\"}") === "That credential does not look complete. Check it and try again.");
+check("helper: quoted arbitrary stays generic", safeRequestMessage("400 \"/guides/runbook\"") === "That did not finish. Try again. If it keeps failing, ask a board manager." && safeRequestMessage("400 \"/guides/runbook\"").indexOf("/guides") < 0);
+check("helper: quoted truncated stays generic", safeRequestMessage("400 \"Token is mal") === "That did not finish. Try again. If it keeps failing, ask a board manager.");
+check("helper: row actual permission keeps access", safeRowHelp("/enable", "403 Access revoked or not granted for this scope.") === "You do not have access to do that. Ask a board manager for access.");
+check("helper: row quoted credential keeps guidance", safeRowHelp("/enable", "400 \"Token is malformed.\"") === "That credential does not look complete. Check it and try again.");
+check("helper: source action cross-family unique", sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Board file", 1, 2) !== sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Meeting file - Quarterly Planning", 2, 2));
+check("helper: source action scope family carried", sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Board file", 1, 2).indexOf("Board file") >= 0 && sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Board file", 1, 2).indexOf("family 1 of 2") >= 0 && sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Meeting file - Quarterly Planning", 2, 2).indexOf("Quarterly Planning") >= 0);
+check("helper: source action no guid", !shownHasGuid(sourceActionLabel("Approve", "Evidence.txt", 1, 1, 1, "Board file", 1, 2)));
 const ctxText = contextSummary({ total: 4, approved: 2, pending: 1, rejected: 1, excluded: 1, indexed: 3, indexFailed: 1, policy: "wikiOnly", extraction: "local deterministic sections; no vector index", hindsight: "PostgreSQL remains authoritative" });
 check("helper: context counts", ctxText.indexOf("4 files") >= 0 && ctxText.indexOf("2 ready for meetings") >= 0 && ctxText.indexOf("1 waiting for review") >= 0);
 check("helper: context policy + failures", ctxText.indexOf("Wiki connector only") >= 0 && ctxText.indexOf("1 needs attention") >= 0);
@@ -250,7 +263,29 @@ check("gov: recall no score or ref", govText.indexOf("score") < 0 && govText.ind
 check("gov: upload scope human", govText.indexOf("Whole board") >= 0 && govText.indexOf("One meeting") >= 0);
 check("gov: no raw json", govText.indexOf("{") < 0 && govText.indexOf("}") < 0);
 check("gov: names human", govNames.indexOf("Upload scope") >= 0 && govNames.indexOf("Recall query") >= 0 && govNames.indexOf("Policy mode") >= 0);
-check("gov: source actions unique", govNames.indexOf("Approve Evidence.txt version 2 (2 of 3)") >= 0 && new Set(govNames).size === govNames.length);
+check("gov: source actions unique scoped family", govNames.indexOf("Approve Evidence.txt version 2 Board file (family 1 of 3, version 2 of 3)") >= 0 && govNames.indexOf("Approve Minutes.txt version 1 Meeting file - Quarterly Planning (family 2 of 3, version 1 of 1)") >= 0 && new Set(govNames).size === govNames.length);
+check("gov: source actions carry scope family", govNames.some((n) => n.indexOf("Board file") >= 0 && n.indexOf("family 1 of 3") >= 0) && govNames.some((n) => n.indexOf("Quarterly Planning") >= 0 && n.indexOf("family 2 of 3") >= 0));
+const dupGroups = [
+  {
+    familyKey: "fk-dup-board", fileName: "Evidence.txt", scope: "board", meetingId: null,
+    origin: "wiki", currentId: null, hasCurrent: false,
+    versions: [
+      { id: "11111111-aaaa-4444-5555-555555555555", boardId: "b1", fileName: "Evidence.txt", contentHash: "dup1", version: 1, approved: false, excluded: false, reviewState: "pending", origin: "wiki", familyKey: "fk-dup-board", indexState: "queued", indexGeneration: 0, indexError: "", sectionCount: 0, isHead: true, isCurrent: false, currentId: null, scope: "board", meetingId: null, createdAt: "2026-10-06T12:00:00.000Z" },
+    ],
+  },
+  {
+    familyKey: "fk-dup-meeting", fileName: "Evidence.txt", scope: "meeting", meetingId: "11111111-2222-3333-4444-555555555555",
+    origin: "wiki", currentId: null, hasCurrent: false,
+    versions: [
+      { id: "22222222-bbbb-4444-5555-555555555555", boardId: "b1", fileName: "Evidence.txt", contentHash: "dup2", version: 1, approved: false, excluded: false, reviewState: "pending", origin: "wiki", familyKey: "fk-dup-meeting", indexState: "queued", indexGeneration: 0, indexError: "", sectionCount: 0, isHead: true, isCurrent: false, currentId: null, scope: "meeting", meetingId: "11111111-2222-3333-4444-555555555555", createdAt: "2026-10-06T12:00:00.000Z" },
+    ],
+  },
+];
+const dupHtml = renderToString(<SourcesGovernance boardId="b1" meetingId="11111111-2222-3333-4444-555555555555" meetings={meetings} actAs="owner" canManage transport={govTransport} fixture={{ groups: dupGroups }} />);
+const dupNames = namesOf(dupHtml);
+check("gov: duplicate families unique", dupNames.indexOf("Approve Evidence.txt version 1 Board file (family 1 of 2, version 1 of 1)") >= 0 && dupNames.indexOf("Approve Evidence.txt version 1 Meeting file - Quarterly Planning (family 2 of 2, version 1 of 1)") >= 0 && new Set(dupNames).size === dupNames.length);
+check("gov: duplicate no guid transport kept", dupNames.every((n) => !shownHasGuid(n)) && dupHtml.indexOf("11111111-aaaa-4444-5555-555555555555") < 0 && visible(dupHtml).indexOf("11111111-aaaa") < 0);
+
 check("gov: names clean", govNames.every((n) => !shownHasGuid(n)));
 check("gov: action controls mounted", govText.indexOf("Approve") >= 0 && govText.indexOf("Reindex") >= 0 && govText.indexOf("Download original") >= 0 && govText.indexOf("History") >= 0 && govText.indexOf("Sections") >= 0);
 // Connector fixture: two resources share an 80-character description prefix

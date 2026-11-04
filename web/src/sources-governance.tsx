@@ -239,7 +239,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
           </select></label>
         )}
       </div>)}
-      {(groups ?? []).map((g) => (
+      {(groups ?? []).map((g, gi, garr) => (
         <div className="card" key={g.familyKey}>
           <b>{g.fileName}</b> <span className="badge">{scopeLabel(g.scope, meetingTitle(meetings, g.meetingId))}</span> <span className="badge">{originLabel(g.origin)}</span>
           {g.hasCurrent ? <span className="badge ok">{currentLabel(true, g.versions.find((v) => v.isCurrent)?.version ?? null)}</span> : <span className="badge">{currentLabel(false)}</span>}
@@ -255,16 +255,16 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
 
               {s.indexState === "failed" && <span className="badge">Search unavailable</span>}
               <div className="meetctl">
-                {canManagePolicy && (<button aria-label={sourceActionLabel("Approve", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
-                {canManagePolicy && (<button aria-label={sourceActionLabel("Reject", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
-                {canManagePolicy && (<button aria-label={sourceActionLabel("Exclude", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
-                {canManagePolicy && (<button aria-label={sourceActionLabel("Restore", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Approve", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Reject", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Exclude", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Restore", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
-                {canWrite && (<button aria-label={sourceActionLabel("Reindex", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "reindex")}>Reindex</button>)}
-                {canWrite && (<button aria-label={sourceActionLabel("Retry extraction for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
-                <button aria-label={sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length)} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
-                <button aria-label={sourceActionLabel("Show history for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => loadHist(s.id)}>History</button>
-                <button aria-label={sourceActionLabel("Show sections for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => loadSecs(s.id)}>Sections</button>
+                {canWrite && (<button aria-label={sourceActionLabel("Reindex", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "reindex")}>Reindex</button>)}
+                {canWrite && (<button aria-label={sourceActionLabel("Retry extraction for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
+                <button aria-label={sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
+                <button aria-label={sourceActionLabel("Show history for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadHist(s.id)}>History</button>
+                <button aria-label={sourceActionLabel("Show sections for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadSecs(s.id)}>Sections</button>
               </div>
               {hist[s.id] && (
                 <details open><summary>Version history ({hist[s.id].length})</summary>

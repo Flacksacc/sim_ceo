@@ -4,7 +4,6 @@ import SourcesGovernance from "./sources-governance";
 import type { GovTransport } from "./sources-governance";
 import WikiResources from "./wiki-resources";
 import type { WikiApi, WikiResourceDto } from "./wiki-resources";
-
 declare global {
   interface Window {
     __mount: {
@@ -17,17 +16,15 @@ declare global {
     };
   }
 }
-
 const meetings = [
   { id: "11111111-2222-3333-4444-555555555555", title: "Quarterly Planning" },
   { id: "22222222-2222-3333-4444-555555555555", title: "Hiring Review" },
 ];
-
 const V3 = "99999999-2222-3333-4444-555555555555";
 const V2 = "33333333-2222-3333-4444-555555555555";
 const V1 = "44444444-2222-3333-4444-555555555555";
 const M1 = "55555555-2222-3333-4444-555555555555";
-
+const M2 = "66666666-2222-3333-4444-555555555555";
 const groups = [
   {
     familyKey: "fk-evidence", fileName: "Evidence.txt", scope: "board", meetingId: null,
@@ -45,8 +42,14 @@ const groups = [
       { id: M1, boardId: "b1", fileName: "Minutes.txt", contentHash: "dd1", version: 1, approved: false, excluded: true, reviewState: "pending", origin: "wiki", familyKey: "fk-minutes", indexState: "queued", indexGeneration: 0, indexError: "", sectionCount: 0, isHead: true, isCurrent: false, currentId: null, scope: "meeting", meetingId: "11111111-2222-3333-4444-555555555555", createdAt: "2026-10-04T12:00:00.000Z" },
     ],
   },
+  {
+    familyKey: "fk-minutes-board", fileName: "Minutes.txt", scope: "board", meetingId: null,
+    origin: "wiki", currentId: null, hasCurrent: false,
+    versions: [
+      { id: M2, boardId: "b1", fileName: "Minutes.txt", contentHash: "dd2", version: 1, approved: false, excluded: false, reviewState: "pending", origin: "wiki", familyKey: "fk-minutes-board", indexState: "queued", indexGeneration: 0, indexError: "", sectionCount: 0, isHead: true, isCurrent: false, currentId: null, scope: "board", meetingId: null, createdAt: "2026-10-04T12:00:00.000Z" },
+    ],
+  },
 ];
-
 const histFor: Record<string, { id: string; action: string; detail: string; createdAt: string; version: number }[]> = {
   [V3]: [{ id: "h3", action: "upload", detail: "scope=board", createdAt: "2026-10-03T12:00:00.000Z", version: 3 }],
   [V2]: [
@@ -55,8 +58,8 @@ const histFor: Record<string, { id: string; action: string; detail: string; crea
   ],
   [V1]: [{ id: "h0", action: "wiki-import", detail: "rev1 Evidence.txt", createdAt: "2026-10-01T11:00:00.000Z", version: 1 }],
   [M1]: [{ id: "h4", action: "exclude", detail: "v1", createdAt: "2026-10-04T13:00:00.000Z", version: 1 }],
+  [M2]: [{ id: "h5", action: "upload", detail: "scope=board", createdAt: "2026-10-04T12:00:00.000Z", version: 1 }],
 };
-
 const secsFor: Record<string, unknown> = {
   [V2]: {
     sourceId: V2, version: 2, contentHash: "cc2", indexState: "completed", indexGeneration: 2, indexError: "",
@@ -65,12 +68,10 @@ const secsFor: Record<string, unknown> = {
     ],
   },
 };
-
 const recallHits = [
   { kind: "source", ref: "Evidence.txt v2", text: "Solar arrays passed inspection.", score: 9 },
   { kind: "record", ref: "aaaaaaaa-2222-3333-4444-555555555555#bbbbbbbb-cccc-dddd-eeee-ffffffffffff", text: "[bbbbbbbb-cccc-dddd-eeee-ffffffffffff] record v3: Approve the hiring plan.", score: 7 },
 ];
-
 const wikiSeed: WikiResourceDto[] = [
   {
     id: "77777777-2222-3333-4444-555555555555", boardId: "b1", scope: "board", meetingId: null,
@@ -78,13 +79,11 @@ const wikiSeed: WikiResourceDto[] = [
     setupUse: false, manualOnly: false, allowlist: ["/guides/**"], exclusions: [],
     requiredTags: ["handbook"], locale: "en", enabled: true, configRevision: 3, attemptGeneration: 2, attemptStatus: "idle",
     syncIntervalMinutes: 60, nextSyncAt: null, status: "succeeded", lastError: "",
-    lastCompletedAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), lastSuccessRevision: 1, lastSuccessAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), usablePages: 1, importedPages: 1, sourceDocs: 1,
+    lastCompletedAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), lastSuccessRevision: 3, lastSuccessAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), usablePages: 1, importedPages: 1, sourceDocs: 1,
     eligibleDocs: 1, hasCredential: true, protocol: "wikijs-2.x-graphql-readonly", createdAt: "2026-10-01T12:00:00.000Z", updatedAt: "2026-10-05T12:00:00.000Z",
   },
 ];
-
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
 function GovApp() {
   const [readOnly, setReadOnly] = useState(false);
   const transport: GovTransport = {
@@ -93,7 +92,7 @@ function GovApp() {
       await wait(25);
       if (u.endsWith("/sources/review")) return structuredClone(groups) as never;
       if (u.endsWith("/source-policy")) return { blockedTypes: "exe, zip", mode: "wikiOnly" } as never;
-      if (u.endsWith("/context")) return { total: 2, approved: 1, pending: 1, rejected: 0, excluded: 1, indexed: 1, indexFailed: 0, policy: "wikiOnly" } as never;
+      if (u.endsWith("/context")) return { total: 3, approved: 1, pending: 2, rejected: 1, excluded: 1, indexed: 1, indexFailed: 1, policy: "wikiOnly" } as never;
       if (u.indexOf("/recall") >= 0) {
         if (window.__mount.govRecallError) { const e = window.__mount.govRecallError; throw new Error(e); }
         return structuredClone(recallHits) as never;
@@ -142,7 +141,6 @@ function GovApp() {
     </div>
   );
 }
-
 function WikiApp() {
   const api: WikiApi = {
     get: async (u: string) => {
@@ -171,9 +169,7 @@ function WikiApp() {
   };
   return <WikiResources boardId="b1" meetingId="11111111-2222-3333-4444-555555555555" meetings={meetings} api={api} onChanged={() => { window.__mount.calls.push("CHANGED"); }} />;
 }
-
 window.__mount = { calls: [], downloads: [], uploads: [], govActError: null, govRecallError: null, wikiOpError: null };
-
 createRoot(document.getElementById("root")!).render(
   <div>
     <GovApp />

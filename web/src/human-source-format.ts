@@ -248,40 +248,47 @@ export function recallExcerpt(kind: string, text: string): string {
 }
 
 const GENERIC_FAILURE = "That did not finish. Try again. If it keeps failing, ask a board manager.";
-
-// Lenient extraction: strip the client prefix and status code, unwrap a
-// well-formed {"error":"..."} envelope. Truncated envelopes (unbalanced
-// braces) yield "" so fragments are never surfaced.
-function looseText(raw: string): string {
+const ACCESS_COPY = "You do not have access to do that. Ask a board manager for access.";
+const CONFLICT_COPY = "That change conflicts with a newer update. Refresh and try again.";
+const REVOKED_PHRASE = "access revoked or not granted for this scope";
+function splitStatus(raw: string): { status: number | null; rest: string } {
   let s = (raw ?? "").trim();
+  if (!s) return { status: null, rest: "" };
+  s = s.replace(/^(Error|Request failed|Row error)\s*:\s*/i, "").trim();
+  const m = s.match(/^(\d{3})\s+([\s\S]*)$/);
+  if (m) {
+    const code = parseInt(m[1], 10);
+    if (Number.isFinite(code)) return { status: code, rest: (m[2] ?? "").trim() };
+  }
+  return { status: null, rest: s };
+}
+function strictUnwrap(rest: string): string {
+  const s = (rest ?? "").trim();
   if (!s) return "";
-  s = s.replace(/^(Error|Request failed|Row error)\s*:\s*/i, "");
-  const m = s.match(/"error"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (m && m[1] !== undefined) {
-    const opens = (s.match(/{/g) || []).length;
-    const closes = (s.match(/}/g) || []).length;
-    if (opens !== closes) return "";
+  if (s.length > 2000) return "";
+  const first = s[0];
+  if (first === "{" || first === '"') {
     try {
-      const parsed = JSON.parse("\"" + m[1] + "\"");
-      return (parsed ?? "").trim();
+      const parsed: unknown = JSON.parse(s);
+      if (typeof parsed === "string") return parsed.trim();
+      if (parsed && typeof parsed === "object") {
+        const err = (parsed as Record<string, unknown>).error;
+        if (typeof err === "string") return err.trim();
+        return "";
+      }
+      return "";
     } catch {
       return "";
     }
   }
-  s = s.replace(/^\d{3}\s+/, "").trim();
-  if (!s || s.length > 500) return "";
-  // Truncated or malformed envelopes ({, }, quotes, error keys) fail closed:
-  // a fragment such as 400 {"error":"Description is required must never
-  // surface as visible copy.
+  if (s.length > 500) return "";
   if (/[{}\[\]"]/.test(s)) return "";
   return s;
 }
-
-// Controlled known-message mappings. Each returns fixed copy; raw backend
-// values (extensions, paths, tokens, IDs) are never echoed. Null means
-// "no known mapping - use the caller fallback".
 function mappedCopy(t: string): string | null {
   if (!t) return null;
+  if (t.indexOf(REVOKED_PHRASE) >= 0) return ACCESS_COPY;
+  if (t.indexOf("denied") >= 0 || t.indexOf("not authorized") >= 0 || t.indexOf("authentication required") >= 0 || /(^|\D)(401|403)(\D|$)/.test(t)) return ACCESS_COPY;
   if (t.indexOf("identical content") >= 0) return "That file is already in the inbox with identical contents.";
   if (t.indexOf("meeting") >= 0 && t.indexOf("scope") >= 0) return "Pick a meeting for meeting uploads - uploads never widen to the board on their own.";
   if (t.indexOf("not a plain extension") >= 0) return "That extension needs fixing - use a plain extension (letters, numbers, or dashes, up to 16 characters, no dot).";
@@ -291,8 +298,7 @@ function mappedCopy(t: string): string | null {
   if (t.indexOf("blocked type") >= 0 || (t.indexOf("blocked") >= 0 && t.indexOf("extension") >= 0)) return "That file type is blocked on this board. Use an allowed type or ask a board manager.";
   if (t.indexOf("does not belong") >= 0) return "That meeting does not belong to this board.";
   if (t.indexOf("superseded") >= 0 || t.indexOf("successor") >= 0 || t.indexOf("newer") >= 0 || t.indexOf("already exists") >= 0) return "A newer version already exists - work from the newest version. This one stays for history.";
-  if (t.indexOf("denied") >= 0 || t.indexOf("not authorized") >= 0 || t.indexOf("authentication required") >= 0 || /(^|\D)(401|403)(\D|$)/.test(t)) return "You do not have access to do that. Ask a board manager for access.";
-  if (t.indexOf("409") >= 0 || t.indexOf("conflict") >= 0) return "That change conflicts with a newer update. Refresh and try again.";
+  if (t.indexOf("409") >= 0 || t.indexOf("conflict") >= 0) return CONFLICT_COPY;
   if (t.indexOf("configure a credential before enabling") >= 0) return "Add a credential before enabling, then enable and sync again.";
   if (t.indexOf("set a description before enabling") >= 0 || t.indexOf("description is required") >= 0) return "Set a description before enabling, then enable again.";
   if (t.indexOf("set allowed use before enabling") >= 0 || t.indexOf("allowed use is required") >= 0) return "Set allowed use before enabling, then enable again.";
@@ -309,18 +315,20 @@ function mappedCopy(t: string): string | null {
   if (t.indexOf("board not found") >= 0 || t.indexOf("meeting not found") >= 0 || t.indexOf("source not found") >= 0) return "That item is no longer available. Refresh and try again.";
   return null;
 }
-
 export function genericFailure(): string {
   return GENERIC_FAILURE;
 }
-
 export function safeRequestMessage(raw: string): string {
-  const text = looseText(raw);
+  const part = splitStatus(raw);
+  if (part.status === 403 || part.status === 401) return ACCESS_COPY;
+  if (part.status === 409) return CONFLICT_COPY;
+  const text = strictUnwrap(part.rest);
   if (!text) return GENERIC_FAILURE;
-  const known = mappedCopy(text.toLowerCase());
+  const lower = text.toLowerCase();
+  if (lower.indexOf(REVOKED_PHRASE) >= 0) return ACCESS_COPY;
+  const known = mappedCopy(lower);
   return known ?? GENERIC_FAILURE;
 }
-
 export function friendlySyncState(status: string, enabled: boolean): string {
   const s = (status ?? "").trim().toLowerCase();
   if (!enabled) return "Disabled";
@@ -329,27 +337,26 @@ export function friendlySyncState(status: string, enabled: boolean): string {
   if (s === "disabled") return "Disabled";
   return "Sync pending";
 }
-
 export function friendlyAttempt(status: string): string {
   return (status ?? "").trim().toLowerCase() === "running" ? "Sync running..." : "Idle";
 }
-
 export function safeSyncHelp(): string {
   return "Last sync did not finish. Check the address, credential, and rules, then sync again.";
 }
-
-// Row errors keep the actionable server reason through the same controlled
-// mappings; only unknown failures fall back to operation-only copy.
 export function safeRowHelp(path: string, raw?: string): string {
-  const text = looseText(raw ?? "");
-  const known = text ? mappedCopy(text.toLowerCase()) : null;
+  const part = splitStatus(raw ?? "");
+  if (part.status === 403 || part.status === 401) return ACCESS_COPY;
+  if (part.status === 409) return CONFLICT_COPY;
+  const text = part.rest ? strictUnwrap(part.rest) : "";
+  const lower = text ? text.toLowerCase() : "";
+  if (lower && lower.indexOf(REVOKED_PHRASE) >= 0) return ACCESS_COPY;
+  const known = lower ? mappedCopy(lower) : null;
   if (known) return known;
   if (path === "/enable") return "Could not enable this connector. Check its description, allowed use, allowlist, and credential, then try again.";
   if (path === "/sync") return "Sync did not finish. Check the address, credential, and rules, then try again.";
   if (path === "/disable") return "Could not disable this connector. Try again.";
   return "That did not finish. Check the connector settings and try again.";
 }
-
 export function relativeTime(iso?: string | null): string | null {
   if (!iso) return null;
   const t = Date.parse(iso);
@@ -365,10 +372,6 @@ export function relativeTime(iso?: string | null): string | null {
   if (d < 7) return d === 1 ? "yesterday" : d + " days ago";
   return new Date(t).toLocaleDateString() + " " + new Date(t).toLocaleTimeString();
 }
-
-// The position/total suffix ("2 of 3") makes every action name unique even
-// when descriptions are duplicated or share a long prefix. It uses the live
-// collection position, never an ID.
 export function resourceLabel(description: string, baseUrl: string, scope: string, meeting: string | null, position?: number | null, total?: number | null): string {
   const name = (description ?? "").trim() || (baseUrl ?? "").trim() || "Wiki connector";
   const where = (scope ?? "").toLowerCase() === "meeting" ? (meeting ? "meeting " + meeting : "meeting") : "board";
@@ -377,16 +380,20 @@ export function resourceLabel(description: string, baseUrl: string, scope: strin
   if (typeof position === "number" && typeof total === "number" && total > 0 && position > 0) label += " - " + position + " of " + total;
   return label;
 }
-
-export function sourceActionLabel(verb: string, fileName: string, version?: number | null, position?: number | null, total?: number | null): string {
+export function sourceActionLabel(verb: string, fileName: string, version?: number | null, position?: number | null, total?: number | null, scopeText?: string | null, familyPos?: number | null, familyTotal?: number | null): string {
   const name = (fileName ?? "").trim() || "File";
   const short = name.length > 60 ? name.slice(0, 60).trimEnd() + "..." : name;
   let label = verb + " " + short;
   if (typeof version === "number") label += " version " + version;
-  if (typeof position === "number" && typeof total === "number" && total > 0 && position > 0) label += " (" + position + " of " + total + ")";
+  const scope = (scopeText ?? "").trim();
+  if (scope) label += " " + scope;
+  const hasFamily = typeof familyPos === "number" && typeof familyTotal === "number" && familyTotal > 0 && familyPos > 0;
+  const hasVersionPos = typeof position === "number" && typeof total === "number" && total > 0 && position > 0;
+  if (hasFamily && hasVersionPos) label += " (family " + familyPos + " of " + familyTotal + ", version " + position + " of " + total + ")";
+  else if (hasFamily) label += " (family " + familyPos + " of " + familyTotal + ")";
+  else if (hasVersionPos) label += " (" + position + " of " + total + ")";
   return label;
 }
-
 export function actionLabel(verb: string, resource: string): string {
   return verb + " " + resource;
 }
