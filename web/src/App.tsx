@@ -177,7 +177,7 @@ const MEETING_STATES = [
 function meetingStateLabel(state: number): string {
   return MEETING_STATES[state] ?? String(state);
 }
-function meetingIsOpen(state: number): boolean {
+function meetingSendOpen(state: unknown): boolean { return state === 0 || state === 1; } function meetingIsOpen(state: number): boolean {
   return (
     state === 0 ||
     state === 1 ||
@@ -4466,7 +4466,7 @@ const testModel = useMutation({
       if (!pipelineOwns((pack as any)?.submitOp, pack as any)) return;
       const st = (pack as any)?.meetingStateAtClick;
       const op = (pack as any)?.submitOp;
-      if (st !== 0 && st !== 1) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
+      if (!meetingSendOpen(st)) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
       const frozenPrompt = (pack as any)?.submittedDraft ?? "";
       const frozenLeadVersion = (pack as any)?.leadVersion ?? null;
       const frozenPolicy = (pack as any)?.policy ?? policy;
@@ -4890,7 +4890,7 @@ const testModel = useMutation({
       });
     }
     else {
-      takePipeline(submitOp, "sending", "Sending message..."); setSendRetryCtx(null); setSendConflict(null);
+      if (!meetingValid || curMeeting == null) { settlePipeline(submitOp, "error", "Meeting is still loading. Wait for the meeting to load, then retry.", null); setSendConflict(null); return; } if (!meetingSendOpen((curMeeting as any).state)) { settlePipeline(submitOp, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; } takePipeline(submitOp, "sending", "Sending message..."); setSendRetryCtx(null); setSendConflict(null);
       send.mutate({ boardId, meetingId, user: secIdentity(), epoch: secEpoch.current, origin: originIdentity(), draft, submitVer: secDraftVer.current, replySeq: replyTo ? replyTo.seq : null, submitOp, leadVersion: lead.data ? lead.data.version : null, policy: policy, briefAtClick: briefText, meetingStateAtClick: curMeeting ? (curMeeting as any).state : null, canContributeAtClick: canActMeeting });
     }
   };
@@ -4976,13 +4976,13 @@ const testModel = useMutation({
   const requestFreshResponses = (): void => {
     if (submitBusyRef.current || runDiscussion.isPending || send.isPending) return;
     if (!canDiscussMeeting || !briefText.trim()) return;
-    if (curMeeting != null && !meetingIsOpen((curMeeting as any).state)) return;
+    if (!meetingValid || curMeeting == null) return; if (curMeeting != null && !meetingIsOpen((curMeeting as any).state)) return;
     const op = "submit-" + (++opSeq.current);
     submitBusyRef.current = true;
     submitOpRef.current = op;
     const origin = originIdentity();
-    const st = curMeeting != null ? (curMeeting as any).state : 1;
-    if (st !== 0 && st !== 1) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
+    const st = (curMeeting as any).state;
+    if (!meetingSendOpen(st)) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
     const prompt = draft || "Continue the discussion.";
     const leadCtx = { boardId: boardId, meetingId: meetingId, user: secIdentity(), epoch: secEpoch.current, prompt: prompt, leadVersion: lead.data ? lead.data.version : null, policy: policy, origin: origin, submitOp: op, saveConfirmed: false };
     showPhase(op, "working", "Requesting advisor responses...");
@@ -8199,7 +8199,7 @@ const testModel = useMutation({
                                   type="button"
                                   className="primary"
                                   onClick={() => submitDraft()}
-                                  disabled={!canDiscussMeeting || !draft.trim() || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending || submitBusyRef.current || sendPhase === "sending" || sendPhase === "working"}
+                                  disabled={!meetingValid || curMeeting == null || !canDiscussMeeting || !draft.trim() || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending || submitBusyRef.current || sendPhase === "sending" || sendPhase === "working"}
                                 >
                                   {" "}
                                   {(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) ? "Sending secretary..." : sendPhase === "sending" ? "Sending..." : sendPhase === "working" ? "Requesting responses..." : "Send"}{" "}
