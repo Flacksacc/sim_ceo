@@ -50,8 +50,19 @@ const post = <T,>(actAs: string, u: string, b?: unknown): Promise<T> =>
 const putPolicy = (actAs: string, bid: string, blockedTypes: string, mode: string) =>
   fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; transport?: GovTransport }) {
-  const { boardId, meetingId, meetings, actAs, readOnly, canManage } = props;
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; canReadBoard?: boolean; allowedMeetings?: string[]; transport?: GovTransport }) {
+  const { boardId, meetingId, meetings, actAs, readOnly, canManage, canReadBoard, allowedMeetings } = props;
+  const boardReadable = canReadBoard === true || canManage === true;
+  const allowedSet = new Set((allowedMeetings ?? []).map((m) => (m ?? "").toLowerCase()));
+  function canDownloadRow(s: GovSource): { ok: boolean; why: string } {
+    if (boardReadable || canManage === true) return { ok: true, why: "" };
+    const approved = (s.reviewState ?? "").toLowerCase() === "approved" && !s.excluded;
+    if (!approved) return { ok: false, why: "Available after approval (meeting guests see approved originals only)." };
+    if ((s.scope ?? "board") !== "meeting") return { ok: false, why: "Board originals are available to board readers; meeting guests see metadata only." };
+    const mid = (s.meetingId ?? "").toLowerCase();
+    if (!mid || !allowedSet.has(mid)) return { ok: false, why: "Not in your meeting scope." };
+    return { ok: true, why: "" };
+  }
   const canWrite = !readOnly;
   const canManagePolicy = canManage === true;
   // Host transport carries the canonical identity/epoch and the central 401
@@ -258,7 +269,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
                 {canWrite && (<button onClick={() => act(s.id, "reindex")}>Reindex</button>)}
                 {canWrite && (<button onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
-                <button onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
+                {(() => { const d = canDownloadRow(s); return d.ok ? (<button onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>) : (<button disabled title={d.why}>Download original</button>); })()}
                 <button onClick={() => loadHist(s.id)}>History</button>
                 <button onClick={() => loadSecs(s.id)}>Sections</button>
               </div>

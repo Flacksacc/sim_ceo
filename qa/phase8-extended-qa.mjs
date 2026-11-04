@@ -36,18 +36,49 @@ ok("guest-voice-finalize",vf.status===200,vf.status+" "+vf.text.slice(0,200));
 // reader voice draft denied? transcribe requires discuss, reader read should 403
 let rvd=await req("POST",`/api/meetings/${mid}/voice`,{partial:"x"},{...B(readerT)});
 ok("reader-voice-denied",rvd.status===403,rvd.status+" "+rvd.text.slice(0,160));
-// source upload by admin, approve, guest download eligible
-const form=new FormData(); form.append("file",new Blob(["hello source"],{type:"text/plain"}),"note.txt");
-let up=await req("POST",`/api/boards/${bid}/sources/upload?scope=board`,form,{...B(adminT)},true);
+// meeting-scoped source: upload in own meeting, approve, guest downloads exact bytes
+const m2=await req("POST",`/api/boards/${bid}/meetings`,{title:run+"-m2",brief:"other"},{...B(adminT)}); const mid2=m2.json.id; const m3=await req("POST",`/api/boards/${bid}/meetings`,{title:run+"-m3",brief:"third"},{...B(adminT)}); const mid3=m3.json.id;
+await req("POST",`/api/boards/${bid}/grants`,{userKey:guestE,access:"discuss",meetingId:mid2},{...B(adminT)});
+const form=new FormData(); form.append("file",new Blob(["hello source"],{type:"text/plain"}),"note.txt"); form.append("scope","meeting"); form.append("meetingId",mid);
+let up=await req("POST",`/api/boards/${bid}/sources/upload`,form,{...B(adminT)},true);
 ok("source-upload",up.status===201,up.status+" "+up.text.slice(0,200));
+ok("source-upload-scope",up.json?.scope==="meeting"&&up.json?.meetingId===mid,JSON.stringify(up.json).slice(0,200));
 const sid=up.json?.id;
-await req("POST",`/api/sources/${sid}/approve`,{},{...B(adminT)});
+let ap=await req("POST",`/api/sources/${sid}/approve`,{},{...B(adminT)});
+ok("source-approve",ap.status===200,ap.status+" "+ap.text.slice(0,160));
 let gdl=await req("GET",`/api/sources/${sid}/download`,undefined,{...B(guestT)});
 ok("guest-download-eligible",gdl.status===200,gdl.status+" "+gdl.text.slice(0,120));
+ok("guest-download-bytes",gdl.text==="hello source",gdl.text.slice(0,120));
+// board-scoped source stays 403 for meeting-only guest (metadata visible, no board bytes)
+const bform=new FormData(); bform.append("file",new Blob(["hello source"],{type:"text/plain"}),"board.txt");
+let bup=await req("POST",`/api/boards/${bid}/sources/upload?scope=board`,bform,{...B(adminT)},true);
+ok("board-source-upload",bup.status===201,bup.status+" "+bup.text.slice(0,200));
+const boardSid=bup.json?.id;
+await req("POST",`/api/sources/${boardSid}/approve`,{},{...B(adminT)});
+let bdl=await req("GET",`/api/sources/${boardSid}/download`,undefined,{...B(guestT)});
+ok("board-scoped-dl-403",bdl.status===403,bdl.status+" "+bdl.text.slice(0,160));
+// other-meeting, pending, excluded, revoked negatives
+const oform=new FormData(); oform.append("file",new Blob(["hello source"],{type:"text/plain"}),"other.txt"); oform.append("scope","meeting"); oform.append("meetingId",mid3);
+let oup=await req("POST",`/api/boards/${bid}/sources/upload`,oform,{...B(adminT)},true);
+const otherSid=oup.json?.id;
+await req("POST",`/api/sources/${otherSid}/approve`,{},{...B(adminT)});
+let odl=await req("GET",`/api/sources/${otherSid}/download`,undefined,{...B(guestT)});
+ok("other-meeting-dl-403",odl.status===403,odl.status+" "+odl.text.slice(0,160));
+const pform=new FormData(); pform.append("file",new Blob(["pending body"],{type:"text/plain"}),"pending.txt"); pform.append("scope","meeting"); pform.append("meetingId",mid);
+let pup=await req("POST",`/api/boards/${bid}/sources/upload`,pform,{...B(adminT)},true);
+let pdl=await req("GET",`/api/sources/${pup.json?.id}/download`,undefined,{...B(guestT)});
+ok("pending-dl-403",pdl.status===403,pdl.status+" "+pdl.text.slice(0,160));
+await req("POST",`/api/sources/${pup.json?.id}/approve`,{},{...B(adminT)});
+await req("POST",`/api/sources/${pup.json?.id}/exclude`,{},{...B(adminT)});
+let xdl=await req("GET",`/api/sources/${pup.json?.id}/download`,undefined,{...B(guestT)});
+ok("excluded-dl-403",xdl.status===403,xdl.status+" "+xdl.text.slice(0,160));
 let sdl=await req("GET",`/api/sources/${sid}/download`,undefined,{Authorization:"Bearer "+"00".repeat(32)});
 ok("expired-download-401",sdl.status===401,sdl.status+" "+sdl.text.slice(0,120));
 let ndl=await req("GET",`/api/sources/${sid}/download`,undefined,{});
 ok("anon-download-401",ndl.status===401,ndl.status+" "+ndl.text.slice(0,120));
+await req("POST",`/api/sources/${sid}/reject`,{},{...B(adminT)});
+let rdl=await req("GET",`/api/sources/${sid}/download`,undefined,{...B(guestT)});
+ok("revoked-dl-403",rdl.status===403,rdl.status+" "+rdl.text.slice(0,160));
 // images: upload portrait as admin roster? skip heavy; test protected image 401 anon
 let imgAnon=await req("GET",`/api/images/00000000-0000-0000-0000-000000000000`,undefined,{});
 ok("image-anon-404-or-401",imgAnon.status===401||imgAnon.status===404,imgAnon.status+" "+imgAnon.text.slice(0,120));

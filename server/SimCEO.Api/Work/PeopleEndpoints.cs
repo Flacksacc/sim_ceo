@@ -265,6 +265,188 @@ public static class PeopleOps
   {
     try { SimCEO.Api.Hubs.BoardHub.RevokeUser(userKey, boardId, meetingId); } catch { }
   }
+  public sealed record MembershipEnsureResult(SimCEO.Api.Domain.Membership? Membership, IResult? Error);
+  public static MembershipEnsureResult EnsureMeetingMembership(InMemoryStore s, HttpRequest req, Guid boardId, Guid meetingId, bool explicitJoin)
+  {
+    SimCEO.Api.Domain.Membership? result = null;
+    IResult? error = null;
+    try
+    {
+      Atomic.Run(s, () =>
+      {
+        if (HasInvalidToken(s, req)) throw new UnauthorizedAccessException("revoked-token");
+        string currentUser;
+        if (IsSecure(s))
+        {
+          if (!AuthOps.TrySession(s, req, out var sessUser) || string.IsNullOrWhiteSpace(sessUser))
+            throw new UnauthorizedAccessException("revoked");
+          currentUser = sessUser;
+        }
+        else
+        {
+          currentUser = AuthOps.TrySession(s, req, out var eu) ? eu : UserOf(s, req);
+        }
+        if (!s.Meetings.TryGetValue(meetingId, out var mtg) || mtg == null || mtg.BoardId != boardId)
+          throw new InvalidOperationException("meeting-gone");
+        Guid restoreBefore = s.RestoreEpochId;
+        var access = AccessFor(s, boardId, meetingId, currentUser);
+        if (access == "none" || (access == "open" && IsSecure(s)))
+          throw new UnauthorizedAccessException("denied");
+        if (s.RestoreEpochId != restoreBefore)
+          throw new InvalidOperationException("restored");
+        if (!s.Meetings.TryGetValue(meetingId, out var mtg2) || mtg2 == null || mtg2.BoardId != boardId)
+          throw new InvalidOperationException("meeting-gone");
+        var existing = s.Memberships.Values.FirstOrDefault(m => m.BoardId == boardId && m.MeetingId == meetingId
+          && string.Equals(m.UserKey, currentUser, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && existing.Active)
+        {
+          result = existing;
+          return;
+        }
+        if (existing != null && !existing.Active)
+        {
+          if (!explicitJoin) throw new UnauthorizedAccessException("denied");
+          existing.Active = true;
+          existing.LeftAt = null;
+          existing.JoinedAt = AuthOps.UtcNow();
+          s.Memberships[existing.Id] = existing;
+          result = existing;
+          return;
+        }
+        var nm = new SimCEO.Api.Domain.Membership
+        {
+          BoardId = boardId,
+          MeetingId = meetingId,
+          UserKey = currentUser,
+          Active = true,
+          JoinedAt = AuthOps.UtcNow(),
+        };
+        s.Memberships[nm.Id] = nm;
+        result = nm;
+      });
+    }
+    catch (UnauthorizedAccessException uae) when (uae.Message == "revoked-token")
+    {
+      error = Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
+    }
+    catch (UnauthorizedAccessException uae) when (uae.Message == "revoked")
+    {
+      error = Results.Json(new { error = "Authentication required." }, statusCode: 401);
+    }
+    catch (UnauthorizedAccessException)
+    {
+      error = Denied();
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "meeting-gone")
+    {
+      error = Results.NotFound("meeting");
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "restored")
+    {
+      error = Results.Conflict("Domain was restored during join; retry.");
+    }
+    catch (Exception ex)
+    {
+      error = Results.Json(new { error = "Join could not be stored: " + ex.Message }, statusCode: 500);
+    }
+    return new MembershipEnsureResult(result, error);
+  }
+  public static MembershipEnsureResult EnsureMeetingMembershipForConnection(InMemoryStore s, string user, string token, Guid boardId, Guid meetingId, bool explicitJoin)
+  {
+    SimCEO.Api.Domain.Membership? result = null;
+    IResult? error = null;
+    try
+    {
+      Atomic.Run(s, () =>
+      {
+        string currentUser = (user ?? "").Trim();
+        if (IsSecure(s))
+        {
+          if (string.IsNullOrWhiteSpace(currentUser) || string.Equals(currentUser, "owner", StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException("revoked");
+          if (SimCEO.Api.Hubs.BoardHub.IsTokenRevoked(token))
+            throw new UnauthorizedAccessException("revoked");
+          bool sessOk = false;
+          string sessEmail = "";
+          try
+          {
+            if (!string.IsNullOrEmpty(token) && s.Sessions.TryGetValue(token, out var sess) && sess.ExpiresAt > AuthOps.UtcNow())
+            {
+              sessOk = true;
+              sessEmail = sess.Email ?? "";
+            }
+          }
+          catch { sessOk = false; }
+          if (!sessOk) throw new UnauthorizedAccessException("revoked");
+          if (!string.Equals(sessEmail, currentUser, StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException("revoked");
+          currentUser = sessEmail;
+        }
+        else if (string.IsNullOrWhiteSpace(currentUser))
+        {
+          currentUser = "owner";
+        }
+        if (!s.Meetings.TryGetValue(meetingId, out var mtg) || mtg == null || mtg.BoardId != boardId)
+          throw new InvalidOperationException("meeting-gone");
+        Guid restoreBefore = s.RestoreEpochId;
+        var access = AccessFor(s, boardId, meetingId, currentUser);
+        if (access == "none" || (access == "open" && IsSecure(s)))
+          throw new UnauthorizedAccessException("denied");
+        if (s.RestoreEpochId != restoreBefore)
+          throw new InvalidOperationException("restored");
+        if (!s.Meetings.TryGetValue(meetingId, out var mtg2) || mtg2 == null || mtg2.BoardId != boardId)
+          throw new InvalidOperationException("meeting-gone");
+        var existing = s.Memberships.Values.FirstOrDefault(m => m.BoardId == boardId && m.MeetingId == meetingId
+          && string.Equals(m.UserKey, currentUser, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && existing.Active)
+        {
+          result = existing;
+          return;
+        }
+        if (existing != null && !existing.Active)
+        {
+          if (!explicitJoin) throw new UnauthorizedAccessException("denied");
+          existing.Active = true;
+          existing.LeftAt = null;
+          existing.JoinedAt = AuthOps.UtcNow();
+          s.Memberships[existing.Id] = existing;
+          result = existing;
+          return;
+        }
+        var nm = new SimCEO.Api.Domain.Membership
+        {
+          BoardId = boardId,
+          MeetingId = meetingId,
+          UserKey = currentUser,
+          Active = true,
+          JoinedAt = AuthOps.UtcNow(),
+        };
+        s.Memberships[nm.Id] = nm;
+        result = nm;
+      });
+    }
+    catch (UnauthorizedAccessException uae) when (uae.Message == "revoked")
+    {
+      error = Results.Json(new { error = "Authentication required." }, statusCode: 401);
+    }
+    catch (UnauthorizedAccessException)
+    {
+      error = Denied();
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "meeting-gone")
+    {
+      error = Results.NotFound("meeting");
+    }
+    catch (InvalidOperationException iox) when (iox.Message == "restored")
+    {
+      error = Results.Conflict("Domain was restored during join; retry.");
+    }
+    catch (Exception ex)
+    {
+      error = Results.Json(new { error = "Join could not be stored: " + ex.Message }, statusCode: 500);
+    }
+    return new MembershipEnsureResult(result, error);
+  }
 }
 
 public static class SecurityOps
@@ -624,10 +806,10 @@ public static class PeopleEndpoints
                 && string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase));
               if (exA is null)
               {
-                var nm = new Membership { BoardId = curA.BoardId, MeetingId = curA.MeetingId.Value, UserKey = user, Active = true, JoinedAt = DateTime.UtcNow };
+                var nm = new Membership { BoardId = curA.BoardId, MeetingId = curA.MeetingId.Value, UserKey = user, Active = true, JoinedAt = AuthOps.UtcNow() };
                 s.Memberships[nm.Id] = nm;
               }
-              else { exA.Active = true; exA.LeftAt = null; exA.JoinedAt = DateTime.UtcNow; s.Memberships[exA.Id] = exA; }
+              else if (!exA.Active) { exA.Active = true; exA.LeftAt = null; exA.JoinedAt = AuthOps.UtcNow(); s.Memberships[exA.Id] = exA; }
             }
             PeopleOps.MarkEnforced(s, curA.BoardId);
             acceptedGrant = ng;
@@ -808,51 +990,13 @@ public static class PeopleEndpoints
     app.MapPost("/api/meetings/{meetingId:guid}/join", (InMemoryStore s, HttpRequest req, Guid meetingId) =>
     {
       if (!s.Meetings.TryGetValue(meetingId, out var mtg)) return Results.NotFound("meeting");
-      if (PeopleOps.BadToken(s, req) is { } bad) return bad;
-      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
-        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-      var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
-      var access = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, user);
-      if (access == "none" || access == "open" && PeopleOps.IsSecure(s))
-        return PeopleOps.Denied();
-      lock (s.SetupLock)
-      {
-        // Recheck CURRENT session + authority inside the mutation lock (TOCTOU).
-        if (PeopleOps.BadToken(s, req) is { } badJ) return badJ;
-        if (PeopleOps.IsSecure(s))
-        {
-          if (!AuthOps.TrySession(s, req, out var je) || !string.Equals(je, user, StringComparison.OrdinalIgnoreCase))
-            return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-        }
-        var freshAccess = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, user);
-        if (freshAccess == "none" || freshAccess == "open" && PeopleOps.IsSecure(s))
-          return PeopleOps.Denied();
-        Membership? joined = null;
-        try
-        {
-          Atomic.Run(s, () =>
-          {
-            if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("Invalid or expired session token.");
-            var ju = PeopleOps.IsSecure(s) && AuthOps.TrySession(s, req, out var jeJ) ? jeJ : PeopleOps.UserOf(s, req);
-            if (!string.Equals(ju, user, StringComparison.OrdinalIgnoreCase)) throw new UnauthorizedAccessException("Authentication required.");
-            var faJ = PeopleOps.AccessFor(s, mtg.BoardId, meetingId, ju);
-            if (faJ == "none" || (faJ == "open" && PeopleOps.IsSecure(s))) throw new InvalidOperationException("Access revoked or not granted for this scope.");
-            var exJ = s.Memberships.Values.FirstOrDefault(m => m.BoardId == mtg.BoardId && m.MeetingId == meetingId
-              && string.Equals(m.UserKey, ju, StringComparison.OrdinalIgnoreCase));
-            if (exJ is null)
-            {
-              exJ = new Membership { BoardId = mtg.BoardId, MeetingId = meetingId, UserKey = ju, Active = true, JoinedAt = DateTime.UtcNow };
-              s.Memberships[exJ.Id] = exJ;
-            }
-            else { exJ.Active = true; exJ.LeftAt = null; exJ.JoinedAt = DateTime.UtcNow; s.Memberships[exJ.Id] = exJ; }
-            joined = exJ;
-          });
-        }
-        catch (UnauthorizedAccessException uae) { return Results.Json(new { error = uae.Message }, statusCode: 401); }
-        catch (InvalidOperationException iox) when (iox.Message == "Access revoked or not granted for this scope.") { return PeopleOps.Denied(); }
-        catch (Exception ex) { return Results.Json(new { error = "Join could not be stored: " + ex.Message }, statusCode: 500); }
-        return Results.Ok(joined);
-      }
+      // Shared authorized durable join: CURRENT session/grant/restore/meeting are
+      // rechecked inside ONE Atomic unit; idempotent (active membership keeps its
+      // original JoinedAt); explicit rejoin may reactivate an inactive row only
+      // with a live grant. No HubGate interaction here.
+      var ensured = PeopleOps.EnsureMeetingMembership(s, req, mtg.BoardId, meetingId, explicitJoin: true);
+      if (ensured.Error is not null) return ensured.Error;
+      return Results.Ok(ensured.Membership);
     });
 
     app.MapPost("/api/meetings/{meetingId:guid}/leave", (InMemoryStore s, HttpRequest req, Guid meetingId) =>

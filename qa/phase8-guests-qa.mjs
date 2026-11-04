@@ -70,7 +70,7 @@ let gcm=await chk(guestT,"POST",`/api/boards/${bid}/meetings`,{title:"x"}); ok("
 let gs=await chk(guestT,"GET",`/api/boards/${bid}/guest-settings`); ok("guest-settings",gs.status===200&&gs.json?.meetingIds,gs.status+" "+gs.text.slice(0,200));
 let gsetup=await chk(guestT,"GET",`/api/boards/${bid}/setup`); ok("guest-denied-setup",gsetup.status===403,gsetup.status+" "+gsetup.text.slice(0,160));
 // guest cannot secretary/briefing/notes-post/records
-let gsec=await chk(guestT,"POST",`/api/meetings/${mid}/secretary`,{request:"hello"}); ok("guest-denied-secretary",gsec.status===403,gsec.status+" "+gsec.text.slice(0,160));
+let gsec=await chk(guestT,"POST",`/api/meetings/${mid}/secretary`,{input:"hello",clientNonce:crypto.randomUUID()}); ok("guest-denied-secretary",gsec.status===403,gsec.status+" "+gsec.text.slice(0,160));
 let gnote=await chk(guestT,"POST",`/api/meetings/${mid}/notes`,{title:"t",body:"b"}); ok("guest-denied-note-post",gnote.status===403,gnote.status+" "+gnote.text.slice(0,160));
 let gbrief=await chk(guestT,"POST",`/api/meetings/${mid}/briefings`,{topic:"t"}); ok("guest-denied-briefing",gbrief.status===403,gbrief.status+" "+gbrief.text.slice(0,160));
 // guest cannot sources upload, can read eligible

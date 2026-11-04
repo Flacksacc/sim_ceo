@@ -8609,7 +8609,7 @@ const testModel = useMutation({
                 <>
               {" "}
               <WikiResources boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} api={wikiApi} onChanged={() => { try { qc.invalidateQueries(); } catch {} }} />
-                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} transport={{ get, post, put, del, upload, download: (u: string, f: string) => authedDownload(u, f), origin: () => originIdentity(), stale: (o: { epoch: number; token: string; user: string }) => originStale(o) }} />
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} canReadBoard={canWriteBoard || capBoard === "read" || canManageBoard} allowedMeetings={((caps.data as { meetings?: string[] } | undefined)?.meetings ?? [])} transport={{ get, post, put, del, upload, download: (u: string, f: string) => authedDownload(u, f), origin: () => originIdentity(), stale: (o: { epoch: number; token: string; user: string }) => originStale(o) }} />
                 </>)}
             </section>
           )}{" "}

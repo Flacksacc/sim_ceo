@@ -154,6 +154,7 @@ if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
   }
 }
 
+if (args.Contains("--expiry-probe")) { System.Environment.Exit(SimCEO.Api.Work.ExpiryProbe.Run()); }
 if (args.Contains("--selftest"))
 {
   var failures = new List<string>();
@@ -1567,6 +1568,9 @@ app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequ
 {
   take = Math.Clamp(take, 1, 100);
   if (!s.Meetings.TryGetValue(meetingId, out var mtg)) return Results.NotFound("meeting");
+  // Durable membership on successful ordinary entry (implicit, never resurrects explicit leave).
+  var ensuredRead = PeopleOps.EnsureMeetingMembership(s, req, mtg.BoardId, meetingId, explicitJoin: false);
+  if (ensuredRead.Error is not null) return ensuredRead.Error;
   if (!PeopleOps.Can(s, req, mtg.BoardId, meetingId, "read")) return PeopleOps.Denied();
   if (!s.Messages.TryGetValue(meetingId, out var list)) return Results.Ok(Array.Empty<Message>());
   lock (s.MessageLock)
@@ -1582,6 +1586,9 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
   if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "discuss") is { } deniedMsg) return deniedMsg;
+  // Durable membership on successful ordinary discuss entry (implicit).
+  var ensuredPost = PeopleOps.EnsureMeetingMembership(s, req, meeting.BoardId, meetingId, explicitJoin: false);
+  if (ensuredPost.Error is not null) return ensuredPost.Error;
   IResult? msgGate = null;
   long savedGenMsg = 0;
   Guid savedRestoreIdMsg = Guid.Empty;

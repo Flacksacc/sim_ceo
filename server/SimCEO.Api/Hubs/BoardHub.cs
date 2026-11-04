@@ -56,7 +56,7 @@ public sealed class BoardHub : Hub
         try
         {
           if (RevokedTokens.ContainsKey(tok)) { expired.Add(kv.Key); continue; }
-          if (!store.Sessions.TryGetValue(tok, out var sess) || sess.ExpiresAt <= DateTime.UtcNow) expired.Add(kv.Key);
+          if (!store.Sessions.TryGetValue(tok, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) expired.Add(kv.Key);
         }
         catch { }
       }
@@ -90,7 +90,7 @@ public sealed class BoardHub : Hub
       token = t;
       if (RevokedTokens.ContainsKey(t)) return false;
       var store = http.RequestServices.GetRequiredService<InMemoryStore>();
-      if (!store.Sessions.TryGetValue(t, out var sess) || sess.ExpiresAt <= DateTime.UtcNow) return false;
+      if (!store.Sessions.TryGetValue(t, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) return false;
       email = sess.Email;
       return true;
     }
@@ -208,12 +208,34 @@ public sealed class BoardHub : Hub
     finally { try { HubGate.Release(); } catch { } }
   }
 
+  public static bool IsTokenRevoked(string token)
+  {
+    try { return !string.IsNullOrEmpty(token) && RevokedTokens.ContainsKey(token); }
+    catch { return false; }
+  }
   public async Task JoinMeeting(string meetingId)
   {
     var http = Context.GetHttpContext();
     var store = http!.RequestServices.GetRequiredService<InMemoryStore>();
     if (!Guid.TryParse(meetingId, out var mid)) throw new HubException("Unknown meeting.");
-    if (!store.Meetings.TryGetValue(mid, out var mtg)) throw new HubException("Unknown meeting.");
+    if (!store.Meetings.TryGetValue(mid, out var mtg0)) throw new HubException("Unknown meeting.");
+    var boardId0 = mtg0.BoardId;
+    string preUser = "";
+    string preTok = "";
+    if (TryGetSession(http, out var preEm, out var preTk)) { preUser = preEm; preTok = preTk; }
+    else if (!PeopleOps.IsSecure(store))
+    {
+      preUser = "owner";
+      try { if (http.Request.Headers.TryGetValue("X-User", out var xv0) && !string.IsNullOrWhiteSpace(xv0.ToString())) preUser = xv0.ToString(); } catch { }
+    }
+    else { Context.Abort(); throw new HubException("Authentication required."); }
+    if (!string.IsNullOrEmpty(preTok) && RevokedTokens.ContainsKey(preTok)) { Context.Abort(); throw new HubException("Session revoked."); }
+    var ensured = PeopleOps.EnsureMeetingMembershipForConnection(store, preUser, preTok, boardId0, mid, explicitJoin: false);
+    if (ensured.Error is not null)
+    {
+      if (PeopleOps.IsSecure(store)) { try { Context.Abort(); } catch { } }
+      throw new HubException("Access revoked or not granted for this scope.");
+    }
     await HubGate.WaitAsync();
     try
     {
@@ -227,19 +249,37 @@ public sealed class BoardHub : Hub
       }
       else { Context.Abort(); throw new HubException("Authentication required."); }
       if (!string.IsNullOrEmpty(tok) && RevokedTokens.ContainsKey(tok)) { Context.Abort(); throw new HubException("Session revoked."); }
-      if (!CanForUser(store, user, mtg.BoardId, mid, "read"))
+      if (!CanForUser(store, user, boardId0, mid, "read"))
       {
         if (PeopleOps.IsSecure(store)) { Context.Abort(); throw new HubException("Access revoked or not granted for this scope."); }
         throw new HubException("Access revoked or not granted for this scope.");
       }
       if (Conns.TryGetValue(Context.ConnectionId, out var ex))
-        Conns[Context.ConnectionId] = ex with { UserKey = user, SessionToken = tok, BoardId = mtg.BoardId, MeetingId = mid };
+        Conns[Context.ConnectionId] = ex with { UserKey = user, SessionToken = tok, BoardId = boardId0, MeetingId = mid };
       else
-        Conns[Context.ConnectionId] = new HubConn(Context.ConnectionId, user, tok, mtg.BoardId, mid, DateTime.UtcNow);
+        Conns[Context.ConnectionId] = new HubConn(Context.ConnectionId, user, tok, boardId0, mid, DateTime.UtcNow);
       LiveContexts[Context.ConnectionId] = Context;
       var grp = $"meeting:{Canonical(mid)}";
       await Groups.AddToGroupAsync(Context.ConnectionId, grp);
       JoinedGroups.AddOrUpdate(Context.ConnectionId, new System.Collections.Generic.HashSet<string> { grp }, (k, s) => { lock (s) { s.Add(grp); } return s; });
+      bool stillOk = false;
+      try
+      {
+        if (!string.IsNullOrEmpty(tok) && RevokedTokens.ContainsKey(tok)) stillOk = false;
+        else stillOk = CanForUser(store, user, boardId0, mid, "read");
+      }
+      catch { stillOk = false; }
+      if (!stillOk)
+      {
+        try { await Groups.RemoveFromGroupAsync(Context.ConnectionId, grp); } catch { }
+        try
+        {
+          if (JoinedGroups.TryGetValue(Context.ConnectionId, out var gs0)) { lock (gs0) { gs0.Remove(grp); } }
+        }
+        catch { }
+        if (PeopleOps.IsSecure(store)) { try { Context.Abort(); } catch { } }
+        throw new HubException("Access revoked or not granted for this scope.");
+      }
     }
     finally { try { HubGate.Release(); } catch { } }
   }
@@ -264,9 +304,10 @@ public sealed class BoardHub : Hub
           try { ctx.Groups.RemoveFromGroupAsync(id, g).GetAwaiter().GetResult(); }
           catch (Exception ex)
           {
-            if (firstError is null) firstError = ex;
-            try { ctx.Groups.RemoveFromGroupAsync(id, g).GetAwaiter().GetResult(); firstError = null; break; }
-            catch (Exception ex2) { firstError = ex2; }
+            Exception? groupError = ex;
+            try { ctx.Groups.RemoveFromGroupAsync(id, g).GetAwaiter().GetResult(); groupError = null; }
+            catch (Exception ex2) { groupError = ex2; }
+            if (groupError is not null && firstError is null) firstError = groupError;
           }
         }
         try { ctx.Clients.Client(id).SendAsync("access-revoked", reason ?? new { revoked = true }).GetAwaiter().GetResult(); }
@@ -377,7 +418,7 @@ public sealed class BoardHub : Hub
         if (!string.IsNullOrEmpty(token))
         {
           if (RevokedTokens.ContainsKey(token)) continue;
-          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) continue;
+          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) continue;
           var liveUser = sess.Email ?? "";
           if (!CanForUser(s, liveUser, mtg.BoardId, meetingId, need)) continue;
           ok = true;
@@ -431,7 +472,7 @@ public sealed class BoardHub : Hub
         if (!string.IsNullOrEmpty(token))
         {
           if (RevokedTokens.ContainsKey(token)) continue;
-          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) continue;
+          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) continue;
           var liveUser = sess.Email ?? "";
           if (!string.Equals(liveUser, userKey, System.StringComparison.OrdinalIgnoreCase)) continue;
           if (!CanForUser(s, liveUser, mtg.BoardId, meetingId, "read")) continue;
