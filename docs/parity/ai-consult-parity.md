@@ -789,3 +789,31 @@ Backup: `.tmp/update-20261104-163537-UTC-0470a8b5`; rollback:
 `simceo-essentials-app:rollback-20261104-163537-0470a8b5`.
 Owned QA stack and browser processes stopped; no background coding agents used.
 The broader parity goal remains paused.
+
+### 2026-11-04 — Board creation selects existing roster advisors
+
+Implemented in `87d115e`. The Advisors step now displays a searchable checkbox
+list of the entire authorized active roster, including results beyond the API's
+200-row page. Select one to ten advisors; selected members remain removable at
+the cap and incomplete profiles explain why they cannot be added. Drafts retain
+roster identities across saves and reloads. Guided interview and setup guide are
+hidden on this step, and interview updates cannot manufacture advisor roles.
+Creation attaches the selected canonical profiles and portraits instead of
+creating duplicate roster entries or placeholder images. Backend guards reject
+missing, archived, incomplete, repeated, or more than ten selections. Existing
+approval, ownership, atomic creation and retry behavior remain in place.
+
+Frontend/backend builds and isolated browser/API QA passed with 211 roster
+members: search, limits, unchecking, reload, creation, original profile retention,
+no duplicates, retry idempotency and invalid selection rejection. Evidence:
+`.tmp/wizard-roster-qa.log`; test: `qa/wizard-roster-qa.mjs`.
+Live browser checks passed in light/dark desktop and narrow mobile layouts with
+zero page errors or domain writes; seven live roster entries and the existing
+board were preserved. Evidence: `.tmp/wizard-roster-live-check.log` and
+`.tmp/wizard-roster-live-{light,dark,mobile}.png`.
+
+Deployed to localhost:5173 with the existing PostgreSQL container and volumes.
+Image: `sha256:79457422429507f2908a147006deb0c72858629773e486de5bd9596d82805f2b`.
+Backup: `.tmp/update-20261104-184659-UTC-c81861e8`.
+Owned QA services/browser contexts stopped; no background coding agents used;
+`tmp.txt` untouched. The broader parity goal remains paused.
