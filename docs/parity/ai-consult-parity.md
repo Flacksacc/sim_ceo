@@ -522,6 +522,33 @@ Backup: `.tmp/update-20261104-164646-UTC-d2909aa3`; rollback:
 Owned test stack and browsers stopped; no coding agents used. Full parity
 remains paused; this checkpoint completes the requested navigation feedback.
 
+### 2026-11-04 — Demo account presentation hidden
+
+User requested hiding login/account/email/password UI without deleting it.
+`168d8e1` introduces `SHOW_ACCOUNT_UI = false` in `web/src/demo-ui.ts`.
+Account panels, sidebar sign-in/identity display, invite claim, People access
+management and related Help entries are omitted from rendering. Profile
+preferences, theme controls, editable profile and Save remain. Demo session
+errors no longer direct users to hidden login controls. Restoring the flag
+restores account presentation; backend authentication/authorization and saved
+data are unchanged. Model and wiki connection credentials remain settings
+for those integrations, separate from login/account forms.
+
+TypeScript/Vite build passed. Focused live browser checks passed across global
+and board routes, both themes and a narrow viewport, with a pre-existing demo
+identity also hidden. Profile Save and theme controls remained available;
+authentication status, profile, boards and roster matched before/after; zero
+domain writes or page errors. Evidence:
+`.tmp/demo-account-ui-live-check-verified.log`; screenshots:
+`output/demo-account-ui-review/2026-11-04`.
+
+Deployed healthy on 5173: image
+`sha256:0b163b54ea2ef17b5aaf2415d549cecb294158fdda3206e5b57b92243ad91b96`.
+Backup `.tmp/update-20261104-165237-UTC-760ec3f0`; rollback
+`simceo-essentials-app:rollback-20261104-165237-760ec3f0`.
+Original database/volumes retained; no background agents or test servers
+launched, owned browsers closed. Full parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
