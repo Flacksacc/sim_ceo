@@ -4322,7 +4322,7 @@ useEffect(() => {
 }, [modelStatus.data, modelChatLoaded]);
 const saveModel = useMutation({
   mutationFn: () =>
-    put<unknown>("/api/model/settings", { apiKey: modelKey, chatModel: modelChat }),
+    put<unknown>("/api/model/settings", { ...(modelKey.trim() ? { apiKey: modelKey } : {}), chatModel: modelChat }),
   onSuccess: () => {
     setModelKey("");
     setModelMsg("Saved. Run Test connection to verify.");

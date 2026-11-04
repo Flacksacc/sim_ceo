@@ -26,6 +26,7 @@ const tested = await call('POST', '/api/model/test', {}, visitor);
 assert.equal(tested.status, 200); assert.equal(tested.data.ok, true);
 assert.equal((await call('GET', '/api/model/status')).data.lastTestOk, true);
 assert.equal((await call('GET', '/api/model/status', undefined, { authorization: 'Bearer invalid-test-token' })).status, 401);
+assert.equal((await call('PUT', '/api/model/settings', { apiKey: 'qa-shared-settings-key-1234' }, visitor)).status, 200);
 console.log('PASS demo visitors read/save/test settings, validation stays atomic, invalid tokens rejected');
 
 const browser = await chromium.launch({ executablePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', headless: true });
@@ -46,6 +47,7 @@ try {
   const saved = page.waitForResponse(r => r.url().endsWith('/api/model/settings') && r.request().method() === 'PUT');
   await settings.getByRole('button', { name: 'Save model settings', exact: true }).click();
   assert.equal((await saved).status(), 200);
+  assert.equal((await call('GET', '/api/model/status')).data.keyHint, '...1234', 'Blank key field preserves the saved connection key');
   const connection = page.waitForResponse(r => r.url().endsWith('/api/model/test') && r.request().method() === 'POST');
   await settings.getByRole('button', { name: 'Test connection', exact: true }).click();
   assert.equal((await connection).status(), 200);
@@ -81,4 +83,5 @@ const final = await call('GET', '/api/model/status', undefined, { authorization:
 assert.equal(final.status, 200);
 assert.equal(Object.hasOwn(final.data, 'apiKey'), false);
 assert.ok(!JSON.stringify(final.data).includes('qa-only-15396-never-real'));
+assert.ok(!JSON.stringify(final.data).includes('qa-shared-settings-key-1234'));
 console.log('PASS secure non-admin read/save/test, anonymous/revoked-session rejection and credential masking');
