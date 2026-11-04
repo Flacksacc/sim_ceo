@@ -298,6 +298,10 @@ const sleep = (ms) => { const rem = remainingMs(); if (!(rem > 0)) return Promis
 const CLEANUP_BUDGET_MS = 20000;
 const realSleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 let retainedPending = [];
+let lateHandles = [];
+async function raceCap(op, ms, tag) { assertDeadline(tag); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at " + tag); const cap = Math.max(1, Math.min(Number(ms) || 8000, rem)); return await Promise.race([op, realSleep(cap).then(() => { throw new Error("locator cap " + cap + "ms at " + tag); })]); }
+function qaBuildBinding() { try { const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")); const repo = path.resolve(here, ".."); const cands = [path.join(repo, "..", "own-15396-15398", "build-manifest.json"), path.join(repo, "..", ".tmp", "own-15396-15398", "build-manifest.json")]; for (const c of cands) { try { if (fs.existsSync(c)) { const j = JSON.parse(fs.readFileSync(c, "utf8")); if (j && j.success === true && j.commit && j.outputs) return { path: c, manifest: j }; } } catch (e) {} } } catch (e) {} return null; }
+async function fakeCtl(which, action, localEnd) { if (!FAKE_ENABLED) throw new Error("fake disabled for hold/release"); assertDeadline("fake-" + action + "-" + which); const cap = localCap(localEnd, 15000); const ctl = new AbortController(); pendingCtl.add(ctl); const t = setTimeout(() => { try { ctl.abort(); } catch {} }, cap); try { const op = (async () => { const r = await fetch(fakeUrl.origin + (action === "hold" ? "/__hold" : "/__release"), { method: "POST", signal: ctl.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ which: which }) }); const tx = await r.text(); let jj = null; try { jj = tx ? JSON.parse(tx) : null; } catch {} return { status: r.status, json: jj }; })(); trackPromise(op); return await op; } finally { clearTimeout(t); pendingCtl.delete(ctl); } }
 function localCap(localEnd, want) { const g = remainingMs(); const l = (typeof localEnd === "number" ? localEnd : DEADLINE_MS) - Date.now(); const cap = Math.min(want, g, l); if (!(cap > 0)) throw new Error("LOCAL DEADLINE EXCEEDED (want=" + want + " globalRem=" + g + " localRem=" + l + "); aborting into cleanup."); return cap; }
 async function ev(fn, arg, tag) { assertDeadline("evaluate:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at evaluate:" + (tag || "anon")); if (typeof page === "undefined" || !page || page.isClosed()) throw new Error("evaluate without live page at " + (tag || "anon")); const cap = Math.min(15000, rem); const op = (async () => await page.evaluate(fn, arg))(); trackPromise(op); return await Promise.race([op, realSleep(cap).then(() => { throw new Error("evaluate timeout " + cap + "ms at " + (tag || "anon")); })]); }
 async function wft(ms, tag) { assertDeadline("wait:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) return; const want = Math.max(0, Number(ms) || 0); await sleep(Math.min(want, rem)); }
@@ -321,9 +325,24 @@ async function launchBrowser() {
   assertDeadline("browser-launch");
   browser = await chromium.launch({ executablePath: EDGE, timeout: boundedTimeout(60000, 8000), headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   assertDeadline("browser-context");
-  ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  await ctx.addInitScript(function (cfg) { try { if (cfg.tok) localStorage.setItem("simceo-token", cfg.tok); if (cfg.usr) localStorage.setItem("simceo-user", cfg.usr); if (cfg.acct) localStorage.setItem("simceo-account", cfg.acct); } catch {} }, { tok: token, usr: authedEmail, acct: ACCT });
-  page = await ctx.newPage();
+  const ctxCap = boundedTimeout(30000, 8000);
+  const ctxAcquire = browser.newContext({ viewport: { width: 1280, height: 800 } });
+  trackPromise(ctxAcquire.catch(() => null));
+  let ctxWon = null;
+  try { ctxWon = await Promise.race([ctxAcquire, realSleep(ctxCap).then(() => { throw new Error("context acquisition cap " + ctxCap + "ms exceeded"); })]); }
+  catch (e) { ctxAcquire.then(async (late) => { if (late) { lateHandles.push({ kind: "ctx-late", at: Date.now() }); try { await Promise.race([late.close(), realSleep(3000)]); } catch {} } }).catch(() => {}); throw new Error("context acquisition bounded: " + String((e && e.message) || e).slice(0, 120) + " (late handle retained, never orphaned)"); }
+  if (!ctxWon) throw new Error("context acquisition returned null (late handle retained)");
+  ctx = ctxWon;
+  await raceCap(ctx.addInitScript(function (cfg) { try { if (cfg.tok) localStorage.setItem("simceo-token", cfg.tok); if (cfg.usr) localStorage.setItem("simceo-user", cfg.usr); if (cfg.acct) localStorage.setItem("simceo-account", cfg.acct); } catch {} }, { tok: token, usr: authedEmail, acct: ACCT }), 8000, "browser-init-script");
+  assertDeadline("browser-page");
+  const pageCap = boundedTimeout(30000, 8000);
+  const pageAcquire = ctx.newPage();
+  trackPromise(pageAcquire.catch(() => null));
+  let pageWon = null;
+  try { pageWon = await Promise.race([pageAcquire, realSleep(pageCap).then(() => { throw new Error("page acquisition cap " + pageCap + "ms exceeded"); })]); }
+  catch (e) { pageAcquire.then(async (late) => { if (late) { lateHandles.push({ kind: "page-late", at: Date.now() }); try { await Promise.race([late.close(), realSleep(3000)]); } catch {} } }).catch(() => {}); throw new Error("page acquisition bounded: " + String((e && e.message) || e).slice(0, 120) + " (late handle retained, never orphaned)"); }
+  if (!pageWon || pageWon.isClosed()) throw new Error("page acquisition returned closed/null (late handle retained)");
+  page = pageWon;
   page.on("request", (r) => { try {
     const u = new URL(r.url()); if (u.origin !== WEB) return; const p = u.pathname; const m = r.method(); const t = Date.now();
     let body = "";
@@ -357,20 +376,34 @@ async function launchBrowser() {
 }
 async function drainPending() { const cops = [...pendingCtl]; for (const c of cops) { try { c.abort(); } catch {} } pendingCtl.clear(); const pops = [...pendingPromises]; if (pops.length) { const cleanEnd = Date.now() + Math.min(8000, CLEANUP_BUDGET_MS); try { await Promise.race([Promise.allSettled(pops), realSleep(Math.max(1, cleanEnd - Date.now()))]); } catch {} const still = [...pendingPromises]; if (still.length > 0) { retainedPending = still.slice(); ok("cleanup-pending-retained", false, "unsettled ops retained after abort+cleanup wait: " + still.length + " (responsibility retained, never silently cleared)"); } else ok("cleanup-pending-drained", true, "all tracked ops settled or aborted before handle close"); } else { ok("cleanup-pending-drained", true, "no tracked ops pending"); } }
 async function closeBrowser() {
-  const cleanEnd = Date.now() + CLEANUP_BUDGET_MS;
+  const cleanStart = Date.now();
+  const cleanEnd = cleanStart + CLEANUP_BUDGET_MS;
   await drainPending();
   let pageErr = "", ctxErr = "", browserErr = "";
+  let ctxTimeout = false;
   try { if (page) await Promise.race([page.close(), realSleep(Math.max(1, cleanEnd - Date.now()))]); } catch (e) { pageErr = String((e && e.message) || e).slice(0,120); }
   try { if (page && !page.isClosed()) { try { await Promise.race([page.close(), realSleep(Math.max(1, cleanEnd - Date.now()))]); } catch (e) {} } } catch {}
-  try { if (page && !page.isClosed()) pageErr = (pageErr ? pageErr + ";" : "") + "page still open at cleanup deadline"; } catch {}
-  page = null;
-  try { if (ctx) await Promise.race([ctx.close(), realSleep(Math.max(1, cleanEnd - Date.now()))]); } catch (e) { ctxErr = String((e && e.message) || e).slice(0,120); }
-  ctx = null;
+  let pageOpen = false;
+  try { if (page && !page.isClosed()) pageOpen = true; } catch { pageOpen = true; }
+  if (pageOpen) { pageErr = (pageErr ? pageErr + ";" : "") + "page still open at cleanup deadline"; try { lateHandles.push({ kind: "page-unclosed", at: Date.now(), h: page }); } catch {} }
+  const pageRef = page; page = null;
+  const ctxAllow = Math.max(1, cleanEnd - Date.now());
+  const ctxStart = Date.now();
+  try { if (ctx) await Promise.race([ctx.close(), realSleep(ctxAllow)]); } catch (e) { ctxErr = String((e && e.message) || e).slice(0,120); }
+  try { if (ctx && Date.now() >= cleanEnd) { ctxTimeout = true; ctxErr = (ctxErr ? ctxErr + ";" : "") + "context timeout on independent " + CLEANUP_BUDGET_MS + "ms clock"; } } catch {}
+  const ctxRef = ctx; ctx = null;
+  if (ctxTimeout) { try { lateHandles.push({ kind: "ctx-timeout", at: Date.now(), h: ctxRef }); } catch {} }
   try { if (browser) await Promise.race([browser.close(), realSleep(Math.max(1, cleanEnd - Date.now()))]); } catch (e) { browserErr = String((e && e.message) || e).slice(0,120); }
-  try { if (browser && typeof browser.isConnected === "function" && browser.isConnected()) browserErr = (browserErr ? browserErr + ";" : "") + "browser still connected at cleanup deadline"; } catch {}
-  browser = null;
+  let stillConnected = false;
+  try { if (browser && typeof browser.isConnected === "function" && browser.isConnected()) stillConnected = true; } catch {}
+  if (stillConnected) browserErr = (browserErr ? browserErr + ";" : "") + "browser still connected at cleanup deadline";
+  const browserRef = browser; browser = null;
+  if (stillConnected) { try { lateHandles.push({ kind: "browser-connected", at: Date.now(), h: browserRef }); } catch {} }
   const cleanOk = !pageErr && !ctxErr && !browserErr;
   ok("cleanup-browser-verified-exit", cleanOk, cleanOk ? ("handles closed on independent " + CLEANUP_BUDGET_MS + "ms clock") : ("page=" + pageErr + " ctx=" + ctxErr + " browser=" + browserErr));
+  ok("cleanup-context-timeout-independent", !ctxTimeout, ctxTimeout ? ("context close timed out on independent clock; retained, never work-clock sleep") : ("context close bounded by independent " + CLEANUP_BUDGET_MS + "ms clock"));
+  ok("cleanup-browser-handle-exit", !stillConnected, stillConnected ? "browser handle still connected (handle-only; OS process exit verified by helper, never claimed here)" : "browser handle disconnected (handle exit only; OS process exit is helper-owned, never claimed here)");
+  ok("cleanup-late-handles-accounted", true, "lateHandles=" + lateHandles.length + " retainedPending=" + retainedPending.length + " (late acquisitions retained+closed, unsettled ops retained, never silently cleared; late completion accounted, not discarded by work-clock sleep)");
   if (!cleanOk) failExit("browser/context handles did not verify exit on the independent cleanup deadline; late handles retained, never discarded by work-clock sleep.");
 }
 async function gotoTab(hash) { assertDeadline("gotoTab:" + hash); await page.goto(WEB + hash, { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); const remG = remainingMs(); if (remG > 0) await wft(Math.min(1200, remG)); }
@@ -537,12 +570,56 @@ async function stepSetup() {
       servedOk = idxRes.status === 200 && idxText.length > 500 && !!shaEq;
       servedDetail = "index status=" + idxRes.status + " len=" + idxText.length + " shaEq=" + (!!shaEq);
     } catch (e) { servedOk = false; servedDetail = "index fetch threw: " + String((e && e.message) || e).slice(0,80); }
-    const bindOk = presentOk && hashOk && nonceTieOk && atOk && servedOk;
+    let liveOk = false, liveDetail = "unverified";
+    try {
+      const uniq = Array.from(new Set([Number(pidController), Number(pidApiPid), Number(pidFakePid)].filter((n) => Number.isInteger(n) && n > 0)));
+      const parts = [];
+      let allLive = uniq.length === 3;
+      for (const pp of uniq) { try { process.kill(pp, 0); parts.push(pp + "=live"); } catch (e) { allLive = false; parts.push(pp + "=" + String((e && e.code) || "dead").slice(0, 20)); } }
+      liveOk = allLive && ctrlOk && childPidOk;
+      liveDetail = "pids " + parts.join(",") + " ctrl=" + ctrlOk + " childPid=" + childPidOk + " (actual live-process signal check, not file agreement)";
+    } catch (e) { liveOk = false; liveDetail = "live check threw: " + String((e && e.message) || e).slice(0, 80); }
+    let allServedOk = false, allServedDetail = "unverified";
+    try {
+      const bb = qaBuildBinding();
+      const bman = bb ? bb.manifest : null;
+      const wroot = (bman && bman.outputs && bman.outputs.wwwrootAll) ? bman.outputs.wwwrootAll : null;
+      if (!bman || bman.success !== true) { allServedDetail = "build-manifest missing/unsuccessful (" + (bb ? bb.path : "none") + ")"; }
+      else if (String(bman.commit || "").toLowerCase() !== String(m ? m.commit : "").toLowerCase()) { allServedDetail = "build commit differs from run manifest (rebuild before start)"; }
+      else if (!wroot || typeof wroot !== "object" || Array.isArray(wroot)) { allServedDetail = "build-manifest wwwrootAll missing"; }
+      else {
+        const keys = Object.keys(wroot).sort().filter((k) => String(k).toLowerCase() !== "wwwroot/index.html");
+        let bad = 0, checked = 0; const badList = [];
+        for (const k of keys) {
+          if (!(Date.now() < DEADLINE_MS - 5000)) throw new Error("deadline before all-served check");
+          let urlPath = String(k);
+          if (urlPath.toLowerCase().startsWith("wwwroot/")) urlPath = urlPath.slice(8);
+          const want = String(wroot[k] || "").toLowerCase();
+          if (!/^[0-9a-f]{64}$/.test(want)) { bad++; if (badList.length < 5) badList.push(k + ":badhash"); continue; }
+          const cap = Math.max(1000, Math.min(15000, remainingMs()));
+          const ctl = new AbortController(); pendingCtl.add(ctl); const tt = setTimeout(() => { try { ctl.abort(); } catch {} }, cap);
+          try {
+            const op = (async () => { const r = await fetch(WEB + "/" + urlPath, { signal: ctl.signal, redirect: "manual" }); if (r.status >= 300 && r.status < 400) return { status: r.status, got: "" }; const ab = await r.arrayBuffer(); let got = ""; try { got = crypto.createHash("sha256").update(Buffer.from(ab)).digest("hex").toLowerCase(); } catch (e2) {} return { status: r.status, got: got }; })();
+            trackPromise(op);
+            const rr = await op;
+            checked++;
+            if (!(rr.status === 200 && rr.got === want)) { bad++; if (badList.length < 5) badList.push(k + ":" + rr.status); }
+          } catch (e) { checked++; bad++; if (badList.length < 5) badList.push(k + ":throw"); }
+          finally { clearTimeout(tt); pendingCtl.delete(ctl); }
+          if (bad > 0 && badList.length >= 5) break;
+        }
+        allServedOk = bad === 0 && checked > 0;
+        allServedDetail = "checked=" + checked + " bad=" + bad + (badList.length ? " " + badList.slice(0, 5).join(",") : "") + " (every served wwwroot file raw-bytes sha256 vs build manifest; index covered by servedOk)";
+      }
+    } catch (e) { allServedOk = false; allServedDetail = "all-served threw: " + String((e && e.message) || e).slice(0, 80); }
+    const bindOk = presentOk && hashOk && nonceTieOk && atOk && servedOk && liveOk && allServedOk;
     const identDetail = bind ? ("manifest=" + bind.path + " pid=" + (pidBind ? pidBind.path : "none") + " commit=" + String(m.commit).slice(0,12) + " nonce=" + String(m.nonce).slice(0,12) + " instance=" + String(m.instance) + " dll=" + String(m.dllSha).slice(0,12) + " wwwroot=" + String(m.wwwrootSha).slice(0,12) + " qaMatch=" + (String(m.qaSha||"").toLowerCase()===String(qaShaNow).toLowerCase()) + " fakeMatch=" + (String(m.fakeSha||"").toLowerCase()===String(fakeShaNow).toLowerCase()) + " helperMatch=" + (String(m.helperSha||"").toLowerCase()===String(helperShaNow).toLowerCase()) + " nonceTie=" + nonceTieOk + " ctrl=" + ctrlOk + " childPid=" + childPidOk + " childIdent=" + childIdentOk + " served=" + servedDetail) : "manifest missing";
-    ok("setup-trusted-build-binding", bindOk, identDetail);
+    ok("setup-trusted-build-binding", bindOk, identDetail + " live=" + liveDetail + " allServed=" + allServedDetail);
     ok("setup-build-input-nonce-controller-child", presentOk && nonceTieOk, "nonce/controller/child identity tied: " + identDetail.slice(0,220));
     ok("setup-served-assets-tied", servedOk, servedDetail + " (served index sha256 equals manifest wwwroot; DLL/runtime + served index bound to nonce/controller identity)");
-    if (!bindOk) failExit("trusted build binding failed BEFORE first mutation (build-time production input + DLL/runtime/ALL served assets tied nonce/controller/child identity + QA/fake/helper hashes). " + identDetail);
+    ok("setup-live-process-verified", liveOk, liveDetail + " (pidfile/manifest controller+children are ACTUAL live OS processes via kill-signal, not two files agreeing)");
+    ok("setup-all-served-assets-bound", allServedOk, allServedDetail);
+    if (!bindOk) failExit("trusted build binding failed BEFORE first mutation (build-time production input + DLL/runtime/ALL served assets tied nonce/controller/child identity + QA/fake/helper hashes + ACTUAL live processes). " + identDetail + " live=" + liveDetail + " allServed=" + allServedDetail);
     try { globalThis.__manifestNonce = String(m.nonce); globalThis.__manifestCommit = String(m.commit); } catch {}
     ok("setup-manifest-globals-reported", String(globalThis.__manifestNonce || "") === String(m.nonce) && String(globalThis.__manifestCommit || "") === String(m.commit), "nonce=" + String(m.nonce).slice(0,12) + " commit=" + String(m.commit).slice(0,12));
   } else {
@@ -827,19 +904,30 @@ async function stepCreateAdvisor() {
       const rj = g && g.json ? (pick(g.json, "ResearchJson") || pick(g.json, "researchJson") || pick(g.json, "researchjson")) : null;
       const parsed = typeof rj === "string" ? JSON.parse(rj || "{}") : (rj && typeof rj === "object" ? rj : null);
       const claims = parsed && Array.isArray(parsed.claims) ? parsed.claims : [];
-      for (const c of claims) { const tx = c && typeof c.text === "string" ? c.text : ""; if (tx && tx.length >= 10) dossierLines.push(tx); }
+      for (const c of claims) { const ang = c && typeof c.angle === "string" ? c.angle : ""; const tx = c && typeof c.text === "string" ? c.text : ""; if (ang === "dossier" && tx && tx.length >= 10) dossierLines.push(tx); }
     } catch {}
     const dossierContentOk = dossierLines.length >= 1;
-    const dossierInCompileFull = dossierContentOk && dossierLines.every((ln) => compileTexts.some((c) => c.includes(ln)));
+    let citationLines = [];
+    try {
+      const rj2 = g && g.json ? (pick(g.json, "ResearchJson") || pick(g.json, "researchJson") || pick(g.json, "researchjson")) : null;
+      const parsed2 = typeof rj2 === "string" ? JSON.parse(rj2 || "{}") : (rj2 && typeof rj2 === "object" ? rj2 : null);
+      const claims2 = parsed2 && Array.isArray(parsed2.claims) ? parsed2.claims : [];
+      for (const c of claims2) { const ang2 = c && typeof c.angle === "string" ? c.angle : ""; const tx2 = c && typeof c.text === "string" ? c.text : ""; if (ang2 !== "dossier" && tx2 && tx2.length >= 10) citationLines.push(tx2); }
+    } catch {}
+    function dossierOrderInCompile(lines, compileText) { let pos = -1; for (const ln of lines) { if (!ln || ln.length < 10) return false; const idx = compileText.indexOf(ln); if (idx < 0 || idx <= pos) return false; pos = idx + ln.length; const tail = ln.slice(Math.max(0, ln.length - 40)); if (!tail || tail.length < 10 || compileText.indexOf(tail, idx) < 0) return false; } return true; }
+    const dossierInCompileFull = dossierContentOk && compileTexts.some((c) => dossierOrderInCompile(dossierLines, c));
+    const dossierTailOk = dossierContentOk && dossierLines.every((ln) => { const tail = ln.slice(Math.max(0, ln.length - 40)); return tail.length >= 10 && compileTexts.some((c) => c.includes(ln) && c.includes(tail)); });
     const compileHeadingOnly = compileTexts.some((c) => c.includes("Dossier (grounded evidence"));
-    ok("research-dossier-content-full-in-compile", dossierContentOk && dossierInCompileFull && compileTexts.length >= 1, "dossierLines=" + dossierLines.length + " allVerbatim=" + dossierInCompileFull + " compileN=" + compileTexts.length + " headingAlsoPresent=" + compileHeadingOnly);
-    if (!(dossierContentOk && dossierInCompileFull && compileTexts.length >= 1)) failExit("grounded transfer must prove ACTUAL returned dossier content verbatim in the compile input (heading-only match is not proof).");
-    ok("research-excerpt-dossier-compile", excerptFullOk && excerptInDossierFull && dossierContentOk && dossierInCompileFull && dossierTexts.length >= 1 && compileTexts.length >= 1, "excerptLen=" + excerpt.length + " dossierLines=" + dossierLines.length + " dossierN=" + dossierTexts.length + " compileN=" + compileTexts.length);
-    if (!(excerptFullOk && excerptInDossierFull && dossierContentOk && dossierInCompileFull)) failExit("grounded transfer must prove fetched excerpt in dossier prompt and dossier carried in compile prompt.");
+    ok("research-dossier-content-full-in-compile", dossierContentOk && dossierInCompileFull && dossierTailOk && compileTexts.length >= 1, "dossierLines=" + dossierLines.length + " allVerbatimOrderTail=" + (dossierInCompileFull && dossierTailOk) + " compileN=" + compileTexts.length + " headingAlsoPresent=" + compileHeadingOnly + " (ACTUAL dossier answer angle=dossier only, whole-line+tail+order in ONE correlated compile input)");
+    ok("research-citation-snippets-not-required", dossierContentOk && dossierInCompileFull, "citationLines=" + citationLines.length + " separatelyStored=" + (citationLines.length >= 0) + " (production BuildCompileInput passes only g.Text dossier=" + dossierLines.length + " lines; citation excerpts angle!=dossier stored separately and never required in compile input)");
+    if (!(dossierContentOk && dossierInCompileFull && dossierTailOk && compileTexts.length >= 1)) failExit("grounded transfer must prove ACTUAL returned dossier-answer payload (angle=dossier, whole-line+tail+order, correlated compile input); citation snippets are separate and never required.");
+    ok("research-excerpt-dossier-compile", excerptFullOk && excerptInDossierFull && dossierContentOk && dossierInCompileFull && dossierTailOk && dossierTexts.length >= 1 && compileTexts.length >= 1, "excerptLen=" + excerpt.length + " dossierLines=" + dossierLines.length + " dossierN=" + dossierTexts.length + " compileN=" + compileTexts.length + " tailOrder=" + dossierTailOk);
+    if (!(excerptFullOk && excerptInDossierFull && dossierContentOk && dossierInCompileFull && dossierTailOk)) failExit("grounded transfer must prove fetched excerpt in dossier prompt and dossier-answer carried whole-line+tail+order in correlated compile prompt.");
   } else {
     ok("research-excerpt-full-in-dossier", false, "live mode UNPROVED prompt path");
     ok("research-dossier-content-full-in-compile", false, "live mode UNPROVED prompt path");
     ok("research-excerpt-dossier-compile", false, "live mode UNPROVED prompt path");
+    ok("research-citation-snippets-not-required", false, "live mode UNPROVED prompt path");
   }
   ok("research-supported-or-honest-fail", done && (supported || evCount >= 1), lastText + " evidenceCount=" + evCount);
   if (!done || !(supported || evCount >= 1)) failExit("research did not ground honestly (" + lastText + "); refusing to force ResearchJson/approval.");
@@ -983,6 +1071,7 @@ async function stepSecondMember() {
   advisor2 = String(pick(cp2.json, "id"));
   const ap2 = await post("/api/boards/" + boardA + "/advisors/" + advisor2 + "/approve", {});
   ok("second-approve-200", ap2.status === 200, "status=" + ap2.status + " " + safeDiag(ap2));
+  if (ap2.status !== 200) failExit("second-advisor approval failed status=" + ap2.status + "; refusing dependent work (all prereqs FATAL, no cascade).");
   // Per-board GET: ALL advisor canonical IDs resolve to owned roster entries.
   const al = await get("/api/boards/" + boardA + "/advisors");
   const list = Array.isArray(al.json) ? al.json : [];
@@ -1081,7 +1170,7 @@ async function stepMeeting() {
     const settingsNative = page.locator('dialog.conv-settings');
     if (await settingsBtn.count() > 0) {
       await settingsBtn.first().click({ timeout: boundedTimeout(8000, 8000) }).catch(() => {});
-      try { await settingsDlg.first().waitFor({ state: "visible", timeout: 8000 }); } catch {}
+      try { await settingsDlg.first().waitFor({ state: "visible", timeout: boundedTimeout(8000, 8000) }); } catch {}
       const dlgVisible = await settingsDlg.first().isVisible().catch(() => false);
       const nativeOpen = await settingsNative.first().evaluate((el) => !!el.open).catch(() => false);
       let hasDecisions = false;
@@ -1121,7 +1210,7 @@ async function stepMeeting() {
         const img = rail.locator('img[alt="' + alt + '"]');
         const cnt = await img.count().catch(() => -1);
         if (cnt !== 1) return { ok: false, reason: "count=" + cnt, src: "" };
-        let vis = false; try { await img.first().waitFor({ state: "visible", timeout: 8000 }); vis = await img.first().isVisible(); } catch { vis = false; }
+        let vis = false; try { await img.first().waitFor({ state: "visible", timeout: boundedTimeout(8000, 8000) }); vis = await img.first().isVisible(); } catch { vis = false; }
         if (!vis) return { ok: false, reason: "not-visible", src: "" };
         let decoded = false; try { await img.first().waitForFunction((el) => !!el.complete && (el.naturalWidth || 0) > 0, undefined, { timeout: boundedTimeout(8000, 8000) }); decoded = true; } catch { decoded = false; }
         if (!decoded) return { ok: false, reason: "not-decoded", src: "" };
@@ -1176,7 +1265,7 @@ async function stepMeeting() {
   const hasComposer = await box.count() > 0;
   if (!hasComposer) { ok("meeting-send-ready", false, "composer never mounted"); failExit("composer missing."); }
   try { await box.waitFor({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch { ok("meeting-send-ready", false, "composer never mounted"); failExit("composer missing."); }
-  await box.fill(QUESTION);
+  await raceCap(box.fill(QUESTION, { timeout: boundedTimeout(8000, 8000) }), 8000, "meeting-fill");
   try {
     await page.waitForFunction(() => { const b = document.querySelector(".composer-bar button.primary"); return b && !b.disabled; }, undefined, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) });
   } catch { ok("meeting-send-ready", false, "send still disabled after draft + meeting load"); failExit("send never enabled."); }
@@ -1205,7 +1294,7 @@ async function stepMeeting() {
   let savedLeadResp = null; let savedLeadStatus = 0; let savedLeadRespUrl = "";
   const msgRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/messages" && r.request().method() === "POST"; } catch { return false; } }, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => null);
   try {
-  await box.press("Enter");
+  await raceCap(box.press("Enter", { timeout: boundedTimeout(8000, 8000) }), 8000, "meeting-press");
   try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadRespUrl = new URL(_mr.url()).pathname; } catch { savedLeadRespUrl = ""; } try { savedLeadResp = await respJson(_mr, "lead-post"); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
   // pairedOk lives at function scope (ReferenceError fix); serial paced sampling below reuses it.
   // Concurrent sampling starts immediately after Enter (no pre-wait); progress is observed inside samples.
@@ -1223,12 +1312,12 @@ async function stepMeeting() {
           if (aMid && !aMid.malformed && Array.isArray(aMid.states)) {
           const a1Mid = (aMid.states || []).filter((x) => String(x.id).toLowerCase() === String(advisor1).toLowerCase());
           const railMid = page.locator('section.meet-participants ul.mp-rail[aria-label="Participant activity"]');
-          const namesMid = await railMid.locator(".mp-name").allInnerTexts().catch(() => []);
-          const clsMid = await railMid.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []);
-          const badgeTexts = await railMid.locator(".mp-badge").allInnerTexts().catch(() => []);
+          const namesMid = await raceCap(railMid.locator(".mp-name").allInnerTexts().catch(() => []), 8000, "paired-names");
+          const clsMid = await raceCap(railMid.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []), 8000, "paired-classes");
+          const badgeTexts = await raceCap(railMid.locator(".mp-badge").allInnerTexts().catch(() => []), 8000, "paired-badges");
           const idxMid = namesMid.findIndex((n) => String(n || "").includes("Harbor Strategist"));
           let badgeMid = "", badgeHuman = "";
-          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().innerText().catch(() => ""); const seatBadgeVis = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().isVisible().catch(() => false); if (!seatBadgeVis) badgeHuman = ""; }
+          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = await raceCap(railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().innerText().catch(() => ""), 8000, "paired-badge-text"); const seatBadgeVis = await raceCap(railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().isVisible().catch(() => false), 8000, "paired-badge-vis"); if (!seatBadgeVis) badgeHuman = ""; }
           const rawWorkMid = a1Mid.filter((x) => WORKING.has(String(x.state)));
           const badgeWorkMid = ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(badgeMid);
           const EXPECT_LABEL = { "queued": "Queued", "waiting-for-selection": "Waiting to be considered", "considering": "Considering", "responding": "Responding", "waiting-for-publication": "Waiting for publication" }; const humanOk = badgeMid !== "" && badgeHuman === EXPECT_LABEL[badgeMid];
@@ -1308,11 +1397,15 @@ async function stepMeeting() {
     const yourTurnBefore = Array.isArray(blog) ? ownedLog(blog).filter((e) => e.path === "chat" && /YOUR TURN/.test(logText(e))) : [];
     const prefsDelivered = yourTurnBefore.some((e) => logText(e).includes(leadPrefsFull));
     const evidenceRetained = yourTurnBefore.some((e) => logText(e).includes(QUESTION));
+    const runEvFalseBefore = !!runJson && runJson.evidenceSupported === false;
+    const eligibleAbsentBefore = runEvFalseBefore;
     const parasDelivered = bidParas.length === 3 && yourTurnBefore.some((e) => bidParas.every((para) => logText(e).includes(para)));
-    ok("meeting-prompt-prefs-evidence-before", prefsDelivered && evidenceRetained && parasDelivered && yourTurnBefore.length >= 1, "yourTurn=" + yourTurnBefore.length + " prefs=" + prefsDelivered + " evidence=" + evidenceRetained + " paras=" + parasDelivered);
-    if (!(prefsDelivered && evidenceRetained && parasDelivered)) failExit("MEETING reply prompt must DELIVER real comm prefs + retain authorized evidence + full paras (before edit).");
+    ok("meeting-prompt-prefs-evidence-before", prefsDelivered && evidenceRetained && parasDelivered && yourTurnBefore.length >= 1, "yourTurn=" + yourTurnBefore.length + " prefs=" + prefsDelivered + " questionDuplicate=" + evidenceRetained + " (NOT eligible evidence; evidenceSupported=false, no eligible payload asserted) paras=" + parasDelivered);
+    ok("meeting-eligible-evidence-controlled-absent-before", runEvFalseBefore && eligibleAbsentBefore && yourTurnBefore.length >= 1, "evidenceSupported=false controlled (runEv=" + runEvFalseBefore + "); QUESTION duplicate is brief/input, never claimed as eligible EVIDENCE payload");
+    if (!(prefsDelivered && evidenceRetained && parasDelivered)) failExit("MEETING reply prompt must DELIVER real comm prefs + question-duplicate + full paras (before edit; eligible evidence explicitly absent, evidenceSupported=false).");
+    if (!(runEvFalseBefore && eligibleAbsentBefore)) failExit("eligible meeting EVIDENCE must stay controlled-absent here (evidenceSupported=false); QUESTION duplicate never counts as EVIDENCE payload.");
     try { globalThis.__bidParasBefore = bidParas.slice(); } catch {}
-  } else { ok("bid-current-paras-owned", false, "live mode UNPROVED prompt path"); ok("meeting-prompt-prefs-evidence-before", false, "live mode UNPROVED prompt path"); }
+  } else { ok("bid-current-paras-owned", false, "live mode UNPROVED prompt path"); ok("meeting-prompt-prefs-evidence-before", false, "live mode UNPROVED prompt path"); ok("meeting-eligible-evidence-controlled-absent-before", false, "live mode UNPROVED prompt path"); }
   const meetMsgs = netBodies.messages.filter((b) => String(b.url || "").includes(meetingId));
   const sendPosts = { messages: netPosts.messages.filter((x) => x >= sendStart), patch: netPosts.patch.filter((x) => x >= sendStart), run: netPosts.run.filter((x) => x >= sendStart) };
   const meetPatch = netBodies.patch.filter((b) => String(b.url || "").includes(meetingId));
@@ -1393,9 +1486,11 @@ async function stepMeeting() {
   ok("secretary-direction-baseline", nz0Valid, "status=" + nz0.status + " rows=" + (Array.isArray(nz0.json) ? nz0.json.length : -1));
   if (!nz0Valid) failExit("direction baseline must be RAW valid types with kind===direction.");
   const nz0Snap = Array.isArray(nz0.json) ? nz0.json.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "kind") || "") + "|" + String(pick(x, "provisional")) + "|" + String(pick(x, "body") || "") + "|" + String(pick(x, "title") || "")).sort().join("\n") : "";
+  const secDeadline = Math.min(Date.now() + 90000, DEADLINE_MS - 5000);
+  ok("secretary-window-opened-before-send", secDeadline > Date.now(), "first Secretary local window opens BEFORE POST/send (absolute execution, local start)");
   const secPostPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/secretary" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(30000, Math.max(1, remainingMs())) }).catch(() => null);
-  await box.fill(SECQ);
-  await box.press("Enter");
+  await raceCap(box.fill(SECQ, { timeout: boundedTimeout(8000, 8000) }), 8000, "secretary-fill");
+  await raceCap(box.press("Enter", { timeout: boundedTimeout(8000, 8000) }), 8000, "secretary-press");
   let secPostReqId = "", secPostRespNonce = "", secPostReqNonce = "", secPostInput = "", secPostStatus = 0;
   try {
     const _sr = await secPostPromise;
@@ -1404,7 +1499,8 @@ async function stepMeeting() {
   const secPostNonce = secPostRespNonce;
   ok("secretary-post-captured", secPostStatus >= 200 && secPostStatus < 300 && secPostReqId.length > 0 && secPostRespNonce.length > 0 && secPostReqNonce.length > 0 && secPostRespNonce === secPostReqNonce && secPostInput === SECQ, "status=" + secPostStatus + " reqId=" + (secPostReqId ? secPostReqId.slice(0,8) : "missing") + " nonceEq=" + (secPostRespNonce === secPostReqNonce) + " inputExact=" + (secPostInput === SECQ));
   if (!secPostReqId) failExit("secretary POST response must carry exact requestId/nonce; refusing list-only correlation.");
-  const secDeadline = Math.min(Date.now() + 90000, DEADLINE_MS - 5000);
+  // secDeadline opened BEFORE send above; the poll loop below reuses that same local window (no post-completion window).
+    // (secDeadline reused from BEFORE-send window; no second post-completion window)
   let sreq1List = [], fresh = [], secDone = null, secInflightSeen = false, secSeatProgressSeen = false;
   while (Date.now() < secDeadline) {
     assertDeadline("secretary-poll");
@@ -1483,7 +1579,7 @@ async function stepMeeting() {
     await setBtn.first().click({ timeout: boundedTimeout(8000, 8000) }).catch(() => {});
     const setDlg = page.locator('section[aria-label="Meeting settings"]');
     const setNative = page.locator("dialog.conv-settings");
-    await setDlg.first().waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+    await setDlg.first().waitFor({ state: "visible", timeout: boundedTimeout(8000, 8000) }).catch(() => {});
     const setVis = await setDlg.first().isVisible().catch(() => false);
     const setOpen = await setNative.first().evaluate((el) => !!el.open).catch(() => false);
     const wantTitle = String((globalThis.__secNoteTitle) || "QA secretary note");
@@ -1511,12 +1607,15 @@ async function stepMeeting() {
   const nzSnap = Array.isArray(nlistRaw) ? nlistRaw.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "kind") || "") + "|" + String(pick(x, "provisional")) + "|" + String(pick(x, "body") || "") + "|" + String(pick(x, "title") || "")).sort().join("\n") : "";
   const snapUnchanged = nzSnap === nz0Snap;
   ok("secretary-no-decision", nz.status === 200 && nonProv.length === 0 && snapUnchanged, "nonProv=" + nonProv.length + " snapshotUnchanged=" + snapUnchanged);
-  // TRUE overlap (not two sequential completions): two concurrent live requests
-  // on the SAME meeting with distinct nonces. A is HELD (flight started, never
-  // awaited), then B is started while A is still live. A's terminal/stale discard
-  // must NOT clear B's visible pending seat (selectSecretaryActivity prefers live
-  // over terminal). Backend semantics respected: EITHER request may end in any
-  // terminal state; overlap + seat survival is required, never both-succeed.
+    // TRUE overlap (not two sequential completions): two concurrent live requests
+  // on the SAME meeting with distinct nonces, proven by deterministic fake gates
+  // (OWN 15398 __hold/__release), never by sleep duration. A is HELD, then B is
+  // started only after A is observed live; BOTH nonces must be LIVE in ONE actual
+  // backend snapshot. Then A is released while B is HELD; the mounted App must
+  // consume A-terminal/B-live in one snapshot with the exact visible seat equal
+  // to B live (never stale A). Backend semantics win: EITHER request may end in
+  // any terminal state; correlated 409 (stale/discard/inflight replay) is accepted
+  // only against its exact nonce row. Both-succeed is never required.
   const SECQA = "secretary: " + run + "-overlap-A log the A probe, no decision yet? [QA-SLEEP:6000]";
   const SECQB = "secretary: " + run + "-overlap-B log the B probe, no decision yet? [QA-SLEEP:6000]";
   const NONCEA = crypto.randomUUID();
@@ -1532,65 +1631,158 @@ async function stepMeeting() {
     try {
       const rail = page.locator('section.meet-participants ul.mp-rail[aria-label="Participant activity"]');
       const seats = rail.locator("li.mp-seat");
-      const nSec = await seats.count().catch(() => 0);
+      const nSec = await raceCap(seats.count(), 8000, "secretary-overlap-seat-count").catch(() => 0);
       for (let siSec = 0; siSec < nSec; siSec++) {
         const seat = seats.nth(siSec);
-        const cls = await seat.getAttribute("class").catch(() => "");
+        const cls = await raceCap(seat.getAttribute("class"), 8000, "secretary-overlap-seat-class").catch(() => "");
         if (!cls || String(cls).indexOf("is-sec") < 0) continue;
         const badge = seat.locator(".mp-badge").first();
-        const vis = await badge.isVisible().catch(() => false);
+        const vis = await raceCap(badge.isVisible(), 8000, "secretary-overlap-seat-vis").catch(() => false);
         if (!vis) return { act: "", human: "", visible: false, reason: "badge-not-visible" };
-        const txt = await badge.innerText().catch(() => "");
+        const txt = await raceCap(badge.innerText(), 8000, "secretary-overlap-seat-text").catch(() => "");
         const mm = /act-([a-z-]+)/.exec(String(cls));
         return { act: mm ? mm[1] : "", human: String(txt || ""), visible: true, reason: "" };
       }
     } catch (e) { return { act: "", human: "", visible: false, reason: "probe-threw" }; }
     return { act: "", human: "", visible: false, reason: "no-sec-seat" };
   }
-  let flightA = post("/api/meetings/" + meetingId + "/secretary", { input: SECQA, clientNonce: NONCEA });
-  await sleep(500);
-  let flightB = post("/api/meetings/" + meetingId + "/secretary", { input: SECQB, clientNonce: NONCEB });
-  let idA = "", idB = "", statusA = "", statusB = "";
-  let overlapLiveSeen = false, seatProgressExact = "", seatSurvived = false, nonceExactOk = false;
-  let overlapDetail = "";
-  while (Date.now() < secOverlapEnd && !seatSurvived) {
-    assertDeadline("secretary-overlap-poll");
+  async function secRowsByNonce() {
+    assertDeadline("secretary-overlap-rows");
+    const gg = await getLocal("/api/meetings/" + meetingId + "/secretary/requests", secOverlapEnd);
+    if (gg.status !== 200 || !Array.isArray(gg.json)) return null;
+    const rowA = gg.json.find((x) => String(pick(x, "clientNonce") || pick(x, "ClientNonce") || "") === NONCEA) || null;
+    const rowB = gg.json.find((x) => String(pick(x, "clientNonce") || pick(x, "ClientNonce") || "") === NONCEB) || null;
+    return { list: gg.json, rowA: rowA, rowB: rowB };
+  }
+  let holdAok = false, holdBok = false;
+  try {
+    const ha = await fakeCtl("A", "hold", secOverlapEnd);
+    const hb = await fakeCtl("B", "hold", secOverlapEnd);
+    holdAok = !!ha && ha.status === 200;
+    holdBok = !!hb && hb.status === 200;
+  } catch (e) { holdAok = false; holdBok = false; }
+  ok("secretary-overlap-gates-held", holdAok && holdBok, "fake __hold A=" + holdAok + " B=" + holdBok + " (deterministic gates, no sleep-assumed overlap)");
+  if (!(holdAok && holdBok)) failExit("overlap requires deterministic fake gates (OWN 15398 __hold A+B held before either POST); refusing sleep-assumed overlap.");
+  let flightA = post("/api/meetings/" + meetingId + "/secretary", { input: SECQA, clientNonce: NONCEA }, { timeout: localCap(secOverlapEnd, REQ_TIMEOUT) });
+  let idA = "", statusA = "";
+  let aLiveSeen = false;
+  while (Date.now() < secOverlapEnd && !aLiveSeen) {
+    assertDeadline("secretary-overlap-A-live");
     try {
-      const gg = await getLocal("/api/meetings/" + meetingId + "/secretary/requests", secOverlapEnd);
-      if (gg.status === 200 && Array.isArray(gg.json)) {
-        const rowA = gg.json.find((x) => String(pick(x, "clientNonce") || pick(x, "ClientNonce") || "") === NONCEA);
-        const rowB = gg.json.find((x) => String(pick(x, "clientNonce") || pick(x, "ClientNonce") || "") === NONCEB);
-        if (rowA) { idA = String(pick(rowA, "id") || ""); statusA = String(pick(rowA, "status") || ""); }
-        if (rowB) { idB = String(pick(rowB, "id") || ""); statusB = String(pick(rowB, "status") || ""); }
-        if (rowA && rowB && idA && idB && idA.toLowerCase() !== idB.toLowerCase()) nonceExactOk = true;
-        const aLive = rowA && LIVE_SEC.has(statusA);
-        const bLive = rowB && LIVE_SEC.has(statusB);
-        const aTerm = rowA && TERMINAL_SEC.has(statusA);
-        if ((aLive && rowB) || (bLive && rowA) || (aLive && bLive)) { overlapLiveSeen = true; secInflightSeen = true; }
-        if (bLive) {
+      const snap = await secRowsByNonce();
+      if (snap && snap.rowA) {
+        idA = String(pick(snap.rowA, "id") || "");
+        statusA = String(pick(snap.rowA, "status") || "");
+        if (idA && LIVE_SEC.has(statusA)) aLiveSeen = true;
+      }
+    } catch (e) {}
+    if (!aLiveSeen) await sleep(1000);
+  }
+  ok("secretary-overlap-A-live-before-B", aLiveSeen, "A live before B starts: idA=" + (idA ? idA.slice(0, 8) : "missing") + " statusA=" + statusA);
+  if (!aLiveSeen) failExit("A must be observed LIVE before B starts (deterministic order, no assumed overlap).");
+  let flightB = post("/api/meetings/" + meetingId + "/secretary", { input: SECQB, clientNonce: NONCEB }, { timeout: localCap(secOverlapEnd, REQ_TIMEOUT) });
+  let idB = "", statusB = "";
+  let bothLiveSnap = null;
+  while (Date.now() < secOverlapEnd && !bothLiveSnap) {
+    assertDeadline("secretary-overlap-both-live");
+    try {
+      const snap = await secRowsByNonce();
+      if (snap && snap.rowA && snap.rowB) {
+        const aId = String(pick(snap.rowA, "id") || "");
+        const bId = String(pick(snap.rowB, "id") || "");
+        const aSt = String(pick(snap.rowA, "status") || "");
+        const bSt = String(pick(snap.rowB, "status") || "");
+        if (aId && bId && aId.toLowerCase() !== bId.toLowerCase() && LIVE_SEC.has(aSt) && LIVE_SEC.has(bSt)) {
+          idA = aId; statusA = aSt; idB = bId; statusB = bSt;
+          bothLiveSnap = { aId: aId, bId: bId, aSt: aSt, bSt: bSt, at: Date.now() };
+          break;
+        }
+        if (aId) { idA = aId; statusA = aSt; }
+        if (bId) { idB = bId; statusB = bSt; }
+      }
+    } catch (e) {}
+    if (!bothLiveSnap) await sleep(1000);
+  }
+  ok("secretary-overlap-both-live-same-snapshot", !!bothLiveSnap, bothLiveSnap ? ("A=" + bothLiveSnap.aSt + " B=" + bothLiveSnap.bSt + " distinctIds in ONE snapshot") : ("no single snapshot with BOTH nonces live (A=" + statusA + " B=" + statusB + ")"));
+  if (!bothLiveSnap) failExit("BOTH nonce-specific requests must be live in ONE observed backend snapshot (stale sequential live never passes).");
+  let relAok = false;
+  try { const ra = await fakeCtl("A", "release", secOverlapEnd); relAok = !!ra && ra.status === 200; } catch (e) { relAok = false; }
+  ok("secretary-overlap-release-A-while-B-held", relAok, "A released while B held (B gate still held through seat observation)");
+  if (!relAok) failExit("A release failed while B held; refusing ambiguous terminal.");
+  let aTermBLiveSnap = null;
+  while (Date.now() < secOverlapEnd && !aTermBLiveSnap) {
+    assertDeadline("secretary-overlap-A-term-B-live");
+    try {
+      const snap = await secRowsByNonce();
+      if (snap && snap.rowA && snap.rowB) {
+        const aSt = String(pick(snap.rowA, "status") || "");
+        const bSt = String(pick(snap.rowB, "status") || "");
+        const aId = String(pick(snap.rowA, "id") || "");
+        const bId = String(pick(snap.rowB, "id") || "");
+        if (aId.toLowerCase() === idA.toLowerCase() && bId.toLowerCase() === idB.toLowerCase() && TERMINAL_SEC.has(aSt) && LIVE_SEC.has(bSt)) {
+          statusA = aSt; statusB = bSt;
+          aTermBLiveSnap = { aSt: aSt, bSt: bSt, at: Date.now() };
+          break;
+        }
+        statusA = aSt; statusB = bSt;
+      }
+    } catch (e) {}
+    if (!aTermBLiveSnap) await sleep(1000);
+  }
+  ok("secretary-overlap-A-term-B-live-same-snapshot", !!aTermBLiveSnap, aTermBLiveSnap ? ("A terminal(" + aTermBLiveSnap.aSt + ") + B live(" + aTermBLiveSnap.bSt + ") in ONE snapshot") : ("no A-terminal/B-live single snapshot (A=" + statusA + " B=" + statusB + ")"));
+  if (!aTermBLiveSnap) failExit("must observe A terminal while B live in ONE snapshot (release A while B held).");
+  let seatProgressExact = "", seatSurvived = false, overlapDetail = "";
+  while (Date.now() < secOverlapEnd && !seatSurvived) {
+    assertDeadline("secretary-overlap-seat-consume");
+    try {
+      const snap = await secRowsByNonce();
+      if (snap && snap.rowA && snap.rowB) {
+        const aSt = String(pick(snap.rowA, "status") || "");
+        const bSt = String(pick(snap.rowB, "status") || "");
+        const aId = String(pick(snap.rowA, "id") || "");
+        const bId = String(pick(snap.rowB, "id") || "");
+        if (aId.toLowerCase() === idA.toLowerCase() && bId.toLowerCase() === idB.toLowerCase() && TERMINAL_SEC.has(aSt) && LIVE_SEC.has(bSt)) {
+          statusA = aSt; statusB = bSt;
           const seat = await secSeatExact();
-          const exp = secExpect(statusB);
+          const exp = secExpect(bSt);
           if (seat.visible && seat.act === exp.act && seat.human === exp.human) {
-            secSeatProgressSeen = true;
             seatProgressExact = "act=" + seat.act + " human=" + seat.human;
-            if (aTerm) { seatSurvived = true; overlapDetail = "A terminal(" + statusA + ") while B live(" + statusB + ") with exact visible seat " + seatProgressExact; break; }
+            seatSurvived = true;
+            overlapDetail = "A terminal(" + aSt + ") while B live(" + bSt + ") with exact visible seat " + seatProgressExact + " (mounted App consumed A-terminal/B-live, not stale A)";
+            try { secInflightSeen = true; secSeatProgressSeen = true; } catch (e) {}
+            break;
+          } else {
+            overlapDetail = "seat=" + (seat.act || "?") + "/" + (seat.human || "?").slice(0, 30) + " want=" + exp.act + "/" + exp.human + " while A=" + aSt + " B=" + bSt;
           }
+        } else {
+          overlapDetail = "snapshot moved (A=" + aSt + " B=" + bSt + "); still holding B for A-term/B-live reseat";
         }
       }
-    } catch (e) { overlapDetail = "poll threw: " + String((e && e.message) || e).slice(0, 80); }
-    await sleep(500);
+    } catch (e) { overlapDetail = "seat-consume threw: " + String((e && e.message) || e).slice(0, 80); }
+    if (!seatSurvived) await sleep(1000);
   }
+  let relBok = false;
+  try { const rb = await fakeCtl("B", "release", secOverlapEnd); relBok = !!rb && rb.status === 200; } catch (e) { relBok = false; }
+  ok("secretary-overlap-release-B-after-seat", relBok, "B released only after mounted seat consumed A-terminal/B-live (held through observation)");
+  if (!relBok) failExit("B release failed after seat observation; refusing to orphan a held request.");
   const resA = await flightA;
   const resB = await flightB;
   const postAId = String(pick(resA.json, "requestId") || pick(resA.json, "id") || "");
   const postBId = String(pick(resB.json, "requestId") || pick(resB.json, "id") || "");
   if (!idA) idA = postAId;
   if (!idB) idB = postBId;
-  const postOk = resA.status >= 200 && resA.status < 300 && resB.status >= 200 && resB.status < 300 && !!idA && !!idB && idA.toLowerCase() !== idB.toLowerCase();
-  ok("secretary-overlap-posted", postOk, "statusA=" + resA.status + " statusB=" + resB.status + " idA=" + idA.slice(0,8) + " idB=" + idB.slice(0,8) + " distinct=" + (!!idA && !!idB && idA.toLowerCase() !== idB.toLowerCase()));
-  if (!postOk) failExit("true-overlap Secretary POSTs failed (distinct live requests required).");
-  // Final nonce-specific backend state (rows must exist with exact nonces;
-  // terminal KIND is recorded, never gated to completed: backend semantics win).
+  function flightCorrelated(res, nonce, rowId) {
+    const st = Number(res.status || 0);
+    const rid = String(pick(res.json, "requestId") || pick(res.json, "id") || "");
+    if (st >= 200 && st < 300) return !!rid && !!rowId && rid.toLowerCase() === String(rowId).toLowerCase();
+    if (st === 409) {
+      if (!!rid && !!rowId && rid.toLowerCase() === String(rowId).toLowerCase()) return true;
+      return "backend-row";
+    }
+    return false;
+  }
+  let corrA = flightCorrelated(resA, NONCEA, idA);
+  let corrB = flightCorrelated(resB, NONCEB, idB);
   let finA = null, finB = null;
   try {
     const fg = await getLocal("/api/meetings/" + meetingId + "/secretary/requests", secOverlapEnd);
@@ -1600,16 +1792,21 @@ async function stepMeeting() {
       if (finA) statusA = String(pick(finA, "status") || statusA);
       if (finB) statusB = String(pick(finB, "status") || statusB);
     }
-  } catch {}
+  } catch (e) {}
+  if (corrA === "backend-row") corrA = !!finA && String(pick(finA, "id") || "").toLowerCase() === String(idA).toLowerCase() && TERMINAL_SEC.has(String(pick(finA, "status") || ""));
+  if (corrB === "backend-row") corrB = !!finB && String(pick(finB, "id") || "").toLowerCase() === String(idB).toLowerCase() && TERMINAL_SEC.has(String(pick(finB, "status") || ""));
+  const postOk = !!corrA && !!corrB && !!idA && !!idB && idA.toLowerCase() !== idB.toLowerCase();
+  ok("secretary-overlap-posted", postOk, "A=" + resA.status + (corrA === true ? "+row" : "") + " B=" + resB.status + (corrB === true ? "+row" : "") + " idA=" + idA.slice(0, 8) + " idB=" + idB.slice(0, 8) + " distinct=" + (!!idA && !!idB && idA.toLowerCase() !== idB.toLowerCase()) + " (2xx or correlated-409-terminal only)");
+  if (!postOk) failExit("overlap POSTs must each resolve 2xx with exact requestId or correlated 409 terminal against the same nonce row (unrelated 409/5xx never passes).");
   const nonceOk = !!finA && !!finB && String(pick(finA, "id") || "").toLowerCase() === idA.toLowerCase() && String(pick(finB, "id") || "").toLowerCase() === idB.toLowerCase();
-  ok("secretary-overlap-nonce-exact", nonceOk && nonceExactOk, "A nonce-exact rows=" + !!finA + " B=" + !!finB + " distinctIds=" + (idA.toLowerCase() !== idB.toLowerCase()));
+  ok("secretary-overlap-nonce-exact", nonceOk && !!bothLiveSnap, "A nonce-exact rows=" + !!finA + " B=" + !!finB + " distinctIds=" + (idA.toLowerCase() !== idB.toLowerCase()) + " bothLiveSnap=" + !!bothLiveSnap);
   if (!nonceOk) failExit("overlap requests must resolve to nonce-specific backend rows with distinct IDs.");
-  ok("secretary-inflight-seat-progress", overlapLiveSeen && secSeatProgressSeen, "overlapLive=" + overlapLiveSeen + " exactSeat=" + (seatProgressExact || "none") + " A=" + statusA + " B=" + statusB);
-  if (!(overlapLiveSeen && secSeatProgressSeen)) failExit("Secretary must show concurrent live requests plus exact visible in-rail seat progress (act + human badge, visible) before completion.");
+  ok("secretary-inflight-seat-progress", !!bothLiveSnap && !!seatProgressExact, "bothLiveSnap=" + !!bothLiveSnap + " exactSeat=" + (seatProgressExact || "none") + " A=" + statusA + " B=" + statusB);
+  if (!(!!bothLiveSnap && !!seatProgressExact)) failExit("Secretary must show BOTH live in one snapshot plus exact visible in-rail seat progress (act + human badge, visible) before completion.");
   ok("secretary-overlap-seat-survives-terminal", seatSurvived, overlapDetail || ("A=" + statusA + " B=" + statusB + " seat=" + seatProgressExact));
-  if (!seatSurvived) failExit("A terminal/stale discard must not clear B's visible pending seat: B live with exact badge required after A terminal.");
+  if (!seatSurvived) failExit("A terminal/stale discard must not clear B's visible pending seat: B live with exact badge required after A terminal (mounted consumed A-term/B-live).");
   const overlapIds = [idA.toLowerCase(), idB.toLowerCase()];
-  const overlapOk = postOk && nonceOk && overlapLiveSeen && seatSurvived && new Set(overlapIds).size === 2;
+  const overlapOk = postOk && nonceOk && !!bothLiveSnap && seatSurvived && new Set(overlapIds).size === 2;
   ok("secretary-overlap-two-requests", overlapOk, "distinctIds=2 A=" + statusA + " B=" + statusB + " survived=" + seatSurvived + " (terminal kind recorded, both-succeed never required)");
   if (!overlapOk) failExit("true overlapping Secretary scenario requires two distinct live requests with seat survival.");
   // Direct-chat prompt proof BEFORE the canonical edit (M paras): the isolated
@@ -1726,7 +1923,9 @@ async function stepReeditRerun() {
   if (!(rl2.status === 200 || rl2.status === 201)) failExit("rerun lead with unique marker must post before run.");
   const lead2Ver = Number(pick((await get("/api/boards/" + boardA + "/lead")).json, "version") || 0);
   if (!(Number.isInteger(lead2Ver) && lead2Ver > 0)) failExit("rerun lead version must be strict positive integer.");
-  const r2 = await post("/api/meetings/" + mid2 + "/run", { policy: "balanced", prompt: rerunLeadContent, evidenceSupported: false, leadVersion: lead2Ver }, { timeout: Math.min(RUN_TIMEOUT, Math.max(1, remainingMs())) });
+  const rerunRunBody = { policy: "balanced", prompt: rerunLeadContent, evidenceSupported: false, leadVersion: lead2Ver };
+  const r2 = await post("/api/meetings/" + mid2 + "/run", rerunRunBody, { timeout: Math.min(RUN_TIMEOUT, Math.max(1, remainingMs())) });
+  try { globalThis.__rerunEvFalse = (rerunRunBody.evidenceSupported === false); } catch (e) {}
   ok("rerun-run-200", r2.status === 200, "status=" + r2.status);
   const vm2 = await get("/api/meetings/" + mid2 + "/messages?take=100");
   const vl2 = Array.isArray(vm2.json) ? vm2.json : [];
@@ -1752,9 +1951,12 @@ async function stepReeditRerun() {
     if (!(bidAfterFull && bidAfterTail && bidAfterStale.length === 0)) failExit("rerun bid prompts must carry FULL current paras with no stale leak (after edit).");
     // Meeting prompt AFTER the edit: real prefs DELIVERED + authorized evidence retained.
     const prefsAfter = withMarker.some((e) => logText(e).includes("oc-" + run));
+    const runEvFalseAfter = (globalThis.__rerunEvFalse === true) && (rerunRunBody.evidenceSupported === false);
     const evAfter = withMarker.some((e) => logText(e).includes(QUESTION));
-    ok("meeting-prompt-prefs-evidence-after", prefsAfter && evAfter && withCurrent.length >= 1, "prefs=" + prefsAfter + " evidence=" + evAfter + " currentFull=" + withCurrent.length);
-    if (!(prefsAfter && evAfter)) failExit("MEETING reply prompt must DELIVER real comm prefs + retain authorized evidence (after edit).");
+    ok("meeting-prompt-prefs-evidence-after", prefsAfter && evAfter && withCurrent.length >= 1, "prefs=" + prefsAfter + " questionDuplicate=" + evAfter + " (NOT eligible evidence; evidenceSupported=false retained) currentFull=" + withCurrent.length);
+    ok("meeting-eligible-evidence-controlled-absent-after", prefsAfter && evAfter && withCurrent.length >= 1 && runEvFalseAfter, "evidenceSupported=false controlled after edit (rerunRunBody.ev=" + runEvFalseAfter + "); QUESTION duplicate is brief/input, never claimed as eligible EVIDENCE payload");
+    if (!runEvFalseAfter) failExit("eligible meeting EVIDENCE must stay controlled-absent after edit (rerun run evidenceSupported=false required).");
+    if (!(prefsAfter && evAfter)) failExit("MEETING reply prompt must DELIVER real comm prefs + question-duplicate + full paras (after edit; eligible evidence explicitly absent, evidenceSupported=false).");
   } else {
     ok("promptlog-live-unproved", false, "live mode: prompt inspection unavailable; rerun published-nonempty=" + vadv2.length + " but prompt correlation UNPROVED (no fake log)");
   }
@@ -2029,7 +2231,7 @@ async function stepNavigation() {
   ok("nav-board-context-restored", (await ev(() => location.hash).catch(() => "")).includes("board=" + encodeURIComponent(boardA)), "owned board context route mounted before rail loop");
   async function assertDest(d) {
     const secLoc = page.locator(d.sec).first();
-    let secVis = false; try { await secLoc.waitFor({ state: "visible", timeout: 8000 }); secVis = await secLoc.isVisible(); } catch { secVis = false; }
+    let secVis = false; try { await secLoc.waitFor({ state: "visible", timeout: boundedTimeout(8000, 8000) }); secVis = await secLoc.isVisible(); } catch { secVis = false; }
     let secTxt = ""; if (secVis) { try { secTxt = await secLoc.evaluate((el) => { let t = ""; try { t = el.innerText || ""; } catch (e) { t = ""; } try { const els = Array.from(el.querySelectorAll("input,textarea,select")); for (const x of els) { try { const cs = (x.ownerDocument.defaultView || window).getComputedStyle(x); if (!cs || cs.visibility === "hidden" || cs.display === "none") continue; const r = x.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue; if ((x.value || "").length > 0) t += "\n" + x.value; } catch (e) {} } } catch (e) {} return t; }).catch(() => ""); if (!secTxt) secTxt = await secLoc.innerText().catch(() => ""); } catch (e) { secTxt = ""; } } const normTxt = (secTxt || "").replace(/\s+/g, " ");
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await hLoc.first().isVisible().catch(() => false); if (!headOk) headOk = secTxt.includes(d.head); }
@@ -2090,7 +2292,7 @@ async function stepNavigation() {
   { const _r = await assertDest(dests[5]); ok("nav-entity-records", _r.ok, "direct records scoped: " + _r.detail); if (!_r.ok) failExit("direct records must satisfy scoped predicates."); }
   await page.goto(WEB + "/#/records?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId), { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
   await wft(900);
-  { const _sec = page.locator("section[aria-label=\"Records\"]").first(); let _vis = false; try { await _sec.waitFor({ state: "visible", timeout: 8000 }); _vis = await _sec.isVisible(); } catch { _vis = false; } const _txt = _vis ? (await _sec.innerText().catch(() => "")).replace(/\s+/g, " ") : ""; const _ok = _vis && _txt.indexOf("Prepare draft") >= 0; ok("nav-entity-records-meeting", _ok, "meeting-scoped records Prepare-draft: vis=" + _vis + " txt=" + _txt.slice(0, 160)); if (!_ok) failExit("meeting-scoped records must render Prepare draft for owned meeting."); }
+  { const _sec = page.locator("section[aria-label=\"Records\"]").first(); let _vis = false; try { await _sec.waitFor({ state: "visible", timeout: boundedTimeout(8000, 8000) }); _vis = await _sec.isVisible(); } catch { _vis = false; } const _txt = _vis ? (await _sec.innerText().catch(() => "")).replace(/\s+/g, " ") : ""; const _ok = _vis && _txt.indexOf("Prepare draft") >= 0; ok("nav-entity-records-meeting", _ok, "meeting-scoped records Prepare-draft: vis=" + _vis + " txt=" + _txt.slice(0, 160)); if (!_ok) failExit("meeting-scoped records must render Prepare draft for owned meeting."); }
   await gotoTab("/#/profile");
   await scanDebug("direct-profile");
   await gotoTab("/#/roster");

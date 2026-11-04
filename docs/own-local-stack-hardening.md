@@ -178,3 +178,13 @@ Confirmed findings in scope fixed here (CODE ONLY, UNEXECUTED, no production edi
 5. Dirty-build input drift: with `b.dirty === true` the old HEAD/dirty rules could pass changed sources against old outputs; the new current-vs-manifest production-input map comparison now refuses any input drift regardless of the dirty flag.
 
 Validation this round: `node --check qa/own-local-stack.mjs` PASS; pattern checks for the port gate, kill-first order, public inputs, and dlls/wwwrootAll record+compare present. No `build`/`start`/`stop`/`status`, no services/network/browser/ports/PG/Docker/`.env`/providers run here. Out of scope and left for the primary: F10/F11 monolith predicate redesigns (non-owned fake fixture + production semantics + runtime-required), F6-remainder per-locator caps and Secretary window placement, and all rendered/execution acceptance.
+
+## Repair revision 2026-11-04 CODE ONLY, UNEXECUTED (this root, owned helper only)
+
+Base 0f8d066. No production edits; no services/network/process-control/PG/Docker/.env/providers run here. node --check clean only; in-process actual-helper probes only.
+
+- Exact executable+argv: dotnet/node hosts resolved absolute (where.exe dotnet.exe + process.execPath node); spawns use absolute hosts; validateInitialIdentity requires resolved-exe equality plus exact full argv (api [dll]; fake [fake.js --port 15398] with --port=15398 accepted, no extra tokens) via quote-aware argv split and case-insensitive resolved-path compare. Basename/substring checks replaced, never weakened.
+- CIM terminating: every nonzero query exit is unavailable regardless of stdout (kept); non-alive/unavailable initial identities FATAL; unavailable after spawn retains FAILFILE and cleans up; stop/final verification treats unavailable as retain-and-FAIL, never dead.
+- Shared cleanup deadline: failCleanupAndExit/onSig kill first via retained handles with NO blocking pre-queries, then snapshot inside cleanupFresh on the SAME fresh deadline via procIdentityBounded (remaining-capped, deadline-exceeded yields unavailable+retain). cleanupFresh identity+TCP checks all capped to the same deadline; stop pre-kill and final verifications bounded to stopDeadline with deadline-exceeded retained as failure (no unbounded queries past budget). Stale-pidfile/boot identities bounded to startDeadline remainder.
+
+Explicitly NOT executed here: build/start/stop/status, CIM queries, port checks, PG/Docker/.env/providers. Primary runs fresh build/runtime and independent review.

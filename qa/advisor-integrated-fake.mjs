@@ -9,6 +9,12 @@ const PORT = Number(argIdx >= 0 ? process.argv[argIdx + 1] : 5199);
 let seq = 0;
 const counts = { chat: 0, responses: 0, transcribe: 0, images: 0 };
 const promptLog = [];
+const overlapHolds = { A: false, B: false };
+const overlapWaiters = { A: [], B: [] };
+function overlapHold(which) { if (which === "A") overlapHolds.A = true; else if (which === "B") overlapHolds.B = true; }
+function overlapRelease(which) { const ws = (which === "A" ? overlapWaiters.A : which === "B" ? overlapWaiters.B : null); if (!ws) return false; if (which === "A") overlapHolds.A = false; else overlapHolds.B = false; while (ws.length > 0) { const fn = ws.shift(); try { fn(); } catch {} } return true; }
+function overlapWait(which, timeoutMs) { if (which !== "A" && which !== "B") return Promise.resolve(); if (!overlapHolds[which]) return Promise.resolve(); const cap = Math.max(1000, Math.min(120000, Number(timeoutMs) || 120000)); return new Promise((resolve) => { const to = setTimeout(() => { try { const arr = overlapWaiters[which]; const ix = arr.indexOf(done); if (ix >= 0) arr.splice(ix, 1); } catch {} resolve(); }, cap); const done = () => { clearTimeout(to); resolve(); }; overlapWaiters[which].push(done); }); }
+function overlapMarkerOf(prompt) { const t = String(prompt || ""); if (t.indexOf("overlap-A") >= 0) return "A"; if (t.indexOf("overlap-B") >= 0) return "B"; return ""; }
 const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
 function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
 function gateWait(text, kind) { const w = sleepMsOf(text, kind); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
@@ -221,6 +227,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const rawBuf = await readRaw(req);
+  if (req.method === "POST" && url.pathname === "/__hold") {
+    let which = "";
+    try { const bj = rawBuf.length ? JSON.parse(rawBuf.toString("utf8")) : {}; which = String(bj.which || ""); } catch { which = ""; }
+    if (which !== "A" && which !== "B") { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "which must be A or B" })); return; }
+    overlapHold(which);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, held: which, holds: overlapHolds }));
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/__release") {
+    let which = "";
+    try { const bj = rawBuf.length ? JSON.parse(rawBuf.toString("utf8")) : {}; which = String(bj.which || ""); } catch { which = ""; }
+    if (which !== "A" && which !== "B") { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "which must be A or B" })); return; }
+    overlapRelease(which);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, released: which, holds: overlapHolds }));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/__holds") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ holds: overlapHolds, queuedA: overlapWaiters.A.length, queuedB: overlapWaiters.B.length }));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/chat/completions") {
     counts.chat++;
     let body = {};
@@ -228,6 +257,8 @@ const server = http.createServer(async (req, res) => {
     const msgs = Array.isArray(body?.messages) ? body.messages : [];
     const prompt = msgs.map((m) => m.content).join("\n") || "";
     logPrompt("chat", prompt);
+    const marker = overlapMarkerOf(prompt);
+    if (marker) { try { await overlapWait(marker, 120000); } catch {} }
     const wait = gateWait(prompt, "C");
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
