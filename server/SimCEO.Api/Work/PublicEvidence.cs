@@ -35,6 +35,9 @@ public sealed class PublicEvidenceFetcher
 
   private readonly HttpMessageHandler? _testHandler;
   private readonly Func<string, CancellationToken, Task<IPAddress[]>> _dns;
+  // Salient-token budget for excerpt relevance. Default 12 preserves existing
+  // caller behavior; the character-research path raises it (still bounded).
+  public int MaxSubjectTokens { get; set; } = 12;
 
   // Production: secure defaults, real DNS, per-hop pinned SocketsHttpHandler.
   public PublicEvidenceFetcher()
@@ -157,7 +160,7 @@ public sealed class PublicEvidenceFetcher
           catch { return ("", ""); }
           bct.ThrowIfCancellationRequested();
           (string Title, string Excerpt) parsed;
-          try { parsed = await ExtractExcerptAsync(body, subject, bct).ConfigureAwait(false); }
+          try { parsed = await ExtractExcerptAsync(body, subject, bct, MaxSubjectTokens).ConfigureAwait(false); }
           catch (OperationCanceledException) { return ("", ""); }
           if (string.IsNullOrWhiteSpace(parsed.Excerpt)) return ("", "");
           return parsed;
@@ -379,7 +382,7 @@ public sealed class PublicEvidenceFetcher
     catch { return ("", ""); }
   }
 
-  internal static async Task<(string Title, string Excerpt)> ExtractExcerptAsync(string body, string subject, CancellationToken ct)
+  internal static async Task<(string Title, string Excerpt)> ExtractExcerptAsync(string body, string subject, CancellationToken ct, int maxTokens = 12)
   {
     if (string.IsNullOrWhiteSpace(body)) return ("", "");
     using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -444,7 +447,7 @@ public sealed class PublicEvidenceFetcher
     catch (OperationCanceledException) { throw; }
     catch { return (title, ""); }
     if (visible.Length < 20) return (title, "");
-    var tokens = GetSalientTokens(subject);
+    var tokens = GetSalientTokens(subject, maxTokens);
     if (tokens.Length == 0) return (title, "");
     var sentences = SplitSentences(visible, ct);
     if (sentences.Count == 0)
@@ -566,7 +569,7 @@ public sealed class PublicEvidenceFetcher
     "prose", "factuals", "detailed", "comprehensive", "thorough"
   };
 
-  private static string[] GetSalientTokens(string? subject)
+  private static string[] GetSalientTokens(string? subject, int maxTokens = 12)
   {
     if (string.IsNullOrWhiteSpace(subject)) return Array.Empty<string>();
     var list = new List<string>();
@@ -588,7 +591,7 @@ public sealed class PublicEvidenceFetcher
       else Flush();
     }
     Flush();
-    if (list.Count > 12) list = list.Take(12).ToList();
+    if (list.Count > maxTokens) list = list.Take(Math.Max(1, maxTokens)).ToList();
     return list.ToArray();
   }
 

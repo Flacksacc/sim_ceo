@@ -146,6 +146,12 @@ public sealed class ModelGateway
       throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
     return (dev, user);
   }
+  // Shared user-packet budget: packet builders size USER text against
+  // inputBudget*4 MINUS the developer instruction the gateway always sends,
+  // so an accepted packet can never trip the gateway total below. Single
+  // root formula; no per-caller margins.
+  public static int UserCharBudget(string purpose, int inputBudget)
+    => inputBudget * 4 - DeveloperInstructionFor(purpose).Length;
   // Canonical ORDERED role/content array used by the ACTUAL sender. Hash is of this array, not a delimiter string.
   public static object[] BuildDeliveredMessages(string developer, string userContent) =>
     new object[] { new { role = "developer", content = developer }, new { role = "user", content = userContent } };
@@ -782,7 +788,17 @@ public sealed class ModelGateway
       }
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      // Cancellation classification is preserved, never wrapped as a 502:
+      // callers distinguish bounded-deadline expiry from client abort.
+      sw.Stop();
+      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisTokens,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
@@ -1009,7 +1025,17 @@ public sealed class ModelGateway
       }
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      // Cancellation classification is preserved, never wrapped as a 502:
+      // callers distinguish bounded-deadline expiry from client abort.
+      sw.Stop();
+      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisSearch,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
@@ -1241,7 +1267,16 @@ public sealed class ModelGateway
       var asrBound = res.IsSuccessStatusCode ? TextBoundBytes : ErrorBoundBytes;
       (text, oversized, asrConsumed) = await ReadBoundedBodyAsync(res, asrBound, op).ConfigureAwait(false);
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException)
+    catch (OperationCanceledException ocex)
+    {
+      if (res is not null) try { res.Dispose(); } catch { }
+      sw.Stop();
+      RecordFull(callId, ModelPolicy.Voice, "voice-transcribe", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisVoice,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException)
     {
       if (res is not null) try { res.Dispose(); } catch { }
       sw.Stop();
@@ -1392,7 +1427,15 @@ public sealed class ModelGateway
         "failed: provider HTTP " + pex.Status + "; cost unknown; id " + (imgPid ?? "none"), boardId, meetingId);
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      sw.Stop();
+      RecordFull(callId, ModelPolicy.Image, "image-generate", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisImage,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, ModelPolicy.Image, "image-generate", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,

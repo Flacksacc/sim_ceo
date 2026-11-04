@@ -130,6 +130,17 @@ function fixtureHandler(reqLog, unhandled) {
       if (!b) return V("unknown board");
       return J(m[2] === "setup" ? setupFor(b) : statusFor(b));
     }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/capabilities$/))) {
+      const b = boardById(m[1]);
+      if (!b) return V("unknown board");
+      const mid = u.searchParams.get("meetingId");
+      if (mid) {
+        const mf = meetingById(mid);
+        if (!mf || mf.boardId !== m[1]) return V("unknown meeting");
+        return J({ board: "manage", meeting: "manage", meetings: [], guest: false, admin: false });
+      }
+      return J({ board: "manage", meeting: null, meetings: [], guest: false, admin: false });
+    }
     if ((m = p.match(/^\/api\/boards\/([^/]+)\/(advisors|sources|directions|invites|grants)$/))) {
       if (!boardById(m[1])) return V("unknown board");
       if (m[2] === "advisors" && req.method() === "GET") return J(store.advisors[m[1]] || []);
@@ -151,6 +162,33 @@ function fixtureHandler(reqLog, unhandled) {
     if ((m = p.match(/^\/api\/boards\/([^/]+)\/recall$/))) {
       if (!boardById(m[1])) return V("unknown board");
       return J([]);
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/guest-settings$/))) {
+      const b = boardById(m[1]);
+      if (!b) return V("unknown board");
+      return J({ id: b.id, name: b.name, mission: b.mission, stage: "Seed", discussionPolicy: "balanced", dataUse: "standard", lead: null, meetingIds: [] });
+    }
+    if (p === "/api/profile" && req.method() === "GET") {
+      if (store.globalLead) return J(store.globalLead);
+      return V("no global lead");
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/wiki-resources$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/sources\/review$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/activity$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J({ discussion: { status: "idle", advisors: [] }, secretary: [] });
+    }
+    if ((m = p.match(/^\/api\/roster\/([^/]+)\/research$/)) && req.method() === "GET") {
+      // Fixture roster is empty: any id is unknown (truthful 404 that stays in
+      // reqLog as a validation lookup, never an unhandled gap or allow-all).
+      return V("unknown roster entry");
     }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/(pause|resume|end|reopen)$/)) && req.method() === "POST") {const mm=meetingById(m[1]);if(!mm)return V("unknown meeting");const op=m[2];if(op==="pause")mm.state=3;else if(op==="resume")mm.state=1;else if(op==="end")mm.state=4;else if(op==="reopen")mm.state=1;return J(mm);}
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/close$/)) && req.method() === "POST") {const mm=meetingById(m[1]);if(!mm)return V("unknown meeting");let bb={};try{bb=req.postDataJSON()||{};}catch{}mm.state=bb.withRecord?6:7;return J(mm);}
@@ -188,6 +226,24 @@ function fixtureHandler(reqLog, unhandled) {
       return J({ state: "Active", deliveredRevision: 2, messages: m[1] === "m-one" ? 2 : m[1] === "m-old" ? 1 : 0, lastSequence: m[1] === "m-one" ? 2 : m[1] === "m-old" ? 1 : 0 });
     }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/notes$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/notes\/history$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/source-policy$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J({ blockedTypes: "", mode: "allowAll" });
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/context$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J(null);
+    }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/secretary\/requests$/))) {
       const found = meetingById(m[1]);
       if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
       return J([]);
@@ -231,7 +287,7 @@ function fixtureHandler(reqLog, unhandled) {
       store.byRecordId[rec.id] = rec;
       return J(rec);
     }
-    if ((m = p.match(/^\/api\/records\/([^/]+)\/review$/))) { const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const g = rGuarded(d); const succ = Object.values(store.byRecordId).filter((x) => x.id !== d.id && rIds(x.supersedesJson).includes(d.id)).map((x) => x.id); return J({ draft: g, approved: rIds(d.approvedJson), discarded: rIds(d.discardedJson), pending: rPending(d), notes: [], recentMessages: [], predecessors: rIds(d.supersedesJson), successors: succ, evidence: [], historyCount: 0, meetingWatermark: d.watermark }); }
+    if ((m = p.match(/^\/api\/records\/([^/]+)\/review$/))) { const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const g = rGuarded(d); const succ = Object.values(store.byRecordId).filter((x) => x.id !== d.id && rIds(x.supersedesJson).includes(d.id)).map((x) => x.id); return J({ draft: g, approved: rIds(d.approvedJson), discarded: rIds(d.discardedJson), pending: rPending(d), notes: [], recentMessages: [], predecessors: rIds(d.supersedesJson), successors: succ, evidence: [], historyCount: 0, meetingWatermark: d.watermark, stateValid: rPending(d).length > 0, stateError: rPending(d).length > 0 ? null : "No pending items." }); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/evidence$/))) { if (!store.byRecordId[m[1]]) return V("unknown record"); return J([]); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/items\/approve$/)) && req.method() === "POST") { let b = {}; try { b = req.postDataJSON() || {}; } catch {} const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const ggA = rGuard(d, b); if (ggA) return ggA; const id = b.itemId; const ids = rItems(d).map((x) => x && x.id); if (typeof id !== "string" || !id || !ids.includes(id)) return J({ error: "Unknown item id." }, 422); const ap = new Set(rIds(d.approvedJson)); const dc = new Set(rIds(d.discardedJson)); if (ap.has(id) || dc.has(id) || d.decided) return J({ error: "already decided" }, 409); ap.add(id); d.approvedJson = JSON.stringify([...ap]); d.reviewRevision = (d.reviewRevision ?? 1) + 1; d.reviewToken = "h-tok-" + d.id + "-" + d.reviewRevision; rRefresh(d); return J(rGuarded(d)); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/approve-all$/)) && req.method() === "POST") { let bA = {}; try { bA = req.postDataJSON() || {}; } catch {} const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const ggB = rGuard(d, bA); if (ggB) return ggB; const pe = rPending(d); if (!pe.length) return J({ error: "No pending items." }, 409); const ap = new Set(rIds(d.approvedJson)); pe.forEach((x) => ap.add(x)); d.approvedJson = JSON.stringify([...ap]); d.reviewRevision = (d.reviewRevision ?? 1) + 1; d.reviewToken = "h-tok-" + d.id + "-" + d.reviewRevision; rRefresh(d); return J(rGuarded(d)); }
@@ -304,6 +360,10 @@ function fixtureHandler(reqLog, unhandled) {
     if (p === "/api/spending") return J({ month: "2026-11", monthlyCapUsd: null, mode: "warn", knownSpendUsd: 0, unknownCostCalls: 0, overCap: false, enforced: false, note: "fixture" });
     if (p === "/api/commands") return J([{ command: "meetings", view: "Meetings", action: "Open a meeting" }]);
     if (p === "/api/auth/me") return J({ user: "qa-fixture", authenticated: false });
+    // Honest unsecured fixture (mirrors AuthEndpoints /api/auth/status with no
+    // accounts): authRequired false unblocks anonymous private reads; staying
+    // truthful here is what lets the boards query enable without a fake login.
+    if (p === "/api/auth/status" && req.method() === "GET") return J({ authRequired: false, hasAccounts: false, accountCount: 0, admin: "" });
     return N("no fixture");
   };
 }

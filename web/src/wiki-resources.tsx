@@ -1,5 +1,6 @@
 
 import { useEffect, useRef, useState } from "react";
+import { actionLabel, friendlyAttempt, friendlySyncState, meetingTitle, relativeTime, resourceLabel, safeRequestMessage, safeRowHelp, safeSyncHelp, wikiScopeLabel } from "./human-source-format";
 
 export type WikiApi = {
   get: <T>(u: string) => Promise<T>;
@@ -44,14 +45,14 @@ function fallbackApi(): WikiApi {
 export default function WikiResources(props: {
   boardId: string; meetingId: string;
   meetings: { id: string; title: string }[];
-  api?: WikiApi; onChanged?: () => void;
+  api?: WikiApi; onChanged?: () => void; fixture?: { items?: WikiResourceDto[] | null };
 }) {
   const { boardId, meetingId, meetings } = props;
   const api = props.api ?? fallbackApi();
-  const [items, setItems] = useState<WikiResourceDto[] | null>(null);
+  const [items, setItems] = useState<WikiResourceDto[] | null>(props.fixture?.items ?? null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(props.fixture === undefined);
   const seqRef = useRef(0);
   const boardRef = useRef(boardId);
   boardRef.current = boardId;
@@ -143,7 +144,7 @@ export default function WikiResources(props: {
       if (path === "/sync") setNotice("Manual sync finished; only the current successful sync pages are usable.");
     } catch (e) {
       if (boardRef.current !== opBoard) return;
-      setRowErrors((m) => ({ ...m, [id]: String(e) }));
+      setRowErrors((m) => ({ ...m, [id]: safeRowHelp(path, String(e)) }));
       return;
     }
     finally { if (boardRef.current === opBoard) { await refresh(); notifyChanged(); } }
@@ -152,25 +153,24 @@ export default function WikiResources(props: {
     <div className="card" aria-label="Wiki.js connector resources">
       <h3>Wiki.js 2.x connector (read-only GraphQL)</h3>
       <p>
-        Pinned protocol: pages.list + pages.single over POST /graphql with Bearer token.
-        No mutations are ever emitted. No Wiki.js 3 REST claim. Disabled by default; blank allowlist denies all;
+        Read-only connector. Imported pages enter the review inbox as pending and stay pending until explicitly approved. Disabled by default; blank allowlist denies all;
         exclusions win. Locale exact, every required tag must match. Failed or disabled resources block all cached
         connector evidence until a successful current sync; history stays inspectable. Credentials are server-held only.
       </p>
       {loading && <p role="status">Loading Wiki resources...</p>}
-      {error && <p role="alert">Request failed: {error}</p>}
+      {error && <p role="alert">{safeRequestMessage(error)}</p>}
       {notice && <p role="status">{notice}</p>}
       <div className="meetctl">
         <label>Base URL (origin only) <input aria-label="Wiki base URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://wiki.example.com" /></label>
-        <label>Description <input aria-label="Wiki description" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Team handbook" /></label>
+        <label>Description <textarea aria-label="Wiki description" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Team handbook" rows={3} /></label>
       </div>
       <div className="meetctl">
-        <label>Allowed use (required) <textarea aria-label="Wiki allowed use" value={allowedUse} onChange={(e) => setAllowedUse(e.target.value)} rows={2} placeholder="Handbook lookup for board discussion only" /></label>
+        <label>Allowed use (required) <textarea aria-label="Wiki allowed use" value={allowedUse} onChange={(e) => setAllowedUse(e.target.value)} rows={4} placeholder="Handbook lookup for board discussion only" /></label>
         <label><input type="checkbox" checked={setupUse} onChange={(e) => setSetupUse(e.target.checked)} /> Setup use (off by default)</label>
       </div>
       <div className="meetctl">
         <label>Scope <select aria-label="Wiki scope" value={scope} onChange={(e) => setScope(e.target.value)}>
-          <option value="board">board</option><option value="meeting">meeting</option>
+          <option value="board">Whole board</option><option value="meeting">One meeting</option>
         </select></label>
         {scope === "meeting" && (
           <label>Meeting <select aria-label="Wiki meeting" value={scopeMeeting || meetingId} onChange={(e) => setScopeMeeting(e.target.value)}>
@@ -180,46 +180,46 @@ export default function WikiResources(props: {
         )}
       </div>
       <div className="meetctl">
-        <label>Allowlist (exact or prefix/**, one per line) <textarea aria-label="Wiki allowlist" value={allow} onChange={(e) => setAllow(e.target.value)} rows={2} /></label>
-        <label>Exclusions (win over allowlist) <textarea aria-label="Wiki exclusions" value={excl} onChange={(e) => setExcl(e.target.value)} rows={2} /></label>
+        <label>Allowed paths (exact or prefix/**, one per line) <textarea aria-label="Wiki allowlist" value={allow} onChange={(e) => setAllow(e.target.value)} rows={4} /></label>
+        <label>Excluded paths (win over allowed paths) <textarea aria-label="Wiki exclusions" value={excl} onChange={(e) => setExcl(e.target.value)} rows={4} /></label>
       </div>
       <div className="meetctl">
-        <label>Required tags (all must match, one per line) <textarea aria-label="Wiki required tags" value={tags} onChange={(e) => setTags(e.target.value)} rows={2} /></label>
+        <label>Required tags (all must match, one per line) <textarea aria-label="Wiki required tags" value={tags} onChange={(e) => setTags(e.target.value)} rows={3} /></label>
         <label>Locale (exact; empty = any) <input aria-label="Wiki locale" value={locale} onChange={(e) => setLocale(e.target.value)} placeholder="en" /></label>
         <label>Sync interval (min, 5-1440) <input aria-label="Wiki sync interval" value={interval} onChange={(e) => setInterval(e.target.value)} inputMode="numeric" /></label>
         <label><input type="checkbox" checked={manualOnly} onChange={(e) => setManualOnly(e.target.checked)} /> Manual-only (refresh off)</label>
         <label>Credential token (never echoed; cleared after submit) <input aria-label="Wiki token" type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" /></label>
       </div>
       <div className="meetctl"><button onClick={create}>Create disabled resource</button></div>
-      {(items ?? []).map((r) => (
+      {(items ?? []).map((r, ri, rarr) => (
         <div key={r.id} data-resource-id={r.id} style={{ borderTop: "1px solid var(--line)", marginTop: 8, paddingTop: 8 }}>
-          <b>{r.baseUrl}</b> <span className="badge">{r.scope}{r.meetingId ? " - " + r.meetingId.slice(0, 8) : ""}</span>
-          <span className="badge">rev {r.configRevision}</span>
-          <span className="badge">{r.enabled ? "enabled" : "disabled"}</span>
-          <span className="badge">sync:{r.status}</span>
-          <span className="badge">attempt:{r.attemptStatus}{r.attemptStatus === "running" ? " sync running\u2026" : ""}</span>
-          <span className="badge">{r.hasCredential ? "credential set" : "no credential"}</span>
-          <span className="badge">{r.usablePages} usable pages</span>
-          <span className="badge">{r.eligibleDocs}/{r.sourceDocs} eligible</span>
-          {r.description && <span> - {r.description}</span>}
-          {r.lastError && <p role="alert">Sync note: {r.lastError.slice(0, 300)}</p>}
-          {rowErrors[r.id] && <p role="alert">Row error: {rowErrors[r.id].slice(0, 500)}</p>}
+          <b>{r.description || r.baseUrl}</b> <span className="badge">{wikiScopeLabel(r.scope, meetingTitle(meetings, r.meetingId))}</span> {r.description && r.description !== r.baseUrl ? <span className="muted">{r.baseUrl}</span> : null}
+          <span className="badge">{"Revision " + r.configRevision}</span>
+          <span className="badge">{r.enabled ? "Enabled" : "Disabled"}</span>
+          <span className="badge">{"Sync: " + friendlySyncState(r.status, r.enabled)}</span>
+          <span className="badge">{friendlyAttempt(r.attemptStatus)}</span>
+          <span className="badge">{r.hasCredential ? "Credential saved" : "No credential"}</span>
+          <span className="badge">{"Usable pages: " + r.usablePages}</span>
+          <span className="badge">{"Eligible pages: " + r.eligibleDocs + " of " + r.sourceDocs}</span>
+          
+          {r.status === "failed" && <p role="alert">{safeSyncHelp()}</p>}
+          {rowErrors[r.id] && <p role="alert">{rowErrors[r.id]}</p>}
           <div className="meetctl">
-            <button aria-label={"Enable " + r.id} onClick={() => op(r.id, "/enable")}>Enable</button>
-            <button aria-label={"Disable " + r.id} onClick={() => op(r.id, "/disable")}>Disable</button>
-            <button aria-label={"Sync " + r.id} onClick={() => op(r.id, "/sync")}>Sync now</button>
-            <button onClick={() => setEditing((m) => ({ ...m, [r.id]: !m[r.id] }))}>{editing[r.id] ? "Close editor" : "Edit resource"}</button>
-            <button aria-label={"Delete " + r.id} onClick={() => { if (confirm("Delete this Wiki resource? Cached evidence becomes unavailable; history stays.")) op(r.id, "", "del"); }}>Delete</button>
+            <button aria-label={actionLabel("Enable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/enable")}>Enable</button>
+            <button aria-label={actionLabel("Disable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/disable")}>Disable</button>
+            <button aria-label={actionLabel("Sync connector now", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/sync")}>Sync now</button>
+            <button aria-label={actionLabel(editing[r.id] ? "Close editor for" : "Edit connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => setEditing((m) => ({ ...m, [r.id]: !m[r.id] }))}>{editing[r.id] ? "Close editor" : "Edit resource"}</button>
+            <button aria-label={actionLabel("Delete connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => { if (confirm("Delete this Wiki resource? Cached evidence becomes unavailable; history stays.")) op(r.id, "", "del"); }}>Delete</button>
           </div>
           <details><summary>Rules + membership</summary>
-            <div>Allow: {(r.allowlist ?? []).join(", ") || "(blank - denies all)"}</div>
-            <div>Exclude: {(r.exclusions ?? []).join(", ") || "(none)"}</div>
-            <div>Tags: {(r.requiredTags ?? []).join(", ") || "(none)"} - Locale: {r.locale || "(any)"} - Every {r.syncIntervalMinutes} min{r.manualOnly ? " (manual-only)" : ""}</div>
-            <div>Allowed use: {r.allowedUse || "(missing - enable blocked)"} - Setup use: {r.setupUse ? "on" : "off"}</div>
-            <div>Next sync: {r.nextSyncAt ?? "(due now when enabled)"} - Last: {r.lastCompletedAt ?? "(never)"}</div>
+            <div>Allowed paths: {(r.allowlist ?? []).length ? (r.allowlist ?? []).join(", ") : "none - nothing can sync until paths are added"}</div>
+            <div>Excluded paths: {(r.exclusions ?? []).length ? (r.exclusions ?? []).join(", ") : "none"}</div>
+            <div>Required tags: {(r.requiredTags ?? []).length ? (r.requiredTags ?? []).join(", ") : "none"} - Language: {r.locale || "any"} - Sync every {r.syncIntervalMinutes} minutes{r.manualOnly ? ", manual refresh only" : ""}</div>
+            <div>Purpose: {r.allowedUse || "not set - enabling is blocked until this is set"} - Setup use: {r.setupUse ? "on" : "off"}</div>
+            <div>Next sync: {relativeTime(r.nextSyncAt) ?? "due now when enabled"} - Last finished: {relativeTime(r.lastCompletedAt) ?? "never"}</div>
           </details>
           {editing[r.id] && (
-            <EditRules key={r.id} r={r} meetings={meetings} meetingId={meetingId} onSaved={(msg) => { setNotice(msg); setEditing((m) => ({ ...m, [r.id]: false })); setRowErrors((m) => { const n = { ...m }; delete n[r.id]; return n; }); refresh(); notifyChanged(); }} onError={(e) => { setRowErrors((m) => ({ ...m, [r.id]: String(e) })); }} onRefresh={() => { refresh(); notifyChanged(); }} api={api} />
+            <EditRules key={r.id} r={r} meetings={meetings} meetingId={meetingId} onSaved={(msg) => { setNotice(msg); setEditing((m) => ({ ...m, [r.id]: false })); setRowErrors((m) => { const n = { ...m }; delete n[r.id]; return n; }); refresh(); notifyChanged(); }} onError={(e) => { setRowErrors((m) => ({ ...m, [r.id]: safeRequestMessage(String(e)) })); }} onRefresh={() => { refresh(); notifyChanged(); }} api={api} />
           )}
         </div>
       ))}
@@ -269,21 +269,21 @@ function EditRules(props: { r: WikiResourceDto; meetings: { id: string; title: s
   return (
     <div className="meetctl">
       <label>Base URL <input aria-label="Edit base URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></label>
-      <label>Description <input aria-label="Edit description" value={description} onChange={(e) => setDescription(e.target.value)} /></label>
-      <label>Allowed use <textarea aria-label="Edit allowed use" value={allowedUse} onChange={(e) => setAllowedUse(e.target.value)} rows={2} /></label>
+      <label>Description <textarea aria-label="Edit description" value={description} onChange={(e) => setDescription(e.target.value)} rows={3} /></label>
+      <label>Allowed use <textarea aria-label="Edit allowed use" value={allowedUse} onChange={(e) => setAllowedUse(e.target.value)} rows={4} /></label>
       <label><input type="checkbox" checked={setupUse} onChange={(e) => setSetupUse(e.target.checked)} /> Setup use</label>
-      <label>Scope <select aria-label="Edit scope" value={scope} onChange={(e) => setScope(e.target.value)}><option value="board">board</option><option value="meeting">meeting</option></select></label>
+      <label>Scope <select aria-label="Edit scope" value={scope} onChange={(e) => setScope(e.target.value)}><option value="board">Whole board</option><option value="meeting">One meeting</option></select></label>
       {scope === "meeting" && (<label>Meeting <select aria-label="Edit meeting" value={scopeMeeting} onChange={(e) => setScopeMeeting(e.target.value)}><option value="">Pick a meeting...</option>{meetings.map((m) => <option key={m.id} value={m.id}>{m.title}</option>)}</select></label>)}
-      <label>Allowlist <textarea aria-label="Edit allowlist" value={allow} onChange={(e) => setAllow(e.target.value)} rows={2} /></label>
-      <label>Exclusions <textarea aria-label="Edit exclusions" value={excl} onChange={(e) => setExcl(e.target.value)} rows={2} /></label>
-      <label>Required tags <textarea aria-label="Edit required tags" value={tags} onChange={(e) => setTags(e.target.value)} rows={2} /></label>
+      <label>Allowed paths <textarea aria-label="Edit allowlist" value={allow} onChange={(e) => setAllow(e.target.value)} rows={4} /></label>
+      <label>Excluded paths <textarea aria-label="Edit exclusions" value={excl} onChange={(e) => setExcl(e.target.value)} rows={4} /></label>
+      <label>Required tags <textarea aria-label="Edit required tags" value={tags} onChange={(e) => setTags(e.target.value)} rows={3} /></label>
       <label>Locale <input aria-label="Edit locale" value={locale} onChange={(e) => setLocale(e.target.value)} /></label>
       <label>Interval <input aria-label="Edit interval" value={interval} onChange={(e) => setInterval(e.target.value)} inputMode="numeric" /></label>
       <label><input type="checkbox" checked={manualOnly} onChange={(e) => setManualOnly(e.target.checked)} /> Manual-only</label>
       <label>New token <input aria-label="Edit token" type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" /></label>
       <label><input type="checkbox" checked={clearCred} onChange={(e) => setClearCred(e.target.checked)} /> Clear credential</label>
       <button onClick={save}>Save resource</button>
-      <span className="badge">rev {r.configRevision} will bump on save</span>
+      <span className="badge">{"Revision " + r.configRevision + " will increase when you save"}</span>
     </div>
   );
 }

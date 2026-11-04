@@ -72,10 +72,51 @@ async function desktopSuite(browser) {
     await check(page, "desktop boards has no horizontal overflow", () => noOverflow(page));
     await page.screenshot({ path: path.join(SHOTDIR, "shot-desktop-boards.png") });
 
-    // select Alpha board from the sidebar list
-    await page.locator(".listpanel-rows button", { hasText: "Alpha Board" }).click();
+    // select Alpha board from the sidebar list (the boards query is gated on
+    // the auth-status contract, so wait for the real row, not a fixed delay)
+    const alphaBtn = page.locator(".listpanel-rows button", { hasText: "Alpha Board" });
+    await alphaBtn.waitFor({ timeout: 15000 });
+    await alphaBtn.click();
     await check(page, "sidebar board select writes hash board", async () => (await hashOf(page)).includes("board=b-alpha"));
     await check(page, "main shows open Alpha board", () => page.locator("main").getByText("Open board: Alpha Board").isVisible());
+
+    // Backend-truth contracts the whole suite depends on (unsecured fixture:
+    // authRequired false; board capabilities manage/guest false; meeting scope
+    // manage; unknown scope stays 404; activity idle DTO shape).
+    const contracts = await page.evaluate(async () => {
+      const j = async (url, opts) => {
+        const r = await fetch(url, opts);
+        let b = null;
+        try { b = await r.json(); } catch { b = null; }
+        return { status: r.status, body: b };
+      };
+      const out = {};
+      const st = await j("/api/auth/status");
+      out.statusOk = st.status === 200 && !!st.body;
+      out.unsecured = !!st.body && st.body.authRequired === false;
+      out.statusShape = !!st.body && st.body.hasAccounts === false && st.body.accountCount === 0 && st.body.admin === "";
+      const cb = await j("/api/boards/b-alpha/capabilities");
+      out.capsBoard = cb.status === 200 && !!cb.body && cb.body.board === "manage" && cb.body.guest === false && cb.body.admin === false;
+      const cm = await j("/api/boards/b-alpha/capabilities?meetingId=m-one");
+      out.capsMeeting = cm.status === 200 && !!cm.body && cm.body.meeting === "manage";
+      const unk = await j("/api/boards/NOPE/capabilities");
+      out.capsUnknown404 = unk.status === 404;
+      const mm = await j("/api/boards/b-beta/capabilities?meetingId=m-one");
+      out.capsMismatch404 = mm.status === 404;
+      const act = await j("/api/meetings/m-one/activity");
+      out.activityShape = act.status === 200 && !!act.body && !!act.body.discussion && Array.isArray(act.body.discussion.advisors) && Array.isArray(act.body.secretary);
+      const actUnk = await j("/api/meetings/NOPE-MEET/activity");
+      out.activityUnknown404 = actUnk.status === 404;
+      return out;
+    });
+    await check(page, "auth status honest unsecured", async () => contracts.statusOk && contracts.unsecured);
+    await check(page, "auth status shape matches backend", async () => contracts.statusShape);
+    await check(page, "capabilities board manage, guest false", async () => contracts.capsBoard);
+    await check(page, "capabilities meeting manage for member meeting", async () => contracts.capsMeeting);
+    await check(page, "capabilities unknown board stays 404", async () => contracts.capsUnknown404);
+    await check(page, "capabilities mismatched meeting stays 404", async () => contracts.capsMismatch404);
+    await check(page, "meeting activity idle DTO shape", async () => contracts.activityShape);
+    await check(page, "meeting activity unknown stays 404", async () => contracts.activityUnknown404);
 
     // all 12 destinations reachable from the rail
     await rail("Meetings").click();
@@ -108,19 +149,36 @@ async function desktopSuite(browser) {
     await page.screenshot({ path: path.join(SHOTDIR, "shot-desktop-meet.png") });
     const base2 = "#/meet?board=b-alpha&meeting=m-one";
     await check(page, "discussion view exact hash (mtab default omitted)", async () => (await hashOf(page)) === base2);
-    await page.getByRole("tab", { name: "Key takeaways", exact: true }).click();
-    await check(page, "takeaways view exact hash", async () => (await hashOf(page)) === base2 + "&mtab=takeaways");
-    await page.getByRole("tab", { name: "Options", exact: true }).click();
-    await check(page, "options view exact hash", async () => (await hashOf(page)) === base2 + "&mtab=options");
-    await page.getByRole("tab", { name: "Decision", exact: true }).click();
-    await check(page, "decision view exact hash", async () => (await hashOf(page)) === base2 + "&mtab=decision");
-    await check(page, "meeting view Decision selected", () => page.getByRole("tab", { name: "Decision", exact: true }).getAttribute("aria-selected").then((v) => v === "true"));
-    await page.getByRole("tab", { name: "Board members", exact: true }).click();
-    await check(page, "members context exact hash", async () => (await hashOf(page)) === base2 + "&mtab=decision&ctab=members");
-    await page.getByRole("tab", { name: "Context", exact: true }).click();
-    await check(page, "context default omitted from hash", async () => (await hashOf(page)) === base2 + "&mtab=decision");
-    await page.getByRole("tab", { name: "Decisions", exact: true }).click();
-    await check(page, "decisions context exact hash", async () => (await hashOf(page)) === base2 + "&mtab=decision&ctab=decisions");
+    // Unified meeting messages area + settings (replaces removed mtab/ctab tabs):
+    // Key takeaways / Options / Decision + Context / Board members / Decisions
+    // now live in ONE messages area + Meeting settings dialog as human-readable text.
+    // Advanced JSON disclosure was removed for human-readable text.
+    await check(page, "meeting messages show fixture hello", () => page.getByText("Hello board").isVisible());
+    await check(page, "meeting has no obsolete tabs", async () => (await page.getByRole("tab").count()) === 0);
+    await check(page, "conversation search field present", () => page.getByLabel("Search messages").isVisible());
+    await check(page, "request advisor responses present", () => page.getByRole("button", { name: "Request advisor responses" }).isVisible());
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await check(page, "settings shows decision state", () => page.locator('section[aria-label="Meeting settings"]').getByText("Decision state").isVisible());
+    await check(page, "settings shows options on table", () => page.locator('section[aria-label="Meeting settings"]').getByText("Options on the table").isVisible());
+    await check(page, "settings shows key takeaways human-readable", () => page.locator('section[aria-label="Meeting settings"]').getByText("Key takeaways (provisional \u2014 never decisions)").isVisible());
+    await check(page, "settings shows evidence context", () => page.locator('section[aria-label="Meeting settings"]').getByText("Evidence").first().isVisible());
+    await check(page, "settings shows record context", () => page.locator('section[aria-label="Meeting settings"]').getByText("Record").first().isVisible());
+    await check(page, "settings lists participants", () => page.locator('section[aria-label="Meeting settings"]').getByText("CFO Ada").isVisible());
+    await check(page, "settings has no Advanced JSON disclosure", async () => (await page.locator('section[aria-label="Meeting settings"]').getByText("Advanced JSON").count()) === 0);
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
+    await check(page, "settings close keeps discussion hash", async () => (await hashOf(page)) === base2);
+    // legacy mtab/ctab deep link: source keeps params per parseHash/buildHash, screen stays unified
+    await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one&mtab=takeaways&ctab=members", { waitUntil: "domcontentloaded" });
+    await page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
+    await check(page, "legacy hash preserved per source parse", async () => (await hashOf(page)) === base2 + "&mtab=takeaways&ctab=members");
+    await check(page, "legacy link shows unified messages not tabs", async () => (await page.getByRole("tab").count()) === 0 && await page.getByText("Hello board").isVisible());
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await check(page, "legacy link settings holds takeaways content", () => page.locator('section[aria-label="Meeting settings"]').getByText("Key takeaways (provisional \u2014 never decisions)").isVisible());
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
+    await page.goto(BASE + base2, { waitUntil: "domcontentloaded" });
+    await page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
     await check(page, "desktop meet has no horizontal overflow", () => noOverflow(page));
 
     // OMITTED-FROM-WINDOW meeting: valid via scoped lookup, absent from the
@@ -142,8 +200,10 @@ async function desktopSuite(browser) {
     await check(page, "searched omitted meeting keeps hash", async () => (await hashOf(page)) === "#/meet?board=b-alpha&meeting=m-old");
     // a refresh that still lacks the entity must not clear it (delayed list)
     await setDelay(page, "meetings", 1500);
-    await page.locator('summary:has-text("Meeting setup")').click();
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     await page.waitForTimeout(1200);
     await page.waitForTimeout(300);
     await check(page, "omitted meeting survives in-flight refresh", async () => (await hashOf(page)).includes("meeting=m-old"));
@@ -169,9 +229,9 @@ async function desktopSuite(browser) {
     // OMITTED-FROM-WINDOW board: valid via singular lookup, outside newest-100.
     mark = reqLog.length;
     await page.goto(BASE + "#/meet?board=b-old", { waitUntil: "domcontentloaded" });
-    await page.locator(".listpanel-sub", { hasText: "Old Archive Board" }).waitFor({ timeout: 15000 });
+    await page.locator(".mobilebar .boardname").waitFor({ state: "attached", timeout: 15000 });
     await check(page, "omitted board deep link keeps hash", async () => (await hashOf(page)) === "#/meet?board=b-old");
-    await check(page, "omitted board heading uses detail, not list fallback", () => page.locator(".listpanel-sub", { hasText: "Old Archive Board" }).isVisible());
+    await check(page, "omitted board heading uses detail, not list fallback", () => page.locator(".mobilebar .boardname").textContent().then((v) => (v || "").includes("Old Archive Board")));
     await check(page, "singular board lookup fired for omitted board", async () => reqLog.slice(mark).some((u) => u === "GET /api/boards/b-old"));
     await check(page, "window boards list honestly omits b-old", async () => page.evaluate(() => fetch("/api/boards").then((r) => r.json()).then((l) => Array.isArray(l) && !l.some((x) => x.id === "b-old"))));
     await check(page, "omitted board gates open for its meetings", async () => reqLog.slice(mark).some((u) => u.includes("/api/boards/b-old/meetings")));
@@ -217,65 +277,67 @@ async function desktopSuite(browser) {
     // OMITTED-FROM-WINDOW record: valid via singular lookup for its meeting,
     // absent from that meeting's newest-50 list window.
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-old&rec=r-old", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v3/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 3/ }).waitFor({ timeout: 15000 });
     await check(page, "omitted record deep link keeps exact hash", async () => (await hashOf(page)) === "#/records?board=b-alpha&meeting=m-old&rec=r-old");
-    await check(page, "omitted record review opens from detail", () => page.getByRole("heading", { name: /Review v3/ }).isVisible());
-    await check(page, "omitted record legacy item renders", () => page.getByText("Legacy item stands").isVisible());
+    await check(page, "omitted record review opens from detail", () => page.getByRole("heading", { name: /Review version 3/ }).isVisible());
+    await check(page, "omitted record legacy item renders", () => page.getByText("Legacy item stands").first().isVisible());
 
     // record deep link + create-record + revise + compare-select lifecycle
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await check(page, "record deep link opens review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "record deep link opens review", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await setDelay(page, "records", 1200);
-    await page.getByRole("button", { name: "Prepare draft from items" }).click();
+    await page.getByRole("button", { name: "Prepare draft from the list above" }).click();
     await page.waitForFunction(() => /rec=r-new-/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
     await check(page, "prepared draft navigates to r-new", async () => /rec=r-new-/.test(await hashOf(page)));
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await check(page, "prepared draft review renders", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "prepared draft review renders", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     const draftHash = await hashOf(page);
     await page.waitForTimeout(1800);
     await check(page, "prepared draft survives delayed records refresh", async () => (await hashOf(page)) === draftHash);
-    await page.locator('summary:has-text("Advanced JSON")').first().click();
+    await check(page, "no Advanced JSON disclosure (human-readable text only)", async () => (await page.getByText("Advanced JSON").count()) === 0);
     await page.getByRole("button", { name: "Request revision (new version)" }).click();
-    await page.getByRole("heading", { name: /Review v2/ }).waitFor({ timeout: 15000 });
-    await check(page, "revision creates next version review", () => page.getByRole("heading", { name: /Review v2/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 2/ }).waitFor({ timeout: 15000 });
+    await check(page, "revision creates next version review", () => page.getByRole("heading", { name: /Review version 2/ }).isVisible());
     await check(page, "revision hash carries new rec", async () => /rec=r-new-/.test(await hashOf(page)) && (await hashOf(page)) !== draftHash);
     const revHash = await hashOf(page);
     await page.locator('select').filter({ hasText: "pick" }).first().selectOption("r-2");
-    await check(page, "compare select takes earlier version", () => page.locator("main section").getByText("Raise starter by $5").first().isVisible());
+    await check(page, "compare select takes earlier version (human-readable added)", () => page.locator("main section").getByText("Hold enterprise flat").first().isVisible());
+    await check(page, "compare shows human-readable change summary", () => page.locator("main section").getByText("changes since").first().isVisible());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-two", { waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => !window.location.hash.includes("rec="), null, { timeout: 8000 }).catch(() => {});
     await check(page, "meeting switch drops record, board+meeting kept", async () => (await hashOf(page)) === "#/records?board=b-alpha&meeting=m-two");
-    await check(page, "meeting switch clears compare selection", () => page.getByText("Review v", { exact: false }).isHidden().catch(() => true));
+    await check(page, "meeting switch clears compare selection", () => page.getByText("Review version ", { exact: false }).isHidden().catch(() => true));
+    await check(page, "meeting switch clears compare summary", async () => (await page.locator("main section").getByText("changes since").count()) === 0);
     await page.goBack();
     await check(page, "Back restores exact record hash", async () => (await hashOf(page)) === revHash);
-    await page.getByRole("heading", { name: /Review v2/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 2/ }).waitFor({ timeout: 15000 });
     await check(page, "Back restores review without compare state", async () => (await page.locator('main select').first().inputValue()) === "");
 
     // P2 response-selection: delayed record prepare revise amend A to B must preserve B selection.
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-two", { waitUntil: "domcontentloaded" });
     await section("Records").first().waitFor({ timeout: 15000 });
-    await page.getByRole("button", { name: "Prepare draft from items" }).click();
+    await page.getByRole("button", { name: "Prepare draft from the list above" }).click();
     await page.waitForFunction(() => /rec=r-new-/.test(window.location.hash), null, { timeout: 8000 }).catch(() => {});
     const destHash = await hashOf(page);
     await check(page, "delayed record setup B has own selection", async () => /rec=r-new-/.test(await hashOf(page)));
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await check(page, "delayed record setup B review renders", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "delayed record setup B review renders", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
     await setDelay(page, "record-write", 1500);
-    await page.getByRole("button", { name: "Prepare draft from items" }).click();
+    await page.getByRole("button", { name: "Prepare draft from the list above" }).click();
     await page.waitForTimeout(300);
     await page.evaluate((h) => { window.location.hash = h; }, destHash);
     await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
     await check(page, "delayed prepare switch lands on B", async () => (await hashOf(page)) === destHash);
     await page.waitForTimeout(2200);
     await check(page, "delayed prepare preserves B hash", async () => (await hashOf(page)) === destHash);
-    await check(page, "delayed prepare preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed prepare preserves B review", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await check(page, "delayed prepare preserves B content", () => page.getByText("QA draft item").first().isVisible());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await page.locator('summary:has-text("Advanced JSON")').first().click();
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "no Advanced JSON disclosure (human-readable text only)", async () => (await page.getByText("Advanced JSON").count()) === 0);
     await setDelay(page, "record-write", 1500);
     await page.getByRole("button", { name: "Request revision (new version)" }).click();
     await page.waitForTimeout(300);
@@ -283,32 +345,39 @@ async function desktopSuite(browser) {
     await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(2200);
     await check(page, "delayed revise preserves B hash", async () => (await hashOf(page)) === destHash);
-    await check(page, "delayed revise preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed revise preserves B review", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await check(page, "delayed revise preserves B actions", () => page.getByRole("button", { name: "Request revision (new version)" }).isVisible());
-    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await page.getByRole("button", { name: "Approve a" }).first().click();
-    await page.getByRole("button", { name: "Amend (name superseded IDs)" }).waitFor({ timeout: 20000 });
+    // Partial approval keeps the draft actionable under current gating
+    // (approval controls require a server-valid review with pending items;
+    // full approval would empty pending and hide Amend). r-2 carries two
+    // decisions: uncheck decision 2, approve selected (a only), b stays
+    // pending so Amend stays available. Maps the old per-item approve.
+    await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-2", { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: /Review version 2/ }).waitFor({ timeout: 15000 });
+    await page.waitForFunction(() => { const el = document.querySelector('input[aria-label="Select decision 2"]'); return el && el.checked === true; }, null, { timeout: 8000 }).catch(() => {});
+    await check(page, "decision 2 checkbox starts checked (auto-select)", async () => page.getByRole("checkbox", { name: "Select decision 2" }).isChecked());
+    await page.getByRole("checkbox", { name: "Select decision 2" }).click();
+    await check(page, "unchecking decision 2 leaves decision 1 selected", async () => page.getByRole("checkbox", { name: "Select decision 1" }).isChecked());
+    await page.getByRole("button", { name: "Approve selected" }).click();
+    await page.getByRole("button", { name: "Amend approved record" }).waitFor({ timeout: 20000 });
     await setDelay(page, "record-write", 1500);
-    await page.getByRole("button", { name: "Amend (name superseded IDs)" }).click();
+    await page.getByRole("button", { name: "Amend approved record" }).click();
     await page.waitForTimeout(300);
     await page.evaluate((h) => { window.location.hash = h; }, destHash);
     await page.waitForFunction((w) => window.location.hash === w, destHash, { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(2200);
     await check(page, "delayed amend preserves B hash", async () => (await hashOf(page)) === destHash);
-    await check(page, "delayed amend preserves B review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await check(page, "delayed amend preserves B review", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await check(page, "delayed amend preserves B content", () => page.getByText("QA draft item").first().isVisible());
 
     // message-search isolation: owned search state resets on board switch,
     // while a Back traversal restores the URL without resurrecting it
     await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
     await page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
-    await page.locator('summary:has-text("Search this conversation")').click();
-    const searchBox = page.locator('details:has-text("Search this conversation")');
-    await searchBox.getByLabel("Search messages").fill("raise");
-    await searchBox.getByRole("button", { name: "Search", exact: true }).click();
-    await page.locator('details:has-text("Search this conversation")').getByText("Raise it.").waitFor({ timeout: 8000 });
-    await check(page, "populated message search returns fixture hit", () => page.locator('details:has-text("Search this conversation")').getByText("Raise it.").isVisible());
+    await page.getByLabel("Search messages").fill("raise");
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await page.locator('ul[aria-label="Conversation search results"]').getByText("Raise it.").waitFor({ timeout: 8000 });
+    await check(page, "populated message search returns fixture hit", () => page.locator('ul[aria-label="Conversation search results"]').getByText("Raise it.").isVisible());
     await rail("Boards").click();
     await page.locator(".listpanel-rows button", { hasText: "Beta Board" }).click();
     await check(page, "board switch drops meeting from hash", async () => { const h = await hashOf(page); return h.includes("board=b-beta") && !h.includes("meeting="); });
@@ -318,7 +387,7 @@ async function desktopSuite(browser) {
     await page.locator("ol.agenda button", { hasText: "Beta kickoff" }).click();
     await check(page, "beta meeting select writes hash", async () => (await hashOf(page)) === "#/meet?board=b-beta&meeting=m-three");
     await check(page, "board switch clears message search text", () => page.getByLabel("Search messages").inputValue().then((v) => v === ""));
-    await check(page, "board switch clears message search hits", () => page.locator('details:has-text("Search this conversation")').getByText("Raise it.").isHidden());
+    await check(page, "board switch clears message search hits", () => page.locator('ul[aria-label="Conversation search results"]').isHidden());
     await page.goBack();
     await waitHash(page, "#/meet?board=b-beta");
     await page.goBack();
@@ -337,8 +406,8 @@ async function desktopSuite(browser) {
     await section("Resources and Inbox").first().waitFor();
     await page.goBack();
     await check(page, "Back restores exact decision+decisions hash", async () => (await hashOf(page)) === "#/meet?board=b-alpha&meeting=m-one&mtab=decision&ctab=decisions");
-    await check(page, "Back restores decision tab selected", () => page.getByRole("tab", { name: "Decision", exact: true }).getAttribute("aria-selected").then((v) => v === "true"));
-    await check(page, "Back restores decisions context selected", () => page.getByRole("tab", { name: "Decisions", exact: true }).getAttribute("aria-selected").then((v) => v === "true"));
+    await check(page, "Back restores unified messages not tabs", async () => (await page.getByRole("tab").count()) === 0 && await page.getByText("Hello board").isVisible());
+    await check(page, "Back restores meeting heading", () => page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).isVisible());
     await page.goForward();
     await section("Resources and Inbox").first().waitFor({ timeout: 8000 });
     await check(page, "Forward restores Sources", () => section("Resources and Inbox").first().isVisible());
@@ -350,8 +419,8 @@ async function desktopSuite(browser) {
     await page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
     await check(page, "reload keeps meeting heading", () => page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).isVisible());
     await check(page, "reload keeps hash inc mtab+ctab", async () => (await hashOf(page)) === "#/meet?board=b-alpha&meeting=m-one&mtab=takeaways&ctab=members");
-    await check(page, "reload keeps meeting tab selected", () => page.getByRole("tab", { name: "Key takeaways" }).getAttribute("aria-selected").then((v) => v === "true"));
-    await check(page, "reload keeps context tab selected", () => page.getByRole("tab", { name: "Board members" }).getAttribute("aria-selected").then((v) => v === "true"));
+    await check(page, "reload keeps unified messages not tabs", async () => (await page.getByRole("tab").count()) === 0 && await page.getByText("Hello board").isVisible());
+    await check(page, "reload keeps current meeting retention", () => page.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).isVisible());
 
     // copied deep link in a fresh page (same context keeps fixtures)
     const page2 = await ctx.newPage();
@@ -359,8 +428,8 @@ async function desktopSuite(browser) {
     page2.on("pageerror", (e) => pageErrs.push("[p2] " + String(e).slice(0, 200)));
     await page2.goto(BASE + "#/meet?board=b-alpha&meeting=m-one&mtab=options&ctab=decisions", { waitUntil: "domcontentloaded" });
     await page2.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
-    await check(page2, "deep link restores meeting + options view", () => page2.getByRole("tab", { name: "Options" }).getAttribute("aria-selected").then((v) => v === "true"));
-    await check(page2, "deep link restores decisions context", () => page2.getByRole("tab", { name: "Decisions" }).getAttribute("aria-selected").then((v) => v === "true"));
+    await check(page2, "deep link restores unified messages", async () => (await page2.getByRole("tab").count()) === 0 && await page2.getByText("Hello board").isVisible());
+    await check(page2, "deep link keeps current meeting heading", () => page2.locator('section[aria-label="Meetings and conversation"] h2', { hasText: "Pricing move QA session" }).isVisible());
     await page2.close();
 
     // Activity guard: usage waits for a VALID board; invalid boards never fire it
@@ -374,31 +443,41 @@ async function desktopSuite(browser) {
     await check(page, "activity with bogus board lands on Boards", async () => (await hashOf(page)) === "#/boards");
     await check(page, "activity with bogus board never fires usage", async () => !reqLog.slice(mark).some((u) => u.includes("/api/usage") && u.includes("NOPE")));
 
-    // board-owned isolation: advisor chat selection + history reset on switch
+    // board-owned isolation: portrait advisor pick + per-board advisor lists.
+    // The old board-scoped direct-chat card ("Chat directly with an advisor")
+    // no longer exists: private advisor chat now lives on the roster tab
+    // (RosterChatPanel, "Chat with this advisor", roster-scoped by design and
+    // explicitly not joined to any board). The current board-owned selection
+    // is the Portraits "Board advisor" pick (selAdv, cleared by
+    // resetBoardOwnedState on board switch) plus the per-board advisor lists.
     await page.goto(BASE + "#/advisors?board=b-alpha", { waitUntil: "domcontentloaded" });
     await page.locator('section[aria-label="This Board\'s Advisors"] h2').waitFor({ timeout: 15000 });
     await check(page, "populated advisors list shows two seats", () => page.locator('section[aria-label="This Board\'s Advisors"] h2', { hasText: "2/10" }).isVisible());
-    const chatCard = page.locator('.card:has(h3:text("Chat directly with an advisor"))');
-    await chatCard.locator("select").selectOption("a-1");
-    await chatCard.getByPlaceholder("Ask this advisor directly").fill("hello fixture");
-    await chatCard.getByPlaceholder("Ask this advisor directly").press("Enter");
-    await page.getByText("Fixture reply from CFO Ada: noted.").waitFor({ timeout: 8000 });
-    await check(page, "advisor test chat returns fixture reply", () => page.getByText("Fixture reply from CFO Ada: noted.").isVisible());
+    await check(page, "alpha advisor present with human status", () => page.locator('section[aria-label="This Board\'s Advisors"]').getByText("CFO Ada").first().isVisible());
+    await check(page, "no board-scoped direct chat card (roster-scoped now)", async () => (await page.getByText("Chat directly with an advisor").count()) === 0);
+    await page.locator('section[aria-label="This Board\'s Advisors"] div.card:has(h3:text("Portraits")) select').selectOption("a-1");
+    await page.waitForFunction(() => { const el = document.querySelector('section[aria-label="This Board\'s Advisors"] select'); return el && el.value === "a-1"; }, null, { timeout: 8000 }).catch(() => {});
+    const pickSeen = await page.locator('section[aria-label="This Board\'s Advisors"] div.card:has(h3:text("Portraits")) select').inputValue().catch(() => "<unreadable>");
+    await check(page, `portrait pick selects a-1 (saw ${pickSeen})`, async () => pickSeen === "a-1");
     await page.goto(BASE + "#/boards?board=b-beta", { waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => window.location.hash === "#/boards?board=b-beta", null, { timeout: 8000 }).catch(() => {});
     await page.goto(BASE + "#/advisors?board=b-beta", { waitUntil: "domcontentloaded" });
     await page.locator('section[aria-label="This Board\'s Advisors"] h2').waitFor({ timeout: 15000 });
-    await check(page, "board switch clears advisor chat selection", () => page.locator('.card:has(h3:text("Chat directly with an advisor")) select').inputValue().then((v) => v === ""));
-    await check(page, "board switch clears advisor chat history", () => page.getByText("Fixture reply from CFO Ada: noted.").isHidden());
+    await check(page, "beta advisors list is its own (empty seats)", () => page.locator('section[aria-label="This Board\'s Advisors"] h2', { hasText: "0/10" }).isVisible());
+    await check(page, "alpha advisor not shown on beta board", () => page.locator('section[aria-label="This Board\'s Advisors"]').getByText("CFO Ada").isHidden());
+    await page.waitForFunction(() => { const el = document.querySelector('section[aria-label="This Board\'s Advisors"] select'); return el && el.value === ""; }, null, { timeout: 8000 }).catch(() => {});
+    const betaSeen = await page.locator('section[aria-label="This Board\'s Advisors"] div.card:has(h3:text("Portraits")) select').inputValue().catch(() => "<unreadable>");
+    await check(page, `board switch clears portrait advisor pick (saw ${betaSeen})`, async () => betaSeen === "");
     await page.goBack();
     await page.goBack();
     await page.locator('section[aria-label="This Board\'s Advisors"] h2').waitFor({ timeout: 15000 });
-    await check(page, "Back restores advisors URL without chat state", async () => (await hashOf(page)) === "#/advisors?board=b-alpha");
-    await check(page, "Back does not resurrect chat selection", () => page.locator('.card:has(h3:text("Chat directly with an advisor")) select').inputValue().then((v) => v === ""));
-
+    await check(page, "Back restores advisors URL without pick state", async () => (await hashOf(page)) === "#/advisors?board=b-alpha");
+    await page.waitForFunction(() => { const el = document.querySelector('section[aria-label="This Board\'s Advisors"] select'); return el && el.value === ""; }, null, { timeout: 8000 }).catch(() => {});
+    const backSeen = await page.locator('section[aria-label="This Board\'s Advisors"] div.card:has(h3:text("Portraits")) select').inputValue().catch(() => "<unreadable>");
+    await check(page, `Back does not resurrect portrait pick (saw ${backSeen})`, async () => backSeen === "");
     // board switch drops stale meeting/record (existing behavior, kept)
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
     await rail("Boards").click();
     await page.locator(".listpanel-rows button", { hasText: "Beta Board" }).click();
     await check(page, "board switch drops meeting from hash", async () => { const h = await hashOf(page); return h.includes("board=b-beta") && !h.includes("meeting="); });
@@ -426,7 +505,10 @@ async function desktopSuite(browser) {
     await check(page, "sidebar marks active Alpha row", () => page.locator(".listpanel-rows button", { hasText: "Alpha Board" }).getAttribute("class").then((c) => (c || "").includes("active")));
     await page.locator("main section .card button", { hasText: "Beta Board" }).first().click();
     await check(page, "main board card switches board", async () => (await hashOf(page)).includes("board=b-beta"));
-    await check(page, "sidebar meeting list follows main selection", () => page.locator(".listpanel-rows button", { hasText: "Beta kickoff" }).isVisible());
+    // Main board cards navigate to the meet tab in the current UI (no sidebar
+    // there): the agenda carries the per-board meetings instead.
+    await check(page, "meet agenda follows main selection", () => page.locator("ol.agenda button", { hasText: "Beta kickoff" }).isVisible());
+    await check(page, "old board meeting absent from new agenda", () => page.locator("ol.agenda button", { hasText: "Pricing move QA session" }).isHidden());
 
     // logo returns to Boards and preserves wizard draft
     await rail("Boards").click();
@@ -470,27 +552,35 @@ async function desktopSuite(browser) {
 
     await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
     await page.locator("section[aria-label=\"Meetings and conversation\"] h2").waitFor({ timeout: 15000 });
-    await page.locator("summary:has-text(\"Meeting setup\")").click();
-    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Updated brief for QA run enables discussion");
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").fill("Updated brief for QA run enables discussion");
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "meeting brief save updates detail", () => page.locator("section[aria-label=\"Meetings and conversation\"] div.meet-head").getByText("Updated brief for QA run enables discussion").isVisible());
+    await check(page, "meeting brief save updates detail", () => page.locator("section[aria-label=\"Meetings and conversation\"] div.conv-head").getByText("Updated brief for QA run enables discussion").isVisible());
     await check(page, "saved brief enables Run", () => page.getByRole("button", { name: "Request advisor responses" }).isEnabled());
-    await page.getByRole("button", { name: "Pause" }).click();
+    await page.getByRole("button", { name: "Pause meeting" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "pause enables Resume", () => page.getByRole("button", { name: "Resume" }).isEnabled());
-    await page.getByRole("button", { name: "Resume" }).click();
+    await check(page, "pause enables Resume", () => page.getByRole("button", { name: "Resume meeting" }).isEnabled());
+    await page.getByRole("button", { name: "Resume meeting" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "resume restores Pause", () => page.getByRole("button", { name: "Pause" }).isEnabled());
-    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Should we raise the starter tier?");
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await check(page, "resume restores Pause", () => page.getByRole("button", { name: "Pause meeting" }).isEnabled());
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").fill("Should we raise the starter tier?");
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
     await page.waitForTimeout(1200);
-    await page.getByRole("button", { name: "Close without publication" }).click();
+    // Close/reopen live in the settings dialog in the current UI: the dialog
+    // stays open across them (header Pause/Resume already proved the save),
+    // and Done closes it at the end so later blocks start clean.
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Close without publication" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "close disables Pause", () => page.getByRole("button", { name: "Pause" }).isDisabled());
-    await page.getByRole("button", { name: "Reopen (history intact)" }).click();
+    await check(page, "close disables Pause", () => page.getByRole("button", { name: "Pause meeting" }).isDisabled());
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Reopen (history intact)" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "reopen restores Pause", () => page.getByRole("button", { name: "Pause" }).isEnabled());
+    await check(page, "reopen restores Pause", () => page.getByRole("button", { name: "Pause meeting" }).isEnabled());
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     await page.goto(BASE + "#/boards?board=b-alpha", { waitUntil: "domcontentloaded" });
     await section("Boards").first().waitFor({ timeout: 8000 });
     await section("Boards").getByLabel("Board name").fill("Alpha Board RENAMED");
@@ -507,30 +597,38 @@ async function desktopSuite(browser) {
     // Meeting case: save A (m-one) with delay, switch to B (m-two) before response.
     await page.goto(BASE + "#/meet?board=b-alpha&meeting=m-one", { waitUntil: "domcontentloaded" });
     await page.locator("section[aria-label=\"Meetings and conversation\"] h2", { hasText: "Pricing move QA session" }).waitFor({ timeout: 15000 });
-    await page.locator("summary:has-text(\"Meeting setup\")").click();
-    const briefBox = page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)");
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    const briefBox = page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief");
     await briefBox.fill("A-DELAYED-P1-BOARD-CHECK");
     await setDelay(page, "save-meeting", 1500);
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     // immediate user switch to B before A response returns (push semantics preserved)
     await page.locator("ol.agenda button", { hasText: "Second session notes" }).click();
     await page.waitForFunction(() => window.location.hash.includes("meeting=m-two"), null, { timeout: 8000 }).catch(() => {});
     await check(page, "delayed save switch lands on B", async () => (await hashOf(page)).includes("meeting=m-two"));
     await page.waitForTimeout(2200);
-    await check(page, "B form untouched by A delayed response", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => !v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
-    // second save on B must not carry A data
-    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Follow-up notes");
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await check(page, "B form untouched by A delayed response", () => page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").inputValue().then((v) => !v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
+    // second save on B must not carry A data (dialog owns the form now)
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").fill("Follow-up notes");
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     await page.waitForTimeout(1200);
-    await check(page, "B second save keeps B data", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => v.includes("Follow-up notes") && !v.includes("A-DELAYED")).catch(() => false));
+    await check(page, "B second save keeps B data", () => page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").inputValue().then((v) => v.includes("Follow-up notes") && !v.includes("A-DELAYED")).catch(() => false));
     // switch back to A: A must carry its delayed update
     await page.locator("ol.agenda button", { hasText: "Pricing move QA session" }).click();
     await page.waitForFunction(() => window.location.hash.includes("meeting=m-one"), null, { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(800);
-    await check(page, "A updated by its delayed save", () => page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").inputValue().then((v) => v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
+    await check(page, "A updated by its delayed save", () => page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").inputValue().then((v) => v.includes("A-DELAYED-P1-BOARD-CHECK")).catch(() => false));
     // restore A brief for later suites
-    await page.locator("section[aria-label=\"Meetings and conversation\"]").getByLabel("Brief (a meeting needs a brief before discussion)").fill("Should we raise the starter tier?");
-    await page.getByRole("button", { name: "Save title + brief" }).click();
+    await page.getByRole("button", { name: "Meeting settings" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 8000 });
+    await page.locator('section[aria-label="Meeting settings"]').getByLabel("Meeting brief").fill("Should we raise the starter tier?");
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Save title + brief" }).click();
+    await page.locator('section[aria-label="Meeting settings"]').getByRole("button", { name: "Done" }).click();
     await page.waitForTimeout(1200);
 
     // P1 board case: save Alpha with delay, switch to Beta before response.
@@ -590,29 +688,29 @@ async function desktopSuite(browser) {
 
     // Genuine SPA cached record -> wrong parent (no reload): no review/actions while unverified.
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await check(page, "SPA setup review visible before switch", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "SPA setup review visible before switch", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
     await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
     await page.waitForFunction(() => !window.location.hash.includes("rec="), null, { timeout: 8000 }).catch(() => {});
     await check(page, "SPA wrong-parent drops rec without reload", async () => !(await hashOf(page)).includes("rec="));
-    await check(page, "SPA wrong-parent hides review without reload", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "SPA wrong-parent hides review without reload", () => page.getByRole("heading", { name: /Review version / }).isHidden());
     await check(page, "SPA wrong-parent hides approve action", () => page.getByRole("button", { name: /Approve/ }).isHidden().catch(() => true));
     // SPA parent pending: delay meeting-detail, switch meeting, assert no review while pending
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
     await setDelay(page, "meeting-detail", 1500);
     await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
     await page.waitForTimeout(400);
-    await check(page, "SPA pending parent hides review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "SPA pending parent hides review", () => page.getByRole("heading", { name: /Review version / }).isHidden());
     await page.waitForTimeout(1800);
     await check(page, "SPA pending resolves without rec (still wrong parent)", async () => !(await hashOf(page)).includes("rec="));
     // SPA parent error: inject 500 for meeting-detail, switch, assert no review/actions
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
     await page.evaluate(() => fetch("/api/__qa/fail?key=meeting-detail&status=500").then((r) => r.json()));
     await page.evaluate(() => { window.location.hash = "#/records?board=b-alpha&meeting=m-two&rec=r-1"; });
     await page.waitForTimeout(900);
-    await check(page, "SPA error parent hides review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "SPA error parent hides review", () => page.getByRole("heading", { name: /Review version / }).isHidden());
     await check(page, "SPA error parent hides revise action", () => page.getByRole("button", { name: /Request revision/ }).isHidden().catch(() => true));
     await page.reload({ waitUntil: "domcontentloaded" });
     await section("Records").first().waitFor({ timeout: 15000 }).catch(() => {});
@@ -710,17 +808,17 @@ async function desktopSuite(browser) {
     await section("Records").first().waitFor({ timeout: 15000 });
     await page.waitForFunction(() => !window.location.hash.includes("rec="), null, { timeout: 8000 }).catch(() => {});
     await check(page, "wrong-parent cached record drops rec", async () => !(await hashOf(page)).includes("rec="));
-    await check(page, "wrong-parent hides review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "wrong-parent hides review", () => page.getByRole("heading", { name: /Review version / }).isHidden());
     await page.goto(BASE + "#/records?board=b-alpha&meeting=m-one&rec=r-1", { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
     await page.evaluate(() => fetch("/api/__qa/fail?key=m-one&status=500").then((r) => r.json()));
     await page.reload({ waitUntil: "domcontentloaded" });
     await section("Records").first().waitFor({ timeout: 15000 });
     await page.waitForTimeout(800);
-    await check(page, "transport-error hides cached review", () => page.getByRole("heading", { name: /Review v/ }).isHidden());
+    await check(page, "transport-error hides cached review", () => page.getByRole("heading", { name: /Review version / }).isHidden());
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: /Review v1/ }).waitFor({ timeout: 15000 });
-    await check(page, "recovered parent restores review", () => page.getByRole("heading", { name: /Review v1/ }).isVisible());
+    await page.getByRole("heading", { name: /Review version 1/ }).waitFor({ timeout: 15000 });
+    await check(page, "recovered parent restores review", () => page.getByRole("heading", { name: /Review version 1/ }).isVisible());
 
     await page.goto(BASE + "#/roster?board=b-alpha", { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(500);
@@ -734,6 +832,21 @@ async function desktopSuite(browser) {
     await page.getByRole("button", { name: "New board", exact: true }).first().click();
     await page.locator("section[aria-label=\"New-board wizard\"]").waitFor({ timeout: 8000 });
     await check(page, "second New board is fresh Step1", () => page.getByPlaceholder("e.g. Pricing review").inputValue().then((v) => v === ""));
+    // Defect recovery (bundle keeps the completed wizard on Step 4 with the
+    // just-created board instead of a fresh Step 1; reported separately and
+    // the freshness failure above is preserved). Walk back with the wizard's
+    // own Back buttons so the creation + distinctness coverage below still
+    // runs; Step-1 fills overwrite stale fields, an extra seat is harmless
+    // (still <= 10). If recovery is impossible the flow fails honestly below.
+    for (let wb = 0; wb < 3; wb++) {
+      const wizSec = page.locator("section[aria-label=\"New-board wizard\"]");
+      if (await wizSec.getByPlaceholder("e.g. Pricing review").count() > 0) break;
+      const backBtn = wizSec.getByRole("button", { name: "Back", exact: true });
+      if (await backBtn.count() === 0) break;
+      await backBtn.first().click();
+      await page.waitForTimeout(300);
+    }
+    await check(page, "wizard recovered to Step 1 via Back", () => page.getByPlaceholder("e.g. Pricing review").isVisible());
     await page.getByPlaceholder("e.g. Pricing review").fill("QA Second Board");
     await page.getByPlaceholder("What should the board help you decide?").fill("Second mission decides onboarding");
     await page.locator("section[aria-label=\"New-board wizard\"]").getByRole("button", { name: "Continue" }).first().click();
@@ -985,3 +1098,4 @@ async function liveSmoke(browser) {
   // Never close the user's browser; our contexts were closed per-suite.
   process.exit(failed ? 1 : 0);
 })();
+

@@ -1,0 +1,35 @@
+/* CreateAdvisor — simplified character-based creation/editor.
+   Uses global theme tokens so light/dark both pass contrast. */
+.cc-flow { max-width: 56rem; }
+.cc-lede { margin-top: 0; color: var(--muted); }
+.cc-step { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 0.9rem 1rem 1rem; margin: 0 0 1rem; }
+.cc-step > legend { padding: 0 0.4rem; font-weight: 650; }
+.cc-grid { display: grid; gap: 0.6rem; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); }
+.cc-field { display: block; font-weight: 600; }
+.cc-field > span { display: block; margin-bottom: 0.25rem; }
+.cc-hint { display: block; font-weight: 400; color: var(--muted); font-size: 0.82rem; }
+.cc-field input { width: 100%; }
+.cc-area { width: 100%; min-height: 9rem; resize: vertical; line-height: 1.55; }
+.cc-area-short { width: 100%; min-height: 4.5rem; resize: vertical; line-height: 1.55; }
+.cc-links input { width: 100%; margin-top: 0.35rem; }
+.cc-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.8rem; align-items: center; }
+.cc-status { margin-top: 0.8rem; padding: 0.6rem 0.75rem; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--panel-2); }
+.cc-status strong { display: block; margin-bottom: 0.15rem; }
+.cc-err { margin-top: 0.6rem; color: var(--danger); }
+.cc-sources { margin: 0.5rem 0 0; padding-left: 1.1rem; }
+.cc-sources li { margin-bottom: 0.5rem; }
+.cc-sources .cc-excerpt { color: var(--muted); font-size: 0.88rem; }
+.cc-research-detail { margin-top: 0.7rem; border: 1px solid var(--line); border-radius: var(--radius-s); padding: 0.55rem 0.75rem; }
+.cc-research-detail > summary { cursor: pointer; font-weight: 650; }
+.cc-fictional { border-left: 3px solid var(--accent); padding-left: 0.6rem; color: var(--muted); font-size: 0.9rem; }
+@media (max-width: 40rem) {
+  .cc-step { padding: 0.7rem 0.7rem 0.8rem; }
+}
+.cc-field input:focus-visible, .cc-area:focus-visible, .cc-area-short:focus-visible,
+.cc-research-detail > summary:focus-visible, .cc-actions button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cc-flow * { transition: none; }
+}
+.cc-count { font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; }

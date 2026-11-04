@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { contextSummary, currentLabel, historyText, indexLabel, meetingTitle, originLabel, promotedGroupLabel, promotedLabel, recallExcerpt, recallKindLabel, recallTitle, reviewLabel, safeIndexHelp, safeRequestMessage, scopeLabel, sourceActionLabel, usableLabel, visibilityLabel } from "./human-source-format";
 
 type GovSource = {
   id: string; boardId: string; fileName: string; contentHash: string; version: number;
   approved: boolean; excluded: boolean; reviewState: string; origin: string;
   familyKey: string; indexState: string; indexGeneration: number; indexError: string;
   indexCompletedAt?: string | null; sectionCount: number; isHead: boolean;
-  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null;
+  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null; policyAllows?: boolean;
   createdAt: string;
 };
 type ReviewGroup = {
@@ -50,8 +51,20 @@ const post = <T,>(actAs: string, u: string, b?: unknown): Promise<T> =>
 const putPolicy = (actAs: string, bid: string, blockedTypes: string, mode: string) =>
   fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; transport?: GovTransport }) {
-  const { boardId, meetingId, meetings, actAs, readOnly, canManage } = props;
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; canReadBoard?: boolean; allowedMeetings?: string[]; transport?: GovTransport; fixture?: { groups?: ReviewGroup[] | null; policy?: { blockedTypes: string; mode: string } | null; ctx?: unknown; recallHits?: { kind: string; ref: string; text: string; score: number }[]; hist?: Record<string, HistEvent[]>; secs?: Record<string, SecResp | null> } }) {
+  const { boardId, meetingId, meetings, actAs, readOnly, canManage, canReadBoard, allowedMeetings } = props;
+  const boardReadable = canReadBoard === true || canManage === true;
+  const allowedSet = new Set((allowedMeetings ?? []).map((m) => (m ?? "").toLowerCase()));
+  function canDownloadRow(s: GovSource): { ok: boolean; why: string } {
+    if (boardReadable) return { ok: true, why: "" };
+    if ((s as any).policyAllows === false) return { ok: false, why: "Blocked by current board policy (wiki-only or extension block)." };
+    const approved = (s.reviewState ?? "").toLowerCase() === "approved" && !s.excluded;
+    if (!approved) return { ok: false, why: "Available after approval (meeting guests see approved originals only)." };
+    if ((s.scope ?? "board") !== "meeting") return { ok: false, why: "Board originals are available to board readers; meeting guests see metadata only." };
+    const mid = (s.meetingId ?? "").toLowerCase();
+    if (!mid || !allowedSet.has(mid)) return { ok: false, why: "Not in your meeting scope." };
+    return { ok: true, why: "" };
+  }
   const canWrite = !readOnly;
   const canManagePolicy = canManage === true;
   // Host transport carries the canonical identity/epoch and the central 401
@@ -76,18 +89,18 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
     origin: () => ({ epoch: 0, token: "", user: (actAs || "").trim() || "owner" }),
     stale: () => false,
   };
-  const [groups, setGroups] = useState<ReviewGroup[] | null>(null);
-  const [policy, setPolicy] = useState<{ blockedTypes: string; mode: string } | null>(null);
-  const [blocked, setBlocked] = useState("");
-  const [mode, setMode] = useState("allowAll");
-  const [loading, setLoading] = useState(true);
+  const [groups, setGroups] = useState<ReviewGroup[] | null>(props.fixture?.groups ?? null);
+  const [policy, setPolicy] = useState<{ blockedTypes: string; mode: string } | null>(props.fixture?.policy ?? null);
+  const [blocked, setBlocked] = useState(props.fixture?.policy?.blockedTypes ?? "");
+  const [mode, setMode] = useState(props.fixture?.policy?.mode ?? "allowAll");
+  const [loading, setLoading] = useState(props.fixture === undefined);
   const [conflict, setConflict] = useState("");
   const [notice, setNotice] = useState("");
-  const [hist, setHist] = useState<Record<string, HistEvent[]>>({});
-  const [secs, setSecs] = useState<Record<string, SecResp | null>>({});
-  const [ctx, setCtx] = useState<unknown>(null);
+  const [hist, setHist] = useState<Record<string, HistEvent[]>>(props.fixture?.hist ?? {});
+  const [secs, setSecs] = useState<Record<string, SecResp | null>>(props.fixture?.secs ?? {});
+  const [ctx, setCtx] = useState<unknown>(props.fixture?.ctx ?? null);
   const [recallQ, setRecallQ] = useState("");
-  const [recallHits, setRecallHits] = useState<{ kind: string; ref: string; text: string; score: number }[]>([]);
+  const [recallHits, setRecallHits] = useState<{ kind: string; ref: string; text: string; score: number }[]>(props.fixture?.recallHits ?? []);
   const [uploadScope, setUploadScope] = useState("board");
   // File-input key: selecting a file bumps the key so the control resets.
   // Picking the SAME file again after choosing a meeting reliably fires a
@@ -210,7 +223,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
     <div>
       <p>Uploads enter an approval inbox as pending. Approval is explicit; new versions never auto-approve. Excluding or revoking the current version produces no fallback to an older version. Rejecting and excluding are distinct. Each version&apos;s board/meeting scope is immutable: moving a file means uploading it again in the destination scope as a new pending version. Policy changes apply immediately and pause affected meetings.</p>
       {loading && <p role="status">Loading sources…</p>}
-      {!loading && conflict && <p role="alert">Request failed: {conflict}</p>}
+      {!loading && conflict && <p role="alert">{safeRequestMessage(conflict)}</p>}
       {notice && <p role="status">{notice}</p>}
       {canManagePolicy && (<div className="card">
         <h3>Source policy</h3>
@@ -221,58 +234,61 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
         </select></label>
         <label> Blocked file types (comma-separated extensions) <input value={blocked} onChange={(e) => setBlocked(e.target.value)} placeholder="exe, zip" /></label>
         <div className="meetctl"><button onClick={savePolicy}>Save policy</button>
-        {policy && <span className="badge">current: {policy.mode} · blocked: {policy.blockedTypes || "none"}</span>}</div>
-        {ctx !== null && <details><summary>Index status</summary><pre>{JSON.stringify(ctx, null, 2)}</pre></details>}
+        {policy && <span className="badge">{"Policy: " + (policy.mode === "wikiOnly" ? "Wiki connector only" : "Uploads allowed with blocked types") + (policy.blockedTypes ? " - blocked: " + policy.blockedTypes : "")}</span>}</div>
+        <p role="status">{contextSummary(ctx)}</p>
       </div>)}
       {!loading && !conflict && flat.length === 0 && <p role="status">No sources yet — upload a file to start review.</p>}
       <p role="status" className="source-summary">
-        <span className="badge">{pending} pending</span> <span className="badge ok">{approvedCur} current-approved</span> <span className="badge">{rejected} rejected</span> <span className="badge">{excluded} excluded</span> <span className="badge">{failed} index-failed</span>
+        <span className="badge">{pending} waiting for review</span> <span className="badge ok">{approvedCur} current and approved</span> <span className="badge">{rejected} not kept</span> <span className="badge">{excluded} temporarily hidden</span> <span className="badge">{failed} need attention</span>
       </p>
       {canWrite && (<div className="meetctl">
         <label>Upload file <input key={fileKey} type="file" onChange={(e) => { const f = e.target.files?.[0]; setFileKey((k) => k + 1); uploadFile(f); }} /></label>
-        <label>Scope <select aria-label="Upload scope" value={uploadScope} onChange={(e) => setUploadScope(e.target.value)}><option value="board">board</option><option value="meeting">meeting</option></select></label>
+        <label>Scope <select aria-label="Upload scope" value={uploadScope} onChange={(e) => setUploadScope(e.target.value)}><option value="board">Whole board</option><option value="meeting">One meeting</option></select></label>
         {uploadScope === "meeting" && (
           <label>Meeting <select aria-label="Upload meeting" value={effUploadMeeting} onChange={(e) => setUploadMeetingId(e.target.value)}>
             <option value="">Pick a meeting…</option>
-            {meetings.map((m) => <option key={m.id} value={m.id}>{m.title} · {m.id.slice(0, 8)}</option>)}
+            {meetings.map((m) => <option key={m.id} value={m.id}>{m.title}</option>)}
           </select></label>
         )}
       </div>)}
-      {(groups ?? []).map((g) => (
+      {(groups ?? []).map((g, gi, garr) => (
         <div className="card" key={g.familyKey}>
-          <b>{g.fileName}</b> <span className="badge">{g.scope}{g.meetingId ? " · " + g.meetingId.slice(0, 8) : ""} · {g.origin}</span>
-          {g.hasCurrent ? <span className="badge ok">current: {g.versions.find((v) => v.isCurrent)?.version ? "v" + g.versions.find((v) => v.isCurrent)!.version : ""}</span> : <span className="badge">No current version (head excluded/revoked — no fallback)</span>}
-          {g.versions.map((s) => (
+          <b>{g.fileName}</b> <span className="badge">{scopeLabel(g.scope, meetingTitle(meetings, g.meetingId))}</span> <span className="badge">{originLabel(g.origin)}</span>
+          {g.hasCurrent ? <span className="badge ok">{currentLabel(true, g.versions.find((v) => v.isCurrent)?.version ?? null)}</span> : <span className="badge">{currentLabel(false)}</span>}
+          {(() => { const head = g.versions.find((v) => v.isHead); const label = promotedGroupLabel(head ? head.version : null); return label ? <span className="badge">{label}</span> : null; })()}
+          {g.versions.map((s, vi, varr) => (
             <div key={s.id} style={{ borderTop: "1px solid var(--line)", marginTop: 8, paddingTop: 8 }}>
-              <span className="badge">v{s.version}</span> <span className="badge">{s.reviewState}</span>
-              {s.excluded && <span className="badge">excluded (temporary)</span>}
-              <span className="badge">index:{s.indexState} g{s.indexGeneration}</span>
-              {s.isCurrent && <span className="badge ok">CURRENT</span>}
-              {s.isHead && <span className="badge">head</span>}
-              {s.indexState === "failed" && <span className="badge">evidence blocked{s.indexError ? ": " + s.indexError.slice(0, 120) : ""}</span>}
+              <span className="badge">{"Version " + s.version}</span> <span className="badge">{reviewLabel(s.reviewState, s.excluded).label}</span> <span className="badge">{visibilityLabel(s.excluded).label}</span>
+              {promotedLabel(s.isHead) ? <span className="badge">{promotedLabel(s.isHead)}</span> : null}
+              {usableLabel(s.isCurrent) ? <span className="badge ok">{usableLabel(s.isCurrent)}</span> : null}
+
+              <span className="badge">{indexLabel(s.indexState, s.isCurrent)}</span>
+
+
+              {s.indexState === "failed" && <span className="badge">Search unavailable</span>}
               <div className="meetctl">
-                {canManagePolicy && (<button onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Approve", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Reject", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Exclude", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Restore", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
-                {canWrite && (<button onClick={() => act(s.id, "reindex")}>Reindex</button>)}
-                {canWrite && (<button onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
-                <button onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
-                <button onClick={() => loadHist(s.id)}>History</button>
-                <button onClick={() => loadSecs(s.id)}>Sections</button>
+                {canWrite && (<button aria-label={sourceActionLabel("Reindex", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "reindex")}>Reindex</button>)}
+                {canWrite && (<button aria-label={sourceActionLabel("Retry extraction for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
+                {(() => { const d = canDownloadRow(s); const lbl = sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length); return d.ok ? (<button aria-label={lbl} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>) : (<button aria-label={lbl} disabled title={d.why}>Download original</button>); })()}
+                <button aria-label={sourceActionLabel("Show history for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadHist(s.id)}>History</button>
+                <button aria-label={sourceActionLabel("Show sections for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadSecs(s.id)}>Sections</button>
               </div>
               {hist[s.id] && (
                 <details open><summary>Version history ({hist[s.id].length})</summary>
-                  {hist[s.id].map((h) => <div key={h.id}>{h.createdAt} · {h.action} · v{h.version} · {h.detail}</div>)}
+                  {hist[s.id].map((h) => { const ht = historyText(h.action, h.detail); return <div key={h.id}>{ht.headline + " - version " + h.version + ". " + ht.detail}</div>; })}
                 </details>
               )}
               {secs[s.id] && (
-                <details open><summary>Persisted sections ({secs[s.id]!.sections.length}) · {secs[s.id]!.indexState} g{secs[s.id]!.indexGeneration}</summary>
+                <details open><summary>{"Saved sections (" + secs[s.id]!.sections.length + ") - " + indexLabel(secs[s.id]!.indexState, s.isCurrent)}</summary>
                   {secs[s.id]!.sections.map((sec) => (
-                    <div key={sec.id}><b>{sec.heading || sec.location}</b> <span className="badge">{sec.location}</span><p>{sec.text}</p></div>
+                    <div key={sec.id}><b>{sec.heading || "Section " + sec.ordinal}</b><p>{sec.text}</p></div>
                   ))}
-                  {secs[s.id]!.sections.length === 0 && <p role="status">No sections — {secs[s.id]!.indexError || "index incomplete; not usable as evidence."}</p>}
+                  {secs[s.id]!.sections.length === 0 && <p role="status">{safeIndexHelp()}</p>}
                 </details>
               )}
             </div>
@@ -285,7 +301,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
         <button onClick={runRecall}>Recall</button>
         {recallHits.length === 0 && <p role="status">No recall results yet.</p>}
         {recallHits.map((h, i) => (
-          <div key={i}><span className="badge">{h.kind}</span> <b>{h.ref}</b> (score {h.score}): {h.text}</div>
+          <div key={i}><span className="badge">{recallKindLabel(h.kind)}</span> {recallTitle(h.kind, h.ref) ? <b>{recallTitle(h.kind, h.ref)}</b> : <span>Relevant material</span>} <span>{recallExcerpt(h.kind, h.text)}</span></div>
         ))}
         <p>External hits that cannot resolve to eligible sources are dropped server-side and never become evidence.</p>
       </div>

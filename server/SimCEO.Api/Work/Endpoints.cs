@@ -1186,6 +1186,7 @@ public static class SimCEOEndpoints
         if (!s.RunningRuns.Add(id))
           return Results.Conflict("A discussion run is already in progress for this meeting; wait for it to finish.");
       }
+      Guid activityOpId = Guid.Empty;
       try
       {
       // Finding 2: the authoritative context and the restore pin are captured
@@ -1230,6 +1231,9 @@ public static class SimCEOEndpoints
         return Results.Conflict("Meeting is paused; resume to run discussion."); }
       if (eligible.Count == 0)
         return Results.Json(new { error = "No advisors available for discussion.", fixes = pickedCount > 0 ? new[] { "Re-pick participants from this board's current advisors." } : new[] { "Approve at least one advisor on this board before running discussion." }, yielded }, statusCode: 409);
+      activityOpId = Guid.NewGuid();
+      MeetingActivity.DiscussionStarted(s, id, m.BoardId, activityOpId, gen, leadFloor, eligible, dx.RestoreBefore);
+      _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
       var ownerOverride = PeopleOps.IsOwner(req);
       var capBody = JsonSerializer.Serialize(new { leadSeq = leadFloor, cap = effectiveCap, policy });
       try
@@ -1302,6 +1306,7 @@ public static class SimCEOEndpoints
         // it is authoritative for the write below.
         try { PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss"); }
         catch (Exception laneBPreEx) { var laneBPreMapped = PublicationGuard.MapGuardFailure(laneBPreEx); if (laneBPreMapped is not null) return laneBPreMapped; throw; }
+        try { MeetingActivity.FinishDiscussion(s, id, activityOpId, "interrupted", laneBReason); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         var laneBRev = LaneBRevision();
         var laneBTitle = "Run interrupted: " + laneBReason;
         var laneBBody = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = laneBRev, rounds = laneBPlannedRounds, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, status = "interrupted", reason = laneBReason, remaining = laneBRemaining });
@@ -1329,20 +1334,28 @@ public static class SimCEOEndpoints
         bidResults = await Task.WhenAll(eligible.Select(async adv =>
         {
           await bidSem.WaitAsync();
+          try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "considering", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
           try
           {
             string bidPacket;
             try { bidPacket = BuildBidPacketPinned(s, req, dx, m, adv, prompt, board); }
-            catch (Exception pktEx) { return (adv, score: 0.0, text: "", error: (string?)pktEx.Message); }
+            catch (Exception pktEx) { try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, score: 0.0, text: "", error: (string?)pktEx.Message); }
             var bidText = await gw.CompleteAsync(spark, "advisor-bid",
-              bidPacket + "\nReply with exactly YES or NO, then one line why.",
-              ContextBudget.BidTokens, 512, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id);
+              bidPacket + ContextCurator.AdvisorBidSuffix,
+              CharacterBehavior.BidInputTokens, 512, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
             var yes = bidText.TrimStart().StartsWith("YES", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+              if (yes) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "awaiting-selection", null);
+              else MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "bid-declined");
+              _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+            }
+            catch { }
             return (adv, score: yes ? 10.0 + (adv.BoardRole.Length % 7) : 0.0, text: bidText, error: (string?)null);
           }
           catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
           {
-            return (adv, score: 0.0, text: "", error: (string?)ex.Message);
+            try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, score: 0.0, text: "", error: (string?)ex.Message);
           }
           finally { bidSem.Release(); }
         }));
@@ -1398,6 +1411,7 @@ public static class SimCEOEndpoints
       bidErrors.AddRange(bidResults.Where(b => b.error is not null).Select(b => new { advisor = b.adv.BoardRole, error = b.error }));
       foreach (var b in bidResults.Where(b => b.error is not null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "provider-error" });
       foreach (var b in bidResults.Where(b => b.score <= 0 && b.error is null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "bid-declined" });
+      try { MeetingActivity.SyncSelection(id, activityOpId, bidResults.Select(b => (b.adv.Id, b.adv.BoardRole, b.score, b.error)).ToList(), selectedIds, alreadyIds); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
       var evSupported = body.TryGetProperty("evidenceSupported", out var e) && e.GetBoolean();
       using var draftSem = new SemaphoreSlim(4);
       string? lastChallenged = null;
@@ -1406,23 +1420,32 @@ public static class SimCEOEndpoints
         var drafts = await Task.WhenAll(round.Select(async adv =>
         {
           await draftSem.WaitAsync();
+          try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
           try
           {
             string packet;
             CuratorManifest? manifest;
             try { var built = BuildDiscussionPacketPinned(s, req, dx, m, adv, prompt, board, lead); packet = built.packet; manifest = built.manifest; }
-            catch (Exception pktEx) { return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)pktEx.Message); }
+            catch (Exception pktEx) { try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)pktEx.Message); }
             var text = await gw.CompleteAsync(spark, "advisor-reply",
-              packet + "\nYOUR TURN. Cite [source:name] or [record:version] where used; if you add nothing, reply with exactly ABSTAIN. If your reply takes a clear position on the lead question or another advisor point, end with [stance: Agrees|Disagrees|Raises risk|Proposes alternative]; otherwise omit the tag.",
-              ContextBudget.DraftTokens, 4096, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id);
+              packet + ContextCurator.AdvisorReplySuffix,
+              ContextBudget.DraftTokens, 4096, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
+            try
+            {
+              if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "abstained");
+              else MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "awaiting-publication", null);
+              _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+            }
+            catch { }
             return (adv, text: (string?)text, manifest: (CuratorManifest?)manifest, error: (string?)null);
           }
           catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
           {
-            return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)ex.Message);
+            try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)ex.Message);
           }
           finally { draftSem.Release(); }
         }));
+        try { MeetingActivity.SyncDraftOutcome(id, activityOpId, drafts.Select(d => (d.adv.Id, d.adv.BoardRole, d.text, d.error)).ToList()); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         { long freshGenBetween = gen; try { if (s.Meetings.TryGetValue(id, out var freshBetween) && freshBetween is not null) freshGenBetween = freshBetween.Generation; } catch { }
         if (freshGenBetween != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
         {
@@ -1436,6 +1459,8 @@ public static class SimCEOEndpoints
         // SetupLock; pause/resume/end/close use MessageLock only, so this order never inverts).
         // Meeting, advisor and roster rows are fresh-fetched here; captured generation, lead sequence,
         // allowed state and reviewed-input fingerprints are compared immediately before commit.
+        int __actPub0 = published.Count;
+        int __actY0 = yielded.Count;
         lock (s.SetupLock)
         {
           lock (s.MessageLock)
@@ -1498,7 +1523,7 @@ public static class SimCEOEndpoints
             var batch = new List<Message>();
             foreach (var (adv, text, manifest, error) in drafts)
             {
-              if (text is null || error is not null) { yielded.Add(new { advisor = adv.BoardRole, reason = "provider-error" }); continue; }
+              if (text is null || error is not null) { var why = error is string emStale && (emStale.Contains("roster-changed") || emStale.Contains("generation-changed") || emStale.Contains("restored") || emStale.Contains("source-changed") || emStale.Contains("lead-changed") || emStale.Contains("board-changed") || emStale.Contains("directions-changed") || emStale.Contains("records-changed")) ? (emStale.Contains("roster-changed") ? "stale-profile" : "stale-context") : "provider-error"; yielded.Add(new { advisor = adv.BoardRole, reason = why }); continue; }
               if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) { abstained.Add(adv.BoardRole); yielded.Add(new { advisor = adv.BoardRole, reason = "abstained" }); continue; }
               // Lane B: fresh-fetch; a sync or edit/review during generation yields/discards the stale response.
               if (!s.Advisors.TryGetValue(adv.Id, out var freshAdv) || freshAdv.Removed || freshAdv.BoardId != cur.BoardId)
@@ -1547,6 +1572,25 @@ public static class SimCEOEndpoints
             if (laneBGate is null) completedGroups++;
             }); // end Atomic gate: authoritative fetch/authorize/validate/mutate in one backend transaction
             if (laneBGate is not null) return laneBGate;
+            try
+            {
+              var __actNewPub = new HashSet<Guid>(published.Skip(__actPub0).Select(p => p.AdvisorId));
+              var __actNewY = new List<(string advisor, string reason)>();
+              foreach (var __ye in yielded.Skip(__actY0))
+              {
+                try
+                {
+                  using var __yd = JsonDocument.Parse(JsonSerializer.Serialize(__ye));
+                  var __yar = __yd.RootElement.TryGetProperty("advisor", out var __yav) ? __yav.GetString() ?? "" : "";
+                  var __yrn = __yd.RootElement.TryGetProperty("reason", out var __yrv) ? __yrv.GetString() ?? "" : "";
+                  if (!string.IsNullOrWhiteSpace(__yar)) __actNewY.Add((__yar, string.IsNullOrWhiteSpace(__yrn) ? "yielded" : __yrn));
+                }
+                catch { }
+              }
+              MeetingActivity.SyncRoundCommit(id, activityOpId, round.Select(a => (a.Id, a.BoardRole)).ToList(), __actNewPub, __actNewY);
+              _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+            }
+            catch { }
           }
         }
       }
@@ -1571,10 +1615,13 @@ public static class SimCEOEndpoints
       });
       }
       catch (Exception finEx) { var finMapped = PublicationGuard.MapGuardFailure(finEx); if (finMapped is not null) return finMapped; throw; }
+      MeetingActivity.FinishDiscussion(s, id, activityOpId, "completed", null);
+      _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
             return Results.Ok(new { rounds = rounds.Select(r => r.Select(a => a.BoardRole)), published, challenged = lastChallenged, abstained, bidErrors, yielded, overflow });
       }
       finally
       {
+        try { MeetingActivity.FinishIfRunning(s, id, activityOpId, "interrupted", "run ended"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         lock (s.MessageLock) { s.RunningRuns.Remove(id); }
       }
 
@@ -1582,7 +1629,11 @@ public static class SimCEOEndpoints
 
 
     app.MapSecretary();
+    app.MapMeetingActivity();
     app.MapRoster();
+    app.MapRosterChat();
+    app.MapCharacterResearch();
+    app.MapRosterReconciliation();
     app.MapWizardGuide();
     app.MapMeetingExtras();
     app.MapRecords();

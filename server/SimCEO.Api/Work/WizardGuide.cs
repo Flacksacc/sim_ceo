@@ -74,7 +74,7 @@ public static class WizardGuide
         var parsed = ParseGuideJson(raw);
         if (parsed is not null) return Results.Ok(parsed);
       }
-      catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException)
+      catch (Exception ex) when (ex is ProviderNotConfiguredException or ProviderException or CapExceededException or TaskCanceledException)
       {
         Atomic.Audit(s, new AuditEvent { Action = "wizard.guide-fallback", Detail = ex.GetType().Name });
       }

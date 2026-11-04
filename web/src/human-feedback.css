@@ -1,0 +1,141 @@
+/* human-feedback.css — narrow styles for the human-readable review kit.
+   Reuses the app tokens (card, muted, badge) and only adds human-* classes. */
+
+.human-item-list {
+  list-style: decimal;
+  margin: 0.5rem 0 0.5rem 1.4rem;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.human-item { display: flex; gap: 0.5rem; align-items: flex-start; }
+
+.human-item-body { display: grid; gap: 0.15rem; min-width: 0; }
+
+.human-item-text { overflow-wrap: anywhere; }
+
+.human-item-check { margin-top: 0.15rem; }
+
+.human-disclosure { font-size: 0.85em; }
+
+.human-disclosure-summary {
+  cursor: pointer;
+  color: var(--muted, #6b7280);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.human-disclosure-body {
+  margin-top: 0.25rem;
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.human-ref code {
+  font-size: 0.85em;
+  background: rgba(127, 127, 127, 0.12);
+  padding: 0 0.3em;
+  border-radius: 0.25em;
+}
+
+.human-ref-copy,
+.human-error-details-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: inherit;
+}
+
+.human-error {
+  border-left: 3px solid var(--amber, #b45309);
+  padding: 0.25rem 0.6rem;
+}
+
+.human-error-technical {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+  color: var(--muted, #6b7280);
+}
+
+.human-status {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  border-radius: 999px;
+  font-size: 0.85em;
+  border: 1px solid currentColor;
+}
+
+.human-status-open { color: var(--amber, #b45309); }
+.human-status-progress { color: #2563eb; }
+.human-status-done { color: #15803d; }
+.human-status-muted { color: var(--muted, #6b7280); }
+
+.human-editor { display: grid; gap: 0.4rem; margin-top: 0.6rem; }
+
+.human-editor-label { font-weight: 600; }
+
+.human-editor-text {
+  width: 100%;
+  font: inherit;
+  line-height: 1.5;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--edge, #d6cfc2);
+  border-radius: 0.4rem;
+  background: var(--field, #fff);
+  color: inherit;
+}
+
+.human-editor-status { margin: 0; font-size: 0.9em; }
+
+.human-empty { margin: 0.5rem 0; }
+
+.human-compare-summary { margin: 0.4rem 0; font-weight: 600; }
+
+.human-compare-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.human-change { display: grid; gap: 0.1rem; }
+
+.human-change-kind { font-weight: 700; font-size: 0.85em; }
+
+.human-change-added .human-change-kind { color: #15803d; }
+.human-change-removed .human-change-kind { color: #b91c1c; }
+.human-change-updated .human-change-kind { color: #2563eb; }
+
+.human-change-text { overflow-wrap: anywhere; }
+
+.human-version {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0.35rem 0;
+}
+
+.human-version-selected .human-version-pick { font-weight: 700; }
+
+.human-version-pick {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
