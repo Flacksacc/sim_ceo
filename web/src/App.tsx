@@ -5,7 +5,7 @@ import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
 import { SHOW_ACCOUNT_UI, SHOW_HELP_UI } from "./demo-ui";
 import { AdvisorSections, AdvisorReferences } from "./advisor-sections";
-import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
+import { CreateAdvisor, CharacterEditor, GrowingTextarea, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
 import {
   ConversationHeader,
@@ -7367,7 +7367,7 @@ const testModel = useMutation({
                 <label>
                   {" "}
                   Background{" "}
-                  <textarea
+                  <GrowingTextarea
                     rows={3}
                     className="profile-area"
                     value={leadForm.background}
@@ -7375,12 +7375,12 @@ const testModel = useMutation({
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, background: e.target.value })
                     }
-                  ></textarea>{" "}
+                  ></GrowingTextarea>{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects already familiar{" "}
-                  <textarea
+                  <GrowingTextarea
                     rows={3}
                     className="profile-area"
                     value={leadForm.familiarTopics}
@@ -7391,12 +7391,12 @@ const testModel = useMutation({
                         familiarTopics: e.target.value,
                       })
                     }
-                  ></textarea>{" "}
+                  ></GrowingTextarea>{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   Subjects needing simpler explanation{" "}
-                  <textarea
+                  <GrowingTextarea
                     rows={3}
                     className="profile-area"
                     value={leadForm.simplerTopics}
@@ -7407,12 +7407,12 @@ const testModel = useMutation({
                         simplerTopics: e.target.value,
                       })
                     }
-                  ></textarea>{" "}
+                  ></GrowingTextarea>{" "}
                 </label>{" "}
                 <label>
                   {" "}
                   Communication preferences{" "}
-                  <textarea
+                  <GrowingTextarea
                     rows={4}
                     className="profile-area"
                     value={leadForm.commPrefs}
@@ -7420,7 +7420,7 @@ const testModel = useMutation({
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, commPrefs: e.target.value })
                     }
-                  ></textarea>{" "}
+                  ></GrowingTextarea>{" "}
                 </label>{" "}
                 <div className="meetctl">
                   {" "}

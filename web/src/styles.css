@@ -616,8 +616,9 @@ textarea.profile-area {
   min-width: 100%;
   box-sizing: border-box;
   min-height: 96px;
-  max-height: 320px;
-  resize: vertical;
+  max-height: none;
+  overflow: hidden;
+  resize: none;
   line-height: 1.45;
 }
 
