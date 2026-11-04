@@ -607,6 +607,31 @@ Backup `.tmp/update-20261104-170833-UTC-641f1515`; rollback
 Original database/volumes retained. Owned QA services/browser exited; no coding
 agents used, user `tmp.txt` untouched. Full parity remains paused.
 
+### 2026-11-04 — Advisor portraits in meeting messages
+
+`9713656` replaces initials-only message headers with the corresponding accepted
+advisor portrait, using the same authenticated portrait URLs as the participant
+panel. New messages resolve their stable advisor ID; older messages with empty
+IDs resolve a unique current board role/name. Missing or ambiguous identities,
+absent portraits and image decoding failures retain initials. Explicit unknown
+IDs never borrow another advisor's picture. Portrait/approval resolution and
+stored messages remain unchanged.
+
+TypeScript/Vite build and `node qa/message-portraits.cjs` passed. Live read-only
+checks passed for light/dark desktop and narrow layouts, real legacy and
+ID-bearing messages, correct identity/participant URL matching, missing metadata
+and invalid image bytes. Zero domain writes/page errors; roster, messages,
+memberships and approval data preserved. Evidence:
+`.tmp/message-portraits-live-check.log`; screenshots:
+`output/message-portraits-review/2026-11-04`.
+
+Healthy on 5173, image
+`sha256:0a7c445b0c8922409709f73c6a1465144e4d8209bb05e7f3b728b2fcd0002c3b`.
+Backup `.tmp/update-20261104-174241-UTC-eb762e4b`; rollback
+`simceo-essentials-app:rollback-20261104-174241-eb762e4b`.
+Original database/volumes retained, own browsers closed, no test servers or
+coding agents used. Broader parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
