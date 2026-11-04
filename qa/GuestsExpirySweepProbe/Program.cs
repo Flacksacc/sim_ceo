@@ -36,6 +36,12 @@ void Check(bool ok, string name, string detail)
 }
 bool WithinBudget() => sw.Elapsed.TotalSeconds < OverallSeconds;
 
+static async Task<bool> WithTimeout(Task t, int ms)
+{
+  var done = await Task.WhenAny(t, Task.Delay(ms));
+  return ReferenceEquals(done, t);
+}
+
 static async Task<bool> LoopbackOpenAsync()
 {
   try
@@ -89,6 +95,17 @@ static string Prop(string json, string name)
 {
   try { using var doc = JsonDocument.Parse(json); return doc.RootElement.TryGetProperty(name, out var v) ? (v.GetString() ?? "") : ""; }
   catch { return ""; }
+}
+
+static bool TryAuthFalse(string json)
+{
+  try
+  {
+    using var doc = JsonDocument.Parse(json);
+    return doc.RootElement.TryGetProperty("authenticated", out var v)
+      && v.ValueKind == JsonValueKind.False;
+  }
+  catch { return false; }
 }
 
 HubConnection? guest = null;
@@ -159,6 +176,12 @@ try
   Check(Has(ownerGot, "qaM1") && Has(guestGot, "qaM1"), "positive-publish-meeting-both", "actual PublishMeeting reached owner and guest");
   Check(Has(guestGot, "qaPrivG") && !Has(ownerGot, "qaPrivG"), "positive-private-guest-only", "guest private marker stayed private");
   Check(Has(ownerGot, "qaPrivO") && !Has(guestGot, "qaPrivO"), "positive-private-owner-only", "owner private marker stayed private");
+  string capPath = "api/boards/" + boardId + "/capabilities?meetingId=" + meetingId;
+  var capGuestPre = await SendAsync(http, "GET", capPath, null, guestTok);
+  Check(capGuestPre.status == 200, "positive-rest-guest-200", "actual MapPeople capabilities guest pre-expiry, status=" + capGuestPre.status);
+  var capOwnerPre = await SendAsync(http, "GET", capPath, null, ownerTok);
+  Check(capOwnerPre.status == 200, "positive-rest-owner-200", "actual MapPeople capabilities owner pre-expiry, status=" + capOwnerPre.status);
+  bool preRestOk = capGuestPre.status == 200 && capOwnerPre.status == 200;
   DateTime guestExp;
   lock (store.RootGate)
   {
@@ -190,12 +213,21 @@ try
   await Task.Delay(1500);
   Check(Has(ownerGot, "qaM3"), "postsweep-owner-positive", "owner still receives after sweep");
   Check(!Has(guestGot, "qaM3"), "postsweep-guest-zero", "guest receives nothing after sweep");
-  var msg = await SendAsync(http, "GET", "api/meetings/" + meetingId + "/messages", null, guestTok);
-  Check(msg.status == 401, "postsweep-rest-401", "protected People route rejects expired session, status=" + msg.status);
-  var me = await SendAsync(http, "GET", "api/auth/me", null, guestTok);
-  Check(me.status == 200 && me.text.Contains("authenticated", StringComparison.OrdinalIgnoreCase) && me.text.Contains("false", StringComparison.Ordinal), "postsweep-authme-unauthenticated", "auth/me 200 with authenticated false");
-  var own = await SendAsync(http, "GET", "api/meetings/" + meetingId + "/messages", null, ownerTok);
-  Check(own.status == 200, "postsweep-owner-rest-200", "owner still authorized, status=" + own.status);
+  if (!preRestOk)
+  {
+    Check(false, "postsweep-rest-401", "skipped-prereq positive-rest-guest-200/owner-200 failed");
+    Check(false, "postsweep-authme-unauthenticated", "skipped-prereq positive-rest-guest-200/owner-200 failed");
+    Check(false, "postsweep-owner-rest-200", "skipped-prereq positive-rest-guest-200/owner-200 failed");
+  }
+  else
+  {
+    var capGuestPost = await SendAsync(http, "GET", capPath, null, guestTok);
+    Check(capGuestPost.status == 401, "postsweep-rest-401", "SAME MapPeople capabilities route rejects expired session, status=" + capGuestPost.status);
+    var me = await SendAsync(http, "GET", "api/auth/me", null, guestTok);
+    Check(me.status == 200 && TryAuthFalse(me.text), "postsweep-authme-unauthenticated", "auth/me 200 with authenticated===false strict JSON");
+    var capOwnerPost = await SendAsync(http, "GET", capPath, null, ownerTok);
+    Check(capOwnerPost.status == 200, "postsweep-owner-rest-200", "SAME route owner still authorized, status=" + capOwnerPost.status);
+  }
   Check(store.Sessions.ContainsKey(guestTok), "expired-row-still-present", "expired session row retained, not deleted");
   Check(!BoardHub.IsTokenRevoked(guestTok), "no-revoke-path-used", "RevokedTokens untouched; no logout or revoke faked expiry");
 }
@@ -205,11 +237,11 @@ catch (Exception ex)
 }
 finally
 {
-  try { if (guest is not null) await guest.StopAsync(); } catch { }
-  try { if (owner is not null) await owner.StopAsync(); } catch { }
+  try { if (guest is not null) await WithTimeout(guest.StopAsync(), 5000); } catch { }
+  try { if (owner is not null) await WithTimeout(owner.StopAsync(), 5000); } catch { }
   try { if (guest is not null) await guest.DisposeAsync(); } catch { }
   try { if (owner is not null) await owner.DisposeAsync(); } catch { }
-  try { await app.StopAsync(); } catch { }
+  try { await WithTimeout(app.StopAsync(), 8000); } catch { }
   http.Dispose();
   await Task.Delay(1000);
   if (await LoopbackOpenAsync())

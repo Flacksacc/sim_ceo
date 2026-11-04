@@ -14,9 +14,14 @@ Author: Muse, sole QA author. No production changes. `qa/GuestsGetCommitProbe` u
   guest markers, and the ACTUAL `BoardHub.PublishPrivateMeeting` delivers ZERO guest markers.
 - The REAL 30 second sweep started by `BoardHub.Wire` then emits `access-revoked` AND closes
   the guest hub connection, while the owner connection continues and still receives markers.
-- After the sweep the same publisher is still owner-positive and guest-zero, the protected
-  People REST route returns 401 for the guest token, `GET /api/auth/me` returns 200 with
-  `authenticated: false`, the owner REST path stays 200, the expired session row is retained,
+- The SAME protected MapPeople route `GET /api/boards/{bid}/capabilities?meetingId={mid}`
+  (actual `MapPeople`, `BadToken`/`TrySession`) is guest-200 AND owner-200 BEFORE expiry,
+  guest-401 AFTER the sweep with owner-200 AFTER. No mirror route; no
+  `/api/meetings/{id}/messages` (production `Program` map, not `MapPeople`, would 404 here).
+- After the sweep the same publisher is still owner-positive and guest-zero, the SAME
+  capabilities route returns 401 for the guest token, `GET /api/auth/me` returns 200 with
+  `authenticated === false` by strict JSON parse, the SAME owner REST path stays 200,
+  the expired session row is retained,
   and `RevokedTokens` is untouched (no revoke path faked expiry).
 
 ## Exact cases (exit nonzero on any FAIL; no empty-array passes)
@@ -26,6 +31,7 @@ Author: Muse, sole QA author. No production changes. `qa/GuestsGetCommitProbe` u
 `issued-expiry-future`, `seed-board-meeting`, `grant-guest-discuss`, `guest-join`,
 `signalr-connected`, `guest-join-meeting-hub`, `owner-join-meeting-hub`,
 `positive-publish-meeting-both`, `positive-private-guest-only`, `positive-private-owner-only`,
+`positive-rest-guest-200`, `positive-rest-owner-200`,
 `fixture-row-retained`, `fixture-expiry-reached`, `expired-presweep-owner-positive`,
 `expired-presweep-guest-zero`, `expired-presweep-private-guest-zero`, `presweep-sweep-not-yet`,
 `sweep-access-revoked-event`, `sweep-guest-connection-closed`, `sweep-owner-continues`,
@@ -37,7 +43,10 @@ Author: Muse, sole QA author. No production changes. `qa/GuestsGetCommitProbe` u
 
 - Fixed loopback preflight: the probe refuses to start unless `127.0.0.1:15344` is free, and
   exits nonzero if the listener is still bound after cleanup.
-- Shared overall bound ~75 seconds; every wait is bounded and cleanup runs in `finally`.
+- Shared overall bound ~75 seconds; every wait AND every cleanup stop (`HubConnection.StopAsync` 5s,
+  `app.StopAsync` 8s via `WithTimeout`) is bounded and cleanup runs in `finally`.
+- Prerequisite gating: if the pre-expiry SAME-route positives fail, the three post-sweep REST
+  cases fail fast as `skipped-prereq` instead of asserting against a broken fixture.
 - Command: `dotnet run --project qa/GuestsExpirySweepProbe/GuestsExpirySweepProbe.csproj -p:SkipStagePostgres=true`
 - Do NOT run with `USE_POSTGRES=1`; the probe fail-closes unless `Pg.Backend` is null.
 - Source and build by Muse; PRIMARY executes the network host probe.
