@@ -11,8 +11,8 @@
 //
 // Boundedness: at most 1 research + 1 roster chat + 1 audition (paid/model calls).
 // App-internal research subcalls (fetch round + <=2 model calls) are natural and bounded
-// by the server ResearchDeadline (<=180s). TOTAL execution is bounded at 480s with a
-// separate 15s abort/drain phase. NO retries/double POST, NO policy/force changes,
+// by the server ResearchDeadline (<=180s). TOTAL execution is bounded at 480s plus ONE absolute 15s cleanup allowance
+// shared by abort/drain + artifact write. NO retries/double POST, NO policy/force changes,
 // NO admin DB/restore/reconcile, NO meeting/board run, NO 5173/15180/9333/5080 contact,
 // NO .env/key/token reads. One fresh attempt only: no resume, no extra accounts/retry.
 //
@@ -407,17 +407,14 @@ async function runResearch(token, id) {
   check("research-done", stage === "done", "stage=" + stage + " draftStatus=" + draftStatus);
   check("research-draft-done", draftStatus === "done", "draftStatus=" + draftStatus + " (need done before PUT save)");
   const srcs = Array.isArray(pick(cur, "sources")) ? pick(cur, "sources") : [];
-  // Strict proof: fetched===true (strict) + excerpt present + URL belongs to the
-  // approved seed URLs / actual fetch (ownerSupplied). OR excerpt-as-proof: a
-  // non-empty excerpt pinned to an approved URL still counts as fetch evidence.
+  // Strict proof ONLY: fetched===true (strict) + non-empty excerpt + URL in the
+  // approved seed URLs or actual owned fetch (ownerSupplied===true). Excerpt
+  // alone never proves fetch: fetched===false (or missing) always fails.
   const strictGood = srcs.filter((s) => s && s.fetched === true &&
-    typeof s.excerpt === "string" && s.excerpt.length > 0 && SOURCE_URLS.includes(String(s.url || "")));
-  const ownerGood = srcs.filter((s) => s && s.fetched === true &&
-    typeof s.excerpt === "string" && s.excerpt.length > 0 && s.ownerSupplied === true);
-  const excerptProof = srcs.filter((s) => s && typeof s.excerpt === "string" && s.excerpt.length > 20 &&
-    SOURCE_URLS.includes(String(s.url || "")));
-  check("research-evidence-fetched", (strictGood.length > 0 || ownerGood.length > 0) || excerptProof.length > 0,
-    "sources=" + srcs.length + " strict=" + strictGood.length + " owner=" + ownerGood.length + " excerptProof=" + excerptProof.length);
+    typeof s.excerpt === "string" && s.excerpt.length > 0 &&
+    (SOURCE_URLS.includes(String(s.url || "")) || s.ownerSupplied === true));
+  check("research-evidence-fetched", strictGood.length > 0,
+    "sources=" + srcs.length + " strict=" + strictGood.length);
   const draft = pick(cur, "draftProfile") || {};
   const paras = {};
   for (const k of PARA_KEYS) paras[k] = typeof draft[k] === "string" ? draft[k] : "";
@@ -433,7 +430,7 @@ async function runResearch(token, id) {
   return {
     elapsedMs: Date.now() - researchStart, stages, stage, draftStatus,
     inputs,
-    evidence: (strictGood.length ? strictGood : ownerGood.length ? ownerGood : excerptProof).slice(0, 5).map((s) => ({
+    evidence: strictGood.slice(0, 5).map((s) => ({
       url: String(s.url || ""), title: String(s.title || "").slice(0, 200),
       excerpt: String(s.excerpt || "").slice(0, 500), fetched: s.fetched === true,
     })),
@@ -547,7 +544,8 @@ function artifactBase(extra) {
   }, extra || {});
 }
 async function writeArtifacts(doc) {
-  assertBudget("write-artifacts");
+  // No assertBudget here: at TOTAL expiry the execution budget is gone, but the
+  // ONE absolute 15s cleanup allowance (drainAndExit) still covers this write.
   const jsonText = JSON.stringify(doc, null, 2);
   await track(fs.writeFile(RESULT_PATH, jsonText, "utf8"));
   const mdPath = RESULT_PATH.replace(/\.json$/i, "") + ".md";
@@ -594,25 +592,30 @@ async function writeArtifacts(doc) {
 }
 async function drainAndExit(code, doc) {
   for (const ctl of Array.from(inFlight)) { try { ctl.abort(new Error("drain")); } catch {} }
-  // Separate 15s abort/drain: await REAL pending operations (HTTP bodies already
-  // consumed via call(); fs writes tracked via track()), not mapped
-  // AbortControllers-to-Promise.resolve. Bounded so resources never leak past DRAIN_MS.
-  const drainStart = Date.now();
+  // ONE absolute 15s cleanup allowance shared by abort/drain + artifact write:
+  // cleanupEnd caps everything (no separate 15s + 10s beyond this allowance).
+  // Execution (assertBudget/clampTimeout) stays hard at HARD_STOP; only this
+  // cleanup path may run past HARD_STOP, up to HARD_STOP + DRAIN_MS.
+  const cleanupEnd = Math.min(HARD_STOP + DRAIN_MS, Date.now() + DRAIN_MS);
   try {
-    await Promise.race([
-      (async () => { while (pendingOps.size > 0 && Date.now() - drainStart < DRAIN_MS) await new Promise((r) => setTimeout(r, 50)); })(),
-      new Promise((r) => setTimeout(r, DRAIN_MS)),
-    ]);
+    while (pendingOps.size > 0 && Date.now() < cleanupEnd) await new Promise((r) => setTimeout(r, 50));
   } catch {}
   for (const t of Array.from(timers)) { try { clearTimeout(t); } catch {} timers.delete(t); }
   const paths = { jsonPath: RESULT_PATH, mdPath: RESULT_PATH.replace(/\.json$/i, "") + ".md" };
+  // No success after execution expiry, and no success on failed pending drain.
+  let finalCode = code;
+  if (Date.now() > HARD_STOP) finalCode = 1;
+  if (pendingOps.size > 0) finalCode = 1;
   if (doc) {
     try {
       doc.elapsedMs = Date.now() - startedAt;
-      doc.outcome = code === 0 ? "PASS" : "FAIL";
+      doc.outcome = finalCode === 0 ? "PASS" : "FAIL";
+      if (pendingOps.size > 0) doc.pendingDrainFailed = true;
+      if (Date.now() > HARD_STOP) doc.executionExpired = true;
+      const remain = Math.max(0, cleanupEnd - Date.now());
       const w = await Promise.race([
         writeArtifacts(doc),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("artifact write exceeded remaining budget")), Math.min(DRAIN_MS, 10000))),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("artifact write exceeded cleanup budget")), remain)),
       ]);
       paths.jsonPath = w.jsonPath; paths.mdPath = w.mdPath;
     } catch (e) {
@@ -623,10 +626,10 @@ async function drainAndExit(code, doc) {
       process.exit(1);
     }
   }
-  console.log(code === 0 ? "LIVE-PROVIDER PROOF PASS" : "LIVE-PROVIDER PROOF FAIL (exit " + code + ")");
+  console.log(finalCode === 0 ? "LIVE-PROVIDER PROOF PASS" : "LIVE-PROVIDER PROOF FAIL (exit " + finalCode + ")");
   console.log("artifact: " + paths.jsonPath);
   console.log("readable: " + paths.mdPath);
-  process.exit(code);
+  process.exit(finalCode);
 }
 let unhandled = null;
 process.on("unhandledRejection", (e) => {

@@ -43,9 +43,10 @@ at the EXACT origin `http://127.0.0.1:15190`:
    one absolute research end from BEFORE POST (<=185s, within TOTAL 480s). The POST promise is
    tracked while concurrently polling the actual `GET /research` stages; request/body end is
    bounded; the POST is awaited exactly once. No retries/double POST. Polls are free GETs.
-   Terminal requires `stage=done` + `draftStatus=done` with strict `fetched===true` evidence
-   whose URL belongs to the approved seed URLs / actual fetch (`ownerSupplied`), excerpt present —
-   OR excerpt-as-proof pinned to an approved URL. Honest stop on `unsupported`/`failed`
+   Terminal requires `stage=done` + `draftStatus=done` with STRICT `fetched===true` evidence
+   only: non-empty excerpt AND (URL in the approved seed URLs OR actual owned fetch
+   `ownerSupplied===true`). Excerpt alone never proves fetch (`fetched===false`/missing
+   always fails); only the strict set is serialized. Honest stop on `unsupported`/`failed`
    (no forced retries).
 6. Canonical readback via `GET /api/roster?accountId=` + exact-ID unwrap (`entry.profileJson`),
    then explicit `PUT /api/roster/{id}` save of the researched draft (background + all other
@@ -63,10 +64,13 @@ at the EXACT origin `http://127.0.0.1:15190`:
 
 At most 1 research + 1 chat + 1 audition (paid/model). App-internal research subcalls
 (fetch round + up to 2 model calls) are natural and server-bounded; TOTAL execution is bounded
-at 480s hard timer with remaining-clamp on EVERY full body/acquisition/poll/write (incl. fs),
-plus a separate 15s abort/drain phase awaiting REAL pending operations (not mapping
-AbortControllers to `Promise.resolve`; timers cleared, bodies already consumed, in-flight
-aborted, failure artifact written). Artifact write failure exits nonzero. Failure artifacts
+at 480s hard execution timer with remaining-clamp on EVERY execution body/acquisition/poll
+(excl. cleanup fs writes), plus ONE absolute 15s cleanup allowance shared by abort/drain +
+artifact write so an expired execution still writes its failure artifact within the cleanup
+budget (not mapping AbortControllers to `Promise.resolve`; timers cleared, bodies already
+consumed, in-flight aborted, failure artifact written; no success after execution expiry or
+on failed pending drain; no separate 15s + 10s beyond the one allowance). Artifact write
+failure exits nonzero. Failure artifacts
 retain completed research/paragraph/identity-nonsecret/partial results instead of discarding
 the doc. No unhandled-rejection swallows (first unhandled turns the run FAIL).
 
