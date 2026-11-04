@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
+import { SHOW_ACCOUNT_UI } from "./demo-ui";
 import { AdvisorSections, AdvisorReferences } from "./advisor-sections";
 import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
@@ -2515,10 +2516,10 @@ export default function App() {
       profileSnap.current = JSON.stringify(acknowledged);
       setProfileConflict(null);
       if (profileEditRev.current !== attempt.editRev) {
-        setSaveMsg("Saved as your account default. Your newer edits are still in the form; save again to apply them.");
+        setSaveMsg("Saved as your default profile. Your newer edits are still in the form; save again to apply them.");
       } else {
         setLeadForm(acknowledged);
-        setSaveMsg("Profile saved as your account default for all boards.");
+        setSaveMsg("Profile saved as your default for all boards.");
       }
       try { qc.setQueryData(["profile"], rr); } catch { /* keep server truth on next refetch */ }
       refresh("profile", "lead", "setup");
@@ -5008,7 +5009,7 @@ const testModel = useMutation({
     const status = p.status;
     const hay = p.hay;
     const definitive = status >= 400 && status < 500;
-    if (status === 401 || (definitive && hay.includes("authentication required"))) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 401 || (definitive && hay.includes("authentication required"))) return SHOW_ACCOUNT_UI ? "Your session changed. Sign in again, then retry responses." : "This demo session changed. Reload the app before retrying responses.";
     if (status === 403 || (definitive && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")))) return "Access changed for this meeting. Reopen it from Boards, then retry.";
     if (status === 404 || (definitive && hay.includes("meeting is gone"))) return "This meeting is gone. Reopen it from Boards.";
     if (hay.includes("lead profile changed")) return "Lead profile changed since you sent. Review the current lead profile, then retry with the current version.";
@@ -5029,7 +5030,7 @@ const testModel = useMutation({
     if (m) {
       const status = parseInt(m[1], 10);
       const hay = m[2].toLowerCase();
-      if (status === 401 || ((status >= 400 && status < 500) && hay.includes("authentication required"))) return "Your session changed. Sign in again, then resend your message.";
+      if (status === 401 || ((status >= 400 && status < 500) && hay.includes("authentication required"))) return SHOW_ACCOUNT_UI ? "Your session changed. Sign in again, then resend your message." : "This demo session changed. Reload the app before retrying your message.";
       if (status === 403 || ((status >= 400 && status < 500) && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")))) return "Access changed for this meeting. Reopen it from Boards, then resend.";
       if (status === 404 || ((status >= 400 && status < 500) && hay.includes("meeting is gone"))) return "This meeting is gone. Reopen it from Boards.";
       return "Could not confirm your message was saved. The server response was unclear: check the conversation and resend only if it does not appear.";
@@ -5042,7 +5043,7 @@ const testModel = useMutation({
     const hay = (m ? m[2] : raw).toLowerCase();
     const status = m ? parseInt(m[1], 10) : 0;
     const definitive = status >= 400 && status < 500;
-    if (status === 401 || (definitive && hay.includes("authentication required"))) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 401 || (definitive && hay.includes("authentication required"))) return SHOW_ACCOUNT_UI ? "Your session changed. Sign in again, then retry responses." : "This demo session changed. Reload the app before retrying responses.";
     if (status === 403 || (definitive && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied") || hay.includes("contribute")))) return "Only contributors can save the brief. Ask a contributor to add a brief, then retry responses.";
     if (status === 409) {
       const hay409 = hay;
@@ -6220,7 +6221,7 @@ const testModel = useMutation({
               {navTip.label}
             </div>
           )}{" "}
-        <div className="railfoot">
+        {SHOW_ACCOUNT_UI && <div className="railfoot">
           <div className="profile-wrap rail-profile">
             {" "}
             {!fbUser ? (
@@ -6266,7 +6267,7 @@ const testModel = useMutation({
               </>
             )}{" "}
           </div>{" "}
-        </div>{" "}
+        </div>}{" "}
       </nav>{" "}
 
       {showListPanel && (
@@ -6459,27 +6460,27 @@ const testModel = useMutation({
         </div>{" "}
         <main className="main" id="main" tabIndex={-1}>
           {" "}
-          {sessExpired && (<p role="alert">Session expired. Sign in again to continue; private data is hidden until re-authentication.</p>)}
+          {sessExpired && (<p role="alert">{SHOW_ACCOUNT_UI ? "Session expired. Sign in again to continue; private data is hidden until re-authentication." : "This demo session is unavailable. Reload the app to try again."}</p>)}
           {privateHidden ? (
             <section aria-label="Session verification">
-              <AuthPanel />
-              <InviteClaim />
-              <p role="status">Session verification pending — private content is hidden until the current session is verified. Unsent per-account drafts are preserved for re-authentication.</p>
+              {SHOW_ACCOUNT_UI && <AuthPanel />}
+              {SHOW_ACCOUNT_UI && <InviteClaim />}
+              <p role="status">{SHOW_ACCOUNT_UI ? "Session verification pending — private content is hidden until the current session is verified. Unsent per-account drafts are preserved for re-authentication." : "Checking the demo session…"}</p>
             </section>
           ) : (<>
           {showBoardMeetings && boardOk && !boardDenied && (
             <details className="board-tools">
               <summary>Board settings</summary>
               <nav aria-label="Board tools">
-                {([["boards", "Board overview"], ["advisors", "Board Advisors"], ["sources", "Sources"], ["records", "Records"], ["people", "People"], ["activity", "Activity"]] as [Tab, string][]).map(([key, label]) =>
+                {([["boards", "Board overview"], ["advisors", "Board Advisors"], ["sources", "Sources"], ["records", "Records"], ["people", "People"], ["activity", "Activity"]] as [Tab, string][]).filter(([key]) => SHOW_ACCOUNT_UI || key !== "people").map(([key, label]) =>
                   <button key={key} type="button" className={tab === key ? "btn primary" : "btn ghost"} aria-current={tab === key ? "page" : undefined} onClick={e => { setTab(key); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{label}</button>)}
               </nav>
             </details>
           )}
           {tab === "boards" && (
             <section aria-label="Boards">
-              <AuthPanel />
-              <InviteClaim />
+              {SHOW_ACCOUNT_UI && <AuthPanel />}
+              {SHOW_ACCOUNT_UI && <InviteClaim />}
               {" "}
               <h2>Boards</h2>{" "}
               {boardId && (
@@ -7552,15 +7553,15 @@ const testModel = useMutation({
             <section aria-label="Profile">
               {" "}
               <h2>Profile</h2>{" "}
-              <div className="card" aria-label="Account">
+              <div className="card" aria-label={SHOW_ACCOUNT_UI ? "Account" : "Preferences"}>
                 {" "}
-                <h3>Account</h3>{" "}
-                <p role="status">
+                <h3>{SHOW_ACCOUNT_UI ? "Account" : "Preferences"}</h3>{" "}
+                {SHOW_ACCOUNT_UI && <p role="status">
                   {" "}
                   {fbUser
                     ? `${fbUser} · Signed in with Facebook (demo)`
                     : "Not signed in"}{" "}
-                </p>{" "}
+                </p>}{" "}
                 <div className="meetctl">
                   {" "}
                   <button type="button" onClick={() => setTab("help")}>
@@ -7576,7 +7577,7 @@ const testModel = useMutation({
                     {" "}
                     {theme === "dark" ? "Switch to light" : "Switch to dark"}{" "}
                   </button>{" "}
-                  {fbUser && (
+                  {SHOW_ACCOUNT_UI && fbUser && (
                     <button type="button" onClick={fbSignOut}>
                       {" "}
                       Sign out{" "}
@@ -7586,7 +7587,7 @@ const testModel = useMutation({
               </div>{" "}
 
                             <p>
-                Your account default: shared by all your boards unless a board saves its own override.
+                Your default profile: shared by all your boards unless a board saves its own override.
               </p>
               <>
                 {" "}
@@ -7598,7 +7599,7 @@ const testModel = useMutation({
                 </p>{" "}
                 <p>
                   {" "}
-                  Saving here updates your account default immediately for future meeting
+                  Saving here updates your default profile immediately for future meeting
                   context on all your boards. Boards with their own saved profile keep that profile.{" "}
                 </p>{" "}
                 {(!profileResolved && !sessGate && !profile.isError) && (
@@ -9592,7 +9593,10 @@ const testModel = useMutation({
               )}{" "}
             </section>
           )}{" "}
-          {tab === "people" && (
+          {tab === "people" && !SHOW_ACCOUNT_UI && (
+            <section aria-label="People"><h2>Sharing</h2><p>Sharing controls are not available in this demo.</p></section>
+          )}
+          {tab === "people" && SHOW_ACCOUNT_UI && (
             <section aria-label="People">
               {" "}
               <h2>People</h2>{" "}
@@ -10071,6 +10075,7 @@ const testModel = useMutation({
                 onChange={(e) => setHq(e.target.value)}
               />{" "}
               {(cmds.data ?? [])
+                .filter(c => SHOW_ACCOUNT_UI || !/\b(auth(?:entication)?|accounts?|e-?mail|password|facebook|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|register|invit(?:e|ation)s?|grants?|identity|people)\b/i.test(`${c.command} ${c.action} ${c.view}`))
                 .filter(
                   (c) =>
                     !hq ||

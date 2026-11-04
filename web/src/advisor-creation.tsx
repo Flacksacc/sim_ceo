@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
 import "./advisor-creation.css";
 import { FriendlyError } from "./human-disclosure";
+import { SHOW_ACCOUNT_UI } from "./demo-ui";
 
 export function extractCharacterServerText(raw: string): { status: number; serverError: string } {
   const input = String(raw ?? "");
@@ -154,7 +155,7 @@ export function characterFriendlyError(raw: string): string {
   const status = parts.status;
   const serverError = parts.serverError;
   const hay = String(serverError || input).toLowerCase();
-  if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
+  if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return SHOW_ACCOUNT_UI ? "Your session changed. Sign in again, then retry. Your draft above is unchanged." : "This demo session changed. Reload the app to try again. Your draft above is unchanged.";
   if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
   if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
   // Research conflicts are handled here, before any generic mapping (the
