@@ -1,0 +1,18 @@
+.advisor-sections { min-width: 0; }
+.advisor-section-tabs { display: flex; gap: .35rem; border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+.advisor-section-tabs [role="tab"] { padding: .7rem 1rem; border: 0; border-bottom: 3px solid transparent; border-radius: 0; color: var(--muted); background: transparent; font: inherit; cursor: pointer; }
+.advisor-section-tabs [role="tab"][aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 650; }
+.advisor-section-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.advisor-section-panel[hidden] { display: none; }
+.advisor-section-panel > .card { margin-top: 0; }
+.advisor-section-panel .roster-chat-log { min-height: 18rem; max-height: 55vh; }
+.advisor-references { min-width: 0; }
+.advisor-references p, .advisor-references blockquote { white-space: pre-wrap; overflow-wrap: anywhere; }
+.advisor-references .card { margin-top: 1rem; }
+.advisor-reading-list, .advisor-research-notes { padding-left: 1.3rem; }
+.advisor-reading-list > li, .advisor-research-notes > li { margin: 1rem 0; }
+.advisor-reading-list .badge { margin-left: .5rem; }
+.advisor-reading-list a, .advisor-research-notes a { overflow-wrap: anywhere; }
+.advisor-reading-list blockquote { margin: .7rem 0; padding: .6rem .9rem; border-left: 3px solid var(--accent); color: var(--muted); }
+.advisor-research-notes a { margin-right: .7rem; }
+@media (max-width: 40rem) { .advisor-section-tabs [role="tab"] { flex: 1; padding: .65rem .5rem; } }
