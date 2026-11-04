@@ -32,7 +32,20 @@ static class Probe
     d[h.Url] = new List<PoolPassage> { new PoolPassage(h.Title ?? "", h.Excerpt ?? "", h.Fetched, h.Origin ?? "") };
     return d;
   }
-  static int Main() => RunAsync().GetAwaiter().GetResult();
+  static int Main(string[] args) => (args.Contains("--public-holmes") ? RunPublicHolmesAsync() : RunAsync()).GetAwaiter().GetResult();
+  static async Task<int> RunPublicHolmesAsync()
+  {
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+    var fetcher = new PublicEvidenceFetcher { MaxSubjectTokens = 24 };
+    var sources = new List<ModelGateway.Citation> {
+      new("https://en.wikipedia.org/wiki/Sherlock_Holmes", "", ""),
+      new("https://www.gutenberg.org/ebooks/1661", "", "")
+    };
+    var passages = await fetcher.HydrateAsync(sources,
+      "Sherlock Holmes fictional consulting detective 221B Baker Street observation deduction evidence reasoning uncertain witness testimony", deadline.Token);
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(passages));
+    return passages.All(p => p.Fetched && !string.IsNullOrWhiteSpace(p.Excerpt)) ? 0 : 1;
+  }
   static async Task<int> RunAsync()
   {
     var subject = "harbor port risk crew coordination logistics dredging expansion scheduling";
