@@ -846,6 +846,7 @@ public static class PeopleEndpoints
         if (!s.Boards.TryGetValue(inv.BoardId, out var __bo) || (!string.Equals(__bo.OwnerKey, PeopleOps.UserOf(s, req), StringComparison.OrdinalIgnoreCase) && !PeopleOps.IsInstallationAdmin(s, PeopleOps.UserOf(s, req)))) return PeopleOps.Denied();
       }
       else if (PeopleOps.Check(s, req, inv.BoardId, inv.MeetingId, "manage") is { } denied) return denied;
+      var __inviteRevokeUsers = new List<string>(); var __inviteRevokeBoard = Guid.Empty; Guid? __inviteRevokeMeeting = null; IResult? __inviteRevokeResult = null;
       lock (s.SetupLock)
       {
         // Recheck CURRENT authority inside the mutation lock (TOCTOU).
@@ -897,9 +898,13 @@ public static class PeopleEndpoints
         Atomic.Audit(s, new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { target, scope = boardWide ? "board" : "meeting", meeting = inv.MeetingId }) });
         var __revokeUsers = removedUsers.ToList(); var __rb = inv.BoardId; Guid? __rm = boardWide ? null : inv.MeetingId;
         var __ret = Results.Ok(inv);
-        foreach (var u in __revokeUsers) { try { PeopleOps.RevokeLive(u, __rb, __rm); } catch { } }
-        return __ret;
+        // Hub revocation (HubGate + network) runs OUTSIDE the outermost ROOT gate.
+        // Authority mutation already committed above; capture payload, execute after locks release.
+        __inviteRevokeUsers = __revokeUsers; __inviteRevokeBoard = __rb; __inviteRevokeMeeting = __rm;
+        __inviteRevokeResult = __ret;
       }
+      foreach (var u in __inviteRevokeUsers) { try { PeopleOps.RevokeLive(u, __inviteRevokeBoard, __inviteRevokeMeeting); } catch { } }
+      return __inviteRevokeResult!;
     });
 
     app.MapGet("/api/boards/{bid:guid}/grants", (InMemoryStore s, HttpRequest req, Guid bid) =>
@@ -957,6 +962,7 @@ public static class PeopleEndpoints
     {
       if (!s.Grants.TryGetValue(id, out var g)) return Results.NotFound();
       if (PeopleOps.Check(s, req, g.BoardId, g.MeetingId, "manage") is { } denied) return denied;
+      var __grantRevokeUser = ""; var __grantRevokeBoard = Guid.Empty; Guid? __grantRevokeMeeting = null; IResult? __grantRevokeResult = null;
       lock (s.SetupLock)
       {
         // Recheck CURRENT authority inside the mutation lock (TOCTOU).
@@ -985,9 +991,12 @@ public static class PeopleEndpoints
         Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { user, meeting = mid }) });
         var __ru = user; var __rb2 = bid; var __rm2 = mid;
         var __nc = Results.NoContent();
-        try { PeopleOps.RevokeLive(__ru, __rb2, __rm2); } catch { }
-        return __nc;
+        // Hub revocation runs OUTSIDE the outermost ROOT gate; capture payload, execute after locks release.
+        __grantRevokeUser = __ru; __grantRevokeBoard = __rb2; __grantRevokeMeeting = __rm2;
+        __grantRevokeResult = __nc;
       }
+      try { PeopleOps.RevokeLive(__grantRevokeUser!, __grantRevokeBoard, __grantRevokeMeeting); } catch { }
+      return __grantRevokeResult!;
     });
 
     app.MapGet("/api/boards/{bid:guid}/memberships", (InMemoryStore s, HttpRequest req, Guid bid) =>
@@ -998,12 +1007,27 @@ public static class PeopleEndpoints
       if (PeopleOps.BadToken(s, req) is { } bad) return bad;
       if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
         return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-      var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
       try
       {
         return Atomic.Run(s, () =>
         {
-          var mine = s.Memberships.Values.Where(m => string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase)).ToList();
+          // Revalidate CURRENT bearer INSIDE the Atomic unit: a logout/revocation
+          // between the preliminary checks and commit must fail closed, never
+          // disclose another identity's private titles.
+          if (PeopleOps.HasInvalidToken(s, req)) throw new UnauthorizedAccessException("revoked-token");
+          string inUser;
+          if (PeopleOps.IsSecure(s))
+          {
+            if (!AuthOps.TrySession(s, req, out var inSess) || string.IsNullOrWhiteSpace(inSess))
+              throw new UnauthorizedAccessException("revoked");
+            inUser = inSess;
+          }
+          else
+          {
+            inUser = AuthOps.TrySession(s, req, out var eIn) ? eIn : PeopleOps.UserOf(s, req);
+          }
+          if (string.IsNullOrWhiteSpace(inUser)) throw new UnauthorizedAccessException("revoked");
+          var mine = s.Memberships.Values.Where(m => string.Equals(m.UserKey, inUser, StringComparison.OrdinalIgnoreCase)).ToList();
           var active = mine.Where(m => m.Active).ToList();
           // Rejoinable inactive: same user, inactive row, meeting still exists on the
           // same board, AND a CURRENT fresh meeting grant (or board-wide grant) still
@@ -1013,9 +1037,24 @@ public static class PeopleEndpoints
           var outList = new System.Collections.Generic.List<object>();
           foreach (var m in active.OrderByDescending(m => m.JoinedAt))
           {
+            // CURRENT parent/grant/session validation before any private titles:
+            // a restored graph movement must not leak the new board's titles
+            // through a stale membership row, and a revoked grant must not leak.
+            bool sameParent = false;
+            try { sameParent = s.Meetings.TryGetValue(m.MeetingId, out var __cm) && __cm is not null && __cm.BoardId == m.BoardId; } catch { sameParent = false; }
+            if (!sameParent) continue;
+            bool hasGrantNow = false;
+            try
+            {
+              hasGrantNow = s.Grants.Values.Any(g => g.BoardId == m.BoardId
+                && (g.MeetingId == null || g.MeetingId == m.MeetingId)
+                && string.Equals(g.UserKey, inUser, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { hasGrantNow = false; }
+            if (!hasGrantNow) continue;
             string mt = "";
             string bt = "";
-            try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm) && mm is not null) mt = mm.Title ?? ""; } catch { }
+            try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm) && mm is not null && mm.BoardId == m.BoardId) mt = mm.Title ?? ""; else continue; } catch { continue; }
             try { if (s.Boards.TryGetValue(m.BoardId, out var bb) && bb is not null) bt = bb.Name ?? ""; } catch { }
             outList.Add(new { id = m.Id, boardId = m.BoardId, meetingId = m.MeetingId, userKey = m.UserKey, active = true, canRejoin = false, meetingTitle = mt, boardName = bt, joinedAt = m.JoinedAt, leftAt = (DateTime?)null });
           }
@@ -1026,7 +1065,7 @@ public static class PeopleEndpoints
             {
               hasGrant = s.Grants.Values.Any(g => g.BoardId == m.BoardId
                 && (g.MeetingId == null || g.MeetingId == m.MeetingId)
-                && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
+                && string.Equals(g.UserKey, inUser, StringComparison.OrdinalIgnoreCase));
             }
             catch { hasGrant = false; }
             bool sameMeeting = false;
@@ -1045,8 +1084,8 @@ public static class PeopleEndpoints
             var myMids = new System.Collections.Generic.HashSet<Guid>(mine.Select(m => m.MeetingId));
             foreach (var inv in s.Invites.Values.Where(i => i.State == "pending" && i.MeetingId.HasValue).ToList())
             {
-              bool mine2 = string.Equals(inv.UserKey ?? "", user, StringComparison.OrdinalIgnoreCase)
-                || (!string.IsNullOrWhiteSpace(inv.Email) && string.Equals(inv.Email ?? "", user, StringComparison.OrdinalIgnoreCase));
+              bool mine2 = string.Equals(inv.UserKey ?? "", inUser, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrWhiteSpace(inv.Email) && string.Equals(inv.Email ?? "", inUser, StringComparison.OrdinalIgnoreCase));
               if (!mine2) continue;
               var mid = inv.MeetingId!.Value;
               if (myMids.Contains(mid)) continue;
@@ -1054,13 +1093,17 @@ public static class PeopleEndpoints
               string mt = ""; string bt = "";
               try { mt = im.Title ?? ""; } catch { }
               try { if (s.Boards.TryGetValue(inv.BoardId, out var ib) && ib is not null) bt = ib.Name ?? ""; } catch { }
-              outList.Add(new { id = inv.Id, boardId = inv.BoardId, meetingId = mid, userKey = user, active = false, canRejoin = true, meetingTitle = mt, boardName = bt, joinedAt = (DateTime?)null, leftAt = (DateTime?)null, inviteId = inv.Id });
+              outList.Add(new { id = inv.Id, boardId = inv.BoardId, meetingId = mid, userKey = inUser, active = false, canRejoin = true, meetingTitle = mt, boardName = bt, joinedAt = (DateTime?)null, leftAt = (DateTime?)null, inviteId = inv.Id });
             }
           }
           catch { }
           return Results.Ok(outList);
         });
       }
+      catch (UnauthorizedAccessException uae) when (uae.Message == "revoked-token")
+      { return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401); }
+      catch (UnauthorizedAccessException)
+      { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch { return Results.Json(new { error = "Membership read failed." }, statusCode: 500); }
     });
 
@@ -1083,6 +1126,7 @@ public static class PeopleEndpoints
       if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
         return Results.Json(new { error = "Authentication required." }, statusCode: 401);
       var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
+      var __leaveUser = ""; var __leaveBoard = Guid.Empty; Guid? __leaveMeeting = null; IResult? __leaveResult = null;
       lock (s.SetupLock)
       {
         // Recheck CURRENT session identity inside the mutation lock: a stale
@@ -1108,9 +1152,12 @@ public static class PeopleEndpoints
         Atomic.Audit(s, new AuditEvent { BoardId = mtg.BoardId, Action = "membership.leave", Detail = JsonSerializer.Serialize(new { user = lu, meeting = meetingId }) });
         var __lu = lu; var __lb = mtg.BoardId; var __lm = meetingId;
         var __ok = Results.Ok(new { left = true, meetingId });
-        try { PeopleOps.RevokeLive(__lu, __lb, __lm); } catch { }
-        return __ok;
+        // Hub revocation runs OUTSIDE the outermost ROOT gate; capture payload, execute after locks release.
+        __leaveUser = __lu; __leaveBoard = __lb; __leaveMeeting = __lm;
+        __leaveResult = __ok;
       }
+      try { PeopleOps.RevokeLive(__leaveUser!, __leaveBoard, __leaveMeeting); } catch { }
+      return __leaveResult!;
     });
 
     app.MapPost("/api/boards/{bid:guid}/repair-access", (InMemoryStore s, HttpRequest req, Guid bid) =>
@@ -1126,9 +1173,9 @@ public static class PeopleEndpoints
       }
       if (!s.Boards.TryGetValue(bid, out var board)) return Results.NotFound();
       var repaired = new List<object>();
+      var revokedLive = new List<string>();
       lock (s.SetupLock)
       {
-        var revokedLive = new List<string>();
         try
         {
           Atomic.Run(s, () =>
@@ -1172,8 +1219,9 @@ public static class PeopleEndpoints
         catch (UnauthorizedAccessException) { return Results.Json(new { error = "Only the installation admin or board owner can repair access." }, statusCode: 403); }
         catch (InvalidOperationException iox) when (iox.Message == "Board is gone.") { return Results.NotFound(); }
         catch (Exception ex) { return Results.Json(new { error = "Access repair could not be stored: " + ex.Message }, statusCode: 500); }
-        foreach (var __u in revokedLive.Distinct(StringComparer.OrdinalIgnoreCase)) PeopleOps.RevokeLive(__u, bid, null);
+        // Hub revocation already captured in revokedLive; executed after this lock block below.
       }
+      foreach (var __u in revokedLive.Distinct(StringComparer.OrdinalIgnoreCase)) { try { PeopleOps.RevokeLive(__u, bid, null); } catch { } }
       Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "access.repair", Detail = JsonSerializer.Serialize(new { repaired = repaired.Count }) });
       return Results.Ok(new { repaired });
     });

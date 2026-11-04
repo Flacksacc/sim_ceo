@@ -502,6 +502,23 @@ async function fetchAuth<T>(u: string, init: RequestInit, wantJson = true): Prom
       try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
     }
   }
+  // CURRENT-expiry synchronous retirement: /auth/me 200 + authenticated:false with a
+  // held nonempty token retires transport authority SYNCHRONOUSLY at receipt,
+  // before any held blob/download continuation can run. The originating
+  // epoch/token/user must still match CURRENT identity (protects fresh login
+  // from a queued old result); empty-token anonymous never retires. The
+  // dispatch is synchronous, so the purge (epoch bump + abort + revoke)
+  // executes before continuations. Once-only dedupe is shared in the handler.
+  if (r.ok && u.includes("/api/auth/me") && myToken) {
+    try {
+      const __parsed = text ? JSON.parse(text) : null;
+      if (__parsed && (__parsed as { authenticated?: boolean }).authenticated === false) {
+        if (epochNow() === myEpoch && currentToken() === myToken && currentUser() === myUser) {
+          try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
+        }
+      }
+    } catch {}
+  }
   if (!r.ok) throw new Error(`${r.status} ${text}`);
   // HTTP 204 means deliberate no-content success (e.g. grant/invite delete);
   // accept it explicitly. Other empty bodies still fail closed for JSON calls.
@@ -559,7 +576,10 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
   if (r.status === 401) {
     try {
       const latest = currentToken();
-      if (latest === myToken) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } }));
+      // Empty-token anonymous never enters the expired-session purge; only a
+      // held nonempty token whose originating epoch/user still match CURRENT
+      // identity expires. Once-only dedupe is shared in the handler.
+      if (myToken && latest === myToken && epochNow() === myEpoch && currentUser() === myUser) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } }));
     } catch {}
   }
   const buf = await r.arrayBuffer();
@@ -1015,6 +1035,17 @@ function AuthPanel() {
         }
       }
       await post<unknown>(`/api/meetings/${m.meetingId}/join`, {});
+      // Fresh readback verification: success requires a matching ACTIVE
+      // membership for this meeting. Readback errors, empty lists, or a
+      // revoked/inactive row never announce success.
+      let __fresh: MineRow[] = [];
+      try {
+        __fresh = await get<MineRow[]>(`/api/me/memberships`);
+      } catch (e) {
+        throw new Error("Rejoin verification failed: membership readback failed.");
+      }
+      const __ok = (__fresh ?? []).some((r) => String((r as MineRow).meetingId) === String(m.meetingId) && (r as MineRow).active !== false);
+      if (!__ok) throw new Error("Rejoin verification failed: no active membership for this meeting.");
       try { await qcPanel.refetchQueries({ queryKey: ["my-memberships"] }); } catch {}
       try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
       try { qcPanel.invalidateQueries({ queryKey: ["messages", m.meetingId] }); } catch {}
@@ -1435,7 +1466,14 @@ export default function App() {
   const [usagePurpose, setUsagePurpose] = useState("");
   const authStatusQ = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
   const anonPrivateBlocked = !currentToken() && authStatusQ.data?.authRequired !== false;
-  const sessQ = useQuery({ queryKey: ["sess"], queryFn: () => get<{ user: string; authenticated: boolean }>(`/api/auth/me`), retry: false, refetchInterval: 30000 });
+  const sessQ = useQuery({ queryKey: ["sess"], queryFn: async () => {
+    // Capture originating epoch/token/user at request time: the receipt
+    // handler must compare CURRENT identity against THESE values (fresh-login
+    // protection) and never against the fallback response user.
+    const __e = epochNow(); const __t = currentToken(); const __u = currentUser();
+    try { (window as unknown as { __simceoSessReq?: { epoch: number; token: string; user: string } }).__simceoSessReq = { epoch: __e, token: __t, user: __u }; } catch {}
+    return get<{ user: string; authenticated: boolean }>(`/api/auth/me`);
+  }, retry: false, refetchInterval: 30000 });
   const [sessExpiredFlag, setSessExpiredFlag] = useState(false);
   useEffect(() => { try { if (sessQ.data && sessQ.data.authenticated) setSessExpiredFlag(false); } catch {} }, [sessQ.data]);
   const sessExpired = sessExpiredFlag || (() => { try { return !!currentToken() && !!sessQ.data && !sessQ.data.authenticated; } catch { return false; } })();
@@ -1462,9 +1500,9 @@ export default function App() {
   // purge (expiry, revocation, leave) BEFORE any held save/reload callback can
   // resolve, so stale completions can never repopulate cleared state.
   const profileOpRef = useRef(0);
-  // Dedupe key for CURRENT-expiry purges driven by /auth/me polls (200 +
-  // authenticated:false with a held token). One purge per expired identity;
-  // anonymous (no token) and fresh-login (authenticated) never purge.
+  // Once-only dedupe for CURRENT-expiry purges (shared by 401 and 200-false):
+  // key is originating epoch|token|user (never the fallback response user).
+  // Anonymous (no token) and fresh-login (authenticated or identity-changed) never purge.
   const lastExpiredPurgeRef = useRef("");
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
@@ -1512,31 +1550,46 @@ export default function App() {
     try { setLive(false); } catch {}
   };
   // CURRENT-expiry poll transition: /auth/me returns 200 + authenticated:false
-  // while a token is still held (natural expiry, no 401). Invoke the SAME
-  // synchronous purge boundary once per expired identity, BEFORE any held
-  // body/click can resolve. Anonymous (no token) and fresh-login
-  // (authenticated:true) never purge. Stale-identity aware via current token.
+  // while a token is still held (natural expiry, no 401). The synchronous
+  // retirement already fired at receipt inside fetchAuth (before held
+  // blob/download continuations); this effect is only a fallback that routes
+  // through the SAME once-only event boundary. Never use the fallback
+  // response user ("owner"); the originating epoch/token/user travel in the
+  // event detail. Anonymous (no token) never purges.
   useEffect(() => {
     try {
-      const tok = currentToken();
-      if (!tok) return;
       const d = sessQ.data as { user?: string; authenticated?: boolean } | undefined;
       if (!d) return;
-      if (d.authenticated) { lastExpiredPurgeRef.current = ""; return; }
-      const key = tok + "|" + (d.user || "");
-      if (lastExpiredPurgeRef.current === key) return;
-      lastExpiredPurgeRef.current = key;
-      setSessExpiredFlag(true);
-      purgePrivate("expired");
+      if (d.authenticated) {
+        try { lastExpiredPurgeRef.current = ""; } catch {}
+        try { (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey = ""; } catch {}
+        return;
+      }
+      const req = (window as unknown as { __simceoSessReq?: { epoch: number; token: string; user: string } }).__simceoSessReq;
+      if (!req || !req.token) return;
+      // Fresh-login protection: the request origin must still match CURRENT
+      // identity at fallback time, or a queued old result must not purge.
+      if (epochNow() !== req.epoch || currentToken() !== req.token || currentUser() !== req.user) return;
+      try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: req.epoch, token: req.token, user: req.user } })); } catch {}
     } catch {}
   }, [sessQ.data]);
   useEffect(() => {
     const onAuthFailed = (e: Event) => {
       try {
         const d = (e as CustomEvent<{ epoch: number; token: string; user: string }>).detail;
-        if (!d) return;
-        if (epochNow() !== d.epoch || currentToken() !== d.token) return; // stale failure; ignore
-        try { lastExpiredPurgeRef.current = d.token + "|" + (d.user || ""); } catch {}
+        if (!d || !d.token) return; // empty-token anonymous never purges
+        // Fresh-login / stale protection: originating epoch/token/user must
+        // still match CURRENT identity at receipt time.
+        if (epochNow() !== d.epoch || currentToken() !== d.token || currentUser() !== d.user) return;
+        // Once-only per originating epoch/token/user, shared by 401 and
+        // 200-false paths (both route through this event with originating detail).
+        const key = String(d.epoch) + "|" + d.token + "|" + d.user;
+        try {
+          const seen = (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey ?? lastExpiredPurgeRef.current;
+          if (seen === key) return;
+        } catch {}
+        try { lastExpiredPurgeRef.current = key; } catch {}
+        try { (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey = key; } catch {}
         setSessExpiredFlag(true);
         purgePrivate("expired");
       } catch {}

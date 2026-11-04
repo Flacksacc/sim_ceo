@@ -119,6 +119,8 @@ public static class AuthEndpoints
       if (!AuthOps.ValidEmail(email)) return Results.BadRequest("A valid email is required.");
       if (password.Length < AuthOps.MinPasswordLength)
         return Results.BadRequest($"Password must be at least {AuthOps.MinPasswordLength} characters.");
+      bool __regFirstAcct = false;
+      IResult? __regResult = null;
       lock (s.SetupLock)
       {
         lock (s.AuthLock)
@@ -153,11 +155,17 @@ public static class AuthEndpoints
           try { __firstAcct = s.Accounts.Values.Count == 1; } catch { __firstAcct = false; }
           Atomic.Audit(s, new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
           var __created = Results.Created("/api/auth/me", new { email, token = session.Token, expiresAt = session.ExpiresAt });
-          if (__firstAcct) { try { SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { } }
-          return __created;
+          // Hub work (HubGate + network) runs OUTSIDE the outermost ROOT gate.
+          // Authority mutation already committed above; capture payload, execute after all locks release.
+          __regFirstAcct = __firstAcct;
+          __regResult = __created;
+          // (AbortAnonymous executes after this lock block; see below.)
           }
         }
       }
+      // OUTSIDE all ROOT gates (Setup/Auth/Message): live anonymous revocation never holds ROOT.
+      if (__regFirstAcct) { try { SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { } }
+      return __regResult!;
     });
 
     app.MapPost("/api/auth/login", (InMemoryStore s, JsonElement body) =>
