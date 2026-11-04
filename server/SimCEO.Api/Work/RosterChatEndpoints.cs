@@ -73,15 +73,17 @@ public static class RosterChatEndpoints
       string answer;
       var essentialChat = "ROSTER ADVISOR CHAT (isolated, not a meeting message). " + userContext + AdvisorDialogue.Guidance + "\n" + behaviorSection
         + AdvisorDialogue.Background(snapProfile, snapDesc)
-        + "Lead says: " + message + "\nReply in character from the criteria above: agree/disagree/challenge as the character's bluntness or diplomacy; concise; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements.\n";
-      var chatPacket = CharacterBehavior.FitEssentialFirst(essentialChat, historyLines.TakeLast(10).ToList(), ModelGateway.UserCharBudget("roster-chat", CharacterBehavior.ChatInputTokens));
+        + "Lead says: " + message + "\nReply in character from the standards above: evidence determines judgment and the character determines delivery; concise; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements.\n";
+      var chatPacket = CharacterBehavior.FitEssentialFirst(essentialChat, historyLines.TakeLast(10).ToList(), AdvisorAssessment.PacketBudget("roster-chat", CharacterBehavior.ChatInputTokens));
       if (chatPacket is null)
         return Results.Json(new { error = "Chat prompt over budget." }, statusCode: 413);
       try
       {
-        answer = await gw.CompleteAsync(ModelPolicy.SparkStandard, "roster-chat",
-          chatPacket, CharacterBehavior.ChatInputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), truncatePrompt: false);
+        answer = await AdvisorAssessment.CompleteAsync(gw, ModelPolicy.SparkStandard, "roster-chat",
+          chatPacket, CharacterBehavior.ChatInputTokens, req.HttpContext.RequestAborted, ownerOverride: PeopleOps.IsOwner(req),
+          ensureFresh: () => { if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) throw new ChatChangedException(failure); });
       }
+      catch (ChatChangedException changed) { return changed.Result; }
       catch (OperationCanceledException) { return Results.StatusCode(499); }
       catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
       // Post-await recheck under ONE RootGate THROUGH the immutable final
@@ -90,17 +92,8 @@ public static class RosterChatEndpoints
       // two reads cannot mix an old profile with a new epoch check.
       lock (s.RootGate)
       {
-        if (PeopleOps.BadToken(s, req) is { } bad2) return bad2;
-        if (s.RestoreEpochId != restorePin.epochId || s.RestoreEpochRev != restorePin.epochRev)
-          return Results.Conflict("Domain was restored during generation; stale reply discarded, retry.");
-        if (!s.Roster.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
-        if (fresh.Archived)
-          return Results.Conflict("Roster entry was archived during generation; stale reply discarded.");
-        if (!RosterEndpoints.CanReadRoster(s, req, fresh)) return PeopleOps.Denied();
-        if (fresh.Version != snapVersion)
-          return Results.Conflict("Advisor was edited during generation; stale reply discarded, retry with the current version.");
-        if (userContext != AdvisorDialogue.UserContext(LeadSetup.ResolveDefaultForCaller(s, req)))
-          return Results.Conflict("Your profile changed during generation; retry with your current profile.");
+        if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) return failure;
+        var fresh = s.Roster[id];
         return Results.Ok(new
         {
           answer,
@@ -119,4 +112,29 @@ public static class RosterChatEndpoints
       }
     });
   }
+  private sealed class ChatChangedException(IResult result) : Exception
+  {
+    public IResult Result { get; } = result;
+  }
+
+  private static IResult? CheckSnapshot(InMemoryStore s, HttpRequest req, Guid id, int version,
+    string expectedUserContext, (Guid epochId, long epochRev) restorePin)
+  {
+    lock (s.RootGate)
+    {
+        if (PeopleOps.BadToken(s, req) is { } bad) return bad;
+        if (s.RestoreEpochId != restorePin.epochId || s.RestoreEpochRev != restorePin.epochRev)
+          return Results.Conflict("Domain was restored during generation; stale reply discarded, retry.");
+        if (!s.Roster.TryGetValue(id, out var fresh) || fresh is null) return Results.NotFound();
+        if (fresh.Archived)
+          return Results.Conflict("Roster entry was archived during generation; stale reply discarded.");
+        if (!RosterEndpoints.CanReadRoster(s, req, fresh)) return PeopleOps.Denied();
+        if (fresh.Version != version)
+          return Results.Conflict("Advisor was edited during generation; stale reply discarded, retry with the current version.");
+        if (expectedUserContext != AdvisorDialogue.UserContext(LeadSetup.ResolveDefaultForCaller(s, req)))
+          return Results.Conflict("Your profile changed during generation; retry with your current profile.");
+      return null;
+    }
+  }
+
 }

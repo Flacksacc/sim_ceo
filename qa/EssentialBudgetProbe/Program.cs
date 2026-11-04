@@ -137,12 +137,13 @@ var okProfile = JsonSerializer.Serialize(new { contributionCriteria = cPara, rea
 // ---- Sender contract: source check alone (NOT provider proof) ----
 {
   var src = File.ReadAllText("server/SimCEO.Api/Work/Endpoints.cs");
-  var hasReplyConst = src.Contains("packet + ContextCurator.AdvisorReplySuffix");
-  var hasBidConst = src.Contains("bidPacket + ContextCurator.AdvisorBidSuffix");
-  var hasReplyNoTrunc = src.Contains("\"advisor-reply\"") && src.Contains("truncatePrompt: false");
-  var hasBidNoTrunc = src.Contains("\"advisor-bid\"") && src.Contains("truncatePrompt: false");
-  Check(hasReplyConst && hasBidConst, "sender-shared-suffix", "builder reserve + sender append share one constant (no duplicated magic margin)");
-  Check(hasReplyNoTrunc && hasBidNoTrunc, "sender-truncate-false", "CompleteAsync truncatePrompt:false for bid+reply (source check only, not provider proof)");
+  var assessmentSender = File.ReadAllText("server/SimCEO.Api/Work/AdvisorAssessment.cs");
+  var hasReplyConst = src.Contains("AdvisorAssessment.CompleteAsync") && assessmentSender.Contains("writerPacket += ContextCurator.AdvisorReplySuffix");
+  var hasSelection = src.Contains("AdvisorDialogue.SelectionPacket") && src.Contains("\"advisor-select\"");
+  var hasReplyNoTrunc = assessmentSender.Contains("truncatePrompt: false") && assessmentSender.Contains("\"advisor-assess\"");
+  var hasSelectionNoTrunc = hasSelection && src.Contains("truncatePrompt: false");
+  Check(hasReplyConst && hasSelection, "sender-shared-suffix", "actual assessment/writer and orchestrator paths use their shared packet contracts");
+  Check(hasReplyNoTrunc && hasSelectionNoTrunc, "sender-truncate-false", "assessment, writer and selector reject oversized packets (source check only, not provider proof)");
   Console.WriteLine("NOTE sender-source-check is static text evidence only; provider behavior is proven by fake-transport tests below, never claimed from text.");
 }
 

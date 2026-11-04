@@ -21,10 +21,10 @@ public sealed record CuratorManifest(
 public static class ContextCurator
 {
   // Delivered instruction suffixes: SINGLE shared source for builder reserve + sender append.
-  // The provider USER message is packet + suffix; the builder reserves suffix.Length inside
-  // ModelGateway.UserCharBudget so packet+suffix never exceeds the delivered budget. Sender
-  // must append these constants (never a duplicated literal) with truncatePrompt:false.
-  public const string AdvisorReplySuffix = "\nYOUR TURN. Cite [source:name] or [record:version] where used; if you add nothing, reply with exactly ABSTAIN. If your reply takes a clear position on the lead question or another advisor point, end with [stance: Agrees|Disagrees|Raises risk|Proposes alternative]; otherwise omit the tag.";
+  // The builder reserves the assessment and writer instruction envelope through
+  // AdvisorAssessment.PacketBudget. The sender appends these shared suffixes
+  // with truncatePrompt:false; essential profile and question text is never cut.
+  public const string AdvisorReplySuffix = "\nYOUR TURN. Cite [source:name] or [record:version] where used. Follow the validated assessment; do not expose its JSON. Write the actual requested response, without stance or reply-to tags; those are supplied by the server.";
   public const string AdvisorBidSuffix = "\nReply with exactly YES or NO, then one line why.";
 
   // Explicit budget rejection: essentials (behavior + question + latest lead + suffix) cannot
@@ -176,8 +176,7 @@ public static class ContextCurator
     // Source blocks: COMPLETE single-line blocks with metadata/pins/evidence.
     // Multiline excerpts are flattened to one line per block so trimming can
     // never leave a quoted body orphan after removing its header line.
-    var replyBudget0 = ModelGateway.UserCharBudget("advisor-reply", draftTokens);
-    var effective0 = replyBudget0 - AdvisorReplySuffix.Length;
+    var effective0 = AdvisorAssessment.PacketBudget("advisor-reply", draftTokens);
     var baseLen = essentialPrefix.Length
       + transcriptBlocks.Sum(b => b.line.Length + 1)
       + recordBlocks.Sum(b => b.Line.Length + 1)
@@ -218,16 +217,16 @@ public static class ContextCurator
       return b.ToString();
     }
     var budget = ModelGateway.UserCharBudget("advisor-reply", draftTokens);
-    var effectiveBudget = budget - AdvisorReplySuffix.Length;
+    var effectiveBudget = AdvisorAssessment.PacketBudget("advisor-reply", draftTokens);
     if (essentialPrefix.Length > effectiveBudget)
-      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential + {AdvisorReplySuffix.Length} chars instruction exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
+      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential plus {budget - effectiveBudget} chars reserved for assessment/instructions exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
     var packet = Rebuild(out var curSourceIds, out var curSeqs, out var curEvidence);
     while (packet.Length > effectiveBudget && sourceBlocks.Count > 0) { sourceBlocks.RemoveAt(sourceBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
     while (packet.Length > effectiveBudget && recordBlocks.Count > 0) { recordBlocks.RemoveAt(recordBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
     while (packet.Length > effectiveBudget && directionBlocks.Count > 0) { directionBlocks.RemoveAt(directionBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
     while (packet.Length > effectiveBudget && transcriptBlocks.Count > 0) { transcriptBlocks.RemoveAt(0); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
     if (packet.Length > effectiveBudget)
-      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential + {AdvisorReplySuffix.Length} chars instruction exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
+      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential plus {budget - effectiveBudget} chars reserved for assessment/instructions exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
     var manifest = new CuratorManifest(curSourceIds, curSeqs,
       lead?.Version ?? 0,
       eff.policy,

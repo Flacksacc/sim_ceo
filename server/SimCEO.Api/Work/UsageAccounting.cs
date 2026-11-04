@@ -24,7 +24,7 @@ public static class UsageAccounting
   // default; the UI labels them so hidden work is not mistaken for free.
   public static readonly HashSet<string> HiddenPurposes = new(StringComparer.OrdinalIgnoreCase)
   {
-    "advisor-bid", "advisor-research", "advisor-profile",
+    "advisor-bid", "advisor-research", "advisor-profile", "advisor-assess",
     "wizard-guide", "wizard-interview",
     "secretary", "briefing",
     "audition", "advisor-chat",

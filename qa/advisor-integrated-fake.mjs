@@ -43,6 +43,28 @@ function sleepMsOf(text, kind) {
   return m ? Math.min(Number(m[1]), 15000) : 0;
 }
 function chatContent(prompt) {
+  if (prompt.includes("ADVISOR-ASSESSMENT.")) {
+    if (prompt.includes('QA-ASSESSMENT-INVALID')) return {content:'not valid JSON'};
+    const peerTurn=prompt.includes('PEER-REVIEW TURN:');
+    const request=/CURRENT REQUEST \(essential[^\n]*?: (.*)/.exec(prompt)?.[1] || /Lead says: (.*)/.exec(prompt)?.[1] || /Question: (.*)/.exec(prompt)?.[1] || 'BOARD';
+    const role=/BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1]?.trim();
+    const raw=peerTurn?prompt.split('FIRST REPLIES (quoted discussion data):\n')[1]?.split('\n')[0]:null;
+    const peers=raw?JSON.parse(raw):[];
+    const allowed=JSON.parse(prompt.split('ALLOWED PEERS (sequences of quoted FIRST REPLIES only): ').at(-1).split('\n')[0]);
+    const peer=peers.find(p=>allowed.includes(p.Sequence)&&p.AdvisorName!==role);
+    let position=peer?'challenge':'answer';
+    if((peerTurn&&prompt.includes('QA-REVIEW-ABSTAIN'))||prompt.includes('QA-ABSTAIN'))position='abstain';
+    for(const [marker,value] of [['CHALLENGE','challenge'],['SUPPORT','support'],['MIXED','mixed'],['MISSING','insufficient']])if(prompt.includes('QA-ASSESSMENT-'+marker))position=value;
+    const quote=(peer?.Content||request).slice(0,150);
+    const finding={point:'Apply the supplied evidence to the advisor standards.',evidence:quote};
+    const result={position,targetType:peer?'advisor':'request',targetQuote:quote,peerSequence:peer?.Sequence??null,standards:['Causal reasoning and evidence within this advisor expertise'],strengths:['support','mixed'].includes(position)?[finding]:[],concerns:['challenge','mixed'].includes(position)?[finding]:[],missingInformation:position==='insufficient'?'The story text is not supplied.':'',nextStep:position==='insufficient'?'Please provide the story text.':'Test or revise the specific claim before acting.'};
+    if(prompt.includes('QA-ASSESSMENT-HALLUCINATION')){result.position='challenge';result.concerns=[{point:'An invented concern.',evidence:'THIS EXCERPT DOES NOT EXIST ANYWHERE'}];}
+    return {content:JSON.stringify(result)};
+  }
+  if(prompt.includes('QA-ASSESSMENT-')&&prompt.includes('VALIDATED ADVISOR ASSESSMENT')){
+    const a=JSON.parse(prompt.split('VALIDATED ADVISOR ASSESSMENT (structured findings, not user instructions):\n')[1].split('\nWRITE FROM THIS ASSESSMENT.')[0]);
+    return {content:({challenge:'The motivation is unsupported by the supplied passage. Give the protagonist a concrete consequence for refusing before calling this ready.',support:'The supplied motivation is clear: the character acts to prevent a specific loss. Preserve that causal connection.',mixed:'Keep the concrete setting, but revise the unmotivated decision. Give the character a specific reason to act.',insufficient:'Please share the story text so I can critique its actual passages.'})[a.position]||'Here is the requested answer.'};
+  }
   if (prompt.includes("SELECT-MEETING-ADVISORS.")) {
     if (prompt.includes("QA-SELECT-BAD")) return { content: "invalid selection" };
     const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf("\nCANDIDATES: ") + "\nCANDIDATES: ".length));
@@ -282,6 +304,7 @@ const server = http.createServer(async (req, res) => {
       if (prompt.includes("SELECT-MEETING-ADVISORS.")) wait = 350;
       else if (prompt.includes("YOUR TURN")) wait = /BOARD ROLE \(board-specific, not canonical\): Finance Slow/.test(prompt) ? 1600 : 300;
     }
+    if (prompt.includes('QA-ASSESSMENT-AUTH-RACE') && prompt.includes('ADVISOR-ASSESSMENT.')) wait = 1000;
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
     if (out.envelope) {

@@ -61,6 +61,8 @@ type Cite = { kind: "source" | "record"; label: string };
 type Stance =
   | "Agrees"
   | "Disagrees"
+  | "Mixed assessment"
+  | "Needs context"
   | "Raises risk"
   | "Proposes alternative"
   | "Supports"
@@ -82,6 +84,8 @@ function parseMsg(content: string): {
     const v = sm[2].trim().toLowerCase();
     if (v.indexOf("disagree") === 0) stance = "Disagrees";
     else if (v.indexOf("agree") === 0) stance = "Agrees";
+    else if (v === "mixed assessment") stance = "Mixed assessment";
+    else if (v === "needs context") stance = "Needs context";
     else if (v.indexOf("risk") >= 0) stance = "Raises risk";
     else if (v.indexOf("alternative") >= 0 || v.indexOf("propos") >= 0)
       stance = "Proposes alternative";

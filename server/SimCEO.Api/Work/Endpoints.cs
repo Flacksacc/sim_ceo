@@ -1461,16 +1461,19 @@ public static class SimCEOEndpoints
         inFlightDrafts.AddRange(waveAdvisors.Select(async adv =>
         {
           await draftSem.WaitAsync(runCancel.Token);
-          try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
+          try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "considering", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
           try
           {
             string packet;
             CuratorManifest? manifest;
             try { var built = BuildDiscussionPacketPinned(s, req, dx, m, adv, prompt, board, lead, reviewContext); packet = built.packet; manifest = built.manifest; }
             catch (Exception pktEx) { try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)pktEx.Message); }
-            var text = await gw.CompleteAsync(spark, "advisor-reply",
-              packet + ContextCurator.AdvisorReplySuffix,
-              followup ? ContextBudget.MaxTokens : ContextBudget.DraftTokens, 2048, runCancel.Token, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
+            var text = await AdvisorAssessment.CompleteAsync(gw, spark, "advisor-reply", packet,
+              followup ? ContextBudget.MaxTokens : ContextBudget.DraftTokens, runCancel.Token,
+              ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id,
+              peers: followup ? firstReplies : null, self: adv.Id,
+              ensureFresh: () => { lock (s.RootGate) { CheckPacketFreshnessLocked(s, req, dx, m, adv); } },
+              onAssessed: () => { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); });
             try
             {
               if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "abstained");
@@ -1481,7 +1484,7 @@ public static class SimCEOEndpoints
             return (adv, text: (string?)text, manifest: (CuratorManifest?)manifest, error: (string?)null);
           }
           catch (OperationCanceledException) when (runCancel.IsCancellationRequested) { throw; }
-          catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
+          catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException or InvalidOperationException)
           {
             try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)ex.Message);
           }
@@ -1495,6 +1498,7 @@ public static class SimCEOEndpoints
         (BoardAdvisor adv, string? text, CuratorManifest? manifest, string? error) draft;
         try { draft = await finished; }
         catch (OperationCanceledException) { return LaneBFail("response run cancelled", rounds.Count, WaveRemaining()); }
+        catch (UnauthorizedAccessException) { return LaneBFail("access changed during advisor assessment; unsent drafts discarded", rounds.Count, WaveRemaining()); }
         var drafts = new[] { draft };
         var round = new List<BoardAdvisor> { draft.adv };
         try { MeetingActivity.SyncDraftOutcome(id, activityOpId, drafts.Select(d => (d.adv.Id, d.adv.BoardRole, d.text, d.error)).ToList()); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }

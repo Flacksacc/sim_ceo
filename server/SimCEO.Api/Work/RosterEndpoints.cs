@@ -1039,18 +1039,18 @@ public static class RosterEndpoints
       // Essential-first packet: behavior + current question always whole;
       // owner board info is droppable context. truncatePrompt:false so the
       // gateway never blindly cuts the question tail.
-      var essentialAud = "AUDITION (isolated, not a meeting message). " + auditionBehavior
+      var essentialAud = "AUDITION (isolated, not a meeting message). " + AdvisorDialogue.Guidance + auditionBehavior
         + " Question: " + question + "\nReply in character from the criteria above: agree/disagree/challenge as the character's bluntness or diplomacy; concise; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements. ";
       var audPacket = CharacterBehavior.FitEssentialFirst(essentialAud,
         string.IsNullOrWhiteSpace(boardInfo) ? new List<string>() : new List<string> { "Board info: " + boardInfo },
-        ModelGateway.UserCharBudget("audition", CharacterBehavior.ChatInputTokens));
+        AdvisorAssessment.PacketBudget("audition", CharacterBehavior.ChatInputTokens));
       if (audPacket is null)
         return Results.Json(new { error = "Character behavior plus question exceed the audition prompt budget; shorten the saved paragraphs." }, statusCode: 413);
       string answer;
       try
       {
-        answer = await gw.CompleteAsync(ModelPolicy.SparkStandard, "audition",
-          audPacket, CharacterBehavior.ChatInputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), truncatePrompt: false);
+        answer = await AdvisorAssessment.CompleteAsync(gw, ModelPolicy.SparkStandard, "audition",
+          audPacket, CharacterBehavior.ChatInputTokens, req.HttpContext.RequestAborted, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (OperationCanceledException) { return Results.StatusCode(499); }
       catch (Exception ex) when (ex is ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ProviderError(ex is ProviderException pex ? pex : new ProviderException(502, ex.Message)); }

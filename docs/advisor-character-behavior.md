@@ -1,5 +1,44 @@
 # Advisor character and meeting behavior
 
+## Independent judgment and constructive challenge (2026-11-04)
+
+Every meeting answer, optional peer follow-up, roster chat answer and audition
+uses two stages: assess the supplied context, then write from the validated
+assessment. Advisors derive evaluation standards from their own researched
+expertise and principles. Communication preferences govern delivery rather than
+correctness. Agreement, challenge and mixed judgments require specific supported
+findings; missing essential material calls for a focused question. Explanations
+and creative deliverables remain possible without forcing a critique template.
+
+The bounded assessment identifies its target, criteria, supported strengths and
+concerns, position, missing information and a concrete next step. Quote excerpts
+must occur in supplied context. Peer targets must be real first replies from
+another advisor and the target quote must belong to that peer. Malformed,
+unsupported or invented-target assessments block the writer; there is no silent
+fallback to an unassessed answer. A concise findings summary is used, not a
+private reasoning transcript.
+
+The writer connects the particular claim or passage to the advisor's expertise
+and the CEO's circumstances, explains the tradeoff, and gives a useful next
+step. It avoids compulsory praise, manufactured conflict and blanket approval.
+AI authorship alone does not establish poor quality. A local improvement does
+not establish that the whole plan or draft is ready. Peer review remains at most
+one substantive follow-up, with abstention when nothing useful changes.
+
+The assessment supplies stance labels and peer targets. Users see conversational
+replies and human-readable positions, including Mixed assessment and Needs
+context; they do not see the assessment's JSON. Activity distinguishes considering
+from responding. Both model calls use the applicable model/privacy policy and
+normal metering, bounded prompt/output budgets, cancellation and freshness
+checks. Existing canonical profiles stay intact; future research compilation
+adds domain-specific evaluation standards within the existing three paragraphs.
+
+Quality verification must cover justified agreement as well as criticism,
+mixed judgments, absent material, peer targeting, invented quotations, ordinary
+creative requests, profile/context changes and cancellation. Real provider
+examples supplement deterministic contract/integration tests; sample success is
+not a guarantee of the quality of every future judgment.
+
 Latest user direction, 2026-11-03. This supersedes fixed tone selectors, many independently configured personality attributes, and the old independent board-profile-copy design. It is an acceptance specification, not a claim that implementation is deployed.
 
 The user supplies an advisor name and description. Background and a few web links are optional. A short research run, targeting two to three minutes with a total hard deadline of no more than three minutes, compiles the character into three short paragraphs the user can edit:

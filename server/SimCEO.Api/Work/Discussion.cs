@@ -82,6 +82,8 @@ public static class MessageTags
     var v = (raw ?? "").Trim().ToLowerInvariant();
     if (v.StartsWith("disagree")) return "Disagrees";
     if (v.StartsWith("agree")) return "Agrees";
+    if (v == "mixed assessment") return "Mixed assessment";
+    if (v == "needs context") return "Needs context";
     if (v.Contains("risk")) return "Raises risk";
     if (v.Contains("alternative") || v.Contains("propos")) return "Proposes alternative";
     if (v.Contains("support")) return "Supports";

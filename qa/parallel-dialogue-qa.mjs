@@ -42,8 +42,8 @@ try {
   await ctx.grantPermissions(['local-network-access'],{origin:base});
   const page = await ctx.newPage(); page.on('pageerror',error=>errors.push(String(error)));
   await page.goto(`${base}/#/meet?board=${board.id}&meeting=${m.id}`);
-  await page.locator('.is-composer .mp-head .badge.live').waitFor();
-  assert.equal(await page.locator('.composer-bar .mp-seat').count(),6,'All four board advisors plus orchestrator and secretary');
+  await page.locator('.is-grid .mp-head .badge.live').waitFor();
+  assert.equal(await page.locator('.meeting-tools .mp-seat').count(),6,'All four board advisors plus orchestrator and secretary');
   let finished = false;
   const pending = call('POST',`/api/meetings/${m.id}/run`,{prompt:question,leadVersion:profile.version}).then(r=>{finished=true;return r;});
   await until(async()=> (await activity(m))?.phase==='selecting','Orchestrator selection activity missing');
@@ -83,7 +83,7 @@ for(const role of ['Operator Fast','Finance Slow']) {
 }
 const firstDispatches = log.filter(p=>p.full.includes('YOUR TURN')&&!p.full.includes('PEER-REVIEW TURN:'));
 assert.equal(firstDispatches.length,2); assert.ok(Math.abs(firstDispatches[0].t-firstDispatches[1].t)<500,'Workers dispatch in parallel');
-const reviews = log.filter(p=>p.full.includes('PEER-REVIEW TURN:'));
+const reviews = log.filter(p=>p.full.includes('PEER-REVIEW TURN:')&&!p.full.includes('ADVISOR-ASSESSMENT.'));
 assert.equal(reviews.length,2);
 assert.ok(reviews.every(p=>p.full.includes('subject-matter expert')&&p.full.includes('FamiliarTopics')&&p.full.includes('SimplerTopics')));
 assert.ok(reviews.every(p=>p.full.includes('QA first reply from Operator Fast')&&p.full.includes('QA first reply from Finance Slow')));
