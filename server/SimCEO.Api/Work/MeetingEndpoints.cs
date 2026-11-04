@@ -108,7 +108,80 @@ public static class MeetingEndpoints
         // Lane B: participant-set change invalidates any in-flight generation so it discards.
         if (!string.Equals(curP.ParticipantIdsJson, nextParts, StringComparison.Ordinal)) { curP.ParticipantIdsJson = nextParts; curP.Generation++; }
       }
-      if (body.TryGetProperty("brief", out var b) && b.ValueKind == JsonValueKind.String)
+      bool isAutoInit = false;
+      if (body.TryGetProperty("briefAutoInit", out var ai0) && ai0.ValueKind == JsonValueKind.True) isAutoInit = true;
+      if (!isAutoInit && body.TryGetProperty("BriefAutoInit", out var ai1) && ai1.ValueKind == JsonValueKind.True) isAutoInit = true;
+      if (!isAutoInit && body.TryGetProperty("autoInit", out var ai2) && ai2.ValueKind == JsonValueKind.True) isAutoInit = true;
+      if (!isAutoInit && body.TryGetProperty("AutoInit", out var ai3) && ai3.ValueKind == JsonValueKind.True) isAutoInit = true;
+      if (isAutoInit && body.TryGetProperty("brief", out var ab) && ab.ValueKind == JsonValueKind.String)
+        {
+          var proposedBrief = ab.GetString() ?? "";
+          string? expectedBrief = null;
+          if (body.TryGetProperty("expectedBrief", out var eb) && eb.ValueKind == JsonValueKind.String) expectedBrief = eb.GetString();
+          else if (body.TryGetProperty("ExpectedBrief", out var eb2) && eb2.ValueKind == JsonValueKind.String) expectedBrief = eb2.GetString();
+          bool expectEmpty = false;
+          if (body.TryGetProperty("expectBriefEmpty", out var ee) && ee.ValueKind == JsonValueKind.True) expectEmpty = true;
+          if (body.TryGetProperty("ExpectBriefEmpty", out var ee2) && ee2.ValueKind == JsonValueKind.True) expectEmpty = true;
+          var curBriefAuto = curP.Brief ?? "";
+          if (expectedBrief != null)
+          {
+            if (!string.Equals(curBriefAuto, expectedBrief, StringComparison.Ordinal))
+            {
+              if (!string.Equals(curBriefAuto, proposedBrief, StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-blank");
+            }
+          }
+          else
+          {
+            if (!string.IsNullOrWhiteSpace(curBriefAuto))
+            {
+              if (!string.Equals(curBriefAuto, proposedBrief, StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-blank");
+            }
+          }
+          long? expSeq = null;
+          if (body.TryGetProperty("leadSequence", out var ls) && ls.ValueKind == JsonValueKind.Number && ls.TryGetInt64(out var lsv)) expSeq = lsv;
+          else if (body.TryGetProperty("LeadSequence", out var ls2) && ls2.ValueKind == JsonValueKind.Number && ls2.TryGetInt64(out var lsv2)) expSeq = lsv2;
+          string? expContent = null;
+          if (body.TryGetProperty("leadContent", out var lc) && lc.ValueKind == JsonValueKind.String) expContent = lc.GetString();
+          else if (body.TryGetProperty("LeadContent", out var lc2) && lc2.ValueKind == JsonValueKind.String) expContent = lc2.GetString();
+          long? expGen = null;
+          if (body.TryGetProperty("expectedGeneration", out var eg) && eg.ValueKind == JsonValueKind.Number && eg.TryGetInt64(out var egv)) expGen = egv;
+          else if (body.TryGetProperty("ExpectedGeneration", out var eg2) && eg2.ValueKind == JsonValueKind.Number && eg2.TryGetInt64(out var egv2)) expGen = egv2;
+          else if (body.TryGetProperty("generation", out var gn) && gn.ValueKind == JsonValueKind.Number && gn.TryGetInt64(out var gnv)) expGen = gnv;
+          else if (body.TryGetProperty("Generation", out var gn2) && gn2.ValueKind == JsonValueKind.Number && gn2.TryGetInt64(out var gnv2)) expGen = gnv2;
+          Guid? expRestoreId = null;
+          if (body.TryGetProperty("restoreEpochId", out var ri) && ri.ValueKind == JsonValueKind.String && Guid.TryParse(ri.GetString(), out var rig)) expRestoreId = rig;
+          else if (body.TryGetProperty("RestoreEpochId", out var ri2) && ri2.ValueKind == JsonValueKind.String && Guid.TryParse(ri2.GetString(), out var rig2)) expRestoreId = rig2;
+          long? expRestoreRev = null;
+          if (body.TryGetProperty("restoreEpochRev", out var rr) && rr.ValueKind == JsonValueKind.Number && rr.TryGetInt64(out var rrv)) expRestoreRev = rrv;
+          else if (body.TryGetProperty("RestoreEpochRev", out var rr2) && rr2.ValueKind == JsonValueKind.Number && rr2.TryGetInt64(out var rrv2)) expRestoreRev = rrv2;
+          var msgListAuto = s.Messages.GetOrAdd(id, _ => new List<Domain.Message>());
+          Domain.Message? latestLeadAuto = null;
+          foreach (var mm in msgListAuto) { if (string.Equals(mm.Sender, "lead", StringComparison.OrdinalIgnoreCase)) { if (latestLeadAuto == null || mm.Sequence > latestLeadAuto.Sequence) latestLeadAuto = mm; } }
+          if (expSeq.HasValue)
+          {
+            if (latestLeadAuto == null || latestLeadAuto.Sequence != expSeq.Value) throw new InvalidOperationException("brief-autoinit-lead");
+          }
+          if (expContent != null)
+          {
+            if (latestLeadAuto == null || !string.Equals(latestLeadAuto.Content ?? "", expContent ?? "", StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-lead");
+          }
+          if (expGen.HasValue)
+          {
+            if (curP.Generation != expGen.Value) throw new InvalidOperationException("brief-autoinit-generation");
+          }
+          if (expRestoreId.HasValue || expRestoreRev.HasValue)
+          {
+            if (expRestoreId.HasValue && s.RestoreEpochId != expRestoreId.Value) throw new InvalidOperationException("brief-autoinit-restore");
+            if (expRestoreRev.HasValue && s.RestoreEpochRev != expRestoreRev.Value) throw new InvalidOperationException("brief-autoinit-restore");
+          }
+          if (string.IsNullOrWhiteSpace(curBriefAuto))
+          {
+            curP.Brief = proposedBrief;
+            if (!string.IsNullOrWhiteSpace(curP.Brief) && curP.State == MeetingState.AwaitingBrief)
+              curP.State = MeetingState.Active;
+          }
+        }
+      else if (body.TryGetProperty("brief", out var b) && b.ValueKind == JsonValueKind.String)
         {
           curP.Brief = b.GetString() ?? "";
           if (!string.IsNullOrWhiteSpace(curP.Brief) && curP.State == MeetingState.AwaitingBrief)
@@ -120,6 +193,10 @@ public static class MeetingEndpoints
       catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
       catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException iox) when (iox.Message == "brief-autoinit-blank") { return Results.Json(new { error = "Brief was already set by a newer message; auto-init discarded. Retry responses." }, statusCode: 409); }
+      catch (InvalidOperationException iox) when (iox.Message == "brief-autoinit-lead") { return Results.Json(new { error = "Lead message was superseded by a newer message; auto-init discarded. Retry responses." }, statusCode: 409); }
+      catch (InvalidOperationException iox) when (iox.Message == "brief-autoinit-generation") { return Results.Json(new { error = "Meeting changed since the lead was saved; auto-init discarded. Retry responses." }, statusCode: 409); }
+      catch (InvalidOperationException iox) when (iox.Message == "brief-autoinit-restore") { return Results.Json(new { error = "Domain was restored during send; auto-init discarded. Retry." }, statusCode: 409); }
       catch (InvalidOperationException iox) when (SimCEO.Api.Work.CommitOutcome.IsMissing(iox, "Meeting is gone.")) { return Results.NotFound("meeting"); }
       catch (InvalidOperationException iox) { return SimCEO.Api.Work.CommitOutcome.StorageFault("Meeting update", iox); }
       catch (Exception ex) { return SimCEO.Api.Work.CommitOutcome.MapCommitFailure(ex, "Meeting update") ?? Results.Json(new { error = "Meeting update failed; no state changed: " + ex.Message }, statusCode: 500); }

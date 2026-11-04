@@ -4381,9 +4381,10 @@ const testModel = useMutation({
     const p = parseRunError(e);
     const status = p.status;
     const hay = p.hay;
-    if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then retry responses.";
-    if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")) return "Access changed for this meeting. Reopen it from Boards, then retry.";
-    if (status === 404 || hay.includes("meeting is gone")) return "This meeting is gone. Reopen it from Boards.";
+    const definitive = status >= 400 && status < 500;
+    if (status === 401 || (definitive && hay.includes("authentication required"))) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 403 || (definitive && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")))) return "Access changed for this meeting. Reopen it from Boards, then retry.";
+    if (status === 404 || (definitive && hay.includes("meeting is gone"))) return "This meeting is gone. Reopen it from Boards.";
     if (hay.includes("lead profile changed")) return "Lead profile changed since you sent. Review the current lead profile, then retry with the current version.";
     if (hay.includes("already in progress")) return "A response run is already in progress for this meeting. Wait for it to finish.";
     if (hay.includes("no advisors available")) {
@@ -4402,9 +4403,9 @@ const testModel = useMutation({
     if (m) {
       const status = parseInt(m[1], 10);
       const hay = m[2].toLowerCase();
-      if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then resend your message.";
-      if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")) return "Access changed for this meeting. Reopen it from Boards, then resend.";
-      if (status === 404 || hay.includes("meeting is gone")) return "This meeting is gone. Reopen it from Boards.";
+      if (status === 401 || ((status >= 400 && status < 500) && hay.includes("authentication required"))) return "Your session changed. Sign in again, then resend your message.";
+      if (status === 403 || ((status >= 400 && status < 500) && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")))) return "Access changed for this meeting. Reopen it from Boards, then resend.";
+      if (status === 404 || ((status >= 400 && status < 500) && hay.includes("meeting is gone"))) return "This meeting is gone. Reopen it from Boards.";
       return "Could not confirm your message was saved. The server response was unclear: check the conversation and resend only if it does not appear.";
     }
     return "Could not confirm your message was saved. Check the conversation: if it appears, do not resend; otherwise resend.";
@@ -4414,8 +4415,10 @@ const testModel = useMutation({
     const m = /^(\d{3})\s([\s\S]*)$/.exec(raw);
     const hay = (m ? m[2] : raw).toLowerCase();
     const status = m ? parseInt(m[1], 10) : 0;
-    if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then retry responses.";
-    if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied") || hay.includes("contribute")) return "Only contributors can save the brief. Ask a contributor to add a brief, then retry responses.";
+    const definitive = status >= 400 && status < 500;
+    if (status === 401 || (definitive && hay.includes("authentication required"))) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 403 || (definitive && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied") || hay.includes("contribute")))) return "Only contributors can save the brief. Ask a contributor to add a brief, then retry responses.";
+    if (status === 409) { try { const parsed = JSON.parse(m ? m[2] : raw); const se = (parsed && typeof parsed.error === "string") ? parsed.error : ""; if (se) return se; } catch {} }
     return "Your message was saved but the brief could not be updated. Retry responses.";
   };
   const send = useMutation({
@@ -4463,12 +4466,21 @@ const testModel = useMutation({
       const frozenBrief = (pack as any)?.briefAtClick ?? "";
       const frozenCanContribute = !!(pack as any)?.canContributeAtClick;
       const oB = (pack as any)?.originBoardId; const oM = (pack as any)?.originMeetingId; const oU = (pack as any)?.originUser; const oE = (pack as any)?.originEpoch; const oOrigin = (pack as any)?.origin;
-      const leadCtx = { boardId: oB, meetingId: oM, user: oU, epoch: oE, prompt: frozenPrompt, leadVersion: frozenLeadVersion, policy: frozenPolicy, origin: oOrigin, submitOp: op, saveConfirmed: true };
+      const savedLead = (pack as any)?.r ?? null;
+      const savedSeq = (savedLead as any)?.sequence ?? (savedLead as any)?.Sequence ?? null;
+      const savedContent = (savedLead as any)?.content ?? (savedLead as any)?.Content ?? frozenPrompt;
+      const savedGen = (savedLead as any)?.generation ?? (savedLead as any)?.Generation ?? null;
+      const savedRestoreId = (savedLead as any)?.restoreEpochId ?? (savedLead as any)?.RestoreEpochId ?? null;
+      const savedRestoreRev = (savedLead as any)?.restoreEpochRev ?? (savedLead as any)?.RestoreEpochRev ?? null;
+      const savedReplySeq = (_v as any)?.replySeq ?? null;
+      const leadCtx = { boardId: oB, meetingId: oM, user: oU, epoch: oE, prompt: frozenPrompt, leadVersion: frozenLeadVersion, policy: frozenPolicy, origin: oOrigin, submitOp: op, saveConfirmed: true, replySeq: savedReplySeq, leadSequence: savedSeq, leadContent: savedContent, generation: savedGen, restoreEpochId: savedRestoreId, restoreEpochRev: savedRestoreRev };
       if (!String(frozenBrief ?? "").trim()) {
         if (!frozenCanContribute) { settlePipeline(op, "error", "Add a brief before requesting advisor responses.", leadCtx); setSendConflict(null); return; }
         showPhase(op, "working", "Requesting advisor responses...");
         chainedOpRef.current = op;
-        patch("/api/meetings/" + oM, { brief: String(frozenPrompt).slice(0, 800) }).then(() => {
+        const autoBrief = String(savedContent ?? frozenPrompt).slice(0, 800);
+        const autoBody = { brief: autoBrief, briefAutoInit: true, expectedBrief: "", expectBriefEmpty: true, leadSequence: savedSeq, leadContent: savedContent, expectedGeneration: savedGen, restoreEpochId: savedRestoreId, restoreEpochRev: savedRestoreRev };
+        patch("/api/meetings/" + oM, autoBody).then(() => {
           if (!pipelineOwns(op, pack as any)) { retirePipeline(op); return; }
           refresh("meetings", "meeting-detail");
           showPhase(op, "working", "Requesting advisor responses...");
@@ -4922,12 +4934,21 @@ const testModel = useMutation({
     const op = "submit-" + (++opSeq.current);
     submitBusyRef.current = true;
     submitOpRef.current = op;
-    const leadCtx = { boardId: rc.boardId, meetingId: rc.meetingId, user: rc.user, epoch: rc.epoch, prompt: rc.prompt, leadVersion: rc.leadVersion, policy: rc.policy, origin: rc.origin, submitOp: op, saveConfirmed: !!(rc as any).saveConfirmed };
+    const rcLeadSeq = (rc as any)?.leadSequence ?? null;
+    const rcLeadContent = (rc as any)?.leadContent ?? rc.prompt;
+    const rcGen = (rc as any)?.generation ?? null;
+    const rcRestoreId = (rc as any)?.restoreEpochId ?? null;
+    const rcRestoreRev = (rc as any)?.restoreEpochRev ?? null;
+    const rcReplySeq = (rc as any)?.replySeq ?? null;
+    const leadCtx = { boardId: rc.boardId, meetingId: rc.meetingId, user: rc.user, epoch: rc.epoch, prompt: rc.prompt, leadVersion: rc.leadVersion, policy: rc.policy, origin: rc.origin, submitOp: op, saveConfirmed: !!(rc as any).saveConfirmed, replySeq: rcReplySeq, leadSequence: rcLeadSeq, leadContent: rcLeadContent, generation: rcGen, restoreEpochId: rcRestoreId, restoreEpochRev: rcRestoreRev };
     const needBrief = !String(briefText ?? "").trim();
     if (needBrief && !canActMeeting) { settlePipeline(op, "error", "Add a brief before requesting advisor responses.", leadCtx); setSendConflict(null); return; }
     showPhase(op, "working", "Requesting advisor responses...");
     if (needBrief) {
-      chainedOpRef.current = op; patch("/api/meetings/" + rc.meetingId, { brief: String(rc.prompt).slice(0, 800) }).then(() => {
+      chainedOpRef.current = op;
+      const retryBrief = String(rcLeadContent ?? rc.prompt).slice(0, 800);
+      const retryBody = { brief: retryBrief, briefAutoInit: true, expectedBrief: "", expectBriefEmpty: true, leadSequence: rcLeadSeq, leadContent: rcLeadContent, expectedGeneration: rcGen, restoreEpochId: rcRestoreId, restoreEpochRev: rcRestoreRev };
+      patch("/api/meetings/" + rc.meetingId, retryBody).then(() => {
         if (submitOpRef.current !== op || !rc.origin || originStale(rc.origin)) { retirePipeline(op); return; }
         const live = liveSelRef.current;
         if (live.boardId !== rc.boardId || live.meetingId !== rc.meetingId) { retirePipeline(op); return; }

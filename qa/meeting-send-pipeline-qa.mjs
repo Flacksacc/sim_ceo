@@ -77,9 +77,10 @@ let reqLog = [];
 let runCalls = 0;
 let lastRunBody = null;
 let runBehavior = "success"; let failMessages = null; let capsOverride = null; let leadVersionStub = 7; let secretaryBehavior = "success"; let secretaryBodies = [];
+let patchBehavior = "success"; let lastPatchBody = null; let patchCalls = 0; let lastMessagesBody = null;
 let gates = { messages: null, run: null, secretary: null, patch: null };
 function deferred() { let r = null; const promise = new Promise((res) => { r = res; }); return { promise, release: r }; }
-function resetProbeState() { messages = freshMessages(); meetings = freshMeetings(); runCalls = 0; lastRunBody = null; runBehavior = "success"; failMessages = null; capsOverride = null; leadVersionStub = 7; secretaryBehavior = "success"; secretaryBodies = []; gates = { messages: null, run: null, secretary: null, patch: null }; }
+function resetProbeState() { messages = freshMessages(); meetings = freshMeetings(); runCalls = 0; lastRunBody = null; runBehavior = "success"; failMessages = null; capsOverride = null; leadVersionStub = 7; secretaryBehavior = "success"; secretaryBodies = []; patchBehavior = "success"; lastPatchBody = null; patchCalls = 0; lastMessagesBody = null; gates = { messages: null, run: null, secretary: null, patch: null }; }
 const fixtureFallback = fx.fixtureHandler(reqLog, []);
 async function apiStub(route) {
   const req = route.request();
@@ -105,15 +106,48 @@ async function apiStub(route) {
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/delivery$/))) { const list = messages[m[1]] || []; const last = list.length ? list[list.length - 1].sequence : 0; return J({ state: "Active", deliveredRevision: last, messages: list.length, lastSequence: last }); }
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages$/)) && method === "GET") return J(messages[m[1]] || []);
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages$/)) && method === "POST") {
-    if (failMessages === "once-abort") { failMessages = null; await route.abort("failed"); return; } if (failMessages === "commit-then-abort") { failMessages = null; const bb = bodyOf(); const ll = messages[m[1]] || (messages[m[1]] = []); const sq = (ll.length ? ll[ll.length - 1].sequence : 0) + 1; ll.push({ sequence: sq, sender: "lead", content: bb.content || "", advisorId: "", advisorName: null, status: "committed" }); await route.abort("failed"); return; } if (failMessages === "once-500") { failMessages = null; return J({ error: "store failed" }, 500); } if (gates.messages) await gates.messages.promise;
-    const b = bodyOf();
+    if (failMessages === "once-abort") { failMessages = null; await route.abort("failed"); return; } if (failMessages === "commit-then-abort") { failMessages = null; const bb = bodyOf(); const ll = messages[m[1]] || (messages[m[1]] = []); const sq = (ll.length ? ll[ll.length - 1].sequence : 0) + 1; ll.push({ sequence: sq, sender: "lead", content: bb.content || "", parentSequence: bb.parentSequence ?? null, advisorId: "", advisorName: null, status: "committed" }); await route.abort("failed"); return; } if (failMessages === "once-500") { failMessages = null; return J({ error: "store failed" }, 500); } if (failMessages === "once-500-denied") { failMessages = null; return J({ error: "Post-commit effect failed: access denied" }, 500); } if (failMessages === "commit-then-500-denied") { failMessages = null; const bb2 = bodyOf(); const ll2 = messages[m[1]] || (messages[m[1]] = []); const sq2 = (ll2.length ? ll2[ll2.length - 1].sequence : 0) + 1; ll2.push({ sequence: sq2, sender: "lead", content: bb2.content || "", parentSequence: bb2.parentSequence ?? null, advisorId: "", advisorName: null, status: "committed" }); return J({ error: "Post-commit effect failed: access denied" }, 500); } if (failMessages === "once-403-denied") { failMessages = null; return J({ error: "Access revoked or not granted for this scope." }, 403); } if (gates.messages) await gates.messages.promise;
+    const b = bodyOf(); lastMessagesBody = b;
     const list = messages[m[1]] || (messages[m[1]] = []);
     const seq = (list.length ? list[list.length - 1].sequence : 0) + 1;
-    const msg = { sequence: seq, sender: "lead", content: b.content || "", advisorId: "", advisorName: null, status: "committed" };
+    const msg = { sequence: seq, sender: "lead", content: b.content || "", parentSequence: b.parentSequence ?? null, advisorId: "", advisorName: null, status: "committed" };
     list.push(msg);
     return J(msg, 201);
   }
-  if ((m = p.match(/^\/api\/meetings\/([^/]+)$/)) && method === "PATCH") { if (gates.patch) await gates.patch.promise; const b = bodyOf(); const mt = meetings[m[1]]; if (mt && typeof b.brief === "string") mt.brief = b.brief; return J(mt || {}); }
+  if ((m = p.match(/^\/api\/meetings\/([^/]+)$/)) && method === "PATCH") {
+    if (gates.patch) await gates.patch.promise;
+    const b = bodyOf(); lastPatchBody = b; patchCalls++;
+    if (patchBehavior === "fail500-once") { patchBehavior = "success"; return J({ error: "brief store failed" }, 500); }
+    if (patchBehavior === "fail409-brief-once") { patchBehavior = "success"; return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
+    const mt = meetings[m[1]];
+    if (mt && typeof b.brief === "string") {
+      const isAuto = b.briefAutoInit === true || b.autoInit === true;
+      if (isAuto) {
+        const proposed = b.brief || "";
+        const cur = mt.brief || "";
+        let expected = null;
+        if (typeof b.expectedBrief === "string") expected = b.expectedBrief;
+        if (expected !== null) { if (cur !== expected && cur !== proposed) return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
+        else { if (cur.trim() !== "" && cur !== proposed) return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
+        if (b.leadSequence !== undefined && b.leadSequence !== null) {
+          const lst = messages[m[1]] || [];
+          let latest = null;
+          for (const mm of lst) { if (mm.sender === "lead" && (latest === null || mm.sequence > latest)) latest = mm.sequence; }
+          if (latest !== b.leadSequence) return J({ error: "Lead message was superseded by a newer message; auto-init discarded. Retry responses." }, 409);
+        }
+        if (b.leadContent !== undefined && b.leadContent !== null) {
+          const lst2 = messages[m[1]] || [];
+          let latestMsg = null;
+          for (const mm of lst2) { if (mm.sender === "lead" && (!latestMsg || mm.sequence > latestMsg.sequence)) latestMsg = mm; }
+          if (!latestMsg || (latestMsg.content || "") !== b.leadContent) return J({ error: "Lead message was superseded by a newer message; auto-init discarded. Retry responses." }, 409);
+        }
+        if (cur.trim() === "") mt.brief = proposed;
+        return J(mt || {});
+      }
+      mt.brief = b.brief;
+    }
+    return J(mt || {});
+  }
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/run$/)) && method === "POST") {
     runCalls++;
     if (gates.run) await gates.run.promise;
@@ -121,6 +155,7 @@ async function apiStub(route) {
     lastRunBody = b; try { fs.appendFileSync(".tmp/qa-runs.log", "RUN " + m[1] + " prompt=" + JSON.stringify((b.prompt || "").slice(0, 40)) + " leadVersion=" + b.leadVersion + "\n"); } catch (e) {}
     if (runBehavior === "fail409-once") { runBehavior = "success"; return J({ error: "No advisors available for discussion.", fixes: ["Approve at least one advisor on this board before running discussion."], yielded: [] }, 409); }
     if (runBehavior === "fail502-once") { runBehavior = "success"; return J({ error: "provider failure" }, 502); }
+    if (runBehavior === "fail500-denied-once") { runBehavior = "success"; return J({ error: "Post-commit effect failed: access denied" }, 500); }
     if (runBehavior === "strict-version" && b.leadVersion !== leadVersionStub) return J({ error: "Lead profile changed; refresh and retry with the current version." }, 409); if (runBehavior === "conflict-once") { runBehavior = "success"; return J({ error: "Lead profile changed; refresh and retry with the current version." }, 409); } if (runBehavior === "empty-once") { runBehavior = "success"; return J({ published: [], yielded: [{ advisor: "CFO Ada", reason: "bid-declined" }], abstained: ["CFO Ada"], overflow: null }); }
     const list = messages[m[1]] || (messages[m[1]] = []);
     const seq = (list.length ? listHC(list) : 0) + 1;
@@ -157,7 +192,7 @@ async function launch() {
   page = await ctx.newPage();
   const pageErrors = [];
   page.on("pageerror", (e) => { try { pageErrors.push(String(e).slice(0, 300)); } catch (x) {} });
-  page.on("console", (msg) => { try { const t = String(msg.text()); if (t.indexOf("Failed to complete negotiation") >= 0 || t.indexOf("Failed to start the connection") >= 0 || t.indexOf("net::ERR_FAILED") >= 0 || t.indexOf("net::ERR_CONNECTION_REFUSED") >= 0 || t.indexOf("status of 409") >= 0 || t.indexOf("status of 502") >= 0 || t.indexOf("status of 500") >= 0) { hubNoise.push(t.slice(0, 140)); return; } if (msg.type() === "error") pageErrors.push(t.slice(0, 200)); } catch (x) {} });
+  page.on("console", (msg) => { try { const t = String(msg.text()); if (t.indexOf("Failed to complete negotiation") >= 0 || t.indexOf("Failed to start the connection") >= 0 || t.indexOf("net::ERR_FAILED") >= 0 || t.indexOf("net::ERR_CONNECTION_REFUSED") >= 0 || t.indexOf("status of 409") >= 0 || t.indexOf("status of 502") >= 0 || t.indexOf("status of 500") >= 0 || t.indexOf("status of 403") >= 0 || t.indexOf("status of 401") >= 0) { hubNoise.push(t.slice(0, 140)); return; } if (msg.type() === "error") pageErrors.push(t.slice(0, 200)); } catch (x) {} });
   page.on("response", (r) => { try { if (r.status() >= 400) outLine("HTTP" + r.status() + " " + r.url().slice(0, 160)); } catch (x) {} });
   page.__qaErrors = pageErrors;
   await page.route("**/hubs/**", (r) => r.abort("connectionrefused")); await page.route("**/api/**", apiStub);
@@ -587,11 +622,146 @@ async function testLeadUncertainNoAutorepost() {
   await openMeeting("m-one", "Pricing move QA session");
   ok("uncertain-reconciled", (await bodyText()).indexOf("Uncertain delivery lead") >= 0, "");
 }
+async function testSendDeniedRequires4xx() {
+  const mark = reqLog.length;
+  resetProbeState();
+  failMessages = "commit-then-500-denied";
+  await page.reload();
+  await openMeeting("m-one", "Pricing move QA session");
+  const box = composer();
+  await box.fill("Denied 500 lead");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Could not confirm", { timeout: 30000 });
+  const t1 = await bodyText();
+  ok("denied500-uncertain", t1.indexOf("Could not confirm") >= 0 && t1.indexOf("resend only if it does not appear") >= 0, t1.slice(0, 300));
+  ok("denied500-no-definitive", t1.indexOf("Reopen it from Boards, then resend") < 0, t1.slice(0, 300));
+  ok("denied500-single", countFrom(mark, "POST", "/api/meetings/m-one/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-one/messages"));
+  await sleep(800);
+  ok("denied500-no-autorepost", countFrom(mark, "POST", "/api/meetings/m-one/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-one/messages"));
+  failMessages = null;
+  await page.reload();
+  await openMeeting("m-one", "Pricing move QA session");
+  ok("denied500-reconciled", (await bodyText()).indexOf("Denied 500 lead") >= 0, "");
+  const mark2 = reqLog.length;
+  resetProbeState();
+  failMessages = "once-403-denied";
+  await page.reload();
+  await openMeeting("m-one", "Pricing move QA session");
+  const box2 = composer();
+  await box2.fill("Denied 403 lead");
+  await box2.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Access changed", { timeout: 30000 });
+  const t2 = await bodyText();
+  ok("denied403-definitive", t2.indexOf("Reopen it from Boards, then resend") >= 0, t2.slice(0, 300));
+  ok("denied403-single", countFrom(mark2, "POST", "/api/meetings/m-one/messages") === 1, "messages=" + countFrom(mark2, "POST", "/api/meetings/m-one/messages"));
+  failMessages = null;
+  const mark3 = reqLog.length;
+  resetProbeState();
+  runBehavior = "fail500-denied-once";
+  await page.reload();
+  await openMeeting("m-one", "Pricing move QA session");
+  const box3 = composer();
+  await box3.fill("Run denied 500 lead");
+  await box3.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Advisor responses failed", { timeout: 30000 });
+  const card = page.locator("div[role=alert]").first();
+  const cardText = await card.innerText();
+  ok("run500-saved", cardText.indexOf("lead message is saved") >= 0, cardText.slice(0, 300));
+  ok("run500-no-access", cardText.indexOf("Access changed") < 0, cardText.slice(0, 300));
+  ok("run500-lead-once", countFrom(mark3, "POST", "/api/meetings/m-one/messages") === 1, "messages=" + countFrom(mark3, "POST", "/api/meetings/m-one/messages"));
+  ok("run500-run-once", countFrom(mark3, "POST", "/api/meetings/m-one/run") === 1, "run=" + countFrom(mark3, "POST", "/api/meetings/m-one/run"));
+}
+async function testHeldPatchOverlapNewSurvives() {
+  const mark = reqLog.length;
+  resetProbeState();
+  capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
+  gates.patch = deferred();
+  gates.run = deferred();
+  await page.reload();
+  await openMeeting("m-empty", "Empty brief session");
+  const box = composer();
+  await box.fill("Overlap first lead");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Requesting advisor responses...", { timeout: 30000 });
+  await sleep(400);
+  ok("overlap-no-run-yet", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  await page.evaluate((h) => { window.location.hash = h; }, "#/people?board=b-alpha&meeting=m-empty");
+  await page.getByRole("heading", { name: "Act as (demo identity for grant checks)", exact: true }).waitFor({ timeout: 15000 });
+  await page.getByLabel("Act as user").fill("owner");
+  await page.getByRole("button", { name: "Apply identity" }).click();
+  await sleep(800);
+  await page.evaluate((h) => { window.location.hash = h; }, "#/meet?board=b-alpha&meeting=m-empty");
+  await page.getByRole("heading", { name: "Empty brief session", exact: true }).waitFor({ timeout: 20000 });
+  await composer().fill("Overlap second lead");
+  await composer().press("Enter");
+  await sleep(800);
+  ok("overlap-two-leads", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 2, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+  gates.patch.release();
+  gates.patch = null;
+  await sleep(1000);
+  const tmid = await bodyText();
+  ok("overlap-new-working", tmid.indexOf("Requesting advisor responses...") >= 0, tmid.slice(0, 300));
+  ok("overlap-no-complete-yet", tmid.indexOf("Responses complete.") < 0, tmid.slice(0, 300));
+  ok("overlap-no-run-yet2", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  ok("overlap-brief-new", (meetings["m-empty"] && meetings["m-empty"].brief === "Overlap second lead"), "brief=" + JSON.stringify(meetings["m-empty"] && meetings["m-empty"].brief));
+  gates.run.release();
+  gates.run = null;
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("overlap-new-completes", true, "");
+  ok("overlap-single-run", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  ok("overlap-two-leads-final", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 2, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+}
+async function testPatchFailureReplyFrozen() {
+  const mark = reqLog.length;
+  resetProbeState();
+  await page.reload();
+  await openMeeting("m-one", "Pricing move QA session");
+  const replyBtn = page.getByRole("button", { name: "Reply in thread" }).nth(1);
+  await replyBtn.waitFor({ timeout: 15000 });
+  await replyBtn.click();
+  await sleep(300);
+  const box = composer();
+  await box.fill("Reply frost lead");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("reply-lead-once", countFrom(mark, "POST", "/api/meetings/m-one/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-one/messages"));
+  ok("reply-parent", lastMessagesBody && lastMessagesBody.parentSequence === 2, JSON.stringify(lastMessagesBody));
+  ok("reply-prompt-frozen", lastRunBody && lastRunBody.prompt === "Reply frost lead", JSON.stringify(lastRunBody));
+  ok("reply-run-once", countFrom(mark, "POST", "/api/meetings/m-one/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-one/run"));
+  const mark2 = reqLog.length;
+  resetProbeState();
+  capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
+  patchBehavior = "fail500-once";
+  await page.reload();
+  await openMeeting("m-empty", "Empty brief session");
+  const box2 = composer();
+  await box2.fill("Patch fail lead");
+  await box2.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Advisor responses failed", { timeout: 30000 });
+  const cardText = await page.locator("div[role=alert]").first().innerText();
+  ok("patchfail-terminal", cardText.indexOf("brief") >= 0 || cardText.indexOf("Brief") >= 0 || cardText.indexOf("responses") >= 0, cardText.slice(0, 300));
+  ok("patchfail-lead-once", countFrom(mark2, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark2, "POST", "/api/meetings/m-empty/messages"));
+  ok("patchfail-no-run", countFrom(mark2, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark2, "POST", "/api/meetings/m-empty/run"));
+  gates.patch = deferred();
+  const retryBtn = page.getByRole("button", { name: "Retry responses (same lead)" }).first();
+  await retryBtn.waitFor({ timeout: 15000 });
+  await retryBtn.click();
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Requesting advisor responses...", { timeout: 30000 });
+  await sleep(600);
+  ok("patchretry-no-run-yet", countFrom(mark2, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark2, "POST", "/api/meetings/m-empty/run"));
+  ok("patchretry-no-repost", countFrom(mark2, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark2, "POST", "/api/meetings/m-empty/messages"));
+  gates.patch.release();
+  gates.patch = null;
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("patchretry-run-once", countFrom(mark2, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark2, "POST", "/api/meetings/m-empty/run"));
+  ok("patchretry-prompt-frozen", lastRunBody && lastRunBody.prompt === "Patch fail lead", JSON.stringify(lastRunBody));
+  ok("patchretry-still-once", countFrom(mark2, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark2, "POST", "/api/meetings/m-empty/messages"));
+}
 async function main() {
   try {
     await launch();
     const only = (process.env.QA_ONLY || "").split(",").map((s) => s.trim()).filter((s) => !!s);
-    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible];
+    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible, testSendDeniedRequires4xx, testHeldPatchOverlapNewSurvives, testPatchFailureReplyFrozen];
     const tests = only.length ? all.filter((t) => only.indexOf(t.name) >= 0) : all;
     for (const t of tests) {
       try { await t(); } catch (e) { fail++; const m = t.name + " threw " + String((e && e.message) || e).slice(0, 600); failures.push(m); console.log("  FAIL " + m); outLine("FAIL " + m); try { outLine("PAGE-TAIL " + (await bodyText()).slice(-2500)); } catch (e2) {} }

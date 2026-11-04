@@ -859,6 +859,9 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
   if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "discuss") is { } deniedMsg) return deniedMsg;
   IResult? msgGate = null;
+  long savedGenMsg = 0;
+  Guid savedRestoreIdMsg = Guid.Empty;
+  long savedRestoreRevMsg = 0;
   lock (s.MessageLock)
   {
     Atomic.Run(s, () =>
@@ -895,12 +898,15 @@ app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, I
     curM.DeliveredRevision = input.Sequence;
     if (string.Equals(input.Sender, "lead", StringComparison.OrdinalIgnoreCase))
       curM.Generation++;
+    savedGenMsg = curM.Generation;
+    savedRestoreIdMsg = s.RestoreEpochId;
+    savedRestoreRevMsg = s.RestoreEpochRev;
     s.Meetings.Flush();
     });
   }
   if (msgGate is not null) return msgGate;
   await SimCEO.Api.Hubs.BoardHub.PublishMeeting(hub, s, meetingId, "message", new { input.MeetingId, input.Sequence, input.Sender, input.Content }, "read");
-  return Results.Created($"/api/meetings/{meetingId}/messages/{input.Sequence}", input);
+  return Results.Created($"/api/meetings/{meetingId}/messages/{input.Sequence}", new { input.BoardId, input.MeetingId, input.Sequence, input.AdvisorId, input.Sender, input.AdvisorName, input.Content, input.ParentSequence, input.Stance, input.Status, input.CreatedAt, generation = savedGenMsg, restoreEpochId = savedRestoreIdMsg, restoreEpochRev = savedRestoreRevMsg });
 });
 
 app.MapPost("/api/meetings/{meetingId:guid}/record/draft", (InMemoryStore s, HttpRequest req, Guid meetingId, JsonElement items) =>
