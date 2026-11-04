@@ -488,6 +488,40 @@ database remain running. Primary implemented and reviewed this feedback
 directly; no Muse coding agents or new dedicated-agent review were used.
 The broader parity goal remains paused.
 
+### 2026-11-04 — Board-to-meeting sidebar navigation deployed
+
+Delivered requested navigation: selecting a board replaces sidebar board rows
+with its meetings, board name and Back to boards arrow. Selecting a meeting
+opens its conversation and keeps the sidebar available. Search, state filter,
+empty/error states and New meeting move with the list; the duplicate meeting
+selector inside the conversation is removed. Global rail buttons stay stable;
+board-specific destinations are available through Board settings in the main
+area. Messaging uses the freed layout space, with responsive context stacking.
+
+Implementation: `0e60ea8`, QA update `ea56507`, layout correction `517cd06`.
+Frontend/release builds passed. Integrated QA passed 390 assertions, zero
+failures (`.tmp/board-meetings-integrated-rebuilt.log`). The earlier 276/2 run
+is retained: its Records assertion expected no meeting, whereas selecting a
+meeting now retains that scope; the updated assertion checks the selected
+meeting's draft controls and route. Fresh-stack preflight failures are retained
+in separate logs; final suite used a freshly built, verified isolated stack.
+Final CSS changes passed a new build and live layout checks.
+
+Live read-only browser checks passed for both themes: board/meeting selection,
+back arrow, Back/Forward, refresh, filters, relocated board tools, conversation
+width and narrow-screen fit. No domain writes/page errors; existing boards,
+meetings, roster and advisors preserved (timestamp precision normalized in
+comparison only). Evidence: `.tmp/board-meetings-live-check-final.log`;
+screenshots: `output/board-meetings-review/2026-11-04`.
+
+Live image `sha256:9e26f0d6f0e809d992bfd68d112ed39c089ef34d0604f81435959b71484c0961`
+and app container `199520047de69cdb0addfa850497ae6b022a2d69ec4bac5fb4b8e28e9d23d8b1`
+are healthy on 5173. Original database container and volumes retained.
+Backup: `.tmp/update-20261104-164646-UTC-d2909aa3`; rollback:
+`simceo-essentials-app:rollback-20261104-164646-d2909aa3`.
+Owned test stack and browsers stopped; no coding agents used. Full parity
+remains paused; this checkpoint completes the requested navigation feedback.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
