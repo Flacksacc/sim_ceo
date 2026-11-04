@@ -55,7 +55,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
   const boardReadable = canReadBoard === true || canManage === true;
   const allowedSet = new Set((allowedMeetings ?? []).map((m) => (m ?? "").toLowerCase()));
   function canDownloadRow(s: GovSource): { ok: boolean; why: string } {
-    if (boardReadable || canManage === true) return { ok: true, why: "" };
+    if (boardReadable) return { ok: true, why: "" };
     const approved = (s.reviewState ?? "").toLowerCase() === "approved" && !s.excluded;
     if (!approved) return { ok: false, why: "Available after approval (meeting guests see approved originals only)." };
     if ((s.scope ?? "board") !== "meeting") return { ok: false, why: "Board originals are available to board readers; meeting guests see metadata only." };
