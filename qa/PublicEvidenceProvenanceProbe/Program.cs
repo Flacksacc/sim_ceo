@@ -145,6 +145,134 @@ static class Probe
       bool originsOk = mapped.Count == 2 && mapped[0].Refs[0].Fetched && !mapped[1].Refs[0].Fetched && mapped[1].Refs[0].Origin == "provider-search";
       Ok("same-url-distinct-origins", originsOk, "origins wrong");
     }
+    {
+      var dupUrl = "https://example.com/dup-doc";
+      var dupCites = new List<ModelGateway.Citation>
+      {
+        new(dupUrl, "Alpha provider title", "Alpha provider snippet about harbors and ports.", false, "provider-search"),
+        new(dupUrl, "Beta hydrated title", "Fetched Beta passage about harbors and ports with logistics detail.", true, "application-fetch"),
+      };
+      var hit = ClaimEvidenceMapper.SelectPreferredCitation(dupCites, dupUrl);
+      Ok("dup-helper-prefers-fetched", hit is not null && hit.Fetched && hit.Origin == "application-fetch", "helper picked wrong");
+      Ok("dup-helper-beta-content", hit is not null && hit.Title == "Beta hydrated title" && (hit.Excerpt ?? "").Contains("Fetched Beta passage"), "title/excerpt wrong");
+      var legacyFirst = dupCites.FirstOrDefault(c => ClaimEvidenceMapper.UrlsMatch(c.Url ?? "", dupUrl));
+      Ok("dup-helper-legacy-would-lose", legacyFirst is not null && !legacyFirst.Fetched, "legacy assumption changed");
+      var dupPool = new Dictionary<string, List<PoolPassage>>(StringComparer.Ordinal);
+      dupPool[dupUrl] = new List<PoolPassage>
+      {
+        new("Alpha provider title", "Alpha provider snippet about harbors and ports.", false, "provider-search"),
+        new("Beta hydrated title", "Fetched Beta passage about harbors and ports with logistics detail.", true, "application-fetch"),
+      };
+      Ok("dup-helper-pool-retains-both", dupPool[dupUrl].Count == 2, "pool lost passage");
+      var dupLines = new[]
+      {
+        "FACT | Harbor claim || EVIDENCE: https://example.com/dup-doc :: \"Alpha provider snippet about harbors and ports.\"",
+        "INTERPRETATION | Port read || EVIDENCE: https://example.com/dup-doc :: \"Fetched Beta passage about harbors and ports\"",
+      };
+      var dupMapped = ClaimEvidenceMapper.MapAll(dupLines, dupPool, sidEmpty);
+      bool dupOk = dupMapped.Count == 2 && dupMapped.All(v => v.Verified) && !dupMapped[0].Refs[0].Fetched && dupMapped[0].Refs[0].Origin == "provider-search" && dupMapped[1].Refs[0].Fetched && dupMapped[1].Refs[0].Origin == "application-fetch";
+      Ok("dup-helper-claim-origins", dupOk, "claim origins wrong");
+    }
+    {
+      int evidenceHits = 0;
+      var dupFake = new FakeHandler();
+      dupFake.Responder = req =>
+      {
+        var host = req.RequestUri?.Host ?? "";
+        if (string.Equals(host, "example.com", StringComparison.OrdinalIgnoreCase))
+        {
+          evidenceHits++;
+          return Html("Dup doc", "Fetched Beta passage about harbors and ports with logistics detail.");
+        }
+        return new HttpResponseMessage(HttpStatusCode.NotFound);
+      };
+      int port;
+      using (var tcp = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0)) { tcp.Start(); port = ((System.Net.IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop(); }
+      var listener = new HttpListener();
+      listener.Prefixes.Add("http://127.0.0.1:" + port + "/");
+      listener.Start();
+      string dupUrl2 = "https://example.com/dup-doc";
+      string envelope = "{\"id\":\"resp-dup-1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50},\"output\":[{\"type\":\"web_search_call\",\"results\":[{\"url\":\"" + dupUrl2 + "\",\"title\":\"Alpha provider title\",\"snippet\":\"Alpha provider snippet about harbors and ports.\"}]},{\"type\":\"message\",\"content\":[{\"text\":\"research done\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"" + dupUrl2 + "\",\"title\":\"Beta hydrated title\"}]}]}]}";
+      byte[] envelopeBytes = System.Text.Encoding.UTF8.GetBytes(envelope);
+      var served = new TaskCompletionSource<bool>();
+      var listenTask = Task.Run(async () =>
+      {
+        try
+        {
+          var ctx = await listener.GetContextAsync().ConfigureAwait(false);
+          try
+          {
+            using (var sr = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8)) { await sr.ReadToEndAsync().ConfigureAwait(false); }
+            if (ctx.Request.HttpMethod == "POST" && (ctx.Request.Url?.AbsolutePath ?? "") == "/responses")
+            {
+              ctx.Response.StatusCode = 200;
+              ctx.Response.ContentType = "application/json";
+              ctx.Response.ContentLength64 = envelopeBytes.Length;
+              await ctx.Response.OutputStream.WriteAsync(envelopeBytes, 0, envelopeBytes.Length).ConfigureAwait(false);
+            }
+            else { ctx.Response.StatusCode = 404; }
+          }
+          finally { try { ctx.Response.OutputStream.Close(); ctx.Response.Close(); } catch { } served.TrySetResult(true); }
+        }
+        catch (Exception ex) { served.TrySetException(ex); }
+      });
+      string? oldBase = Environment.GetEnvironmentVariable("META_API_BASE");
+      string? oldKey = Environment.GetEnvironmentVariable("META_API_KEY");
+      try
+      {
+        Environment.SetEnvironmentVariable("META_API_BASE", "http://127.0.0.1:" + port);
+        Environment.SetEnvironmentVariable("META_API_KEY", "test-dummy-key");
+        var store = new SimCEO.Api.Data.InMemoryStore();
+        var evidence = new PublicEvidenceFetcher(dupFake, DnsFor);
+        var gw = new ModelGateway(store, evidence);
+        var gr = await gw.CompleteGroundedAsync("muse-spark-1.3-contributor", "advisor-research", subject, 2048, 2048, CancellationToken.None, ownerOverride: true).ConfigureAwait(false);
+        await served.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+        try { await listenTask.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); } catch { }
+        Ok("dup-gw-citation-count", gr.Citations.Count == 2, "count=" + gr.Citations.Count);
+        bool orderOk = gr.Citations.Count == 2 && string.Equals(gr.Citations[0].Url, dupUrl2, StringComparison.Ordinal) && string.Equals(gr.Citations[1].Url, dupUrl2, StringComparison.Ordinal);
+        Ok("dup-gw-same-url-order", orderOk, "order wrong");
+        bool provOk = gr.Citations.Count == 2 && !gr.Citations[0].Fetched && gr.Citations[0].Origin == "provider-search" && !string.IsNullOrWhiteSpace(gr.Citations[0].Excerpt);
+        Ok("dup-gw-alpha-provider", provOk, "alpha wrong f=" + (gr.Citations.Count > 0 ? gr.Citations[0].Fetched.ToString() : "?"));
+        bool hydOk = gr.Citations.Count == 2 && gr.Citations[1].Fetched && gr.Citations[1].Origin == "application-fetch" && !string.IsNullOrWhiteSpace(gr.Citations[1].Excerpt);
+        Ok("dup-gw-beta-hydrated", hydOk, "beta wrong");
+        Ok("dup-gw-actual-fetch-count", evidenceHits >= 1, "hits=" + evidenceHits);
+        var poolMulti = new Dictionary<string, List<PoolPassage>>(StringComparer.Ordinal);
+        foreach (var cite in gr.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
+        {
+          if (string.IsNullOrWhiteSpace(cite.Excerpt)) continue;
+          string akey = cite.Url.Trim();
+          foreach (var k in new List<string>(poolMulti.Keys)) { if (ClaimEvidenceMapper.UrlsMatch(k, akey)) { akey = k; break; } }
+          if (!poolMulti.TryGetValue(akey, out var alist)) { alist = new List<PoolPassage>(); poolMulti[akey] = alist; }
+          bool cf = cite.Fetched;
+          string co = (cite.Origin ?? "").Trim();
+          if (cf && string.IsNullOrWhiteSpace(co)) co = "application-fetch";
+          if (!cf) co = "provider-search";
+          alist.Add(new PoolPassage(cite.Title ?? "", cite.Excerpt ?? "", cf, co));
+        }
+        string poolKey = "";
+        foreach (var k in poolMulti.Keys) { if (ClaimEvidenceMapper.UrlsMatch(k, dupUrl2)) { poolKey = k; break; } }
+        Ok("dup-gw-pool-retains-both", poolKey != "" && poolMulti[poolKey].Count == 2, "pool=" + (poolKey == "" ? "missing" : poolMulti[poolKey].Count.ToString()));
+        var invHit = ClaimEvidenceMapper.SelectPreferredCitation(gr.Citations, dupUrl2);
+
+
+        Ok("dup-gw-inventory-prefers-fetched", invHit is not null && invHit.Fetched && invHit.Origin == "application-fetch" && (invHit.Excerpt ?? "") == (gr.Citations[1].Excerpt ?? "") && !string.IsNullOrWhiteSpace(invHit.Excerpt) && (invHit.Excerpt ?? "") != (gr.Citations[0].Excerpt ?? ""), "inv wrong");
+        string qAlpha = (gr.Citations[0].Excerpt ?? "").Trim();
+        string qBeta = (gr.Citations[1].Excerpt ?? "").Trim();
+        if (qAlpha.Length > 60) qAlpha = qAlpha.Substring(0, 60);
+        if (qBeta.Length > 60) qBeta = qBeta.Substring(0, 60);
+        var claimLines = new[] { "FACT | Harbor claim || EVIDENCE: " + dupUrl2 + " :: \"" + qAlpha + "\"", "INTERPRETATION | Port read || EVIDENCE: " + dupUrl2 + " :: \"" + qBeta + "\"" };
+        var mapped = ClaimEvidenceMapper.MapAll(claimLines, poolMulti, sidEmpty);
+        bool claimOk = mapped.Count == 2 && mapped.All(v => v.Verified) && !mapped[0].Refs[0].Fetched && mapped[0].Refs[0].Origin == "provider-search" && mapped[1].Refs[0].Fetched && mapped[1].Refs[0].Origin == "application-fetch";
+        Ok("dup-gw-claim-origins", claimOk, "claims wrong count=" + mapped.Count);
+      }
+      finally
+      {
+        Environment.SetEnvironmentVariable("META_API_BASE", oldBase);
+        Environment.SetEnvironmentVariable("META_API_KEY", oldKey);
+        try { listener.Stop(); } catch { }
+        try { listener.Close(); } catch { }
+      }
+    }
     Console.WriteLine(pass + " passed, " + fail + " failed");
     return fail == 0 ? 0 : 1;
   }
