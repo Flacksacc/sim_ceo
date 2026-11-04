@@ -175,6 +175,7 @@ async function apiStub(route) {
   if (p.indexOf("/api/boards/") === 0 && p.indexOf("/recall") > 0) return J([]);
   if (p.indexOf("/api/meetings/") === 0 && (p.endsWith("/notes") || p.endsWith("/records") || p.indexOf("/notes/history") > 0 || p.indexOf("/secretary/requests/") > 0 || p.endsWith("/voice"))) return J([]);
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages\/search$/))) return J([]);
+  if (p === "/api/profile" && method === "GET") return J({ error: "no saved profile" }, 404);
   return fixtureFallback(route);
 }
 function listHC(list) { return list.length ? list[list.length - 1].sequence : 0; }
@@ -193,7 +194,7 @@ async function launch() {
   page = await ctx.newPage();
   const pageErrors = [];
   page.on("pageerror", (e) => { try { pageErrors.push(String(e).slice(0, 300)); } catch (x) {} });
-  page.on("console", (msg) => { try { const t = String(msg.text()); if (t.indexOf("Failed to complete negotiation") >= 0 || t.indexOf("Failed to start the connection") >= 0 || t.indexOf("net::ERR_FAILED") >= 0 || t.indexOf("net::ERR_CONNECTION_REFUSED") >= 0 || t.indexOf("status of 409") >= 0 || t.indexOf("status of 502") >= 0 || t.indexOf("status of 500") >= 0 || t.indexOf("status of 403") >= 0 || t.indexOf("status of 401") >= 0) { hubNoise.push(t.slice(0, 140)); return; } if (msg.type() === "error") pageErrors.push(t.slice(0, 200)); } catch (x) {} });
+  page.on("console", (msg) => { try { const t = String(msg.text()); try { const locationURL = String((msg.location() || {}).url || ""); if (msg.type() === "error" && t.indexOf("status of 404") >= 0 && t.indexOf("Failed to load resource") >= 0 && locationURL) { const parsed = new URL(locationURL, webBase); const base = new URL(webBase); if (parsed.origin === base.origin && parsed.pathname === "/api/profile") return; } } catch (e) {} if (t.indexOf("Failed to complete negotiation") >= 0 || t.indexOf("Failed to start the connection") >= 0 || t.indexOf("net::ERR_FAILED") >= 0 || t.indexOf("net::ERR_CONNECTION_REFUSED") >= 0 || t.indexOf("status of 409") >= 0 || t.indexOf("status of 502") >= 0 || t.indexOf("status of 500") >= 0 || t.indexOf("status of 403") >= 0 || t.indexOf("status of 401") >= 0) { hubNoise.push(t.slice(0, 140)); return; } if (msg.type() === "error") pageErrors.push(t.slice(0, 200)); } catch (x) {} });
   page.on("response", (r) => { try { if (r.status() >= 400) outLine("HTTP" + r.status() + " " + r.url().slice(0, 160)); } catch (x) {} });
   page.__qaErrors = pageErrors;
   await page.route("**/hubs/**", (r) => r.abort("connectionrefused")); await page.route("**/api/**", apiStub);
