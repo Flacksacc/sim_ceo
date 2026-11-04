@@ -1582,6 +1582,18 @@ async function stepMeeting() {
   const exactRestricted = Array.isArray(idList) && idList.length === 1 && String(idList[0]).toLowerCase() === String(advisor1).toLowerCase();
   ok("participants-exact-set", exactRestricted, "exactSet={advisor1} len=" + (idList ? idList.length : -1));
   if (!exactRestricted) failExit("participant restriction did not land exactly {advisor1}; refusing status-only proof.");
+  // Source approval invalidates in-flight work and pauses affected meetings.
+  // Exercise the actual resume control before asking for advisor responses.
+  if (pick(detR.json, "state") === 3) {
+    const resumed = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/resume" && r.request().method() === "POST", { timeout: boundedTimeout(15000) });
+    await locClick(page.getByRole("button", { name: "Resume meeting", exact: true }), "meeting-resume-after-evidence");
+    const resumeResponse = await resumed;
+    ok("meeting-resume-real-control", resumeResponse.status() === 200, "status=" + resumeResponse.status());
+    const active = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
+    ok("meeting-resume-active-brief-still-empty", active.status === 200 && pick(active.json, "state") === 1 && !String(pick(active.json, "brief") || "").trim(), safeDiag(active));
+    if (resumeResponse.status() !== 200 || pick(active.json, "state") !== 1) failExit("Resume failed after evidence approval.");
+    await wft(500);
+  }
   // Send ONE question through the real composer.
   const box = page.locator(".composer-bar textarea").first();
   const hasComposer = await box.count() > 0;

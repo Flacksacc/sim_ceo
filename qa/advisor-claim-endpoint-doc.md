@@ -52,7 +52,12 @@ qa/advisor-claim-endpoint-fake.mjs, qa/advisor-claim-endpoint-qa.mjs, this doc.
   then focus 2000 + background 4000 + FIVE full 2000-char distinct URLs at
   POST /research; complete SID bindings and full URLs delivered in the same flow;
   dossier prompt <= 16000; elapsed bounded.
-- Bounds: exactly 3 responses + 3 chat (1+1 per U/S/C flow, no third validator);
+- Maximum-link dossier: five 2000-character URLs are retained and resolved in
+  partial claims, then compilation fails explicitly when that dossier exceeds
+  its smaller compile budget. The stage becomes failed and stops running.
+  A separate explicit research request with ordinary-length URLs proves recovery.
+- Bounds: exactly 4 responses + 3 chat (U/S/C plus one max-link dossier failure;
+  the rejected dossier never reaches compile, no third validator);
   per-flow elapsed under deadlines; cleanup verified (children EXIT + ports
   closed) and controls final exit AFTER cleanup; pidfile removed only when clean,
   retained when uncertain.
@@ -92,3 +97,13 @@ Exit 0 PASS, 1 FAIL (incl. cleanup failure), 2 FATAL/setup. Leaves owned rows fo
 - PG/Docker/human ports/.env keys/providers/other roots: never touched.
 - Prior 41/0 primary result concerned older 67a902f source, not this CBC/851 run.
 - Parallel readonly review may read but never changes production.
+
+## Direct verification after background shutdown
+
+Primary `66e0a86` fresh publish and pinned endpoint run: **92 passed, zero
+failed** (`.tmp/primary-direct-advisor-endpoint2-runtime.log` in the parent QA
+directory). The canonical roster response is unwrapped through `entry`;
+paragraph-only saves retain ResearchInputsJson byte-for-byte. Child cleanup
+recognizes exit or signal completion and waits for both owned ports to close.
+The generated character description is bounded independently while the full
+role/problem remain in ProfileJson. No real provider or human data was used.
