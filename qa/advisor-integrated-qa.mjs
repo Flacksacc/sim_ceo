@@ -1017,7 +1017,7 @@ async function stepCreateAdvisor() {
   // F1+F2: scope EVERYTHING to the actual dialog. The dialog hosts one
   // editor; onCreated also selects the new roster entry, mounting the detail
   // editor behind the modal — global locators would straddle both editors.
-  const dlg = page.locator('div.modal[role="dialog"][aria-label="Create advisor"]');
+  const dlg = page.locator('.roster-detail section.cc-flow[aria-label="Create advisor"]');
   try { await dlg.waitFor({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch { ok("create-dialog-mounted", false, "Create advisor dialog never mounted (frontend mount WIP?)"); failExit("CreateAdvisor UI not mounted."); }
   ok("create-dialog-mounted", true, "dialog div.modal[role=dialog][aria-label=Create advisor] mounted");
   // F4: documentation-grounded fixture. The subject (reserved example domains
@@ -1072,7 +1072,7 @@ async function stepCreateAdvisor() {
     if (!KNOWN_STAGES.has(String(stage))) return false;
     if (!WORKING_STAGES.has(String(stage))) return false;
     if (visible !== true) return false;
-    if (!/research status:\s*working/i.test(t)) return false;
+    if (!/Researching your advisor/i.test(t)) return false;
     const want = backendHuman(String(stage));
     if (!want) return false;
     // Bounded resample tolerance: HTTP stage may advance between UI and HTTP
@@ -1086,11 +1086,11 @@ async function stepCreateAdvisor() {
   researchLocalEnd = Math.min(researchOpStart + RESEARCH_TIMEOUT, DEADLINE_MS - 8000);
   ok("research-window-opened-before-probe", researchLocalEnd > researchOpStart, "local research window starts BEFORE progress probe/send/Secretary");
   const s0 = await readResearch();
-  const autoStarted = s0.valid === true && (s0.running === true || /research status:\s*working/i.test(s0.text));
+  const autoStarted = s0.valid === true && (s0.running === true || /Researching your advisor/i.test(s0.text));
   let clickedManual = false;
   const terminalStage = ["done", "failed", "unsupported", "interrupted"].includes(String(s0.stage));
   // Restart ONLY on exact not-started with HTTP 200, raw boolean false, and no working text.
-  const provenNotStarted = s0.valid === true && s0.running === false && String(s0.stage) === "not-started" && !/research status:\s*working/i.test(s0.text);
+  const provenNotStarted = s0.valid === true && s0.running === false && String(s0.stage) === "not-started" && !/Researching your advisor/i.test(s0.text);
   if (!autoStarted && !terminalStage && provenNotStarted) {
     try { await dlg.getByRole("button", { name: /run research on this draft/i }).click({ timeout: boundedTimeout(8000, 8000) }); clickedManual = true; } catch {}
     await wft(1500);
@@ -1105,6 +1105,8 @@ async function stepCreateAdvisor() {
     await sleep(2000);
   }
   ok("research-progress-live-visible", progressSeen !== "", (progressSeen || "phase=research no working/human-stage/elapsed/live-run visible") + " autoStarted=" + autoStarted + " manualClicked=" + clickedManual + " " + progressBackend);
+  ok("research-paragraph-loading-indicators", await dlg.locator('.cc-field-working').count() === 3, "Each paragraph shows that research is preparing its text");
+  ok("create-inline-no-modal", await page.locator('[role="dialog"][aria-label="Create advisor"]').count() === 0, "Creation is part of the roster panel");
   if (!progressSeen) failExit("research progress never visibly live with backend running/stage correlation; refusing to claim progress from a click. phase=research stage=" + String(s0.stage) + " running=" + String(s0.running) + " textLen=" + String((s0.text||"").length));
   // Bounded wait for the REAL server run via GET research state.
   const end = researchLocalEnd;
@@ -1287,7 +1289,7 @@ async function stepCreateAdvisor() {
   try { if (!(await dlg.count()) || !(await dlg.first().isVisible())) failExit("create dialog must be visible during creation scan."); } catch (e) { failExit("create dialog visibility gate failed before scan."); }
   await scanDebug("create-dialog");
   // F2: close the dialog so later edits use ONLY the selected-roster detail editor (never two mounted editors again).
-  try { await dlg.locator('button[aria-label="Close"]').first().click({ timeout: boundedTimeout(8000, 8000) }); } catch {}
+  try { await dlg.getByRole('button', { name: 'Close', exact: true }).last().click({ timeout: boundedTimeout(8000, 8000) }); } catch {}
   await wft(600);
   ok("create-dialog-closed", await dlg.count() === 0, "dialog editors remaining=" + await dlg.count());
   checkBudget("create-advisor");
@@ -2826,6 +2828,47 @@ async function stepFocusedActivityStates() {
   checkBudget("focused-activity");
 }
 async function stepActivityScenarios() { await stepFocusedActivityStates(); }
+async function stepInlineAdvisorEditing() {
+  await gotoTab('/#/roster');
+  await locClick(page.getByRole('button', { name: '+ Create new Advisor', exact: true }), 'inline-start-create');
+  const flow = page.locator('.roster-detail section.cc-flow');
+  await locFill(flow.locator('#cc-name'), 'Unsaved advisor ' + run, 'inline-unsaved-name');
+  const longText = Array.from({ length: 60 }, (_, i) => 'Line ' + i + ': meaningful advisor background.').join('\n');
+  await locFill(flow.locator('#cc-description'), longText, 'inline-long-description');
+  const grows = await flow.locator('#cc-description').evaluate(el => ({ scroll: el.scrollHeight, visible: el.clientHeight, overflow: getComputedStyle(el).overflowY }));
+  ok('inline-description-expands-without-scrollbar', grows.scroll <= grows.visible + 1 && grows.overflow === 'hidden', JSON.stringify(grows));
+  ok('inline-friendly-flow-description', (await flow.locator('.cc-lede').first().innerText()).includes('finishing touches') && !(await flow.innerText()).includes('board seat'), 'Friendly instructions without internal board metadata');
+  const target = page.locator('.listpanel-rows button[role="listitem"]').filter({ hasText: rosterName }).first();
+  let warning = '';
+  page.once('dialog', async d => { warning = d.message(); await d.dismiss(); });
+  await locClick(target, 'inline-cancel-switch');
+  ok('inline-unsaved-create-switch-warns', /unsaved/i.test(warning), 'Native confirmation appears when selecting another advisor');
+  ok('inline-cancel-keeps-creation-text', await flow.locator('#cc-description').inputValue() === longText, 'Cancel preserves the entire brief');
+  page.once('dialog', async d => { await d.accept(); });
+  await locClick(target, 'inline-confirm-switch');
+  ok('inline-confirm-switch-exits-creation', await flow.count() === 0, 'Confirmed switch displays the selected advisor');
+  const paragraph = page.locator('.roster-detail .cc-editor #cc-contribute');
+  await paragraph.waitFor({ state: 'visible', timeout: boundedTimeout(10000, 8000) });
+  const savedText = await paragraph.inputValue();
+  const editedText = savedText + '\n' + longText.slice(0, 1000);
+  await locFill(paragraph, editedText, 'inline-edit-paragraph');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await wft(200);
+  const size = await paragraph.evaluate(el => ({ scroll: el.scrollHeight, visible: el.clientHeight, overflow: getComputedStyle(el).overflowY }));
+  ok('inline-paragraph-expands-after-narrow-resize', size.scroll <= size.visible + 1 && size.overflow === 'hidden', JSON.stringify(size));
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const other = page.locator('.listpanel-rows button[role="listitem"]').filter({ hasNotText: rosterName }).first();
+  warning = '';
+  page.once('dialog', async d => { warning = d.message(); await d.dismiss(); });
+  await locClick(other, 'inline-cancel-edited-advisor-switch');
+  ok('inline-existing-advisor-switch-warns', /unsaved/i.test(warning), 'Edited existing advisors receive the same protection');
+  ok('inline-existing-advisor-cancel-preserves-text', await paragraph.inputValue() === editedText, 'Cancel keeps every paragraph line');
+  page.once('dialog', async d => { await d.accept(); });
+  await locClick(other, 'inline-confirm-edited-advisor-switch');
+  const canonical = await canonicalEntry(rosterId);
+  ok('inline-discard-never-saves-local-edits', threeParas(pick(canonical.entry, 'profileJson') || '')[0] === savedText, 'Discarding edits leaves the stored profile unchanged');
+  checkBudget('inline-advisor-editing');
+}
 async function main() {
   try {
     await stepSetup();
@@ -2838,6 +2881,7 @@ async function main() {
     await stepReeditRerun();
     await stepRosterChatUI();
     await stepNavigation();
+    await stepInlineAdvisorEditing();
   } catch (e) {
     const raw = String((e && e.stack) || (e && e.message) || e);
     const isFatal = /FATAL|REFUSE|OVERALL DEADLINE|OVERALL BUDGET/.test(raw);

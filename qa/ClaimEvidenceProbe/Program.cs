@@ -18,8 +18,36 @@ static class Probe
     return d;
   }
 
-  static int Main()
+  static int Main(string[] args)
   {
+    if (args.Length == 2 && args[0] == "--replay")
+    {
+      using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(args[1]));
+      var root = doc.RootElement;
+      var lines = root.GetProperty("lines").EnumerateArray().Select(v => v.GetString()!).ToList();
+      var sources = root.GetProperty("sources").EnumerateArray().ToList();
+      var pool = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.Ordinal);
+      foreach (var source in sources) pool[source.GetProperty("url").GetString()!] = ("Retrieved page", source.GetProperty("excerpt").GetString()!);
+      var mapped = ClaimEvidenceMapper.MapAll(lines, pool, ClaimEvidenceMapper.BuildSidMap(Array.Empty<string>()));
+      Ok("actual-response-matches-retrieved-quote", mapped.Any(c => c.Verified));
+      Console.WriteLine("Replayed " + mapped.Count + " claims; verified " + mapped.Count(c => c.Verified));
+      return fail == 0 ? 0 : 1;
+    }
+    {
+      const string u = "https://example.com/mentor";
+      const string quote = "This author teaches narrative structure and thoughtful revision.";
+      var pool = PoolOf((u, "Mentor", quote));
+      var empty = ClaimEvidenceMapper.BuildSidMap(Array.Empty<string>());
+      var bound = ClaimEvidenceMapper.BuildSidMap(new[] { u });
+      var other = ClaimEvidenceMapper.BuildSidMap(new[] { "https://example.com/other" });
+      const string line = "FACT | This author teaches writing. || EVIDENCE: <S1|https://example.com/mentor> :: \"This author teaches narrative structure and thoughtful revision.\"";
+      Ok("combined-ref-explicit-url-exact-passage", ClaimEvidenceMapper.MapAll(new[] { line }, pool, empty).Single().Verified);
+      Ok("combined-ref-bound-id-matches-url", ClaimEvidenceMapper.MapAll(new[] { line }, pool, bound).Single().Verified);
+      Ok("combined-ref-bound-id-conflict-rejected", !ClaimEvidenceMapper.MapAll(new[] { line }, pool, other).Single().Verified);
+      Ok("combined-ref-invented-quote-rejected", !ClaimEvidenceMapper.MapAll(new[] { line.Replace(quote, "This quotation was not retrieved anywhere.") }, pool, empty).Single().Verified);
+      Ok("combined-ref-unretrieved-url-rejected", !ClaimEvidenceMapper.MapAll(new[] { line.Replace("/mentor>", "/missing>") }, pool, empty).Single().Verified);
+      Ok("combined-ref-invalid-scheme-rejected", !ClaimEvidenceMapper.TryResolveUrl("S1|file:///private", empty, out _));
+    }
     // 1: top3 same cites unrelated negative (legacy VERIFIED lines, no EVIDENCE part).
     {
       var pool = PoolOf(

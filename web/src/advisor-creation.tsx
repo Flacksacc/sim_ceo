@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
 import "./advisor-creation.css";
 import { FriendlyError } from "./human-disclosure";
 
@@ -312,12 +312,14 @@ function originDead(api: { originStale?: (o: OriginIdentity) => boolean }, o: Or
 }
 
 export interface CreateAdvisorProps extends CreateAdvisorApi {
+  onDirtyChange?: (dirty: boolean) => void;
   onCreated?: (entry: RosterEntryDto) => void;
   onInvalidated?: () => void;
   onClose?: () => void;
 }
 
 export interface CharacterEditorProps {
+  onDirtyChange?: (dirty: boolean) => void;
   entry: RosterEntryDto;
   get: <T>(path: string) => Promise<T>;
   post: <T>(path: string, body: unknown) => Promise<T>;
@@ -690,6 +692,30 @@ const PARAGRAPH_META: {
     placeholder: "How this character disagrees, concedes, and challenges.",
   },
 ];
+export function GrowingTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const resize = () => {
+    const el = ref.current;
+    if (!el) return;
+    const border = el.offsetHeight - el.clientHeight;
+    el.style.height = "auto";
+    el.style.height = (el.scrollHeight + border) + "px";
+  };
+  useLayoutEffect(resize, [props.value]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let width = el.getBoundingClientRect().width;
+    const observer = new ResizeObserver(() => {
+      const next = el.getBoundingClientRect().width;
+      if (next !== width) { width = next; resize(); }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  return <textarea {...props} ref={ref} />;
+}
+
 export function CharacterEditor(props: CharacterEditorProps) {
   const { get, post, put } = props;
   const [entry, setEntry] = useState<RosterEntryDto>(props.entry);
@@ -1883,6 +1909,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
   const dirty =
     JSON.stringify({ paragraphs, links: normLinks(links) }) !==
     JSON.stringify({ paragraphs: savedSnapshot.paragraphs, links: savedSnapshot.links });
+  useEffect(() => { props.onDirtyChange?.(dirty || busy); }, [dirty, busy, props.onDirtyChange]);
   const provenanceLinks = parseCharacterProfile(entry.profileJson).sourceUrls;
   entryRef.current = entry;
   statusRef.current = researchStatus;
@@ -1894,11 +1921,11 @@ export function CharacterEditor(props: CharacterEditorProps) {
   return (
     <div className="cc-editor">
       <fieldset className="cc-step" disabled={busy}>
-        <legend>Research — part of this flow</legend>
+        <legend>Research your advisor</legend>
         <div className="cc-field cc-links" style={{ marginTop: "0.6rem" }}>
           <span id="cc-links-label">
             Inspiration links (optional, up to 3)
-            <span className="cc-hint">We fetch these pages as background reading during research. They never become the character&apos;s credentials.</span>
+            <span className="cc-hint">Add useful pages to help us understand this advisor.</span>
           </span>
           <div role="group" aria-labelledby="cc-links-label">
             {links.map((l, i) => (
@@ -1933,17 +1960,12 @@ export function CharacterEditor(props: CharacterEditorProps) {
 
       <div className="cc-status" id="cc-research-status" aria-live="polite">
         <strong>
-          Research status: {researchStatus}
+          {researchStatus === "incomplete" ? "Draft ready — sources need review" : researchStatus === "done" ? "Research complete" : researchStatus === "working" ? "Researching your advisor" : researchStatus === "idle" ? "Ready to research" : researchStatus === "failed" ? "Research needs another try" : "Check your latest changes"}
           {researchStatus === "working" && !waitingCancelled
-            ? " — " + (stage ? humanStage(stage) + ", " : "") + elapsed + "s elapsed (live server run, bounded)"
+            ? " — " + (stage ? humanStage(stage) + ", " : "") + elapsed + "s elapsed"
             : ""}
         </strong>
-        <div>{statusNote}</div>
-        {(researchStatus === "done" || researchStatus === "incomplete") && (
-          <div>
-            Cited sources: {sources.length}. Backed by cited excerpts: {supported ? "yes" : "no — treat as incomplete"}.
-          </div>
-        )}
+        <div>{waitingCancelled ? "You stopped waiting. Research may still be running; choose Check again to see how it is going." : researchStatus === "incomplete" ? "Your paragraphs are ready to edit and save. We could not confirm the research claims against the source passages. Try adding a useful source link and researching again." : researchStatus === "done" ? "Your advisor is ready for your finishing touches. Review the paragraphs below and save when you are happy with them." : researchStatus === "working" ? "We are researching the advisor and preparing the paragraphs below." : busy ? "Saving your changes…" : dirty ? "You have unsaved changes." : savedAt ? "Your changes are saved." : "Research this advisor, then review and save the paragraphs."}</div>
         <div>{savedAt ? (dirty ? "Saved " + savedAt + " — you have unsaved changes." : "Saved " + savedAt + ".") : "Not saved yet."}</div>
       </div>
       {conflict && (
@@ -1967,7 +1989,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
 
       {sources.length > 0 && (
         <details className="cc-research-detail">
-          <summary>Human research: {sources.length} cited sources + compiled summary</summary>
+          <summary>Reading and research notes ({sources.length} sources)</summary>
           <ul className="cc-sources">
             {sources.map((s) => (
               <li key={s.url}>
@@ -2002,9 +2024,8 @@ export function CharacterEditor(props: CharacterEditorProps) {
       <fieldset className="cc-step" disabled={busy}>
         <legend>Character paragraphs</legend>
         <p className="cc-lede">
-          Three short paragraphs in the character&apos;s voice. When they step in, how they
-          argue, and how they treat disagreement — bluntness, formality, and when they
-          challenge versus defer. No fixed traits or sliders; context decides.
+          Research fills these paragraphs with when your advisor can help, how they
+          think, and how they respond. You can then make them your own.
         </p>
         {PARAGRAPH_META.map((m) => {
           const compiledDiffers =
@@ -2014,10 +2035,11 @@ export function CharacterEditor(props: CharacterEditorProps) {
               <label htmlFor={m.id}>
                 <span>
                   {m.label}
+                  {researchBusy && <span className="cc-field-working" role="status"><span className="cc-spinner" aria-hidden="true" />Preparing this paragraph…</span>}
                   <span className="cc-hint">{m.hint}</span>
                 </span>
               </label>
-              <textarea
+              <GrowingTextarea
                 id={m.id}
                 className="cc-area"
                 value={paragraphs[m.key]}
@@ -2026,6 +2048,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
                 maxLength={PARAGRAPH_MAX}
                 placeholder={m.placeholder}
                 aria-describedby={m.id + "-count"}
+                aria-busy={researchBusy}
               />
               <div className="cc-count" id={m.id + "-count"}>
                 {paragraphs[m.key].length} / {PARAGRAPH_MAX} characters
@@ -2040,21 +2063,13 @@ export function CharacterEditor(props: CharacterEditorProps) {
             </div>
           );
         })}
-        <p style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
-          Privacy: the roster stores reusable profile fields only. Board names, messages,
-          sources, and decisions are never copied into roster drafts.
-        </p>
       </fieldset>
 
       <fieldset className="cc-step" disabled={busy}>
         <legend>Save</legend>
         <p className="cc-lede" style={{ marginBottom: "0.4rem" }}>
-          Saving stores this draft on the roster. It does not approve a seat, attach a
-          board copy, or place any model call. Changing the character text clears the
-          server research snapshot above (backend rule) — provenance links stay in the
-          saved profile{provenanceLinks.length > 0 ? " (" + provenanceLinks.length + " kept)" : ""}.
-          A portrait is still required before a board can attach this advisor; that happens
-          from the roster record, not here.
+          Save your advisor when you are happy with the paragraphs. You can come back
+          and change them whenever you like.
         </p>
         <div className="cc-actions" style={{ marginTop: 0 }}>
           <button type="button" className="primary" onClick={() => void saveEdits()} disabled={busy}>
@@ -2077,8 +2092,11 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
   const [background, setBackground] = useState("");
   const [links, setLinks] = useState<string[]>(["", "", ""]);
   const [entry, setEntry] = useState<RosterEntryDto | null>(null);
+  const [editorDirty, setEditorDirty] = useState(false);
   const [briefLocked, setBriefLocked] = useState(false);
   const [busy, setBusy] = useState(false);
+  const briefDirty = !entry && !!(name.trim() || description.trim() || background.trim() || links.some(l => l.trim()));
+  useEffect(() => { props.onDirtyChange?.(briefDirty || editorDirty || busy); }, [briefDirty, editorDirty, busy, props.onDirtyChange]);
   const [error, setError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState("Step 1 of 3: name the character and describe them. Nothing is saved yet.");
   const createOp = useRef(0);
@@ -2139,7 +2157,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
       for (const l of sliced) {
         if (!isValidSourceUrl(l)) throw new Error("Links must be URLs (http(s):// or www.). Got: " + l);
       }
-      setStatusNote("Creating the draft on the server.");
+      setStatusNote("Getting your advisor ready…");
       const body: Record<string, unknown> = {
         accountId,
         name: nm,
@@ -2153,8 +2171,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
       setEntry(created);
       setBriefLocked(true);
       setStatusNote(
-        "Draft created. Research starts automatically below; " +
-          "nothing is approved and nothing is attached to a board."
+        "Your advisor has been created. Research is starting below."
       );
       if (myCreate === createOp.current && !originDead(props, myCOrigin)) props.onCreated?.(created);
     } catch (e) {
@@ -2176,14 +2193,9 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
     <section className="card cc-flow" aria-label="Create advisor">
       <h3>Create advisor</h3>
       <p className="cc-lede">
-        One flow in three steps: brief, research with compiled paragraphs, explicit save.
-        Drafts stay drafts until you save; nothing here approves a board seat or attaches this
-        advisor to a board. Board seats are granted later from This Board&apos;s Advisors.
-      </p>
-      <p className="cc-fictional">
-        Fictional character: research below describes real-world inspiration, not this
-        character&apos;s own history. The character never claims real jobs, degrees, licenses,
-        or endorsements.
+        Tell us who you would like advice from and what you would like help with.
+        We will research your advisor and fill in three short paragraphs for you to
+        review. Make any finishing touches, then save your advisor.
       </p>
 
       <fieldset className="cc-step" disabled={busy || briefLocked}>
@@ -2198,6 +2210,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
               placeholder="Advisor name"
               required
               autoComplete="off"
+              autoFocus
             />
           </label>
         </div>
@@ -2206,7 +2219,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
             Description (required)
             <span className="cc-hint">A few sentences in your own words: who is this character and what are they for?</span>
           </span>
-          <textarea
+          <GrowingTextarea
             id="cc-description"
             className="cc-area-short"
             value={description}
@@ -2219,9 +2232,9 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
         <label className="cc-field" htmlFor="cc-background" style={{ marginTop: "0.6rem" }}>
           <span>
             Background (optional)
-            <span className="cc-hint">A few sentences of color: where they come from, what shaped them. Fictional.</span>
+            <span className="cc-hint">Share any background or perspective you would like us to consider.</span>
           </span>
-          <textarea
+          <GrowingTextarea
             id="cc-background"
             className="cc-area-short"
             value={background}
@@ -2233,7 +2246,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
         <div className="cc-field cc-links" style={{ marginTop: "0.6rem" }}>
           <span id="cc-brief-links-label">
             Inspiration links (optional, up to 3)
-            <span className="cc-hint">Pages that inspire the character. We read them during research; they stay inspiration, not credentials.</span>
+            <span className="cc-hint">Optional pages you would like us to read during research.</span>
           </span>
           <div role="group" aria-labelledby="cc-brief-links-label">
             {links.map((l, i) => (
@@ -2282,6 +2295,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
             resolveCanonicalEntry={props.resolveCanonicalEntry}
             freshCreation={true}
             autoStartResearch
+            onDirtyChange={setEditorDirty}
             background={background}
             sourceUrls={links.map((l) => l.trim()).filter((l) => l.length > 0).slice(0, 3)}
             onSaved={(updated) => {
