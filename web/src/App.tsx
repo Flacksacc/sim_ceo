@@ -1221,9 +1221,11 @@ function useDisplayPortraits(boardId: string, entries: { key: string; displayIma
       // never rescue with cached metadata, since owner-readable bytes may
       // still serve a rejected or removed image.
       if (!live || retired()) return;
+      // No seats or no board: initials stay, no spurious advisors fetch
+      // (non-Meet tab or invalid parent). Previous urls already revoked above.
+      if (!boardId || entries.length === 0) return;
       let freshList: any[] | null = null;
       try {
-        if (!boardId) return;
         const fresh = await get<any[]>(`/api/boards/${boardId}/advisors`);
         if (!live || retired()) return;
         if (!Array.isArray(fresh)) return;
@@ -1241,7 +1243,7 @@ function useDisplayPortraits(boardId: string, entries: { key: string; displayIma
       }
       if (!live || retired()) return;
       for (const e of entries) {
-        if (!live) return;
+        if (!live) { for (const u of made) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } return; }
         try {
           // Require a matching current advisor key and valid display id from
           // the successful fresh DTO; omitted or null stays fallback.
@@ -1249,7 +1251,7 @@ function useDisplayPortraits(boardId: string, entries: { key: string; displayIma
           const raw = freshByKey.get(e.key);
           const id = normalizeDisplayImageId(raw ?? null);
           if (!id) continue;
-          if (retired()) return;
+          if (retired()) { for (const u of made) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } return; }
           const b = await authedBlobUrl("/api/images/" + id);
           if (!live || blobStale(b)) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } continue; }
           if (retired()) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } return; }
@@ -1264,7 +1266,9 @@ function useDisplayPortraits(boardId: string, entries: { key: string; displayIma
     // Intentionally keyed on the derived string: identity, epoch, board,
     // review generation, advisor refresh, focus, and display id changes all
     // re-resolve from authorized DTO metadata.
-    return () => { live = false; };
+    // Cleanup retires this run and revokes its locally accumulated urls.
+    // Closed-over made avoids touching a newer run; double revocation is safe.
+    return () => { live = false; for (const u of made) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } };
   }, [key]);
   useEffect(() => () => { for (const u of ownedRef.current) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } ownedRef.current = []; }, []);
   return urls;
@@ -9613,3 +9617,4 @@ const testModel = useMutation({
     </div>
   );
 }
+

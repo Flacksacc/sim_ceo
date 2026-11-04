@@ -67,10 +67,11 @@ must(!app.includes("fallback to cached"), "no cached-metadata rescue text remain
 must(!app.includes("freshByKey.has(e.key) ? freshByKey.get(e.key) : e.displayImageId"), "omitted advisor is not rescued from cached props");
 must(app.includes("if (!freshByKey.has(e.key)) continue"), "omitted advisor stays fallback");
 must(app.includes("if (!Array.isArray(fresh)) return"), "malformed DTO stays fallback");
-must(app.includes("if (!boardId) return"), "missing board stays fallback without request");
+must(app.includes("if (!boardId || entries.length === 0) return;"), "empty/invalid parent returns before any advisors GET");
 must(app.includes("if (!live || retired() || freshList === null) return"), "failed fresh DTO keeps initials, no request after retired");
 must(app.includes("const id = normalizeDisplayImageId(raw ?? null)"), "only valid fresh display id loads");
 must(app.includes("if (!id) continue"), "null fresh metadata stays fallback");
+must(app.includes("return () => { live = false; for (const u of made)"), "effect cleanup retires and revokes locally accumulated urls");
 must(app.includes("useDisplayPortraits(boardId, presenceEntries"), "presence uses fresh hook with boardId");
 must(app.includes("currentToken()") && app.includes("currentUser()") && app.includes("epochNow()"), "token/user/epoch guards preserved");
 must(app.includes("window.addEventListener(\"focus\"") && app.includes("visibilitychange"), "focus/visibility revalidation preserved");
@@ -81,3 +82,4 @@ try { fs.rmSync(out, { recursive: true, force: true }); } catch {}
 // 5. Real in-process C# probe against REAL RosterDisplayOps (no mirrored logic, no HTTP/PG).
 execSync("dotnet run --project qa/PresenceDisplayProbe", { cwd: root, stdio: "inherit", env: { ...process.env, USE_POSTGRES: "0" } });
 console.log("advisor-presence-portrait: PASS");
+

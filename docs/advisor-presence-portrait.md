@@ -29,7 +29,12 @@ focus, since owner-readable bytes alone cannot prove freshness.
   focus, visibility, and advisor refresh. Same-ID revoke or reject therefore
   clears to initials. Fail-closed: failed, malformed, omitted, or null
   fresh metadata keeps initials with no cached rescue, and no request
-  issues after retire. Bytes still flow only through authorized
+  issues after retire. Previous urls are cleared/revoked first, then the hook
+  returns before any advisors GET when there are no seats or no board id
+  (non-Meet tab or invalid parent; key still carries board and origin). Effect
+  cleanup retires the run and revokes its closed-over locally accumulated
+  urls on every key change and unmount, in addition to the existing late-blob
+  retired revocation and in-loop early-return revocation. Bytes still flow only through authorized
   `authedBlobUrl("/api/images/" + id)` with token, user, epoch, immediate
   clear and revoke, `blobStale` and retired checks, unmount cleanup, and no
   wrong-identity reuse. Display ids validate precise GUID groups;
@@ -52,3 +57,4 @@ focus, since owner-readable bytes alone cannot prove freshness.
 ## Gaps
 - Live runtime with real HTTP, Postgres, Docker, or browser was not run here;
   primary actual run plus independent review are still required.
+
