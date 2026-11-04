@@ -75,7 +75,7 @@ let cleaned = false;
 let cleanupFailed = false;
 let cleanupPromise = null;
 function runBounded(cmd, args, opts, timeoutMs) {
-  const r = spawnSync(cmd, args, { ...(opts || {}), timeout: Math.min(timeoutMs, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - RECORDS_QA_PARENT_RESERVE_MS)) });
+  const r = spawnSync(cmd, args, { windowsHide: true, ...(opts || {}), timeout: Math.min(timeoutMs, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - RECORDS_QA_PARENT_RESERVE_MS)) });
   if (r.error && String((r.error && r.error.code) || "") === "ETIMEDOUT") throw new Error("BUILD TIMEOUT " + cmd + " " + (args || []).join(" "));
   if (r.status !== 0) throw new Error("BUILD FAIL " + cmd + " " + (args || []).join(" ") + " status=" + r.status + " " + String(r.stdout || "").replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*(\S+)/gi, "$1=***").slice(-2000) + " err=" + String(r.stderr || "").replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*(\S+)/gi, "$1=***").slice(-1000)); // dotnet reports errors on stdout: retain redacted stdout, not stderr-only
   return r;

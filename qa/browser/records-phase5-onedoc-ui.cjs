@@ -233,6 +233,7 @@ async function main() {
   { let opid = null; try { const pr = browser.process(); opid = pr ? pr.pid : null; } catch {} console.log("owned browser pid=" + String(opid)); }
   launching = false;
   ctx = await browser.newContext();
+  await ctx.grantPermissions(["local-network-access"], { origin: new URL(API).origin });
   const EXACT_API_ORIGIN = new URL(API).origin;
   const EXACT_FAKE_ORIGIN = new URL(FAKE).origin;
   const ALLOWED_ORIGINS = new Set([EXACT_API_ORIGIN, EXACT_FAKE_ORIGIN]);
@@ -1086,6 +1087,7 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     ok("ui-partial-card-version", __partCard.includes("versions 1 to 1"), "partial current card missing exact approving versions 1 to 1: " + __partCard.slice(0, 200));
   }
   ctx2 = await browser.newContext();
+  await ctx2.grantPermissions(["local-network-access"], { origin: new URL(API).origin });
   await ctx2.route("**/*", routeGuard);
   await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
   p2 = await ctx2.newPage();
@@ -1111,6 +1113,7 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
 
   {
     ctx3 = await browser.newContext();
+    await ctx3.grantPermissions(["local-network-access"], { origin: new URL(API).origin });
     await ctx3.route("**/*", routeGuard);
     await ctx3.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: reader, em: readerEmail });
     p3 = await ctx3.newPage();
