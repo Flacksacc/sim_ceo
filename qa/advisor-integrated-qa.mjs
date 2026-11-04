@@ -1,7 +1,7 @@
 // qa/advisor-integrated-qa.mjs — FINAL integrated advisor milestone QA (Muse-authored, sole script author).
 //
 // Own worktree: .tmp/advisor-integration-qa. This file is the owned QA change;
-// no App/server edits (source frozen 954; production merged exact). Muse sole-QA author
+// no App/server edits (source frozen 562; production merged exact). Muse sole-QA author
 // executes it here on the OWN stack (OWN 15396 API + 15398 fake, own headless Edge);
 // launches/binds/verifies its own loopback stack with bounded cleanup of exact owned children.
 // Executed artifact: assertion counts describe what the script checks on actual runs
@@ -14,7 +14,7 @@
 // label after fill, so exact getByLabel stops matching; stable scoped
 // getByRole(textbox, prefix) is used, no refill loops claiming reverts.
 // Uses the dedicated qa/advisor-integrated-fake.mjs (research compile +
-// secretary structured echo) on 15302; standard fake/secretary-fake reused
+// secretary structured echo) on 15398; standard fake/secretary-fake reused
 // for schema reference. Executed by this author (node --check plus full live runs with evidence).
 //  F1. Opens creation with the ACTUAL button "+ Create new Advisor" (App.tsx
 //      rail) and scopes ALL creation locators to the actual dialog
@@ -76,8 +76,8 @@
 //      classified, never counted as unexplained. Owned rows are left for
 //      forensics (exact-ID scope only); browser/context cleanup always runs.
 //
-// Run (primary executes):
-//   QA_WEB=http://127.0.0.1:15300 node qa/advisor-integrated-qa.mjs
+// Run (OWN executes here):
+//   QA_WEB=http://127.0.0.1:15396 QA_FAKE=http://127.0.0.1:15398 node qa/advisor-integrated-qa.mjs
 //   ALLOW_LIVE_PROVIDER=1 QA_WEB=http://127.0.0.1:15180 node qa/advisor-integrated-qa.mjs
 //
 // ALLOWLIST: QA_WEB must be http://127.0.0.1:15396 (OWN native QA, default) or http://127.0.0.1:15300 (legacy primary
@@ -89,9 +89,9 @@
 import crypto from "node:crypto";
 import { chromium } from "playwright-core";
 
-const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15300").trim();
+const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15396").trim();
 const LIVE = process.env.ALLOW_LIVE_PROVIDER === "1";
-const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15302").trim();
+const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15398").trim();
 const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
 const EXPECTED_INSTANCE = (process.env.QA_EXPECTED_INSTANCE || "qa-author-15396").trim();
 const REQ_TIMEOUT = 30000;
@@ -681,7 +681,7 @@ async function stepCreateAdvisor() {
   let ownedPrompt = 0;
   const log0 = MODE === "native" ? await fakeLog() : null;
   if (MODE === "native") {
-    if (!Array.isArray(log0)) failExit("native mode requires the integrated fake prompt log at 15302; log missing.");
+    if (!Array.isArray(log0)) failExit("native mode requires the integrated fake prompt log at OWN fake (15398); log missing.");
     ownedPrompt = dossierHits(log0, OWNED_URL_MARK).length;
   }
   ok("research-evidence-owned-fetched", done && ownedFetched.length >= 1, lastText + " evidenceCount=" + evCount + " ownedFetched=" + ownedFetched.length);
@@ -1634,7 +1634,7 @@ async function stepNavigation() {
   async function assertDest(d) {
     const secLoc = page.locator(d.sec).first();
     let secVis = false; try { await secLoc.waitFor({ state: "visible", timeout: 8000 }); secVis = await secLoc.isVisible(); } catch { secVis = false; }
-    const secTxt = secVis ? await secLoc.innerText().catch(() => "") : ""; const normTxt = secTxt.replace(/\s+/g, " ");
+    let secTxt = ""; if (secVis) { try { secTxt = await secLoc.evaluate((el) => { let t = ""; try { t = el.innerText || ""; } catch (e) { t = ""; } try { const els = Array.from(el.querySelectorAll("input,textarea,select")); for (const x of els) { try { const cs = (x.ownerDocument.defaultView || window).getComputedStyle(x); if (!cs || cs.visibility === "hidden" || cs.display === "none") continue; const r = x.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue; if ((x.value || "").length > 0) t += "\n" + x.value; } catch (e) {} } } catch (e) {} return t; }).catch(() => ""); if (!secTxt) secTxt = await secLoc.innerText().catch(() => ""); } catch (e) { secTxt = ""; } } const normTxt = (secTxt || "").replace(/\s+/g, " ");
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await hLoc.first().isVisible().catch(() => false); if (!headOk) headOk = secTxt.includes(d.head); }
     let entityOk = true;
@@ -1744,3 +1744,8 @@ async function main() {
   process.exit(fail === 0 ? 0 : (fatal ? 2 : 1));
 }
 main().catch((e) => { console.log("FATAL " + redact(String((e && e.stack) || e))); process.exit(2); });
+
+
+
+
+
