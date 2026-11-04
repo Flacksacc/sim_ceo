@@ -1385,6 +1385,9 @@ async function stepMeeting() {
   ok("activity-working-observed", finAdv1Working && trailWorking.length >= 1, "adv1Working=" + finAdv1Working + " trailWorking=" + trailWorking.length + " adv1States=" + finAdv1.map((s) => s.state + ":" + s.reason).join(","));
   ok("activity-adv1-badge-working", ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(adv1Badge) || pairedOk, "adv1Badge=" + adv1Badge + " paired=" + pairedOk);
   if (!finAdv1Working) failExit("no working raw state observed for the owned participant; honest activity requires a transient working state.");
+  // Hoisted run-body capture: BEFORE-block eligible-absence assertion reads runJson; single declaration above first use (reused below).
+  const meetRun = netBodies.run.filter((b) => String(b.url || "").includes(meetingId));
+  let runJson = null; try { runJson = JSON.parse((meetRun[0] && meetRun[0].body) || "null"); } catch { runJson = null; }
   if (MODE === "native") {
     const canonBid = await canonicalEntry(rosterId);
     const bidParas = threeParas(canonBid.entry ? (pick(canonBid.entry, "profileJson") || "") : "");
@@ -1413,7 +1416,7 @@ async function stepMeeting() {
   const meetMsgs = netBodies.messages.filter((b) => String(b.url || "").includes(meetingId));
   const sendPosts = { messages: netPosts.messages.filter((x) => x >= sendStart), patch: netPosts.patch.filter((x) => x >= sendStart), run: netPosts.run.filter((x) => x >= sendStart) };
   const meetPatch = netBodies.patch.filter((b) => String(b.url || "").includes(meetingId));
-  const meetRun = netBodies.run.filter((b) => String(b.url || "").includes(meetingId));
+  // meetRun hoisted above BEFORE-block; reused here (no redeclare).
   const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
   const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
   const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
@@ -1432,7 +1435,7 @@ async function stepMeeting() {
   if (!(meetMsgs.length === 1 && meetPatch.length === 1 && meetRun.length === 1 && orderOk)) failExit("send pipeline must be exactly once each with lead->patch->run order; refusing count-only pass.");
   let leadJson = null; try { leadJson = JSON.parse((meetMsgs[0] && meetMsgs[0].body) || "null"); } catch { leadJson = null; }
   let patchJson = null; try { patchJson = JSON.parse((meetPatch[0] && meetPatch[0].body) || "null"); } catch { patchJson = null; }
-  let runJson = null; try { runJson = JSON.parse((meetRun[0] && meetRun[0].body) || "null"); } catch { runJson = null; }
+  // runJson hoisted above BEFORE-block; reused here (no redeclare).
   const wantBrief = QUESTION.slice(0, 800);
   ok("send-lead-body-exact", !!leadJson && leadJson.content === QUESTION && leadJson.sender === "lead", "contentExact=" + (!!leadJson && leadJson.content === QUESTION));
   if (!(!!leadJson && leadJson.content === QUESTION)) failExit("lead POST content must exactly equal QUESTION.");
