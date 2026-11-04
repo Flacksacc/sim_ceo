@@ -38,6 +38,7 @@ async function req(method, path, body, opts = {}) {
 const get = (p, o) => req("GET", p, undefined, o);
 const post = (p, b, o) => req("POST", p, b, o);
 const put = (p, b, o) => req("PUT", p, b, o);
+const patch = (p, b, o) => req("PATCH", p, b, o);
 const guid = () => crypto.randomUUID();
 const run = "qa-reg-" + Date.now().toString(36) + "-" + Math.floor(Math.random() * 1e6).toString(36);
 const ACCT = guid();
@@ -96,7 +97,28 @@ async function runOutcomes(mid) {
   const n = await get("/api/meetings/" + mid + "/notes?kind=run-outcome");
   return n.json || [];
 }
-
+// Actual lead sequence for a turn: max lead-message sequence in the meeting.
+// Cap records persist per leadSeq, so every cap assertion pins this value.
+async function leadSeqAfter(mid) {
+  const msgs = await get("/api/meetings/" + mid + "/messages?take=100");
+  const leads = (msgs.json || []).filter((m) => (m.sender || m.Sender) === "lead");
+  return leads.reduce((mx, m) => Math.max(mx, Number(m.sequence ?? m.Sequence ?? 0)), 0);
+}
+// Persisted run-cap rows for one lead turn (body carries leadSeq/cap/policy).
+async function capNotesFor(mid, leadSeq, o) {
+  const notes = await get("/api/meetings/" + mid + "/notes?kind=run-cap", o);
+  const rows = [];
+  for (const n of (notes.json || [])) {
+    try {
+      const b = JSON.parse(n.body ?? n.Body ?? "{}");
+      if (Number(b.leadSeq) === Number(leadSeq)) rows.push({ id: n.id ?? n.Id, body: b });
+    } catch { /* unparseable bodies never satisfy a cap assertion */ }
+  }
+  return { status: notes.status, rows };
+}
+function yieldedReasons(runJson) {
+  return ((runJson && runJson.yielded) || []).map((y) => y.reason || y.Reason);
+}
 async function wizardGuards() {
   console.log("lane-b: wizard save version guard");
   const w = await post("/api/wizard", { accountId: ACCT, step: 1, presetKey: "", fieldsJson: "{}" });
@@ -161,21 +183,126 @@ async function capHoldsAcrossPolicies() {
   }
   const mid = await makeMeeting(bid, "cap brief");
   await post("/api/meetings/" + mid + "/messages", { sender: "lead", content: "QA cap turn question" });
-  const f = await post("/api/meetings/" + mid + "/run", { policy: "focused", prompt: "QA cap question" }, { timeout: 90000 });
+  const L1 = await leadSeqAfter(mid);
+  ok("cap-leadseq-recorded", L1 > 0, "leadSeq=" + L1);
+  // Supported configuration only: PATCH the board, then run with NO body
+  // policy. Production captures the effective board policy and deliberately
+  // ignores body policy for every caller, so ordinary run requests must not
+  // carry a policy override.
+  const pf = await patch("/api/boards/" + bid, { discussionPolicy: "focused" });
+  ok("cap-patch-focused-200", pf.status === 200, pf.status + " " + pf.text.slice(0, 200));
+  const f = await post("/api/meetings/" + mid + "/run", { prompt: "QA cap question" }, { timeout: 90000 });
   ok("cap-focused-200", f.status === 200, f.status + " " + f.text.slice(0, 200));
   ok("cap-focused-five", (f.json?.published?.length ?? 0) === 5, "published=" + (f.json?.published?.length));
-  const b = await post("/api/meetings/" + mid + "/run", { policy: "balanced", prompt: "QA cap followup" }, { timeout: 90000 });
+  ok("cap-focused-yield-omitted", yieldedReasons(f.json).includes("cap-omitted"), JSON.stringify(yieldedReasons(f.json)));
+  ok("cap-focused-overflow", f.json?.overflow?.cap === 5 && f.json?.overflow?.policy === "focused", JSON.stringify(f.json?.overflow).slice(0, 200));
+  const capF = await capNotesFor(mid, L1);
+  ok("cap-note-persisted", capF.status === 200 && capF.rows.length === 1 && capF.rows[0].body.cap === 5 && capF.rows[0].body.policy === "focused", "rows=" + capF.rows.length + " " + JSON.stringify(capF.rows[0]?.body).slice(0, 160));
+  // Same lead turn, between completed runs, no new lead message: the PATCHED
+  // balanced policy governs, but the durable same-lead minimum of five stands.
+  const pb = await patch("/api/boards/" + bid, { discussionPolicy: "balanced" });
+  ok("cap-patch-balanced-200", pb.status === 200, pb.status + " " + pb.text.slice(0, 200));
+  const b = await post("/api/meetings/" + mid + "/run", { prompt: "QA cap followup" }, { timeout: 90000 });
   ok("cap-balanced-same-turn-200", b.status === 200, b.status + " " + b.text.slice(0, 200));
   ok("cap-balanced-no-sixth", (b.json?.published?.length ?? -1) === 0, "published=" + (b.json?.published?.length));
+  ok("cap-balanced-yield-omitted", yieldedReasons(b.json).includes("cap-omitted"), JSON.stringify(yieldedReasons(b.json)));
+  ok("cap-balanced-overflow", b.json?.overflow?.cap === 5 && b.json?.overflow?.policy === "balanced", JSON.stringify(b.json?.overflow).slice(0, 200));
+  const capB = await capNotesFor(mid, L1);
+  ok("cap-note-still-five", capB.status === 200 && capB.rows.length === 1 && capB.rows[0].body.cap === 5 && capB.rows[0].body.policy === "balanced", "rows=" + capB.rows.length + " " + JSON.stringify(capB.rows[0]?.body).slice(0, 160));
   const msgs = await get("/api/meetings/" + mid + "/messages?take=100");
   const turnAdvisor = (msgs.json || []).filter((m) => (m.sender || m.Sender) === "advisor" && (m.sequence ?? m.Sequence) > 1);
   ok("cap-turn-total-five", turnAdvisor.length === 5, "advisorMsgs=" + turnAdvisor.length);
-  const capNotes = await get("/api/meetings/" + mid + "/notes?kind=run-cap");
-  const capBodies = (capNotes.json || []).map((n) => { try { return JSON.parse(n.body ?? n.Body ?? "{}"); } catch { return {}; } });
-  ok("cap-note-persisted", capNotes.status === 200 && capBodies.some((b) => b.cap === 5 && typeof b.leadSeq === "number"), capNotes.text.slice(0, 200));
+  // Conflicting body policy must not override the configured board policy.
+  const bo = await post("/api/meetings/" + mid + "/run", { policy: "focused", prompt: "QA body override probe" }, { timeout: 90000 });
+  ok("cap-body-policy-ignored-200", bo.status === 200, bo.status + " " + bo.text.slice(0, 200));
+  ok("cap-body-policy-no-sixth", (bo.json?.published?.length ?? -1) === 0, "published=" + (bo.json?.published?.length));
+  const capBO = await capNotesFor(mid, L1);
+  ok("cap-body-policy-note", capBO.rows.length === 1 && capBO.rows[0].body.cap === 5 && capBO.rows[0].body.policy === "balanced", JSON.stringify(capBO.rows[0]?.body).slice(0, 160));
   await post("/api/meetings/" + mid + "/messages", { sender: "lead", content: "QA new lead question resets turn" });
-  const nb = await post("/api/meetings/" + mid + "/run", { policy: "balanced", prompt: "QA reset answers" }, { timeout: 90000 });
+  const L2 = await leadSeqAfter(mid);
+  ok("cap-new-leadseq-recorded", L2 > L1, "L1=" + L1 + " L2=" + L2);
+  const nb = await post("/api/meetings/" + mid + "/run", { prompt: "QA reset answers" }, { timeout: 90000 });
   ok("cap-new-lead-publishes", nb.status === 200 && (nb.json?.published?.length ?? 0) === 6, nb.status + " published=" + (nb.json?.published?.length));
+  const capN = await capNotesFor(mid, L2);
+  ok("cap-new-lead-ten", capN.status === 200 && capN.rows.length === 1 && capN.rows[0].body.cap === 10, "rows=" + capN.rows.length + " " + JSON.stringify(capN.rows[0]?.body).slice(0, 160));
+
+  return { bid, mid, L1 };
+}
+
+async function capRestrictedSecure(bid, mid, L1) {
+  console.log("lane-b: secure discuss-only caller runs but cannot reconfigure or override policy");
+  // Flipping this store to secure mode is permanent, so these real-identity
+  // checks run last. The first registered account becomes installation admin;
+  // the second is an ordinary account that receives only a meeting discuss
+  // grant. Bearer identity takes precedence over the demo header.
+  const adm = await post("/api/auth/register", { email: run + "-discadmin@example.test", password: "Qa-disc-" + run.slice(0, 8) + "-x9admin" });
+  ok("cap-secure-admin-register", (adm.status === 201 || adm.status === 200) && camel(adm.json, "token"), "status=" + adm.status);
+  const adminTok = camel(adm.json, "token") || "";
+  const du = await post("/api/auth/register", { email: run + "-discuss@example.test", password: "Qa-disc-" + run.slice(0, 8) + "-x9user12" });
+  ok("cap-secure-discuss-register", (du.status === 201 || du.status === 200) && camel(du.json, "token"), "status=" + du.status);
+  const discussTok = camel(du.json, "token") || "";
+  const auth = (tok) => ({ headers: { authorization: "Bearer " + tok } });
+  const gr = await post("/api/boards/" + bid + "/grants", { meetingId: mid, userKey: run + "-discuss@example.test", access: "discuss" }, auth(adminTok));
+  ok("cap-secure-grant-201", gr.status === 201, "status=" + gr.status + " " + gr.text.slice(0, 200));
+  const dr = await post("/api/meetings/" + mid + "/run", { prompt: "QA secure discuss run probe" }, { timeout: 90000, ...auth(discussTok) });
+  ok("cap-secure-discuss-run-200", dr.status === 200, dr.status + " " + dr.text.slice(0, 200));
+  ok("cap-secure-discuss-no-new", (dr.json?.published?.length ?? -1) === 0, "published=" + (dr.json?.published?.length));
+  const dp = await patch("/api/boards/" + bid, { discussionPolicy: "open" }, auth(discussTok));
+  ok("cap-secure-discuss-patch-denied", dp.status === 403, "status=" + dp.status + " " + dp.text.slice(0, 160));
+  const da = await post("/api/boards/" + bid + "/setup/activate", { hash: "0".repeat(64) }, auth(discussTok));
+  ok("cap-secure-discuss-activate-denied", da.status === 403, "status=" + da.status + " " + da.text.slice(0, 160));
+  const dCfg = await get("/api/boards/" + bid + "/setup", auth(adminTok));
+  ok("cap-secure-policy-unchanged", camel(dCfg.json?.board, "discussionPolicy") === "balanced", "policy=" + camel(dCfg.json?.board, "discussionPolicy"));
+  const dOverride = await post("/api/meetings/" + mid + "/run", { policy: "open", prompt: "QA secure discuss override probe" }, { timeout: 90000, ...auth(discussTok) });
+  ok("cap-secure-discuss-override-ignored", dOverride.status === 200 && (dOverride.json?.published?.length ?? -1) === 0, dOverride.status + " published=" + (dOverride.json?.published?.length));
+  const capD = await capNotesFor(mid, L1, auth(adminTok));
+  ok("cap-secure-note-unchanged", capD.rows.length === 1 && capD.rows[0].body.cap === 5 && capD.rows[0].body.policy === "balanced", JSON.stringify(capD.rows[0]?.body).slice(0, 160));
+}
+
+async function capActivatedBoard() {
+  console.log("lane-b: activated board keeps focused until a fresh-hash activation switches it");
+  const bid = await makeBoard(run + "-capact");
+  await post("/api/boards/" + bid + "/lead", { name: "QA Lead", roleLabel: "Lead" });
+  for (const r of ["D1", "D2", "D3", "D4", "D5", "D6"]) {
+    const a = await makeAdvisor(bid, r);
+    ok("capact-advisor-" + r, !a.error, a.error || "");
+  }
+  const pf = await patch("/api/boards/" + bid, { discussionPolicy: "focused" });
+  ok("capact-patch-focused-200", pf.status === 200, pf.status + " " + pf.text.slice(0, 200));
+  const s0 = await get("/api/boards/" + bid + "/setup");
+  const h0 = camel(s0.json, "draftHash") || "";
+  ok("capact-hash-present", s0.status === 200 && !!h0, "status=" + s0.status);
+  const ac = await post("/api/boards/" + bid + "/setup/activate", { hash: h0 });
+  ok("capact-activate-200", ac.status === 200, ac.status + " " + ac.text.slice(0, 300));
+  const mid = await makeMeeting(bid, "capact brief");
+  await post("/api/meetings/" + mid + "/messages", { sender: "lead", content: "QA capact turn question" });
+  const L1 = await leadSeqAfter(mid);
+  ok("capact-leadseq-recorded", L1 > 0, "leadSeq=" + L1);
+  const f = await post("/api/meetings/" + mid + "/run", { prompt: "QA capact question" }, { timeout: 90000 });
+  ok("capact-focused-200", f.status === 200, f.status + " " + f.text.slice(0, 200));
+  ok("capact-focused-five", (f.json?.published?.length ?? 0) === 5, "published=" + (f.json?.published?.length));
+  const capF = await capNotesFor(mid, L1);
+  ok("capact-note-focused", capF.rows.length === 1 && capF.rows[0].body.cap === 5 && capF.rows[0].body.policy === "focused", JSON.stringify(capF.rows[0]?.body).slice(0, 160));
+  // Draft-only PATCH on an activated board leaves the focused effect in place.
+  const pb = await patch("/api/boards/" + bid, { discussionPolicy: "balanced" });
+  ok("capact-patch-balanced-200", pb.status === 200, pb.status + " " + pb.text.slice(0, 200));
+  const b = await post("/api/meetings/" + mid + "/run", { prompt: "QA capact followup" }, { timeout: 90000 });
+  ok("capact-still-focused-200", b.status === 200, b.status + " " + b.text.slice(0, 200));
+  ok("capact-still-focused-no-new", (b.json?.published?.length ?? -1) === 0, "published=" + (b.json?.published?.length));
+  const capB = await capNotesFor(mid, L1);
+  ok("capact-note-still-focused", capB.rows.length === 1 && capB.rows[0].body.cap === 5 && capB.rows[0].body.policy === "focused", JSON.stringify(capB.rows[0]?.body).slice(0, 160));
+  // Stale activation reviews fail closed; a fresh-hash activation switches.
+  const stale = await post("/api/boards/" + bid + "/setup/activate", { hash: "0".repeat(64) });
+  ok("capact-stale-hash-409", stale.status === 409, "status=" + stale.status + " " + stale.text.slice(0, 160));
+  const s1 = await get("/api/boards/" + bid + "/setup");
+  const h1 = camel(s1.json, "draftHash") || "";
+  const ac2 = await post("/api/boards/" + bid + "/setup/activate", { hash: h1 });
+  ok("capact-activate-balanced-200", ac2.status === 200, ac2.status + " " + ac2.text.slice(0, 300));
+  const nb = await post("/api/meetings/" + mid + "/run", { prompt: "QA capact after activation" }, { timeout: 90000 });
+  ok("capact-after-activate-200", nb.status === 200, nb.status + " " + nb.text.slice(0, 200));
+  ok("capact-after-activate-no-new", (nb.json?.published?.length ?? -1) === 0, "published=" + (nb.json?.published?.length));
+  const capN = await capNotesFor(mid, L1);
+  ok("capact-note-balanced-five", capN.rows.length === 1 && capN.rows[0].body.cap === 5 && capN.rows[0].body.policy === "balanced", JSON.stringify(capN.rows[0]?.body).slice(0, 160));
 }
 
 async function pauseTerminal() {
@@ -204,8 +331,10 @@ async function pauseTerminal() {
 await wizardGuards();
 await syncBlocks();
 await profileChangeBlocks();
-await capHoldsAcrossPolicies();
+const capIds = await capHoldsAcrossPolicies();
+await capActivatedBoard();
 await pauseTerminal();
+await capRestrictedSecure(capIds.bid, capIds.mid, capIds.L1);
 
 console.log("PASS " + pass + " FAIL " + fail);
 if (failures.length) console.log("failures:\n" + failures.join("\n"));
