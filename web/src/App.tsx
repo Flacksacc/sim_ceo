@@ -1171,6 +1171,36 @@ function AuthPanel() {
     </div>
   );
 }
+function RosterListPortrait({ id, name, identity }: { id: string; name: string; identity: string }) {
+  const images = useQuery({
+    queryKey: ["roster-images", id],
+    queryFn: () => get<{ id: string; review: string }[]>(`/api/roster/${id}/images`),
+    refetchOnWindowFocus: "always",
+    retry: false,
+  });
+  const accepted = !images.isError && !images.isFetching && Array.isArray(images.data)
+    ? images.data.find(image => (image?.review === "accepted" || image?.review === "grandfathered") && normalizeDisplayImageId(image.id)) : undefined;
+  const imageId = normalizeDisplayImageId(accepted?.id) ?? "";
+  const key = identity + ":" + imageId + ":" + images.dataUpdatedAt;
+  const [loaded, setLoaded] = useState<{ key: string; url: string } | null>(null);
+  useEffect(() => {
+    if (!imageId) return;
+    let live = true;
+    let ownedUrl = "";
+    authedBlobUrl(`/api/images/${imageId}`).then(blob => {
+      if (!live || blobStale(blob)) { URL.revokeObjectURL(blob.url); return; }
+      ownedUrl = blob.url;
+      setLoaded({ key, url: blob.url });
+    }).catch(() => { if (live) setLoaded(null); });
+    return () => { live = false; if (ownedUrl) URL.revokeObjectURL(ownedUrl); };
+  }, [imageId, identity, images.dataUpdatedAt]);
+  const visible = loaded?.key === key && imageId ? loaded.url : "";
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const initials = words.length > 1 ? words[0][0] + words[words.length - 1][0] : words[0]?.slice(0, 2) || "?";
+  return <span className="roster-row-avatar" aria-hidden="true" data-portrait-state={visible ? "image" : "placeholder"}>
+    {visible ? <img src={visible} alt="" onError={() => { URL.revokeObjectURL(visible); setLoaded(null); }} /> : initials.toUpperCase()}
+  </span>;
+}
 function AuthedImg({ id, alt, className }: { id: string; alt: string; className?: string }) {
   const [url, setUrl] = useState("");
   useEffect(() => {
@@ -6313,16 +6343,19 @@ const testModel = useMutation({
                   key={r.entry.id}
                   type="button"
                   role="listitem"
-                  className={r.entry.id === selRoster ? "lprow active" : "lprow"}
+                  className={r.entry.id === selRoster ? "lprow roster-person active" : "lprow roster-person"}
                   title={`${r.entry.name} · ${r.boards.length} boards`}
                   onClick={() => selectRoster(r.entry.id)}
                   aria-current={r.entry.id === selRoster ? "true" : undefined}
                 >
                   {" "}
+                  <RosterListPortrait id={r.entry.id} name={r.entry.name} identity={originRevision()} />
+                  <span className="roster-person-copy">
                   <span className="lprow-name">{r.entry.name}</span>{" "}
                   <span className="lprow-sub">
                     {r.boards.length === 1 ? "1 board" : `${r.boards.length} boards`}
                   </span>{" "}
+                  </span>
                 </button>
               ))}{" "}
             {tab === "roster" && (rosterNames.data ?? []).length === 0 && (

@@ -1042,6 +1042,9 @@ async function stepCreateAdvisor() {
   } catch (e) { ok("create-draft-via-ui", false, "POST /api/roster/quick never completed"); failExit("draft create failed; aborting (no cascade)."); }
   rosterId = String(pick(quickBody, "id") || "");
   if (!rosterId) failExit("201 but no roster id from UI create.");
+  const newRosterAvatar = page.locator('.listpanel-rows button[role="listitem"]').filter({ hasText: rosterName }).locator('.roster-row-avatar');
+  await newRosterAvatar.waitFor({ state: 'visible', timeout: boundedTimeout(8000, 8000) });
+  ok('roster-list-placeholder-without-portrait', await newRosterAvatar.getAttribute('data-portrait-state') === 'placeholder', 'A new advisor has a placeholder before a portrait exists');
   // F5: VISIBLE live progress, dialog-scoped, correlated with server state.
   // Fresh creation auto-starts research; click ONLY from a proven idle state.
   const statusLoc = dlg.locator("#cc-research-status");
@@ -2430,6 +2433,10 @@ async function stepRosterChatUI() {
   if (!selOk) { const allN = await page.locator("aside.listpanel button.lprow .lprow-name").allInnerTexts().catch(() => []); ok("roster-chat-panel-mounted", false, "selection did not land on owned entry aria=" + ariaCur + " rows=" + (allN || []).length + " " + selDiag); failExit("roster selection identity not proven; refusing panel proof. " + selDiag); }
   await wft(800);
   const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
+  const rosterPortrait = rrow.locator('.roster-row-avatar img');
+  await rosterPortrait.waitFor({ state: 'visible', timeout: boundedTimeout(10000, 8000) });
+  await rosterPortrait.evaluate(image => image.decode());
+  ok('roster-list-accepted-portrait-loaded', await rosterPortrait.evaluate(image => image.naturalWidth > 0 && image.naturalHeight > 0), 'The roster list displays the accepted portrait');
   await locClick(page.getByRole('tab', { name: 'Chat', exact: true }), 'roster-open-chat-tab');
   let panelOk = false;
   let panelDiag = "";
