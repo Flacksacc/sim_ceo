@@ -631,6 +631,7 @@ async function main() {
   async function sval(x) { try { return await x.inputValue(); } catch (e) { return ''; } }
   const QS = String.fromCharCode(39);
   const editorBoxes = page.locator('textarea.human-editor-text[id*=' + QS + rid + QS + ']');
+  await editorBoxes.nth(3).waitFor({ state: 'visible', timeout: T.step });
   ok('reload-editor-fields', (await editorBoxes.count()) >= 4, 'selected whole-editor text+detail fields missing ' + String(await editorBoxes.count()));
   for (let _w = 0; _w < 20; _w++) { try { if ((await editorBoxes.nth(0).inputValue()) === 'Bears reload one') break; } catch {} await page.waitForTimeout(300); }
   ok('reload-editor-selected-race', (await editorBoxes.nth(0).inputValue()) === 'Bears reload one', 'selected whole-editor not targeted');

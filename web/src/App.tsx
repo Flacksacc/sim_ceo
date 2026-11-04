@@ -9055,9 +9055,10 @@ const testModel = useMutation({
               <h2>Records</h2>{" "}
               <p>
                 {" "}
-                Review drafts, approve selected or all with hash + watermark
-                checks, request revision, or discard. Free-text agreement never
-                approves.{" "}
+                Review each decision, approve selected decisions or the whole
+                draft, request changes, or set it aside. Approval always checks
+                that you are reviewing the latest meeting input. Agreement in
+                a message does not approve a decision.{" "}
               </p>{" "}
               {!meetingId && <p>Pick a meeting first.</p>}{" "}
               {boardDenied ? (
