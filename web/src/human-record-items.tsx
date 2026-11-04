@@ -296,12 +296,14 @@ export function RecordVersionRow(props: {
   decided: boolean;
   selected: boolean;
   onSelect: () => void;
+  testId?: string;
 }) {
   return (
     <div className={"human-version" + (props.selected ? " human-version-selected" : "")}>
       <button
         type="button"
         className="human-version-pick"
+        data-testid={props.testId}
         aria-current={props.selected}
         onClick={props.onSelect}
       >

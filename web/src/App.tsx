@@ -308,6 +308,8 @@ type RecordReview = {
   predecessors: string[];
   successors: string[];
   evidence: RecordEvidence[];
+  effectiveIds: string[];
+  effectiveExport: string;
   lineageEffects?: LineageEffect[];
   historyCount: number;
   meetingWatermark: number;
@@ -3607,7 +3609,7 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemRevise = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
+    if (!recOk || !canActMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -3644,7 +3646,7 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemDiscard = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
+    if (!recOk || !canActMeeting) return;
     const d = recReview.data?.draft ?? recDetail.data;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
@@ -8660,6 +8662,7 @@ const testModel = useMutation({
                     <div className="card" key={r.id}>
                       {" "}
                       <RecordVersionRow
+                        testId={"record-open-" + r.id}
                         version={r.version}
                         statusLabel={friendlyRecordStatus(r.status, r.decided).label}
                         tone={friendlyRecordStatus(r.status, r.decided).tone}
@@ -8674,7 +8677,7 @@ const testModel = useMutation({
                       {" "}
                       <h3>
                         {" "}
-                        Review version {recDetail.data.version}{" "}
+                        Review v{recDetail.data.version}{" "}
                       </h3>{" "}
                       <StatusChip
                         label={friendlyRecordStatus(recDetail.data.status, recDetail.data.decided).label}
@@ -8687,6 +8690,215 @@ const testModel = useMutation({
                         {" "}
                         Refresh review{" "}
                       </button>)}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (
+                        <p role="status">
+                          {" "}
+                          Review v{recDetail.data.version} of meeting input {recReview.data.meetingWatermark}:{" "}
+                          {(recReview.data.approved ?? []).length} approved · {(recReview.data.discarded ?? []).length} set aside ·{" "}
+                          {(recReview.data.pending ?? []).length} waiting.{" "}
+                        </p>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.pending ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Decisions waiting for review</h4>{" "}
+                          <p>Approve, revise, or set aside each decision below. Approved decisions are kept as the record; set-aside decisions are preserved but stay out of the record.</p>{" "}
+                          <ol className="human-item-list">
+                            {(recReview.data.pending ?? []).map((pid) => {
+                              const found = parseRecordItems(recDetail.data.itemsJson).items.find((it) => it.key === pid);
+                              const ptext = found ? found.text : "";
+                              const tkey = editKey(recDetail.data.id, pid);
+                              return (
+                                <li key={pid} className="human-item">
+                                  <div className="human-item-body">
+                                    <span className="human-item-text">{ptext === "" ? "(decision text unavailable — request a fresh revision)" : ptext}</span>{" "}
+                                    {canApproveRecord && (
+                                      <button type="button" onClick={() => itemApprove(pid)}>
+                                        {" "}
+                                        Approve {pid}{" "}
+                                      </button>
+                                    )}{" "}
+                                    {canActMeeting && recReview.data.stateValid === true && (
+                                      <button type="button" onClick={() => itemDiscard(pid)}>
+                                        {" "}
+                                        Discard {pid}{" "}
+                                      </button>
+                                    )}{" "}
+                                    {canActMeeting && recReview.data.stateValid === true && (
+                                      <>
+                                        <label>
+                                          {" "}
+                                          Revised text for {pid}{" "}
+                                          <textarea
+                                            aria-label={"Revised text for " + pid}
+                                            className="human-editor-text"
+                                            value={itemTexts[tkey] ?? ""}
+                                            rows={2}
+                                            onChange={(e) => {
+                                              const v = e.target.value;
+                                              itemTextRev.current[tkey] = (itemTextRev.current[tkey] ?? 0) + 1;
+                                              setItemTexts((old) => ({ ...old, [tkey]: v }));
+                                            }}
+                                            placeholder="Write the revised decision"
+                                          />{" "}
+                                        </label>{" "}
+                                        <button type="button" onClick={() => itemRevise(pid)}>
+                                          {" "}
+                                          Revise {pid}{" "}
+                                        </button>{" "}
+                                      </>
+                                    )}
+                                  </div>
+                                </li>
+                              );
+                            })}
+                          </ol>{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.notes ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Working notes</h4>{" "}
+                          <p>Provisional notes from this meeting. Notes inform the review; only explicit approval decides the record.</p>{" "}
+                          {(recReview.data.notes ?? []).map((n) => (
+                            <div key={n.id} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{n.title === "" ? "(untitled note)" : n.title}</span>{" "}
+                                <StatusChip label={n.kind === "secretary-note" ? "Secretary provisional note" : n.kind === "secretary-briefing" ? "Secretary briefing" : n.kind === "note" ? "Working note" : n.kind === "briefing" ? "Briefing" : n.kind} tone={n.kind === "secretary-note" || n.kind === "secretary-briefing" ? "progress" : "open"} />{" "}
+                                <p>{n.body === "" ? "(no text)" : n.body}</p>{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.evidence ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Supporting excerpts</h4>{" "}
+                          <p>Quoted material behind the decisions above. Withheld items are named but their text stays hidden until the source is readable again.</p>{" "}
+                          {(recReview.data.evidence ?? []).map((c, i) => (
+                            <div key={c.itemId + ":" + c.kind + ":" + String(i)} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{c.title === "" ? (c.missing ? "Withheld excerpt" : "Supporting excerpt") : c.title}</span>{" "}
+                                <StatusChip label={c.kind === "source" ? "Source excerpt" : c.kind === "direction" ? "Adopted direction" : c.kind === "note" ? "Note" : c.kind === "record" ? "Approved record" : c.kind === "message" ? "Meeting message" : c.kind === "dossier" ? "Advisor profile" : "Reference"} tone={c.missing ? "muted" : c.currentEligible ? "done" : "progress"} />{" "}
+                                {c.missing ? (<p className="muted">No longer readable in this review.</p>) : (<p>{c.excerpt}</p>)}{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.recentMessages ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Recent meeting input</h4>{" "}
+                          {(recReview.data.recentMessages ?? []).map((m) => (
+                            <div key={m.sequence} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{m.advisorName ? m.advisorName : m.sender === "lead" ? "Meeting lead" : m.sender}</span>{" "}
+                                <p>{m.content}</p>{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (
+                        <div className="card">
+                          {" "}
+                          <h4>Version history</h4>{" "}
+                          <p>
+                            {" "}
+                            Version {recDetail.data.version} of this review · meeting input {recReview.data.meetingWatermark} ·{" "}
+                            {recReview.data.historyCount} recorded decisions.{" "}
+                          </p>{" "}
+                          {(recReview.data.predecessors ?? []).length > 0 && (
+                            <p>
+                              {" "}
+                              Earlier version{(recReview.data.predecessors ?? []).length === 1 ? "" : "s"}:{" "}
+                              {(recReview.data.predecessors ?? []).map((pp) => {
+                                const pv = (recs.data ?? []).find((r) => r.id === pp)?.version;
+                                return pv === undefined ? (
+                                  <span key={pp} className="muted">an earlier version (not in the recent list)</span>
+                                ) : (
+                                  <button key={pp} type="button" onClick={() => setRecId(pp)}>
+                                    {" "}
+                                    Open version {pv}{" "}
+                                  </button>
+                                );
+                              })}{" "}
+                            </p>
+                          )}{" "}
+                          {(recReview.data.successors ?? []).length > 0 && (
+                            <p role="status">
+                              {" "}
+                              A newer version replaced this review. Continue here:{" "}
+                              {(recReview.data.successors ?? []).map((sp) => {
+                                const sv = (recs.data ?? []).find((r) => r.id === sp)?.version;
+                                return sv === undefined ? (
+                                  <span key={sp} className="muted">a newer version (not in the recent list)</span>
+                                ) : (
+                                  <button key={sp} type="button" onClick={() => setRecId(sp)}>
+                                    {" "}
+                                    Open version {sv}{" "}
+                                  </button>
+                                );
+                              })}{" "}
+                            </p>
+                          )}{" "}
+                          {(recReview.data.lineageEffects ?? []).length > 0 && (
+                            <HumanDisclosure summary={"How this version carries earlier approvals (" + String((recReview.data.lineageEffects ?? []).length) + ")"}>
+                              <ul className="human-compare-list">
+                                {(recReview.data.lineageEffects ?? []).map((e) => (
+                                  <li key={e.id} className="human-item">
+                                    <span className="human-item-text">{e.text}</span>{" "}
+                                    <span className="muted">{e.status}, versions {e.fromVersion} to {e.toVersion}.</span>{" "}
+                                  </li>
+                                ))}
+                              </ul>
+                            </HumanDisclosure>
+                          )}{" "}
+                          {(recReview.data.effectiveIds ?? []).length > 0 && (
+                            <p className="muted">
+                              {" "}
+                              {(recReview.data.effectiveIds ?? []).length} decision{(recReview.data.effectiveIds ?? []).length === 1 ? " stands" : "s stand"} across the current line.{" "}
+                            </p>
+                          )}{" "}
+                        </div>
+                      )}{" "}
+                      {(() => {
+                        let hist: { seq?: unknown; actor?: unknown; action?: unknown; itemId?: unknown; oldText?: unknown; newText?: unknown }[] = [];
+                        try {
+                          const raw: unknown = JSON.parse(recDetail.data.historyJson ?? "[]");
+                          if (Array.isArray(raw)) hist = raw.filter((e) => e !== null && typeof e === "object");
+                        } catch { hist = []; }
+                        if (hist.length === 0) return null;
+                        const actionLabel = (a: string) => a === "approve" ? "Approved" : a === "revise" ? "Revised" : a === "discard" ? "Set aside" : a === "refresh" ? "Refreshed to current meeting input" : a === "discard-remaining" ? "Remaining set aside" : a === "revise-branch" || a === "revise-child" ? "Branched a new version" : a === "amend-branch" || a === "amend-child" ? "Amended" : a;
+                        const shown = hist.slice(-30);
+                        return (
+                          <div className="card">
+                            {" "}
+                            <h4>Decision history</h4>{" "}
+                            <p>{hist.length} recorded decision{hist.length === 1 ? "" : "s"}{hist.length > shown.length ? ", newest " + String(shown.length) + " shown" : ""}.</p>{" "}
+                            <ol className="human-item-list">
+                              {shown.map((h, i) => {
+                                const nt = typeof h.newText === "string" ? h.newText : "";
+                                const ot = typeof h.oldText === "string" ? h.oldText : "";
+                                const txt = nt !== "" ? nt : ot;
+                                const act = typeof h.action === "string" ? h.action : "";
+                                const who = typeof h.actor === "string" ? h.actor : "";
+                                const sq = typeof h.seq === "number" ? String(h.seq) : String(i);
+                                return (
+                                  <li key={sq + "-" + String(i)} className="human-item">
+                                    <div className="human-item-body">
+                                      <span className="human-item-text">{actionLabel(act)}{txt !== "" ? ": " + (txt.length > 220 ? txt.slice(0, 220) + "…" : txt) : ""}</span>{" "}
+                                      {who !== "" && (<span className="muted">by {who}</span>)}{" "}
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ol>{" "}
+                          </div>
+                        );
+                      })()}{" "}
                       <RecordItemList
                         itemsJson={recDetail.data.itemsJson}
                         selectable={canApproveRecord}
@@ -8739,7 +8951,7 @@ const testModel = useMutation({
                           {" "}
                           Approve selected{" "}
                         </button>)}{" "}
-                        {canApproveRecord && (<button onClick={() => approveRec(true)}>
+                        {canApproveRecord && (<button onClick={() => approveAllFresh()}>
                           {" "}
                           Approve all{" "}
                         </button>)}{" "}
