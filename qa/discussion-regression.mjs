@@ -244,6 +244,15 @@ async function capRestrictedSecure(bid, mid, L1) {
   const auth = (tok) => ({ headers: { authorization: "Bearer " + tok } });
   const gr = await post("/api/boards/" + bid + "/grants", { meetingId: mid, userKey: run + "-discuss@example.test", access: "discuss" }, auth(adminTok));
   ok("cap-secure-grant-201", gr.status === 201, "status=" + gr.status + " " + gr.text.slice(0, 200));
+  // current lead turn: live authenticated messages, never hardcoded
+  const mCur = await get("/api/meetings/" + mid + "/messages?take=100", auth(adminTok));
+  const mArr = Array.isArray(mCur.json) ? mCur.json : (camel(mCur.json, "messages") ?? []);
+  ok("cap-secure-current-messages-200", mCur.status === 200 && Array.isArray(mArr) && mArr.length > 0, "status=" + mCur.status);
+  const curLeads = mArr.filter((m) => (m.sender || m.Sender) === "lead");
+  const cur = curLeads.reduce((mx, m) => Math.max(mx, Number(m.sequence ?? m.Sequence ?? 0)), 0);
+  ok("cap-secure-current-leadseq-recorded", curLeads.length > 0 && cur > L1, "L1=" + L1 + " cur=" + cur);
+  const capCur0 = await capNotesFor(mid, cur, auth(adminTok));
+  ok("cap-secure-current-note-ten", capCur0.status === 200 && capCur0.rows.length === 1 && capCur0.rows[0].body.cap === 10 && capCur0.rows[0].body.policy === "balanced", "rows=" + capCur0.rows.length);
   const dr = await post("/api/meetings/" + mid + "/run", { prompt: "QA secure discuss run probe" }, { timeout: 90000, ...auth(discussTok) });
   ok("cap-secure-discuss-run-200", dr.status === 200, dr.status + " " + dr.text.slice(0, 200));
   ok("cap-secure-discuss-no-new", (dr.json?.published?.length ?? -1) === 0, "published=" + (dr.json?.published?.length));
@@ -255,8 +264,11 @@ async function capRestrictedSecure(bid, mid, L1) {
   ok("cap-secure-policy-unchanged", camel(dCfg.json?.board, "discussionPolicy") === "balanced", "policy=" + camel(dCfg.json?.board, "discussionPolicy"));
   const dOverride = await post("/api/meetings/" + mid + "/run", { policy: "open", prompt: "QA secure discuss override probe" }, { timeout: 90000, ...auth(discussTok) });
   ok("cap-secure-discuss-override-ignored", dOverride.status === 200 && (dOverride.json?.published?.length ?? -1) === 0, dOverride.status + " published=" + (dOverride.json?.published?.length));
+  // old L1 lead turn minimum still stands
   const capD = await capNotesFor(mid, L1, auth(adminTok));
   ok("cap-secure-note-unchanged", capD.rows.length === 1 && capD.rows[0].body.cap === 5 && capD.rows[0].body.policy === "balanced", JSON.stringify(capD.rows[0]?.body).slice(0, 160));
+  const capCur1 = await capNotesFor(mid, cur, auth(adminTok));
+  ok("cap-secure-current-note-unchanged", capCur1.status === 200 && capCur1.rows.length === 1 && capCur1.rows[0].body.cap === 10 && capCur1.rows[0].body.policy === "balanced", "rows=" + capCur1.rows.length);
 }
 
 async function capActivatedBoard() {
