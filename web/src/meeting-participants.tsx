@@ -8,15 +8,15 @@
    meeting-participants.INTEGRATION.md: idle, queued, waiting-for-selection,
    considering, responding, waiting-for-publication, complete, abstained,
    waiting-for-clarification, failed, interrupted, excluded, needs-approval,
-   pending. Each state has a distinct ring plus badge plus human label.
-   pending (Waiting for reply) is a run-level wait only and NEVER means
-   approval is pending - that is the separate needs-approval state. */
+   pending. checking/unavailable are rail-level availability states: while the
+   hook reports loading/paused/unavailable, seats render checking/unavailable
+   and the summary reports checking/unavailable instead of false Listening. */
 
 export type ParticipantActivity =
   | "idle" | "queued" | "waiting-for-selection" | "considering" | "responding"
   | "waiting-for-publication" | "complete" | "abstained"
   | "waiting-for-clarification" | "failed" | "interrupted"
-  | "excluded" | "needs-approval" | "pending";
+  | "excluded" | "needs-approval" | "pending" | "checking" | "unavailable";
 
 export interface MeetingParticipant {
   /* Stable internal key (roster/board-advisor id). Never rendered as text. */
@@ -37,6 +37,8 @@ export interface MeetingParticipantsProps {
   participants: MeetingParticipant[];
   /* True while the parent holds a live activity subscription. Pure label. */
   live?: boolean;
+  /* Explicit hook availability: loading/paused/unavailable override the summary. */
+  availability?: "available" | "loading" | "paused" | "unavailable";
   /* Optional human heading override. Defaults to In this meeting. */
   heading?: string;
 }
@@ -56,6 +58,8 @@ const LABEL: Record<ParticipantActivity, string> = {
   excluded: "Not in this meeting",
   "needs-approval": "Needs approval",
   pending: "Waiting for reply",
+  checking: "Checking activity",
+  unavailable: "Activity unavailable",
 };
 
 /* Lowercase count phrases for the honest aggregate line. */
@@ -74,6 +78,8 @@ const COUNT: Record<ParticipantActivity, string> = {
   excluded: "not in this meeting",
   "needs-approval": "needs approval",
   pending: "waiting for reply",
+  checking: "checking activity",
+  unavailable: "activity unavailable",
 };
 
 /* Canonical order for stable aggregate output. */
@@ -81,7 +87,7 @@ const ORDER: ParticipantActivity[] = [
   "responding", "considering", "queued",
   "waiting-for-selection", "waiting-for-publication",
   "waiting-for-clarification", "pending", "needs-approval",
-  "complete", "abstained", "failed", "interrupted", "idle", "excluded",
+  "complete", "abstained", "failed", "interrupted", "checking", "unavailable", "idle", "excluded",
 ];
 
 /* Seats with genuinely live run activity behind them. */
@@ -109,10 +115,15 @@ export function activityLabel(a: ParticipantActivity): string { return LABEL[a];
 
 export function MeetingParticipants(p: MeetingParticipantsProps) {
   const list = Array.isArray(p.participants) ? p.participants : [];
+  const avail = (p as any)?.availability ?? "available";
   const working = list.filter((m) => WORKING.indexOf(m.activity) >= 0).length;
   let statusLine = "No participants yet.";
   if (list.length > 0) {
-    if (working > 0) {
+    if (avail === "loading" || avail === "paused") {
+      statusLine = list.length + " members, checking activity.";
+    } else if (avail === "unavailable") {
+      statusLine = list.length + " members, activity unavailable.";
+    } else if (working > 0) {
       statusLine = list.length + " members, " + working + " working.";
     } else if (list.every((m) => m.activity === "idle")) {
       statusLine = list.length + " members, all listening.";
@@ -126,10 +137,10 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
     }
   }
   return (
-    <section className="meet-participants" aria-label={p.heading || "Meeting participants"}>
+    <section className="meet-participants" aria-label={p.heading || "In this meeting"}>
       <div className="mp-head">
         <h3>{p.heading || "In this meeting"}</h3>
-        {p.live && <span className="badge live">live</span>}
+        {p.live && avail !== "unavailable" && <span className="badge live">live</span>}
       </div>
       <p className="muted mp-status" role="status">{statusLine}</p>
       {list.length === 0 ? (

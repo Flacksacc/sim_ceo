@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
-import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning } from "./advisor-creation";
+import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
 import {
   ConversationHeader,
@@ -2823,6 +2823,7 @@ const selResearch = useQuery({
   queryKey: ["roster-research", selRow?.entry.id, accountId],
   queryFn: () => get<any>(`/api/roster/${selRow!.entry.id}/research`),
   enabled: !!selRow?.entry.id && tab === "roster" && !sessGate,
+  refetchInterval: !!selRow?.entry.id && tab === "roster" && !sessGate ? 2500 : false,
   retry: false,
 });
 const selResearchRunning = isRosterResearchRunning((selResearch as any)?.data);
@@ -4462,7 +4463,7 @@ const testModel = useMutation({
     }
     else setMeetPartDraft([...meetPartDraft, id]);
   };
-  const { advisorSnapshot, secretaryActivity } = useMeetingActivity({
+  const { advisorSnapshot, secretaryActivity, activityAvailability } = useMeetingActivity({
     boardId: boardId,
     meetingId: meetingId,
     boardValid: boardValid,
@@ -4488,11 +4489,10 @@ const testModel = useMutation({
     advisors: (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ id: a.id, boardRole: a.boardRole, approved: a.approved, portraitUrl: presenceUrls.get(a.id) ?? null }))),
     includedIds: meetPartDraft,
     snapshot: advisorSnapshot as any,
-  }), [lead.data, advisors.data, meetPartDraft, presenceUrls, advisorSnapshot]);
-  const presenceWithSecretary = useMemo(() => {
-    if (!secretaryActivity) return presence;
-    return presence.map((p: any) => ((p as any)?.isSecretary ? { ...(p as any), activity: secretaryActivity } : p));
-  }, [presence, secretaryActivity]);
+    availability: (activityAvailability as any) ?? "available",
+    secretaryActivity: (secretaryActivity as any) ?? null,
+  }), [lead.data, advisors.data, meetPartDraft, presenceUrls, advisorSnapshot, activityAvailability, secretaryActivity]);
+  const presenceWithSecretary = useMemo(() => presence, [presence]);
   const createMeeting = useMutation({
     mutationFn: () =>
       post<Meeting>(`/api/boards/${boardId}/meetings`, {
@@ -7397,7 +7397,7 @@ const testModel = useMutation({
                       <span className="badge">{" "}v{selRow.entry.version}{" "}</span>{" "}
                       <p>{selRow.entry.description}</p>{" "}
                       <ProfileFields profileJson={selRow.entry.profileJson} />{" "}
-                      {selRow.entry.researchedAt ? (<p className="muted">{" "}Researched · {selRow.entry.evidenceCount} evidence claims{" "}</p>) : selResearchRunning ? (<p role="status">{" "}Research in progress…{" "}</p>) : selRow.entry.researchRequested ? (<p className="muted">{" "}Research requested — not running. Open the editor below for its result and retry if needed.{" "}</p>) : (<p className="muted">{" "}No research yet — use Research dossier below to gather evidence.{" "}</p>)}
+                      {shouldShowResearchWorking(selRow.entry.researchedAt, selResearchRunning) ? (<p role="status">{" "}Research in progress · {selRow.entry.evidenceCount} evidence claims{" "}</p>) : selRow.entry.researchedAt ? (<p className="muted">{" "}Researched…{" "}</p>) : selRow.entry.researchRequested ? (<p className="muted">{" "}Research requested — not running. Open the editor below for its result and retry if needed.{" "}</p>) : (<p className="muted">{" "}No research yet — use Research dossier below to gather evidence.{" "}</p>)}
                       {(selImages.data ?? []).length > 0 ? (
                         <div aria-label="Portraits awaiting review">
                           <h4>Portraits - accept one before approval</h4>
@@ -7479,7 +7479,10 @@ const testModel = useMutation({
                           resolveCanonicalEntry={resolveCanonicalEntry}
                           freshCreation={false}
                           onSaved={() => {
-                            refresh(...CANONICAL_SAVE_INVALIDATIONS);
+                            refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
+                          }}
+                          onInvalidated={() => {
+                            refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
                           }}
                         />
                       )}{" "}
@@ -7507,8 +7510,11 @@ const testModel = useMutation({
                       originRevision={originRevision()}
                       resolveCanonicalEntry={resolveCanonicalEntry}
                       onCreated={(entry) => {
-                        refresh("roster", "roster-count", "roster-names");
+                        refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
                         try { setSelRoster(entry.id); setAudId(entry.id); } catch { /* noop */ }
+                      }}
+                      onInvalidated={() => {
+                        refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
                       }}
                       onClose={closeCreate}
                     />{" "}
@@ -8517,7 +8523,7 @@ const testModel = useMutation({
                         }
                       >
                         {" "}
-                        <MeetingParticipants participants={presenceWithSecretary} live={live} />
+                        <MeetingParticipants participants={presenceWithSecretary} live={live} availability={(activityAvailability as any) ?? "available"} />
                         {" "}
                         <div className="context-bar">
                           {" "}
@@ -8828,6 +8834,12 @@ const testModel = useMutation({
                         try { retirePipeline(submitOpRef.current); } catch {}
                         try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
                         try { secEpoch.current++; } catch {}
+                        try { secPendingRef.current = null; } catch {}
+                        try { askSecretary.reset(); } catch {}
+                        try { retrySecretary.reset(); } catch {}
+                        try { answerSecretary.reset(); } catch {}
+                        try { secEnvelopeRev.current++; } catch {}
+                        try { secHydRef.current++; } catch {}
                         try { send.reset(); } catch {}
                         try { runDiscussion.reset(); } catch {}
                         try { qc.clear(); } catch {}

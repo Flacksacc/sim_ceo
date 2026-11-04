@@ -36,6 +36,13 @@ export const CANONICAL_SAVE_INVALIDATIONS: readonly string[] = [
   "board-detail",
 ] as const;
 
+export function shouldShowResearchWorking(researchedAt: unknown, running: boolean): boolean {
+  try {
+    if (running === true) return true;
+    return false;
+  } catch { return false; }
+}
+
 export function isRosterResearchRunning(data: unknown): boolean {
   try {
     const d: any = data;
@@ -74,6 +81,46 @@ export async function fetchFreshCanonicalEntry(deps: FreshCanonicalDeps, id: str
   return null;
 }
 
+const CLIENT_VALIDATION_ALLOWLIST: readonly string[] = [
+  "name is required",
+  "description is required",
+  "name must be",
+  "description must be",
+  "links must be urls",
+  "must be a non-empty paragraph",
+  "is over the",
+  "character limit",
+  "profile is over",
+  "no changes to save",
+  "creation failed before anything was saved",
+];
+
+export function looksTechnicalOrId(text: string): boolean {
+  try {
+    const s = String(text ?? "");
+    if (/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}/.test(s)) return true;
+    if (s.indexOf("{") >= 0 || s.indexOf("}") >= 0) return true;
+    if (s.indexOf("[") >= 0 && s.indexOf("]") >= 0) return true;
+    const l = s.toLowerCase();
+    if (l.indexOf("exception") >= 0 || l.indexOf("stack") >= 0 || l.indexOf("trace") >= 0) return true;
+    if (l.indexOf("status") >= 0 && /\b\d{3}\b/.test(s)) return true;
+    return false;
+  } catch { return true; }
+}
+
+export function isAllowlistedClientValidation(text: string): boolean {
+  try {
+    const s = String(text ?? "");
+    if (!s || s.length >= 300) return false;
+    if (looksTechnicalOrId(s)) return false;
+    const l = s.toLowerCase();
+    for (const phrase of CLIENT_VALIDATION_ALLOWLIST) {
+      if (l.indexOf(phrase) >= 0) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
 export function characterFriendlyError(raw: string): string {
   const input = String(raw ?? "");
   if (!input) return "Something went wrong. Your work is unchanged.";
@@ -88,11 +135,15 @@ export function characterFriendlyError(raw: string): string {
   if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
   if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
   if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
-  if (status === 409 || hay.indexOf("already running") >= 0) return "Research is already running for this draft on the server. Wait, then use Check again - do not start a second run.";
+  if (status === 409 || hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) {
+    if (hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) return "Research is already running for this draft on the server. Wait, then use Check again - do not start a second run.";
+    if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer") >= 0 || hay.indexOf("changed") >= 0 || hay.indexOf("profile") >= 0 || hay.indexOf("version") >= 0 || hay.indexOf("conflict") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
+    if (status === 409) return "That change conflicted with a newer saved version. Your text is kept - use Reload or Check again to review it, then retry.";
+  }
   if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer research") >= 0 || hay.indexOf("changed during research") >= 0 || hay.indexOf("advisor profile changed") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
   if (status === 502 || status === 503 || status === 504 || status === 499 || hay.indexOf("provider") >= 0 || hay.indexOf("model") >= 0 || hay.indexOf("deadline") >= 0 || hay.indexOf("time bound") >= 0 || hay.indexOf("research failed") >= 0 || hay.indexOf("research start failed") >= 0) return "Research could not complete because the text service had a problem. Your draft and brief are unchanged - retry, or edit the paragraphs directly.";
-  if (status === 0 && input.length < 300 && input.indexOf("{") < 0) return input;
-  if (status === 400 && serverError && serverError.length < 300 && serverError.indexOf("{") < 0) return serverError;
+  const candidate = status === 400 && serverError ? serverError : (status === 0 ? input : "");
+  if (candidate && candidate.length < 300 && isAllowlistedClientValidation(candidate)) return candidate;
   return "That request did not complete. Your draft and text are unchanged - retry, or edit directly.";
 }
 
@@ -231,6 +282,7 @@ function originDead(api: { originStale?: (o: OriginIdentity) => boolean }, o: Or
 
 export interface CreateAdvisorProps extends CreateAdvisorApi {
   onCreated?: (entry: RosterEntryDto) => void;
+  onInvalidated?: () => void;
   onClose?: () => void;
 }
 
@@ -243,6 +295,7 @@ export interface CharacterEditorProps {
   background?: string;
   sourceUrls?: string[];
   onSaved?: (entry: RosterEntryDto) => void;
+  onInvalidated?: () => void;
   onClose?: () => void;
   originIdentity: () => OriginIdentity;
   originStale: (o: OriginIdentity) => boolean;
@@ -760,7 +813,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
       setHasCompiled(true);
       setResearchStatus("incomplete");
       setStage("");
-      setStatusNote("Loaded unsupported research — editable draft, explicitly incomplete, never complete. Edit with care or retry.");
+      setStatusNote("Loaded unsupported research ï¿½ editable draft, explicitly incomplete, never complete. Edit with care or retry.");
     } else if (s.draftStatus === "failed") {
       setCompiled({ ...EMPTY_PARAGRAPHS });
       setHasCompiled(false);
@@ -1630,6 +1683,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setSupported(false);
         if (statusRef.current === "done") setResearchStatus("stale");
         setStatusNote("Saved on the server as v" + updated.version + ", but a newer version (v" + floorAfterResolve + ") was observed" + (lookupFailed ? " and the canonical lookup failed" : "") + ". Your previous text is preserved below \u2014 use Reload or Check again to confirm; the older save was not applied here.");
+        if (staleKind(myOp, opId) === "ok") props.onInvalidated?.();
         return;
       }
       setEntry((prev) => (prev.id === updated.id ? updated : prev));
@@ -1648,7 +1702,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setVerifyUnknown(true);
         setSupported(false);
         if (statusRef.current === "done") setResearchStatus("stale");
-        setStatusNote("Draft saved. Research state could not be verified (" + (verifyError || "no response") + ") \u2014 use Check again to refresh. Still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. Research state could not be verified - use Check again to refresh. Still unapproved and not attached to any board.");
         if (staleKind(myOp, opId) === "ok") props.onSaved?.(updated);
         return;
       }
@@ -2163,6 +2217,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
               setEntry(updated);
               props.onCreated?.(updated);
             }}
+            onInvalidated={() => { props.onInvalidated?.(); }}
             onClose={props.onClose}
           />
         </>

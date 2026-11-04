@@ -10,8 +10,12 @@
 // activity feed supply real run states (queued, considering, responding,
 // complete, abstained, interrupted, waiting states); the adapter still
 // forces excluded and needs-approval from owned membership data so the rail
-// can never show a non-member as responding.
+// can never show a non-member as responding. Availability gates the snapshot:
+// loading/paused/unavailable snapshots never render idle-as-listening or
+// retained responding; approved seats render checking/unavailable instead,
+// and unselected seats never infer responding.
 import type { MeetingParticipant, ParticipantActivity } from "./meeting-participants";
+import type { ActivityAvailability } from "./meeting-activity";
 
 export interface PresenceAdvisor {
   id: string;
@@ -30,6 +34,10 @@ export interface PresenceInput {
   includedIds: string[];
   // Future authorized activity snapshot (backend lane). Optional.
   snapshot?: Map<string, ParticipantActivity>;
+  // Explicit hook availability. Only "available" may apply the snapshot.
+  availability?: ActivityAvailability;
+  // Private caller-owned secretary activity (already aggregated). Optional.
+  secretaryActivity?: string | null;
 }
 
 // The board-advisor record carries its selected portrait as
@@ -65,7 +73,7 @@ export function isPortraitAccepted(review: string | null | undefined): boolean {
 
 export interface PortraitImage { id: string; review?: string | null }
 
-// Resolve a provenance selection against the advisor's OWN roster-entry
+// Resolve a provenance selection against the advisor OWN roster-entry
 // image list (never another entry: no wrong-identity matches). A full GUID
 // wins on exact same-entry match; a legacy 8-char prefix wins only on a
 // single same-entry prefix match. Anything else (including ambiguity)
@@ -102,6 +110,9 @@ const SNAPSHOT_STATES: ReadonlySet<string> = new Set([
 
 export function buildPresence(input: PresenceInput): MeetingParticipant[] {
   const seats: MeetingParticipant[] = [];
+  const avail: ActivityAvailability = (input as any)?.availability ?? "available";
+  const live = avail === "available";
+  const availSeat: ParticipantActivity = avail === "unavailable" ? "unavailable" : "checking";
   const restricted = input.includedIds.length > 0;
   const included = new Set(input.includedIds);
   if (input.leadName) {
@@ -110,7 +121,7 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
       displayName: input.leadName,
       roleLabel: input.leadRoleLabel || "Board lead",
       portraitUrl: null,
-      activity: "idle",
+      activity: live ? "idle" : availSeat,
     });
   }
   for (const a of input.advisors) {
@@ -119,6 +130,8 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
       activity = "excluded";
     } else if (!a.approved) {
       activity = "needs-approval";
+    } else if (!live) {
+      activity = availSeat;
     } else if (input.snapshot) {
       const snap = input.snapshot.get(a.id);
       if (snap && SNAPSHOT_STATES.has(snap)) activity = snap;
@@ -130,12 +143,20 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
       activity,
     });
   }
+  let secActivity: ParticipantActivity = live ? "idle" : availSeat;
+  try {
+    if (live) {
+      const s = String((input as any)?.secretaryActivity ?? "");
+      if (s === "responding" || s === "pending" || s === "waiting-for-clarification" || s === "complete" || s === "failed" || s === "interrupted" || s === "abstained") secActivity = s as ParticipantActivity;
+      else secActivity = "idle";
+    }
+  } catch { secActivity = live ? "idle" : availSeat; }
   seats.push({
     key: "secretary",
     displayName: "Secretary",
     roleLabel: "Meeting secretary",
     portraitUrl: null,
-    activity: "idle",
+    activity: secActivity,
     isSecretary: true,
   });
   return seats;

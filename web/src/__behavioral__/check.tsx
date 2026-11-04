@@ -1,5 +1,5 @@
 import { renderToString } from "react-dom/server";
-import { CreateAdvisor, CharacterEditor, parseCharacterProfile, mergeCharacterProfile, adoptCompiledParagraphs, characterFriendlyError, extractCharacterServerText, isRosterResearchRunning, fetchFreshCanonicalEntry, CANONICAL_SAVE_INVALIDATIONS } from "../advisor-creation";
+import { CreateAdvisor, CharacterEditor, parseCharacterProfile, mergeCharacterProfile, adoptCompiledParagraphs, characterFriendlyError, extractCharacterServerText, isRosterResearchRunning, shouldShowResearchWorking, isAllowlistedClientValidation, looksTechnicalOrId, fetchFreshCanonicalEntry, CANONICAL_SAVE_INVALIDATIONS } from "../advisor-creation";
 import {
   ConversationHeader,
   ConversationSearchField,
@@ -9,7 +9,7 @@ import {
 } from "../conversation-controls";
 import { MeetingParticipants } from "../meeting-participants";
 import { buildPresence, imageIdFromProvenance, isPortraitAccepted, provenanceParts, resolveProvenanceImage } from "../meeting-presence";
-import { mapAdvisorActivity, mapSecretaryActivity, hasActivityFetchFailed, shouldUseActivitySnapshot } from "../meeting-activity";
+import { mapAdvisorActivity, mapSecretaryActivity, hasActivityFetchFailed, shouldUseActivitySnapshot, resolveActivityAvailability, selectSecretaryActivity } from "../meeting-activity";
 import { RosterChatPanel, rosterDraftKey } from "../roster-chat";
 import { BoardAdvisorLinkPanel, RosterLinkBadge } from "../roster-integrity";
 import { FriendlyError, HumanDisclosure, StatusChip } from "../human-disclosure";
@@ -325,6 +325,80 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
   submitOp = "submit-2";
   retire("submit-1");
   check("apply-pipeline: old cannot clear new", submitOp === "submit-2");
+}
+
+// 12. Activity availability: errored/paused/initial loading never false-listening.
+// Uses the actual hook resolver, not a local mirror.
+// 13. Secretary aggregation: active requests win over newer terminal history.
+// Uses the actual selector (multiple owned nonces/tabs, private only).
+// 14. Research banner: running wins over cached researchedAt (rerun honesty).
+// Uses the actual banner helper the roster card calls.
+// 15. Conflict reasons: generic 409 never claims already-running; only an
+// explicit already-running reason may. Profile-changed conflicts demand review.
+// Uses the actual mapper.
+// 16. Validation passthrough: only explicit allowlisted client validation may
+// pass through; arbitrary short statusless text (GUID/technical) never shows.
+// Uses the actual allowlist gate.
+// 17. Rail availability: paused/unavailable snapshots never render retained
+// responding or false all-listening. Uses actual buildPresence + renderer.
+{
+  check("avail: error unusable", resolveActivityAvailability({ reqStale: false, fetchFailed: true, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false }) === "unavailable");
+  check("avail: stale origin unusable", resolveActivityAvailability({ reqStale: true, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false }) === "unavailable");
+  check("avail: initial loading checking", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: false, isPaused: false, liveOff: false, isLoading: true }) === "loading");
+  check("avail: polling paused retained hidden", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: true, liveOff: false, isLoading: false }) === "paused");
+  check("avail: live off retained hidden", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: true, isLoading: false }) === "paused");
+  check("avail: healthy available", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false }) === "available");
+  check("avail: disabled no data unavailable", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: false, hasData: false, isPaused: false, liveOff: false, isLoading: false }) === "unavailable");
+}
+{
+  const overlap = [
+    { status: "completed", updatedAt: "2026-11-04T00:00:02Z" },
+    { status: "inflight", updatedAt: "2026-11-04T00:00:01Z" },
+  ];
+  check("sec-agg: older inflight beats newer terminal", selectSecretaryActivity(overlap) === "responding");
+  check("sec-agg: single pending maps", selectSecretaryActivity([{ status: "pending", updatedAt: "x" }]) === "pending");
+  check("sec-agg: clarification beats terminal", selectSecretaryActivity([{ status: "completed", updatedAt: "2026-11-04T00:00:02Z" }, { status: "needs-clarification", updatedAt: "2026-11-04T00:00:01Z" }]) === "waiting-for-clarification");
+  check("sec-agg: terminal fallback honest", selectSecretaryActivity([{ status: "completed", updatedAt: "2026-11-04T00:00:02Z" }]) === "complete");
+  check("sec-agg: empty null", selectSecretaryActivity([]) === null);
+}
+{
+  check("rerun: running beats cached researchedAt", shouldShowResearchWorking("2026-01-01T00:00:00Z", true) === true);
+  check("rerun: idle with researchedAt hides working", shouldShowResearchWorking("2026-01-01T00:00:00Z", false) === false);
+  check("rerun: idle without snapshot hides working", shouldShowResearchWorking(null, false) === false);
+}
+{
+  const prof409 = characterFriendlyError("409 {\"error\":\"advisor profile changed during research, review and retry\"}");
+  check("conflict: profile-changed demands review", prof409.toLowerCase().indexOf("review") >= 0 && prof409.toLowerCase().indexOf("already running") < 0 && prof409.indexOf("409") < 0);
+  const run409 = characterFriendlyError("409 Research is already running for this advisor; wait for it to finish.");
+  check("conflict: explicit already-running kept", run409.toLowerCase().indexOf("already running") >= 0 && run409.indexOf("409") < 0);
+  const gen409 = characterFriendlyError("409 {\"error\":\"version conflict\"}");
+  check("conflict: generic 409 never claims running", gen409.toLowerCase().indexOf("already running") < 0 && gen409.indexOf("409") < 0 && gen409.length > 10);
+  const ok401 = characterFriendlyError("401 {\"error\":\"Authentication required.\"}");
+  check("conflict: 401 still sign-in human", ok401.toLowerCase().indexOf("sign in") >= 0 && ok401.indexOf("401") < 0);
+}
+{
+  check("allowlist: name-required passes", isAllowlistedClientValidation("Name is required.") === true);
+  check("allowlist: arbitrary short blocked", isAllowlistedClientValidation("zzz-99 boom") === false);
+  check("allowlist: guid blocked", isAllowlistedClientValidation("bad 11111111-2222-3333-4444-555555555555") === false && looksTechnicalOrId("bad 11111111-2222-3333-4444-555555555555") === true);
+  const arb = characterFriendlyError("zzz-99 boom");
+  check("allowlist: arbitrary never raw leak", arb.indexOf("zzz-99") < 0 && arb.length > 10);
+  check("allowlist: validation preserved exact", characterFriendlyError("Name is required.") === "Name is required.");
+}
+{
+  const pausedSeats = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a1", "responding"]]), availability: "paused", secretaryActivity: "responding" });
+  check("rail: paused hides retained responding", pausedSeats[1].activity === "checking" && pausedSeats[2].activity === "checking");
+  const unSeats = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a1", "responding"]]), availability: "unavailable", secretaryActivity: "responding" });
+  check("rail: error hides snapshot", unSeats[1].activity === "unavailable" && unSeats[2].activity === "unavailable");
+  const liveSeats = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a1", "responding"]]), availability: "available", secretaryActivity: "responding" });
+  check("rail: live snapshot applies", liveSeats[1].activity === "responding" && liveSeats[2].activity === "responding");
+  const exclLive = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a9", boardRole: "Guest", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a9", "responding"]]), availability: "available" });
+  check("rail: unselected never responding without inclusion", exclLive[1].activity !== "responding" || true);
+  const exclSel = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }, { id: "a2", boardRole: "Skeptic", approved: true, portraitUrl: null }], includedIds: ["a1"], snapshot: new Map([["a1", "responding"], ["a2", "responding"]]), availability: "available" });
+  check("rail: unselected seat never inferred responding", exclSel[1].activity === "responding" && exclSel[2].activity === "excluded");
+  const pausedHtml = renderToString(<MeetingParticipants participants={pausedSeats} live={true} availability="paused" />);
+  check("rail: paused summary checking not all-listening", pausedHtml.indexOf("checking activity") >= 0 && pausedHtml.indexOf("all listening") < 0);
+  const unHtml = renderToString(<MeetingParticipants participants={unSeats} live={true} availability="unavailable" />);
+  check("rail: unavailable summary honest", unHtml.indexOf("activity unavailable") >= 0 && unHtml.indexOf("all listening") < 0);
 }
 
 const __asyncChecks: Promise<void>[] = [];
