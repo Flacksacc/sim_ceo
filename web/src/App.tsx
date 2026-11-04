@@ -1081,31 +1081,6 @@ function AuthedImg({ id, alt, className }: { id: string; alt: string; className?
   if (!url) return <span className="muted">loading portrait�</span>;
   return <img src={url} alt={alt} className={className} />;
 }
-// Presence portraits: resolve ACCEPTED selected-image metadata first, then
-// load bytes through the existing authorized image path (authed blob URLs),
-// identity-scoped with unmount cleanup. Reject/revoke (even with an unchanged
-// selection id) clears the blob and falls back to initials, because the
-// metadata review is part of the resolution key. Legacy 8-char selections
-// resolve only on a single same-entry prefix match, never by guessing.
-// Images from any other roster entry are never used (no wrong identity).
-// Focus/visibility and advisor-query refresh revalidate accepted metadata even
-// load bytes through the existing authorized image path (authed blob URLs),
-// identity-scoped with unmount cleanup. Reject/revoke (even with an unchanged
-// selection id) clears the blob and falls back to initials: the caller bumps
-// rev on every review/selection change and rev is part of the resolution key,
-// and the auth epoch is in the key so a demo Apply-identity (raw token/user
-// unchanged) still re-resolves. Legacy 8-char selections resolve only on a
-// single same-entry prefix match, never by guessing. Images from any other
-// roster entry are never used (no wrong identity).
-// Presence portraits via authorized advisors DTO displayPortraitImageId
-// (server RosterDisplayOps.ResolveDisplayPortrait, same authority as reviewed identity).
-// Loads exact bytes through the existing authorized image path (authed blob URLs),
-// identity-scoped with unmount cleanup. Reject or revoke (even with an unchanged
-// selection id) clears the blob and falls back to initials: the caller bumps
-// rev on every review or selection change and rev is part of the resolution key,
-// and the auth epoch is in the key so a demo Apply-identity still re-resolves.
-// Invalid ids never load; wrong-identity bytes are impossible because the server
-// already scoped the id to the advisor roster entry.
 // Presence portraits via authorized advisors DTO displayPortraitImageId
 // (server RosterDisplayOps.ResolveDisplayPortrait, same authority as reviewed identity).
 // Loads exact bytes through the existing authorized image path (authed blob URLs),
@@ -1150,27 +1125,37 @@ function useDisplayPortraits(boardId: string, entries: { key: string; displayIma
     const made: string[] = [];
     (async () => {
       const next = new Map<string, string>();
-      // Fresh authoritative display ids first: a same-ID reject/revoke changes
-      // the DTO gate but leaves cached props and raw bytes readable for owners,
-      // so bytes alone cannot prove freshness.
-      const freshByKey = new Map<string, string | null>();
+      // Fail-closed freshness: require a successful fresh array DTO for this
+      // board. On failed, malformed, omitted, or null metadata keep initials;
+      // never rescue with cached metadata, since owner-readable bytes may
+      // still serve a rejected or removed image.
+      if (!live || retired()) return;
+      let freshList: any[] | null = null;
       try {
-        if (boardId) {
-          const fresh = await get<any[]>(`/api/boards/${boardId}/advisors`);
-          if (!live || retired()) return;
-          for (const a of fresh ?? []) {
-            const fid = String((a as any)?.id ?? (a as any)?.Id ?? "");
-            if (!fid) continue;
-            const dispRaw = (a as any)?.displayPortraitImageId ?? (a as any)?.DisplayPortraitImageId ?? null;
-            freshByKey.set(fid, dispRaw ? String(dispRaw) : null);
-          }
-        }
-      } catch { /* fallback to cached entries when the fresh DTO read fails */ }
+        if (!boardId) return;
+        const fresh = await get<any[]>(`/api/boards/${boardId}/advisors`);
+        if (!live || retired()) return;
+        if (!Array.isArray(fresh)) return;
+        freshList = fresh;
+      } catch {
+        return;
+      }
+      if (!live || retired() || freshList === null) return;
+      const freshByKey = new Map<string, string | null>();
+      for (const a of freshList) {
+        const fid = String((a as any)?.id ?? (a as any)?.Id ?? "");
+        if (!fid) continue;
+        const dispRaw = (a as any)?.displayPortraitImageId ?? (a as any)?.DisplayPortraitImageId ?? null;
+        freshByKey.set(fid, dispRaw ? String(dispRaw) : null);
+      }
       if (!live || retired()) return;
       for (const e of entries) {
         if (!live) return;
         try {
-          const raw = freshByKey.has(e.key) ? freshByKey.get(e.key) : e.displayImageId;
+          // Require a matching current advisor key and valid display id from
+          // the successful fresh DTO; omitted or null stays fallback.
+          if (!freshByKey.has(e.key)) continue;
+          const raw = freshByKey.get(e.key);
           const id = normalizeDisplayImageId(raw ?? null);
           if (!id) continue;
           if (retired()) return;

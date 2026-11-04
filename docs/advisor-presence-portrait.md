@@ -27,10 +27,14 @@ focus, since owner-readable bytes alone cannot prove freshness.
   re-queries authoritative `GET /api/boards/{boardId}/advisors` for the
   computed display id before loading bytes on every resolve, including
   focus, visibility, and advisor refresh. Same-ID revoke or reject therefore
-  clears to initials. Bytes still flow only through authorized
+  clears to initials. Fail-closed: failed, malformed, omitted, or null
+  fresh metadata keeps initials with no cached rescue, and no request
+  issues after retire. Bytes still flow only through authorized
   `authedBlobUrl("/api/images/" + id)` with token, user, epoch, immediate
   clear and revoke, `blobStale` and retired checks, unmount cleanup, and no
-  wrong-identity reuse.
+  wrong-identity reuse. Display ids validate precise GUID groups;
+  the server Guid is always valid. Guest DTO computes once (no double
+  resolve window).
 
 ## Proof
 - `dotnet build server/SimCEO.Api` Release, 0 errors.
@@ -38,7 +42,12 @@ focus, since owner-readable bytes alone cannot prove freshness.
 - `node qa/advisor-presence-portrait.cjs` PASS against combined source:
   shared resolver and order, canonical projection retained, both DTOs carry
   the additive id, frontend helpers prove selected/none/rejected/ambiguous,
-  and App proves fresh DTO before bytes with preserved guards.
+  and App proves fail-closed fresh DTO before bytes with preserved guards.
+- `dotnet run --project qa/PresenceDisplayProbe` (USE_POSTGRES=0, Pg.Backend
+  null) invokes REAL RosterDisplayOps on an owned InMemoryStore for
+  deterministic legacy, tie-break, no-selection, explicit valid/invalid/
+  rejected/grandfathered, ambiguous linked/prefix, cross-roster, and
+  single pending linked, with fingerprint and gate parity.
 
 ## Gaps
 - Live runtime with real HTTP, Postgres, Docker, or browser was not run here;

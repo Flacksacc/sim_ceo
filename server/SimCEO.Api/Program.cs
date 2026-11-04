@@ -1417,7 +1417,11 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
       try { using var d = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(mm.ParticipantIdsJson) ? "[]" : mm.ParticipantIdsJson); foreach (var e in d.RootElement.EnumerateArray()) if (e.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)) parts.Add(g); } catch { }
   var list = s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed && a.Approved);
   if (parts.Count > 0) list = list.Where(a => parts.Contains(a.Id));
-  return Results.Ok(list.Select(a => new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId, displayPortraitImageId = RosterDisplayOps.ResolveDisplayPortrait(s, a) == null ? (Guid?)null : RosterDisplayOps.ResolveDisplayPortrait(s, a)!.Id }).ToList());
+  return Results.Ok(list.Select(a =>
+  {
+    var guestDisplayId = RosterDisplayOps.ResolveDisplayPortrait(s, a)?.Id;
+    return new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId, displayPortraitImageId = (Guid?)guestDisplayId };
+  }).ToList());
 });
 
 app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>

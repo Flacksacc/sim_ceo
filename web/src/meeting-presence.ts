@@ -77,7 +77,7 @@ export function isPortraitAccepted(review: string | null | undefined): boolean {
 export function normalizeDisplayImageId(id: string | null | undefined): string | null {
   if (!id) return null;
   const trimmed = id.trim();
-  if (/^[0-9a-fA-F-]{36}$/.test(trimmed)) return trimmed;
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed)) return trimmed;
   return null;
 }
 export interface PortraitImage { id: string; review?: string | null }
