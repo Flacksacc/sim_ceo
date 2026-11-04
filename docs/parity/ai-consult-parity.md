@@ -933,3 +933,37 @@ Published main history and the completed changes. A credential-pattern scan of
 files, live app data, scratch output and untracked tmp.txt were excluded from the
 upload. Repository visibility and remote main commit were verified using GitHub
 and git. Scan metadata: `.tmp/public-repo-source-scan.json`.
+
+### 2026-11-04 — No advisor approval process; clipped meeting portraits
+
+User explicitly removed advisor approval as a product requirement. Implemented
+`2277911`: selected roster members participate without Approved flags, version
+re-pinning, research/portrait approval or manual enablement. Current-profile
+readiness still excludes removed, archived or incomplete entries. Meeting
+selection/publication/activity, activation and Secretary eligibility use this
+readiness check. Guest advisor/image projections and dossier availability also
+use current membership/readiness with existing access checks. Existing approval
+fields remain for storage compatibility; the old approve endpoint is a guarded
+compatibility no-op. Source and decision review semantics were not changed.
+
+Removed advisor approval buttons, prompts and status copy throughout active UI.
+Roster edits flow directly into the next reply without sync/reapproval. Meeting
+avatars now have a separately clipped circular image layer with explicit image
+dimensions, while the activity ring remains outside the image crop.
+
+Frontend/backend/release builds passed. Fresh isolated checks passed:
+`.tmp/no-advisor-approval-dialogue-qa.log`, `-qa.log`, `-wizard-qa.log`, and
+`-lists-qa.log` (all prefixed `.tmp/no-advisor-approval`). These verify responses
+with every legacy approval flag false and no approve calls, current edited
+profiles despite stale pins, Secretary operation, pending portrait participation,
+absence of approval UI, and extreme wide/tall image cropping and circle hit tests.
+Grounded claims regression: 49 passed, zero failed
+(`.tmp/no-advisor-approval-grounding.log`). Live desktop light/dark and narrow
+checks passed with zero page errors or domain writes:
+`.tmp/no-advisor-approval-live-check.log` and screenshots.
+
+Healthy localhost:5173 image:
+`sha256:67baea00610d1ae87c4bfca7641da8975f98a17b4394a92cbcaa2c6cd3643b92`.
+Backup `.tmp/update-20261104-194442-UTC-b504a30a`; original DB/volumes retained.
+Published source to https://github.com/Flacksacc/sim_ceo. Owned QA services and
+browsers stopped; no agents used; tmp.txt untouched; broader parity goal paused.
