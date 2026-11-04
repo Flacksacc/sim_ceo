@@ -1175,7 +1175,7 @@ public static class SimCEOEndpoints
         return Results.Ok(done);
       });
 
-    // ---- Discussion run: bids -> challenge -> drafts -> ordered publish ----
+    // ---- Discussion: orchestrator -> parallel immediate replies -> one peer-review wave ----
     app.MapPost("/api/meetings/{id:guid}/run", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (!s.Meetings.TryGetValue(id, out var m)) return Results.NotFound("meeting");
@@ -1188,6 +1188,7 @@ public static class SimCEOEndpoints
       }
       Guid activityOpId = Guid.Empty;
       using var runCancel = CancellationTokenSource.CreateLinkedTokenSource(req.HttpContext.RequestAborted);
+      using var draftSem = new SemaphoreSlim(10);
       var inFlightDrafts = new List<Task<(BoardAdvisor adv, string? text, CuratorManifest? manifest, string? error)>>();
       try
       {
@@ -1365,6 +1366,11 @@ public static class SimCEOEndpoints
       }
       catch (Exception ex) when (ex is not OperationCanceledException)
       {
+        if (ex is ContextCurator.EssentialBudgetExceededException)
+        {
+          LaneBFail("advisor selection context is too large", 0, eligible.Select(a => a.BoardRole).ToList());
+          return Results.Json(new { error = ex.Message }, statusCode: 413);
+        }
         if (ex is InvalidOperationException && ex.Message is "lead-changed" or "roster-changed" or "generation-changed" or "board-changed" or "source-changed" or "directions-changed" or "records-changed")
           return LaneBFail(ex.Message == "lead-changed" ? "lead profile changed; refresh and retry with the current version" : "context changed during advisor selection; refresh and retry", 0, eligible.Select(a => a.BoardRole).ToList());
         MeetingActivity.FinishDiscussion(s, id, activityOpId, "failed", "Advisor selection failed; retry responses.");
@@ -1425,7 +1431,6 @@ public static class SimCEOEndpoints
       try { MeetingActivity.SyncSelection(id, activityOpId, bidResults.Select(b => (b.adv.Id, b.adv.BoardRole, b.score, b.error)).ToList(), selectedIds, alreadyIds); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
       var firstWave = rounds.SelectMany(r => r).ToList();
       rounds = firstWave.Select(a => new List<BoardAdvisor> { a }).ToList();
-      using var draftSem = new SemaphoreSlim(10);
       string? lastChallenged = null;
       var firstReplies = new List<Message>();
       for (var wave = 0; wave < 2; wave++)
@@ -1475,6 +1480,7 @@ public static class SimCEOEndpoints
             catch { }
             return (adv, text: (string?)text, manifest: (CuratorManifest?)manifest, error: (string?)null);
           }
+          catch (OperationCanceledException) when (runCancel.IsCancellationRequested) { throw; }
           catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
           {
             try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)ex.Message);

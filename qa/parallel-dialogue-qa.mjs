@@ -63,6 +63,7 @@ try {
     assert.ok(!reply.content.includes('[reply-to:'));
   }
   assert.equal((await activity(m)).status,'completed');
+  await page.waitForFunction(()=>document.querySelector('.mp-seat[title^="Designer Outside:"]')?.dataset.activity==='not-selected');
   await page.setViewportSize({width:390,height:844});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
   await ctx.close(); assert.deepEqual(errors,[]);
@@ -117,3 +118,23 @@ const bad = await meeting('Bad selector result'); await lead(bad,'QA-SELECT-BAD'
 assert.equal((await call('POST',`/api/meetings/${bad.id}/run`,{prompt:'QA-SELECT-BAD'})).status,502);
 assert.equal((await replies(bad)).length,0); assert.equal((await activity(bad)).status,'failed');
 console.log('PASS stale CEO profile rejects generation; direct chat receives current default profile/latest history; malformed selection ends honestly');
+const cancelled = await meeting('Cancel outstanding parallel workers'); await lead(cancelled,question);
+const controller = new AbortController();
+const cancelledRequest = fetch(base+`/api/meetings/${cancelled.id}/run`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prompt:question}),signal:controller.signal}).catch(error=>error);
+await until(async()=>(await activity(cancelled))?.phase==='responding','Workers did not start before cancellation');
+controller.abort(); await cancelledRequest;
+await until(async()=>['interrupted','failed'].includes((await activity(cancelled))?.status),'Cancelled workers did not terminate');
+assert.equal((await replies(cancelled)).length,0);
+await ok('POST',`/api/meetings/${cancelled.id}/run`,{prompt:'QA-SELECT-NONE'});
+const rosterRace=await meeting('Advisor edited during response'); await lead(rosterRace,question);
+const rosterRaceRun=call('POST',`/api/meetings/${rosterRace.id}/run`,{prompt:question});
+await until(async()=>(await activity(rosterRace))?.phase==='responding','No workers before advisor edit');
+const slowEntry=(await ok('GET','/api/roster?accountId=00000000-0000-0000-0000-000000000000')).find(r=>r.entry.id===advisors[1].rosterId).entry;
+await ok('PUT',`/api/roster/${slowEntry.id}`,{version:slowEntry.version,profileJson:JSON.stringify({...JSON.parse(slowEntry.profileJson),reasoningApproach:'Updated reasoning invalidates the pending old response.'})});
+assert.equal((await rosterRaceRun).status,200);
+assert.ok(!(await replies(rosterRace)).some(r=>r.advisorId===advisors[1].id),'Edited advisor never publishes stale reply');
+const chatRace=call('POST',`/api/roster/${advisors[0].rosterId}/chat`,{message:'QA-CHAT-PROFILE-RACE QA-SLEEP-C:900: personalize this answer.'});
+await until(async()=>(await(await fetch(fake+'/__log')).json()).some(p=>p.full.includes('QA-CHAT-PROFILE-RACE')),'Direct chat did not dispatch');
+profile=await ok('POST','/api/profile',{...profile,background:'CEO-BACKGROUND-NEWEST: current constraints changed.'});
+assert.equal((await chatRace).status,409,'Direct chat rejects a stale personal profile');
+console.log('PASS cancelled workers drain and unlock; edited advisors never publish stale output; direct-chat personal-profile race rejected');

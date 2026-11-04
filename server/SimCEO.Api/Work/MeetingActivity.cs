@@ -191,7 +191,7 @@ public static class MeetingActivity
       foreach (var b in bids)
       {
         if (b.error is not null) SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorFailed, "provider-error");
-        else if (b.score <= 0) SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorAbstained, "bid-declined");
+        else if (b.score <= 0) SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorAbstained, "not-selected");
         else if (alreadyRepliedIds is not null && alreadyRepliedIds.Contains(b.id)) SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorAbstained, "already-replied-this-turn");
         else if (!selectedIds.Contains(b.id)) SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorAbstained, "cap-omitted");
         else SetAdvisor(meetingId, operationId, b.id, b.role, AdvisorAwaitingSelection, null);

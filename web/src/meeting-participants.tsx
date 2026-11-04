@@ -16,7 +16,7 @@ export type ParticipantActivity =
   | "idle" | "queued" | "waiting-for-selection" | "considering" | "responding"
   | "waiting-for-publication" | "complete" | "abstained"
   | "waiting-for-clarification" | "failed" | "interrupted"
-  | "excluded" | "needs-approval" | "pending" | "checking" | "unavailable";
+  | "excluded" | "needs-approval" | "pending" | "checking" | "unavailable" | "not-selected";
 
 export interface MeetingParticipant {
   /* Stable internal key (roster/board-advisor id). Never rendered as text. */
@@ -45,6 +45,7 @@ export interface MeetingParticipantsProps {
 }
 
 const LABEL: Record<ParticipantActivity, string> = {
+  "not-selected": "Not selected",
   idle: "Listening",
   queued: "Queued",
   "waiting-for-selection": "Waiting to be considered",
@@ -65,6 +66,7 @@ const LABEL: Record<ParticipantActivity, string> = {
 
 /* Lowercase count phrases for the honest aggregate line. */
 const COUNT: Record<ParticipantActivity, string> = {
+  "not-selected": "not selected",
   idle: "listening",
   queued: "queued",
   "waiting-for-selection": "waiting to be considered",
@@ -85,6 +87,7 @@ const COUNT: Record<ParticipantActivity, string> = {
 
 /* Canonical order for stable aggregate output. */
 const ORDER: ParticipantActivity[] = [
+  "not-selected",
   "responding", "considering", "queued",
   "waiting-for-selection", "waiting-for-publication",
   "waiting-for-clarification", "pending", "needs-approval",

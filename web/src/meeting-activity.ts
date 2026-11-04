@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 
 export type ActivityAdvisorState = string;
 export function mapAdvisorActivity(state: any, reason: any): string {
+  if (String(reason ?? "") === "not-selected") return "not-selected";
   const s = String(state ?? "");
   const r = String(reason ?? "");
   if (r === "reapproval-required") return "needs-approval";

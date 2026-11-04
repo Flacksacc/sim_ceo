@@ -120,6 +120,7 @@ export function resolveProvenanceImage(parts: { guid: string | null; legacy8: st
 }
 
 const SNAPSHOT_STATES: ReadonlySet<string> = new Set([
+  "not-selected",
   "queued",
   "waiting-for-selection",
   "considering",
