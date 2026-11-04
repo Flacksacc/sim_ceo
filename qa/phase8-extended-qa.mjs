@@ -11,17 +11,46 @@ async function req(method,path,body,headers,isForm){
   const t=await r.text(); let j=null; try{j=t?JSON.parse(t):null;}catch{} return {status:r.status,json:j,text:t,headers:r.headers};
 }
 console.log("extended QA run="+run);
+if (API !== "http://127.0.0.1:15340") { console.log("FATAL-GATE QA_API exact"); process.exitCode = 2; throw new Error("gate"); }
+const FAKEE = process.env.QA_FAKE || "http://127.0.0.1:15342";
+if (FAKEE !== "http://127.0.0.1:15342") { console.log("FATAL-GATE QA_FAKE exact"); process.exitCode = 2; throw new Error("gate"); }
+const PGDBE = process.env.QA_PGDB || "";
+const EXPDBE = process.env.QA_EXPECTED_DB || "";
+if (PGDBE && PGDBE.indexOf("primary_phase8_") !== 0) { console.log("FATAL-GATE QA_PGDB prefix"); process.exitCode = 2; throw new Error("gate"); }
+if (EXPDBE && EXPDBE.indexOf("primary_phase8_") !== 0) { console.log("FATAL-GATE QA_EXPECTED_DB prefix"); process.exitCode = 2; throw new Error("gate"); }
+if (EXPDBE && PGDBE && EXPDBE !== PGDBE) { console.log("FATAL-GATE DB mismatch"); process.exitCode = 2; throw new Error("gate"); }
+const stg = await req("GET","/api/auth/status");
+if (!stg || stg.status !== 200) { console.log("FATAL-GATE status 200 required"); process.exitCode = 2; throw new Error("gate"); }
+try {
+  const fr = await fetch(FAKEE + "/__log", { method: "GET" });
+  const ft = await fr.text(); let fj = null; try { fj = ft ? JSON.parse(ft) : null; } catch {}
+  if (!(fr.status === 200 && Array.isArray(fj))) { console.log("FATAL-GATE fake log array required"); process.exitCode = 2; throw new Error("gate"); }
+} catch { console.log("FATAL-GATE fake unreachable"); process.exitCode = 2; throw new Error("gate"); }
+
+
 const pw="TestPassword123!";
 const adminE=run+"-admin@example.com", guestE=run+"-guest@example.com", readerE=run+"-reader@example.com";
-const ar=await req("POST","/api/auth/register",{email:adminE,password:pw}); const adminT=ar.json.token;
-const gr=await req("POST","/api/auth/register",{email:guestE,password:pw}); const guestT=gr.json.token;
-const rr=await req("POST","/api/auth/register",{email:readerE,password:pw}); const readerT=rr.json.token;
+const ar=await req("POST","/api/auth/register",{email:adminE,password:pw});
+ok("setup-admin-reg-201",ar.status===201 && ar.json && ar.json.token,ar.status+" "+ar.text.slice(0,120));
+const adminT=ar.json.token;
+const gr=await req("POST","/api/auth/register",{email:guestE,password:pw});
+ok("setup-guest-reg-201",gr.status===201 && gr.json && gr.json.token,gr.status+" "+gr.text.slice(0,120));
+const guestT=gr.json.token;
+const rr=await req("POST","/api/auth/register",{email:readerE,password:pw});
+ok("setup-reader-reg-201",rr.status===201 && rr.json && rr.json.token,rr.status+" "+rr.text.slice(0,120));
+const readerT=rr.json.token;
 const B=(t)=>({Authorization:"Bearer "+t});
-const b=await req("POST","/api/boards",{name:run+"-b"},{...B(adminT)}); const bid=b.json.id;
+const b=await req("POST","/api/boards",{name:run+"-b"},{...B(adminT)});
+ok("setup-board-201",b.status===201 && b.json && b.json.id,b.status+" "+b.text.slice(0,120));
+const bid=b.json.id;
 // advisor for run: need approved advisor (use quick + upload + review + copy + approve via existing pattern? simplified: use roster quick then attach? For run to succeed need eligible advisor. To keep test fast, test Run permission only (403 vs 409), not full success.
-const m=await req("POST",`/api/boards/${bid}/meetings`,{title:run+"-m",brief:"brief QA-NO"},{...B(adminT)}); const mid=m.json.id;
-await req("POST",`/api/boards/${bid}/grants`,{userKey:guestE,access:"discuss",meetingId:mid},{...B(adminT)});
-await req("POST",`/api/boards/${bid}/grants`,{userKey:readerE,access:"read"},{...B(adminT)});
+const m=await req("POST",`/api/boards/${bid}/meetings`,{title:run+"-m",brief:"brief QA-NO"},{...B(adminT)});
+ok("setup-meeting-201",m.status===201 && m.json && m.json.id,m.status+" "+m.text.slice(0,120));
+const mid=m.json.id;
+let gg1=await req("POST",`/api/boards/${bid}/grants`,{userKey:guestE,access:"discuss",meetingId:mid},{...B(adminT)});
+ok("grant-guest-setup-201",gg1.status===201,gg1.status+" "+gg1.text.slice(0,160));
+let gg2=await req("POST",`/api/boards/${bid}/grants`,{userKey:readerE,access:"read"},{...B(adminT)});
+ok("grant-reader-setup-201",gg2.status===201,gg2.status+" "+gg2.text.slice(0,160));
 // Run: guest allowed to attempt (may 409 no advisors, but NOT 403); reader denied 403
 let grun=await req("POST",`/api/meetings/${mid}/run`,{policy:"balanced",prompt:"hello"},{...B(guestT)});
 ok("guest-run-not-403",grun.status!==403,grun.status+" "+grun.text.slice(0,200));

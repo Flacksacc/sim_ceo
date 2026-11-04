@@ -26,6 +26,19 @@ function exePath() {
 }
 (async () => {
   console.log("guests-ui run=" + run + " base=" + BASE + " api=" + API);
+  if (API !== "http://127.0.0.1:15340") { console.log("FATAL-GATE QA_API exact"); process.exitCode = 2; throw new Error("gate"); }
+  try { const u = new URL(API); if (u.hostname !== "127.0.0.1" || u.port !== "15340") { console.log("FATAL-GATE API loopback"); process.exitCode = 2; throw new Error("gate"); } } catch { console.log("FATAL-GATE API parse"); process.exitCode = 2; throw new Error("gate"); }
+  try { const ub = new URL(BASE); if (ub.hostname !== "127.0.0.1") { console.log("FATAL-GATE BASE loopback"); process.exitCode = 2; throw new Error("gate"); } } catch { console.log("FATAL-GATE BASE parse"); process.exitCode = 2; throw new Error("gate"); }
+  const FAKEU = process.env.QA_FAKE || "http://127.0.0.1:15342";
+  if (FAKEU !== "http://127.0.0.1:15342") { console.log("FATAL-GATE QA_FAKE exact"); process.exitCode = 2; throw new Error("gate"); }
+  const st0 = await req("GET", "/api/auth/status");
+  if (!st0 || st0.status !== 200) { console.log("FATAL-GATE status 200"); process.exitCode = 2; throw new Error("gate"); }
+  try {
+    const fr = await fetch(FAKEU + "/__log", { method: "GET" });
+    const ft = await fr.text(); let fj = null; try { fj = ft ? JSON.parse(ft) : null; } catch {}
+    if (!(fr.status === 200 && Array.isArray(fj))) { console.log("FATAL-GATE fake log"); process.exitCode = 2; throw new Error("gate"); }
+  } catch { console.log("FATAL-GATE fake unreachable"); process.exitCode = 2; throw new Error("gate"); }
+
   const pw = "TestPassword123!";
   const Bnd = (t) => ({ Authorization: "Bearer " + t });
   const ownerE = run + "-owner@example.com", guestE = run + "-guest@example.com";
@@ -66,18 +79,37 @@ function exePath() {
     await openBtn.click({ timeout: 8000 });
     await sleep(3000);
     const hash = await page.evaluate(() => location.hash);
-    ok("ui-open-hash", hash.includes(bid) && hash.includes(mid), hash);
+    ok("ui-open-hash-structure", hash.includes("#/meet") && hash.includes("board=") && hash.includes("meeting="), hash);
     const meetBody = await page.content();
     ok("ui-meeting-renders", meetBody.includes(run + "-meeting"), "meeting title not rendered");
     const composer = page.getByLabel("Message. Press Enter to send, Shift and Enter for a new line.");
     ok("ui-composer-present", await composer.count() === 1, "composer missing");
     await composer.fill("hello from browser guest");
+    const sendRespP = page.waitForResponse((r) => r.url().includes("/api/meetings/") && r.url().includes("/messages") && r.request().method() === "POST", { timeout: 15000 }).catch(() => null);
     await composer.press("Enter");
-    await sleep(3500);
+    const sendResp = await sendRespP;
+    ok("ui-send-barrier-201", !!sendResp && sendResp.status() === 201, sendResp ? ("status=" + sendResp.status()) : "no-send-response");
+    await sleep(2500);
     const liveSend = await page.content();
     ok("ui-guest-send-live", liveSend.includes("hello from browser guest"), "sent message not rendered live");
     const liveBadge = await page.getByText("live", { exact: true }).count().catch(() => 0);
     ok("ui-hub-live", liveBadge >= 1, "live badge missing");
+    const guestTok0 = await page.evaluate(() => localStorage.getItem("simceo-token") || "");
+    ok("ui-guest-token-present", !!guestTok0 && guestTok0.length > 20, "len=" + (guestTok0 || "").length);
+    const srcForm = new FormData();
+    srcForm.append("file", new Blob(["hello source"], { type: "text/plain" }), "note.txt");
+    srcForm.append("scope", "meeting");
+    srcForm.append("meetingId", mid);
+    const upRes = await fetch(API + "/api/boards/" + bid + "/sources/upload", { method: "POST", headers: Bnd(ownerT), body: srcForm });
+    const upText = await upRes.text(); let upJson = null; try { upJson = upText ? JSON.parse(upText) : null; } catch {}
+    ok("ui-source-upload-201", upRes.status === 201 && upJson && upJson.id, upRes.status + " " + upText.slice(0, 160));
+    const sid = upJson && upJson.id;
+    const apRes = await req("POST", "/api/sources/" + sid + "/approve", {}, Bnd(ownerT));
+    ok("ui-source-approve-200", apRes.status === 200, apRes.status + " " + apRes.text.slice(0, 120));
+    const gdlPos = await req("GET", "/api/sources/" + sid + "/download", undefined, Bnd(guestTok0));
+    ok("ui-download-positive-200", gdlPos.status === 200, gdlPos.status + " " + gdlPos.text.slice(0, 120));
+    ok("ui-download-positive-bytes", gdlPos.text === "hello source", gdlPos.text.slice(0, 120));
+
     await page.reload({ waitUntil: "domcontentloaded" }); await sleep(4500);
     const afterSend = await page.content();
     ok("ui-message-renders", afterSend.includes("hello from browser guest"), "sent message not rendered after reload");
@@ -92,8 +124,11 @@ function exePath() {
     try { await page.screenshot({ path: path.join(SHOT, "p8gui-settings.png") }); } catch {}
     await page.evaluate(() => { window.location.hash = "#/boards"; });
     await sleep(2500);
-    const myMeet = page.getByText(mid, { exact: false });
-    ok("ui-mymeetings-row", await myMeet.count() >= 1, "membership row missing");
+    ok("ui-mymeetings-heading", (await page.getByText("My meetings", { exact: false }).count()) >= 1, "My meetings heading missing");
+    ok("ui-mymeetings-row-named", (await page.getByText("An assigned meeting", { exact: false }).count()) >= 1, "membership row missing");
+    ok("ui-mymeetings-open", (await page.getByRole("button", { name: "Open" }).count()) >= 1, "Open missing");
+    ok("ui-leave-visible", (await page.getByRole("button", { name: "Leave" }).count()) >= 1, "no UI Leave button");
+    ok("ui-rejoin-visible", (await page.getByRole("button", { name: "Rejoin" }).count()) >= 1, "no UI Rejoin button");
     const leaveBtn = page.getByRole("button", { name: "Leave" });
     ok("ui-leave-visible", await leaveBtn.count() >= 1, "no UI Leave button");
     await leaveBtn.first().click({ timeout: 8000 });
@@ -132,8 +167,26 @@ function exePath() {
     const rows = Array.isArray(grants.json) ? grants.json : [];
     const tgt = rows.find((x) => (((x.userKey || x.UserKey) || "").toLowerCase() === guestE) && ((x.meetingId || x.MeetingId) === mid));
     ok("ui-purge-target", !!tgt, "grant rows=" + rows.length);
-    if (tgt) await req("DELETE", "/api/grants/" + (tgt.id || tgt.Id), undefined, Bnd(ownerT));
+
+    ok("ui-purge-target-id", !!tgt && !!((tgt.id || tgt.Id)), "missing grant id");
+    const guestTokPurge = await page.evaluate(() => localStorage.getItem("simceo-token") || "");
+    await page.route("**/api/meetings/*/messages*", async (route) => { await sleep(2500); await route.continue(); });
+    const heldFetchPurge = page.evaluate((args) => fetch(args.api + "/api/meetings/" + args.mid + "/messages?take=5", { headers: { Authorization: "Bearer " + args.tok } }).then(async (r) => ({ status: r.status, text: (await r.text()).slice(0, 120) })).catch((e) => ({ status: 0, text: "fetch-failed" })), { api: API, mid: mid, tok: guestTokPurge });
+    await sleep(800);
+    const delPurge = tgt ? await req("DELETE", "/api/grants/" + (tgt.id || tgt.Id), undefined, Bnd(ownerT)) : { status: 0, text: "no-target" };
+    ok("ui-purge-delete-204", delPurge.status === 204, delPurge.status + " " + (delPurge.text || "").slice(0, 120));
+    const heldResPurge = await heldFetchPurge;
+    try { await page.unroute("**/api/meetings/*/messages*"); } catch {}
+    ok("ui-held-no-private-403", heldResPurge && heldResPurge.status === 403, JSON.stringify(heldResPurge).slice(0, 160));
+    const gdlAfter = await req("GET", "/api/sources/" + sid + "/download", undefined, Bnd(guestTokPurge));
+    ok("ui-download-zero-after-403", gdlAfter.status === 403, gdlAfter.status + " " + gdlAfter.text.slice(0, 120));
+    const blobsAfter = await page.evaluate(() => { try { return (window.__simceoBlobs || []).length; } catch { return -1; } });
+    ok("ui-blobs-revoked", blobsAfter === 0, "blobs=" + blobsAfter);
+    const abortsAfter = await page.evaluate(() => { try { return (window.__simceoAborts || []).length; } catch { return -1; } });
+    ok("ui-aborts-retired", abortsAfter === 0, "aborts=" + abortsAfter);
+
     await sleep(6000);
+
     const purged = await page.content();
     ok("ui-live-purge", !purged.includes("hello from browser guest"), "live private content survived revoke without reload");
     const liveAfter = await page.getByText("live", { exact: true }).count().catch(() => 0);
