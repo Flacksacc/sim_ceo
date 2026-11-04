@@ -1024,6 +1024,11 @@ function AuthPanel() {
   const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
   const [rejoinBusy, setRejoinBusy] = useState("");
   const rejoin = async (m: MineRow) => {
+    // Origin identity for THIS rejoin: the selected row plus the requesting
+    // account. A changed account retires this callback: it must never
+    // announce success for another identity.
+    const __reEpoch = epochNow(); const __reToken = currentToken(); const __reUser = currentUser();
+    const __selBoard = String(m.boardId); const __selMeet = String(m.meetingId); const __selUser = String(m.userKey);
     setMsg("");
     setRejoinBusy(m.meetingId);
     try {
@@ -1034,23 +1039,41 @@ function AuthPanel() {
           if (!s.includes("not pending") && !s.includes("already") && !s.includes("accepted")) throw e;
         }
       }
-      await post<unknown>(`/api/meetings/${m.meetingId}/join`, {});
-      // Fresh readback verification: success requires a matching ACTIVE
-      // membership for this meeting. Readback errors, empty lists, or a
-      // revoked/inactive row never announce success.
+      // Typed /join capture: the returned Membership DTO (Id/BoardId/MeetingId/
+      // UserKey/Active per Domain.Entities Membership) binds THIS result. Accept
+      // either casing; Active must be an explicit boolean true below.
+      const __joined = await post<Record<string, unknown>>(`/api/meetings/${m.meetingId}/join`, {});
+      const __jId = String((__joined as Record<string, unknown>)["id"] ?? (__joined as Record<string, unknown>)["Id"] ?? "");
+      const __jBoard = String((__joined as Record<string, unknown>)["boardId"] ?? (__joined as Record<string, unknown>)["BoardId"] ?? "");
+      const __jMeet = String((__joined as Record<string, unknown>)["meetingId"] ?? (__joined as Record<string, unknown>)["MeetingId"] ?? "");
+      const __jUser = String((__joined as Record<string, unknown>)["userKey"] ?? (__joined as Record<string, unknown>)["UserKey"] ?? "");
+      const __jActive = ((__joined as Record<string, unknown>)["active"] ?? (__joined as Record<string, unknown>)["Active"]);
+      // The /join result must resolve to THIS selection: exact board + meeting
+      // + user with active === true and a returned membership id. A restore of
+      // the meeting onto another board (or another user) resolves elsewhere
+      // and must fail here, never claim the selected row rejoined.
+      if (!__jId || __jBoard !== __selBoard || __jMeet !== __selMeet || __jUser.toLowerCase() !== __selUser.toLowerCase()) throw new Error("Rejoin verification failed: join resolved a different board/meeting/user.");
+      if (__jActive !== true) throw new Error("Rejoin verification failed: join did not activate membership.");
+      // Fresh readback verification: the readback row must EXACTLY match the
+      // returned membership (id + board + meeting + user) with active === true.
+      // Missing active never counts (strict true only). Readback errors, empty
+      // lists, or a row for another board/meeting/user never announce success.
       let __fresh: MineRow[] = [];
       try {
         __fresh = await get<MineRow[]>(`/api/me/memberships`);
       } catch (e) {
         throw new Error("Rejoin verification failed: membership readback failed.");
       }
-      const __ok = (__fresh ?? []).some((r) => String((r as MineRow).meetingId) === String(m.meetingId) && (r as MineRow).active !== false);
-      if (!__ok) throw new Error("Rejoin verification failed: no active membership for this meeting.");
+      const __ok = (__fresh ?? []).some((r) => String((r as MineRow).id ?? (r as unknown as Record<string, unknown>)["Id"] ?? "") === __jId && String((r as MineRow).boardId) === __selBoard && String((r as MineRow).meetingId) === __selMeet && String((r as MineRow).userKey ?? "").toLowerCase() === __selUser.toLowerCase() && (r as MineRow).active === true);
+      if (!__ok) throw new Error("Rejoin verification failed: no active membership for this board/meeting/user.");
+      // Identity origin guard: a changed account since THIS rejoin started
+      // retires the callback instead of announcing a stale success.
+      if (epochNow() !== __reEpoch || currentToken() !== __reToken || currentUser() !== __reUser) return;
       try { await qcPanel.refetchQueries({ queryKey: ["my-memberships"] }); } catch {}
       try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
       try { qcPanel.invalidateQueries({ queryKey: ["messages", m.meetingId] }); } catch {}
       setMsg("Rejoined meeting.");
-    } catch (e) { setMsg(String(e)); }
+    } catch (e) { if (epochNow() !== __reEpoch || currentToken() !== __reToken || currentUser() !== __reUser) return; setMsg(String(e)); }
     finally { setRejoinBusy(""); }
   };
   const doRegister = async () => {
@@ -1467,11 +1490,10 @@ export default function App() {
   const authStatusQ = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
   const anonPrivateBlocked = !currentToken() && authStatusQ.data?.authRequired !== false;
   const sessQ = useQuery({ queryKey: ["sess"], queryFn: async () => {
-    // Capture originating epoch/token/user at request time: the receipt
-    // handler must compare CURRENT identity against THESE values (fresh-login
-    // protection) and never against the fallback response user.
-    const __e = epochNow(); const __t = currentToken(); const __u = currentUser();
-    try { (window as unknown as { __simceoSessReq?: { epoch: number; token: string; user: string } }).__simceoSessReq = { epoch: __e, token: __t, user: __u }; } catch {}
+    // No global request-origin store: the synchronous 200-false retirement in
+    // fetchAuth carries the originating epoch/token/user bound to THAT result.
+    // A passive fallback keyed off the latest request origin is removed so a
+    // queued old result can never purge a fresh identity.
     return get<{ user: string; authenticated: boolean }>(`/api/auth/me`);
   }, retry: false, refetchInterval: 30000 });
   const [sessExpiredFlag, setSessExpiredFlag] = useState(false);
@@ -1501,8 +1523,11 @@ export default function App() {
   // resolve, so stale completions can never repopulate cleared state.
   const profileOpRef = useRef(0);
   // Once-only dedupe for CURRENT-expiry purges (shared by 401 and 200-false):
-  // key is originating epoch|token|user (never the fallback response user).
-  // Anonymous (no token) and fresh-login (authenticated or identity-changed) never purge.
+  // key is the stable nonempty session TOKEN (opaque unique session id,
+  // independent of purge epoch and demo display user), retained across
+  // purges/polls so the same expired token purges once. A new successful
+  // login issues a new token, naturally distinct. Anonymous (no token) and
+  // fresh-login (authenticated or identity-changed) never purge.
   const lastExpiredPurgeRef = useRef("");
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
@@ -1549,30 +1574,10 @@ export default function App() {
     try { window.location.hash = "#/boards"; } catch {}
     try { setLive(false); } catch {}
   };
-  // CURRENT-expiry poll transition: /auth/me returns 200 + authenticated:false
-  // while a token is still held (natural expiry, no 401). The synchronous
-  // retirement already fired at receipt inside fetchAuth (before held
-  // blob/download continuations); this effect is only a fallback that routes
-  // through the SAME once-only event boundary. Never use the fallback
-  // response user ("owner"); the originating epoch/token/user travel in the
-  // event detail. Anonymous (no token) never purges.
-  useEffect(() => {
-    try {
-      const d = sessQ.data as { user?: string; authenticated?: boolean } | undefined;
-      if (!d) return;
-      if (d.authenticated) {
-        try { lastExpiredPurgeRef.current = ""; } catch {}
-        try { (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey = ""; } catch {}
-        return;
-      }
-      const req = (window as unknown as { __simceoSessReq?: { epoch: number; token: string; user: string } }).__simceoSessReq;
-      if (!req || !req.token) return;
-      // Fresh-login protection: the request origin must still match CURRENT
-      // identity at fallback time, or a queued old result must not purge.
-      if (epochNow() !== req.epoch || currentToken() !== req.token || currentUser() !== req.user) return;
-      try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: req.epoch, token: req.token, user: req.user } })); } catch {}
-    } catch {}
-  }, [sessQ.data]);
+  // No passive sessQ.data fallback: every 200-false retires synchronously at
+  // receipt inside fetchAuth with the originating epoch/token/user bound to
+  // THAT result. A data-effect fallback keyed off cached data or the latest
+  // request origin is removed so it can neither reset dedupe nor re-dispatch.
   useEffect(() => {
     const onAuthFailed = (e: Event) => {
       try {
@@ -1581,9 +1586,13 @@ export default function App() {
         // Fresh-login / stale protection: originating epoch/token/user must
         // still match CURRENT identity at receipt time.
         if (epochNow() !== d.epoch || currentToken() !== d.token || currentUser() !== d.user) return;
-        // Once-only per originating epoch/token/user, shared by 401 and
-        // 200-false paths (both route through this event with originating detail).
-        const key = String(d.epoch) + "|" + d.token + "|" + d.user;
+        // Once-only per expired session TOKEN, shared by 401 and 200-false
+        // paths (both route through this event with originating detail).
+        // The purge bumps the epoch but retains the token, so later polls for
+        // the SAME expired token dedupe instead of purging again. Freshness
+        // (origin epoch/token/user still current) is enforced above; only the
+        // stable token forms the dedupe key.
+        const key = d.token;
         try {
           const seen = (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey ?? lastExpiredPurgeRef.current;
           if (seen === key) return;
