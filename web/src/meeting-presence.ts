@@ -1,3 +1,4 @@
+import { TEAM_PORTRAITS } from "./team-portraits";
 // Meeting presence adapter - central frontend integration owner.
 // Builds MeetingParticipant[] props for the presentational MeetingParticipants
 // rail from data App already owns. Truthfulness rules (per the shared
@@ -182,7 +183,7 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
     key: "secretary",
     displayName: "Secretary",
     roleLabel: "Meeting secretary",
-    portraitUrl: null,
+    portraitUrl: TEAM_PORTRAITS.secretary,
     activity: secActivity,
     isSecretary: true,
   });

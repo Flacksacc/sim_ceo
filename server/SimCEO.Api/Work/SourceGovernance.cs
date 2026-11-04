@@ -1018,7 +1018,7 @@ public static class SourceGovernance
   // history/head/review. The already-approved branch is inside the same
   // boundary: a re-approval is a no-op only for the exact current head
   // identity under a still-allowing policy.
-  public static (bool ok, string? error, int status) TryApproveById(InMemoryStore s, HttpRequest req, Guid id)
+  public static (bool ok, string? error, int status) TryApproveById(InMemoryStore s, HttpRequest req, Guid id, Guid? attachmentMeeting = null)
   {
     lock (s.SetupLock)
     {
@@ -1027,6 +1027,8 @@ public static class SourceGovernance
         if (!s.Sources.TryGetValue(id, out var seen) || seen is null)
           return (false, "Source not found.", 404);
         EnsureMigrated(s, seen);
+        if (attachmentMeeting.HasValue && (seen.Scope != "meeting" || seen.MeetingId != attachmentMeeting))
+          return (false, "Attachment no longer belongs to this meeting.", 409);
         if (PeopleOps.Check(s, req, seen.BoardId, seen.MeetingId, "contribute") is { } deniedSx)
           return deniedSx is Microsoft.AspNetCore.Http.HttpResults.JsonHttpResult<object> deniedJson
             ? (false, "Access denied for this scope.", deniedJson.StatusCode ?? 403)
@@ -1127,7 +1129,18 @@ public static class SourceGovernance
               throw new InvalidOperationException("superseded by newer original version before commit");
             s.Sources.Flush(); s.SourceHeads.Flush();
             RecordEvent(s, d, "approve", "v" + d.Version);
-            InvalidateLocked(s, d.BoardId);
+            if (attachmentMeeting.HasValue)
+            {
+              // Explicitly adding a meeting attachment refreshes that meeting's
+              // context without pausing it or interrupting unrelated meetings.
+              // The generation bump still rejects any older in-flight packet.
+              if (d.Scope != "meeting" || d.MeetingId != attachmentMeeting
+                || !s.Meetings.TryGetValue(attachmentMeeting.Value, out var meeting) || meeting.BoardId != d.BoardId)
+                throw new InvalidOperationException("Attachment meeting changed before commit");
+              meeting.Generation++;
+              s.Meetings.Flush();
+            }
+            else InvalidateLocked(s, d.BoardId);
           });
         }
         catch (InvalidOperationException ex) { failure = ex.Message; }

@@ -42,6 +42,7 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
       resourceId = d.ResourceId, familyKey = d.FamilyKey,
       indexState = d.IndexState, indexGeneration = d.IndexGeneration,
       indexError = d.IndexError, indexCompletedAt = d.IndexCompletedAt,
+      indexTruncated = (Extraction.MarkdownOf(d.ExtractionJson)?.Length ?? 0) > SourceGovernance.MaxTotalChars,
       sectionCount = secs, isHead, currentId = cur?.Id,
       isCurrent = cur is not null && cur.Id == d.Id,
       d.Scope, meetingId = d.MeetingId, d.ExtractionJson, d.CreatedAt, policyAllows = polAllows,
@@ -125,6 +126,9 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
         if (!s.Meetings.TryGetValue(effMeeting.Value, out var mtg) || mtg.BoardId != bid)
           return Results.Json(new { error = "Meeting does not belong to this board." }, statusCode: 409);
       }
+      var addToContext = string.Equals(req.Form["addToMeetingContext"], "true", StringComparison.OrdinalIgnoreCase);
+      if (addToContext && effScope != "meeting")
+        return Results.BadRequest("Choose a meeting before adding attachments.");
       // Capability checked against the EFFECTIVE scope: a meeting grant never
       // confers board-scope uploads.
       if (PeopleOps.Check(s, req, bid, effMeeting, "contribute") is { } deniedSrc1) return deniedSrc1;
@@ -146,6 +150,7 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
       // concurrent uploads (or upload vs inline) can never reserve and store
       // the same family/version twice.
       SourceDoc? doc = null;
+      SourceDoc? duplicate = null;
       string? dupMsg = null;
       string? createDenied = null;
       int createDeniedStatus = 403;
@@ -175,7 +180,7 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
             // origin/file family): identical bytes under a different family are a
             // separate pending version, never an unrelated board-wide conflict.
             var dup = s.Sources.Values.FirstOrDefault(x => x.BoardId == bid && x.FamilyKey == familyKey && x.ContentHash == hash);
-            if (dup is not null) { dupMsg = $"Identical content already stored as {dup.Id} (v{dup.Version})."; return; }
+            if (dup is not null) { duplicate = dup; dupMsg = "This file is already stored in this meeting."; return; }
             var version = SourceGovernance.ReserveVersion(s, bid, familyKey);
             var fresh = new SourceDoc
             {
@@ -196,6 +201,8 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
         }
       }
       if (createDenied is not null) return Results.Json(new { error = createDenied }, statusCode: createDeniedStatus);
+      if (doc is null && addToContext && duplicate is not null)
+        return ActivateAttachment(s, req, duplicate, effMeeting);
       if (doc is null) return Results.Conflict(dupMsg ?? "Identical content already stored.");
       // Reserve the index slot, then run actual extraction outside the
       // transaction under that reservation: textual formats decode locally,
@@ -210,6 +217,7 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
         return Results.Json(new { error = finErr, stale }, statusCode: status);
       _ = lost;
       if (!s.Sources.TryGetValue(doc.Id, out var stored) || stored is null) return Results.NotFound();
+      if (addToContext) return ActivateAttachment(s, req, stored, effMeeting);
       return Results.Created($"/api/sources/{stored.Id}", ShapeDoc(s, stored));
     }).DisableAntiforgery();
     app.MapGet("/api/boards/{bid:guid}/sources", (InMemoryStore s, HttpRequest req, Guid bid, string? review, string? family) =>
@@ -727,5 +735,24 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
         hindsight = "PostgreSQL remains authoritative; no vector index configured",
       });
     });
+  }
+
+  private static IResult ActivateAttachment(InMemoryStore s, HttpRequest req, SourceDoc doc, Guid? meetingId)
+  {
+    lock (s.SetupLock)
+    lock (s.MessageLock)
+    {
+      if (!s.Sources.TryGetValue(doc.Id, out var current) || current.Scope != "meeting" || current.MeetingId != meetingId)
+        return Results.Conflict("The attachment changed. Please upload it again.");
+      if (current.IndexState != "completed" || !s.SourceSections.Values.Any(x => x.SourceId == current.Id))
+        return Results.UnprocessableEntity(new { error = "Could not read this file. Use a text document, a PDF with selectable text, or an Office document." });
+      if (current.Excluded || current.ReviewState == "rejected")
+        return Results.Conflict("This attachment was removed from context. Manage it in Sources before adding it again.");
+      var (ok, error, status) = SourceGovernance.TryApproveById(s, req, current.Id, meetingId);
+      if (!ok) return Results.Json(new { error }, statusCode: status);
+      if (!SourceGovernance.IsEligible(s, current, meetingId))
+        return Results.Conflict("This attachment is not available to the meeting.");
+      return Results.Ok(ShapeDoc(s, current));
+    }
   }
 }

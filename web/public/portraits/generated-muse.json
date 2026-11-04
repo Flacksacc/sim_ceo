@@ -1,0 +1,17 @@
+{
+  "provider": "Muse",
+  "model": "muse-image-1.0",
+  "generatedAt": "2026-11-04T20:28:08.262Z",
+  "images": [
+    {
+      "role": "orchestrator",
+      "file": "web/public/portraits/orchestrator-v1.webp",
+      "prompt": "Create a premium, realistic digital head-and-shoulders portrait for a professional advisory-board app. Square canvas, one fictional adult person, centered face with generous margin for a circular avatar crop, direct natural eye contact, soft studio lighting, subtle dark slate background, polished editorial photography aesthetic, approachable and competent, crisp facial details at small sizes, no text, no logos, no frames, no objects obscuring the face. The character represents the meeting orchestrator: a thoughtful man in his forties with short dark hair lightly silvered at the temples, wearing a modern navy jacket over a muted teal shirt. Calm, analytical expression that suggests attentive leadership and fair judgment."
+    },
+    {
+      "role": "secretary",
+      "file": "web/public/portraits/secretary-v1.webp",
+      "prompt": "Create a premium, realistic digital head-and-shoulders portrait for a professional advisory-board app. Square canvas, one fictional adult person, centered face with generous margin for a circular avatar crop, direct natural eye contact, soft studio lighting, subtle dark slate background, polished editorial photography aesthetic, approachable and competent, crisp facial details at small sizes, no text, no logos, no frames, no objects obscuring the face. The character represents the meeting secretary: a poised woman in her forties with neatly styled chestnut hair, wearing an elegant charcoal jacket over a warm ivory blouse. Warm, attentive expression that suggests organization, clarity, and dependable follow-through."
+    }
+  ]
+}
