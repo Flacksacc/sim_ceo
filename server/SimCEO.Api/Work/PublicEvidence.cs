@@ -32,6 +32,7 @@ public sealed class PublicEvidenceFetcher
   public const int MaxRedirects = 2;
   public const int MaxConcurrency = 2;
   public const int MaxExcerptChars = 320;
+  public const int MaxResearchExcerptChars = 1600;
 
   private readonly HttpMessageHandler? _testHandler;
   private readonly Func<string, CancellationToken, Task<IPAddress[]>> _dns;
@@ -55,7 +56,7 @@ public sealed class PublicEvidenceFetcher
   }
 
   public async Task<List<ModelGateway.Citation>> HydrateAsync(
-    IReadOnlyList<ModelGateway.Citation> citations, string subject, CancellationToken ct)
+    IReadOnlyList<ModelGateway.Citation> citations, string subject, CancellationToken ct, bool forResearch = false)
   {
     var original = citations.ToList();
     if (original.Count == 0) return original;
@@ -78,7 +79,7 @@ public sealed class PublicEvidenceFetcher
     var tasks = need.Select(async url =>
     {
       await gate.WaitAsync(ct).ConfigureAwait(false);
-      try { return (Url: url, Fetched: await FetchOneAsync(url, subject, ct).ConfigureAwait(false)); }
+      try { return (Url: url, Fetched: await FetchOneAsync(url, subject, ct, forResearch).ConfigureAwait(false)); }
       finally { gate.Release(); }
     }).ToList();
     var results = await Task.WhenAll(tasks).ConfigureAwait(false);
@@ -101,7 +102,7 @@ public sealed class PublicEvidenceFetcher
     return hydrated;
   }
 
-  private async Task<(string Title, string Excerpt)> FetchOneAsync(string url, string subject, CancellationToken ct)
+  private async Task<(string Title, string Excerpt)> FetchOneAsync(string url, string subject, CancellationToken ct, bool forResearch)
   {
     using var urlCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
     urlCts.CancelAfter(RequestTimeout);
@@ -165,7 +166,7 @@ public sealed class PublicEvidenceFetcher
           catch { return ("", ""); }
           bct.ThrowIfCancellationRequested();
           (string Title, string Excerpt) parsed;
-          try { parsed = await ExtractExcerptAsync(body, subject, bct, MaxSubjectTokens).ConfigureAwait(false); }
+          try { parsed = await ExtractExcerptAsync(body, subject, bct, MaxSubjectTokens, forResearch).ConfigureAwait(false); }
           catch (OperationCanceledException) { return ("", ""); }
           if (string.IsNullOrWhiteSpace(parsed.Excerpt)) return ("", "");
           return parsed;
@@ -387,7 +388,7 @@ public sealed class PublicEvidenceFetcher
     catch { return ("", ""); }
   }
 
-  internal static async Task<(string Title, string Excerpt)> ExtractExcerptAsync(string body, string subject, CancellationToken ct, int maxTokens = 12)
+  internal static async Task<(string Title, string Excerpt)> ExtractExcerptAsync(string body, string subject, CancellationToken ct, int maxTokens = 12, bool forResearch = false)
   {
     if (string.IsNullOrWhiteSpace(body)) return ("", "");
     using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -397,6 +398,8 @@ public sealed class PublicEvidenceFetcher
     ct.ThrowIfCancellationRequested();
     string title = "";
     string visible;
+    var paragraphStarts = new Dictionary<INode, int>();
+    var paragraphRanges = new List<(int Start, int End)>();
     try
     {
       var parser = new HtmlParser();
@@ -423,7 +426,10 @@ public sealed class PublicEvidenceFetcher
         if (visited > 60000) return (title, "");
         if (sb.Length >= 200000) break;
         var (node, endBlock) = stack.Pop();
-        if (endBlock) { sb.Append('\n'); continue; }
+        if (endBlock) {
+          if (paragraphStarts.TryGetValue(node, out var paragraphStart)) paragraphRanges.Add((paragraphStart, sb.Length));
+          sb.Append('\n'); continue;
+        }
         if (node is IElement el)
         {
           var tag = el.TagName;
@@ -439,6 +445,7 @@ public sealed class PublicEvidenceFetcher
           bool block = tag is "P" or "DIV" or "TR" or "LI" or "SECTION" or "ARTICLE"
             or "H1" or "H2" or "H3" or "H4" or "H5" or "H6";
           if (block) { sb.Append('\n'); stack.Push((node, true)); }
+          if (tag == "P") paragraphStarts[node] = sb.Length;
           var children = el.ChildNodes;
           for (int i = children.Length - 1; i >= 0; i--)
             stack.Push((children[i], false));
@@ -446,14 +453,14 @@ public sealed class PublicEvidenceFetcher
         else if (node.NodeType == NodeType.Text)
         {
           var t = node.TextContent;
-          if (!string.IsNullOrWhiteSpace(t))
+          if (t.Length > 0)
           {
-            var text = CollapseWhitespace(t);
+            // Preserve real inline spacing (including quotes around links),
+            // rather than inserting a space after every text node.
+            var text = (char.IsWhiteSpace(t[0]) ? " " : "") + CollapseWhitespace(t)
+              + (char.IsWhiteSpace(t[^1]) ? " " : "");
             var room = 200000 - sb.Length;
-            if (room > 1) {
-              sb.Append(text.AsSpan(0, Math.Min(text.Length, room - 1)));
-              sb.Append(' ');
-            }
+            if (room > 0) sb.Append(text.AsSpan(0, Math.Min(text.Length, room)));
           }
         }
       }
@@ -464,6 +471,20 @@ public sealed class PublicEvidenceFetcher
     if (visible.Length < 20) return (title, "");
     var tokens = GetSalientTokens(subject, maxTokens);
     if (tokens.Length == 0) return (title, "");
+    if (forResearch) {
+      foreach (var range in paragraphRanges.OrderBy(p => p.Start)) {
+        ct.ThrowIfCancellationRequested();
+        var paragraph = CollapseWhitespace(visible.Substring(range.Start, range.End - range.Start));
+        if (paragraph.Length < 80 || IsChallengeSentence(paragraph)) continue;
+        var low = paragraph.ToLowerInvariant();
+        if (tokens.Count(token => low.Contains(token)) < Math.Min(2, tokens.Length)) continue;
+        // One contiguous window from the actual visible document; no
+        // fabricated joins between nonadjacent source passages.
+        var window = CollapseWhitespace(visible.Substring(range.Start));
+        if (window.Length > MaxResearchExcerptChars) window = window[..MaxResearchExcerptChars];
+        return (title, window.Trim());
+      }
+    }
     var sentences = new List<string>();
     foreach (var block in visible.Split('\n'))
     {

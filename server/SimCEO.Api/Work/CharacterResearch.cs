@@ -198,7 +198,7 @@ public static class CharacterResearch
             {
               ct.ThrowIfCancellationRequested();
               var synthetic = batch.Select(u => new ModelGateway.Citation(u, "", "")).ToList();
-              var hydrated = await fetcher.HydrateAsync(synthetic, subject, ct).ConfigureAwait(false);
+              var hydrated = await fetcher.HydrateAsync(synthetic, subject, ct, forResearch: true).ConfigureAwait(false);
               foreach (var h in hydrated)
               {
                 if (!string.IsNullOrWhiteSpace(h.Excerpt))
@@ -318,7 +318,7 @@ public static class CharacterResearch
             if (subject.Length > 2000) subject = subject.Substring(0, 2000);
             var synth = needFetch.Select(u => new ModelGateway.Citation(u, "", "")).ToList();
             var webFetcher = new PublicEvidenceFetcher { MaxSubjectTokens = 24 };
-            var hydrated = await webFetcher.HydrateAsync(synth, subject, ct).ConfigureAwait(false);
+            var hydrated = await webFetcher.HydrateAsync(synth, subject, ct, forResearch: true).ConfigureAwait(false);
             foreach (var h in hydrated)
             {
               if (!string.IsNullOrWhiteSpace(h.Excerpt) && h.Fetched)

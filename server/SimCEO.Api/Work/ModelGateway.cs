@@ -1199,7 +1199,7 @@ public sealed class ModelGateway
           }
           if (needsHydration)
           {
-            var hydrated = await _evidence.HydrateAsync(citations, prompt, ct).ConfigureAwait(false);
+            var hydrated = await _evidence.HydrateAsync(citations, prompt, ct, forResearch: purpose == "advisor-research").ConfigureAwait(false);
             citations.Clear();
             citations.AddRange(hydrated);
           }

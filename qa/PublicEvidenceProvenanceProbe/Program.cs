@@ -42,7 +42,7 @@ static class Probe
       new("https://www.gutenberg.org/ebooks/1661", "", "")
     };
     var passages = await fetcher.HydrateAsync(sources,
-      "Sherlock Holmes fictional consulting detective 221B Baker Street observation deduction evidence reasoning uncertain witness testimony", deadline.Token);
+      "Sherlock Holmes fictional consulting detective 221B Baker Street observation deduction evidence reasoning uncertain witness testimony", deadline.Token, forResearch: true);
     Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(passages));
     return passages.All(p => p.Fetched && !string.IsNullOrWhiteSpace(p.Excerpt)) ? 0 : 1;
   }
