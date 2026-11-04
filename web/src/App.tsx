@@ -3283,10 +3283,10 @@ const tabCount = (k: Tab): number | null => {
     (meetings.data ?? []).find((m) => m.id === meetingId);
   useEffect(() => {
     if (settingsOpen) return;
-    if (curMeeting && mLoaded !== curMeeting.id + curMeeting.brief) {
+    if (curMeeting && mLoaded !== JSON.stringify([curMeeting.id, curMeeting.title, curMeeting.brief])) {
       setMtitle(curMeeting.title);
       setMbrief(curMeeting.brief ?? "");
-      setMLoaded(curMeeting.id + curMeeting.brief);
+      setMLoaded(JSON.stringify([curMeeting.id, curMeeting.title, curMeeting.brief]));
     }
   }, [curMeeting, mLoaded, settingsOpen]);
   const briefText = curMeeting?.brief ?? "";
@@ -3323,6 +3323,18 @@ const tabCount = (k: Tab): number | null => {
       const keyMeeting = (returned as { id?: string } | undefined)?.id ?? (ctx as { originMeetingId?: string } | undefined)?.originMeetingId ?? meetingId;
       qc.setQueryData(["meeting-detail", keyBoard, keyMeeting], r);
       refresh("meetings", "meeting-detail", "delivery");
+    },
+  });
+  const renameMeeting = useMutation({
+    mutationFn: (change: { boardId: string; meetingId: string; title: string }) =>
+      patch<MeetingFull>(`/api/meetings/${change.meetingId}`, { title: change.title }),
+    onMutate: () => ({ origin: originIdentity() }),
+    onSuccess: (meeting, change, ctx) => {
+      if (!ctx?.origin || originStale(ctx.origin)) return;
+      qc.setQueryData(["meeting-detail", change.boardId, change.meetingId], meeting);
+      qc.setQueriesData<MeetingFull[]>({ queryKey: ["meetings", change.boardId] }, rows =>
+        rows?.map(row => row.id === meeting.id ? { ...row, title: meeting.title } : row));
+      refresh("meetings", "meeting-detail");
     },
   });
   const closeMeeting = (withRecord: boolean) => {
@@ -7536,14 +7548,13 @@ const testModel = useMutation({
                         {" "}
                         <div className="meet-center">
                         {" "}
-                        <ConversationHeader
+                        <ConversationHeader key={meetingId + ":" + canonicalUser()}
                           meetingTitle={curMeeting?.title ?? "Meeting"}
                           meetingBrief={curMeeting?.brief ?? ""}
                           stateLabel={curMeeting ? meetingStateLabel(curMeeting.state) : "No meeting"}
                           live={live}
                           messageCount={delivery.data?.messages ?? null}
                           canManageMeeting={canManageMeeting}
-                          canCreateMeeting={canManageBoard}
                           canDiscussMeeting={canDiscussMeeting}
                           pauseAvailable={curMeeting?.state === 1}
                           resumeAvailable={curMeeting?.state === 3}
@@ -7551,7 +7562,7 @@ const testModel = useMutation({
                           briefReady={!!briefText.trim()}
                           requestPending={runDiscussion.isPending}
                           requestAvailable={canDiscussMeeting && !!briefText.trim() && curMeeting != null && (curMeeting.state === 0 || curMeeting.state === 1)}
-                          onNewMeeting={() => createMeeting.mutate()}
+                          onRename={title => renameMeeting.mutateAsync({ boardId, meetingId, title }).then(() => undefined)}
                           onOpenSettings={openSettings}
                           onPause={() => meetingCtl("pause")}
                           onResume={() => meetingCtl("resume")}

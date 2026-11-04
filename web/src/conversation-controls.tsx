@@ -45,7 +45,6 @@ export interface LifecycleProps {
   live: boolean;
   messageCount: number | null;
   canManageMeeting: boolean;
-  canCreateMeeting: boolean;
   canDiscussMeeting: boolean;
   pauseAvailable: boolean;
   resumeAvailable: boolean;
@@ -53,7 +52,7 @@ export interface LifecycleProps {
   briefReady: boolean;
   requestPending: boolean;
   requestAvailable: boolean;
-  onNewMeeting: () => void;
+  onRename?: (title: string) => Promise<void>;
   onOpenSettings: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -69,11 +68,32 @@ export interface LifecycleProps {
 // brief + open meeting), never on the lifecycle endAvailable flag.
 export function ConversationHeader(p: LifecycleProps) {
   const requestDisabled = p.requestPending || !p.requestAvailable;
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(p.meetingTitle);
+  const [saving, setSaving] = useState(false);
+  const [renameError, setRenameError] = useState("");
+  useEffect(() => { if (!p.canManageMeeting) setEditing(false); }, [p.canManageMeeting]);
+  const cancelRename = () => { setEditing(false); setRenameError(""); };
+  const rename = async () => {
+    if (!title.trim() || saving || !p.onRename || !p.canManageMeeting) return;
+    setSaving(true); setRenameError("");
+    try { await p.onRename(title.trim()); setEditing(false); }
+    catch { setRenameError("Could not save the meeting name. Your changes are still here; try again."); }
+    finally { setSaving(false); }
+  };
   return (
     <div className="conv-head">
       <div className="conv-title">
         <div className="eyebrow">Discussion</div>
-        <h2>{p.meetingTitle || "Meeting"}</h2>
+        {editing ? <form className="conv-title-editor" onSubmit={e => { e.preventDefault(); void rename(); }}>
+          <label>Meeting name<input autoFocus value={title} disabled={saving} onChange={e => setTitle(e.target.value)}
+            onKeyDown={e => { if (e.key === "Escape" && !saving) { e.preventDefault(); cancelRename(); } }} /></label>
+          <div className="meetctl"><button type="submit" disabled={!title.trim() || saving}>{saving ? "Saving…" : "Save name"}</button>
+            <button type="button" className="btn ghost" disabled={saving} onClick={cancelRename}>Cancel</button></div>
+          {renameError && <p role="alert">{renameError}</p>}
+        </form> : <div className="conv-title-row"><h2>{p.meetingTitle || "Meeting"}</h2>
+          {p.canManageMeeting && p.onRename && <button type="button" className="btn ghost" onClick={() => { setTitle(p.meetingTitle); setRenameError(""); setEditing(true); }}>Rename meeting</button>}
+        </div>}
         {p.meetingBrief && <p className="muted conv-brief">{p.meetingBrief}</p>}
         <p role="status" className="status-line conv-status">
           <span className="badge">{p.stateLabel}</span>
@@ -84,9 +104,6 @@ export function ConversationHeader(p: LifecycleProps) {
       </div>
       <div className="conv-actions" role="group" aria-label="Meeting and advisor controls">
         <div className="conv-group" role="group" aria-label="Meeting lifecycle">
-          {p.canCreateMeeting && (
-            <button type="button" className="btn ghost" onClick={p.onNewMeeting}>New meeting</button>
-          )}
           <button type="button" className="btn ghost" onClick={p.onOpenSettings}>Meeting settings</button>
           {p.canManageMeeting && (
             <>
@@ -97,7 +114,6 @@ export function ConversationHeader(p: LifecycleProps) {
               <button type="button" onClick={p.onEnd} disabled={!p.endAvailable}>End discussion</button>
             </>
           )}
-          <span className="muted conv-hint">New meeting starts a separate conversation. Creating one never asks the advisors anything.</span>
         </div>
         <div className="conv-group conv-request" role="group" aria-label="Advisor responses">
           <button type="button" className="primary" onClick={p.onRequestResponses}

@@ -20,3 +20,8 @@
 
 .conv-decisions{border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
 .conv-decisions h4{margin:0 0 4px}
+
+.conv-title-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.conv-title-row h2 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.conv-title-editor { width: 100%; min-width: 0; }
+.conv-title-editor input { width: 100%; max-width: 100%; box-sizing: border-box; }

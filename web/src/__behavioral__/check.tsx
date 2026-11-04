@@ -73,16 +73,17 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
 {
   const base = {
     meetingTitle: "M", meetingBrief: "Brief text", stateLabel: meetingStateLabel(1), live: false,
-    messageCount: 3, canManageMeeting: true, canCreateMeeting: true, canDiscussMeeting: true,
+    messageCount: 3, canManageMeeting: true, canDiscussMeeting: true,
     pauseAvailable: true, resumeAvailable: false, endAvailable: true, briefReady: true, requestPending: false,
     requestAvailable: true,
-    onNewMeeting: () => undefined, onOpenSettings: () => undefined, onPause: () => undefined,
+    onRename: async (_title: string) => undefined, onOpenSettings: () => undefined, onPause: () => undefined,
     onResume: () => undefined, onEnd: () => undefined, onRequestResponses: () => undefined,
   };
   const html = renderToString(<ConversationHeader {...base} />);
   check("conv: one Request advisor responses", (html.match(/Request advisor responses/g) ?? []).length === 1);
-  check("conv: lifecycle New meeting", html.includes("New meeting"));
-  check("conv: lifecycle helper copy", html.includes("New meeting starts a separate conversation"));
+  check("conv: no New meeting in header", !html.includes("New meeting"));
+  check("conv: rename meeting available", html.includes("Rename meeting"));
+  check("conv: no New meeting helper copy", !html.includes("New meeting starts a separate conversation"));
   check("conv: advisor helper copy", html.includes("Asks the advisors in the current meeting to respond"));
   check("conv: no legacy Run discussion", !html.includes("Run discussion"));
   check("conv: no legacy Start meeting", !html.includes("Start meeting"));
