@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
-import { CreateAdvisor, CharacterEditor } from "./advisor-creation";
+import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
 import {
   ConversationHeader,
@@ -2819,6 +2819,13 @@ const rosterNames = useQuery({
 // entry always shows its detail and portraits.
 const selRow = (rosterRows ?? []).find((r) => r.entry.id === selRoster)
   ?? (rosterNames.data ?? []).find((r) => r.entry.id === selRoster);
+const selResearch = useQuery({
+  queryKey: ["roster-research", selRow?.entry.id, accountId],
+  queryFn: () => get<any>(`/api/roster/${selRow!.entry.id}/research`),
+  enabled: !!selRow?.entry.id && tab === "roster" && !sessGate,
+  retry: false,
+});
+const selResearchRunning = isRosterResearchRunning((selResearch as any)?.data);
 
 const rosterCount = useQuery({
   queryKey: ["roster-count", accountId],
@@ -3351,18 +3358,10 @@ const tabCount = (k: Tab): number | null => {
   const originRevision = () => String(epochNow()) + "|" + currentToken() + "|" + canonicalUser();
   const resolveCanonicalEntry = async (id: string) => {
     try {
-      const all = ([] as any[]).concat(((rosterList as any)?.data ?? []) as any[]).concat(((rosterNames as any)?.data ?? []) as any[]);
-      for (const r of all) {
-        const e = (r as any)?.entry ?? r;
-        if (e && (e as any).id === id) return e;
-      }
-    } catch {}
-    try {
-      const single = await get<any>("/api/roster/" + id);
-      if (single && (single as any).entry && (single as any).entry.id) return (single as any).entry;
-      if (single && (single as any).id) return single;
-    } catch {}
-    return null;
+      return await fetchFreshCanonicalEntry({ get, accountId, originIdentity: originIdentity as () => unknown, originStale: originStale as (o: unknown) => boolean }, id);
+    } catch {
+      return null;
+    }
   };
   useEffect(() => {
     const key = latestDraft
@@ -4473,6 +4472,8 @@ const testModel = useMutation({
     get: get,
     isOriginStale: originStale,
     originOf: originIdentity,
+    originRevision: originRevision(),
+    live: live,
   });
   // Meeting presence rail data: every board seat (included and excluded) plus
   // the secretary seat, from data App already owns. Per-seat activity is
@@ -7396,7 +7397,7 @@ const testModel = useMutation({
                       <span className="badge">{" "}v{selRow.entry.version}{" "}</span>{" "}
                       <p>{selRow.entry.description}</p>{" "}
                       <ProfileFields profileJson={selRow.entry.profileJson} />{" "}
-                      {selRow.entry.researchRequested ? (selRow.entry.researchedAt ? (<p className="muted">{" "}Researched · {selRow.entry.evidenceCount} evidence claims{" "}</p>) : (<p role="status">{" "}Research in progress…{" "}</p>)) : (<p className="muted">{" "}No research yet — use Research dossier below to gather evidence.{" "}</p>)}
+                      {selRow.entry.researchedAt ? (<p className="muted">{" "}Researched · {selRow.entry.evidenceCount} evidence claims{" "}</p>) : selResearchRunning ? (<p role="status">{" "}Research in progress…{" "}</p>) : selRow.entry.researchRequested ? (<p className="muted">{" "}Research requested — not running. Open the editor below for its result and retry if needed.{" "}</p>) : (<p className="muted">{" "}No research yet — use Research dossier below to gather evidence.{" "}</p>)}
                       {(selImages.data ?? []).length > 0 ? (
                         <div aria-label="Portraits awaiting review">
                           <h4>Portraits - accept one before approval</h4>
@@ -7478,7 +7479,7 @@ const testModel = useMutation({
                           resolveCanonicalEntry={resolveCanonicalEntry}
                           freshCreation={false}
                           onSaved={() => {
-                            refresh("roster", "roster-count", "roster-names");
+                            refresh(...CANONICAL_SAVE_INVALIDATIONS);
                           }}
                         />
                       )}{" "}
@@ -8824,8 +8825,11 @@ const testModel = useMutation({
                         // state nor write into the reset UI.
                         try { profileOpRef.current++; } catch {}
                         try { setProfileReloading(false); } catch {}
+                        try { retirePipeline(submitOpRef.current); } catch {}
                         try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
                         try { secEpoch.current++; } catch {}
+                        try { send.reset(); } catch {}
+                        try { runDiscussion.reset(); } catch {}
                         try { qc.clear(); } catch {}
                         qc.invalidateQueries();
                       }}

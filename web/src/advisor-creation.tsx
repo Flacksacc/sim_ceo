@@ -1,5 +1,100 @@
 import { useEffect, useRef, useState } from "react";
 import "./advisor-creation.css";
+import { FriendlyError } from "./human-disclosure";
+import { friendlyError } from "./human-format";
+
+export function extractCharacterServerText(raw: string): { status: number; serverError: string } {
+  const input = String(raw ?? "");
+  const m = /^(\d{3})\s([\s\S]*)$/.exec(input);
+  const status = m ? parseInt(m[1], 10) : 0;
+  const body = (m ? m[2] : input).trim();
+  let serverError = "";
+  try {
+    const parsed: any = JSON.parse(body);
+    if (parsed && typeof parsed.error === "string") serverError = String(parsed.error);
+    else if (typeof parsed === "string") serverError = parsed;
+    else serverError = body;
+  } catch {
+    serverError = body;
+  }
+  if (!serverError) serverError = body;
+  return { status, serverError };
+}
+
+export const CANONICAL_SAVE_INVALIDATIONS: readonly string[] = [
+  "roster",
+  "roster-count",
+  "roster-names",
+  "roster-images",
+  "images",
+  "advisors",
+  "setup",
+  "status",
+  "meetings",
+  "meeting-detail",
+  "boards",
+  "board-detail",
+] as const;
+
+export function isRosterResearchRunning(data: unknown): boolean {
+  try {
+    const d: any = data;
+    if (!d) return false;
+    if (typeof d.running === "boolean") return d.running === true;
+    const st = String((d as any)?.stage ?? "");
+    if (st === "starting" || st === "fetching-sources" || st === "researching" || st === "compiling" || st === "running") return true;
+    return false;
+  } catch { return false; }
+}
+
+export interface FreshCanonicalDeps {
+  get: <T>(path: string) => Promise<T>;
+  accountId: string;
+  originIdentity: () => unknown;
+  originStale: (o: unknown) => boolean;
+}
+
+export async function fetchFreshCanonicalEntry(deps: FreshCanonicalDeps, id: string): Promise<any | null> {
+  const callOrigin: any = (() => { try { return deps.originIdentity(); } catch { return null; } })();
+  try {
+    const params = new URLSearchParams({ accountId: deps.accountId });
+    const fresh = await deps.get<any[]>(`/api/roster?${params.toString()}`);
+    try { if (callOrigin && deps.originStale(callOrigin)) return null; } catch { return null; }
+    const arr: any[] = Array.isArray(fresh) ? fresh : [];
+    for (const r of arr) {
+      const e = (r as any)?.entry ?? r;
+      if (e && (e as any).id === id) {
+        try { if (callOrigin && deps.originStale(callOrigin)) return null; } catch { return null; }
+        return e;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export function characterFriendlyError(raw: string): string {
+  const input = String(raw ?? "");
+  if (!input) return "Something went wrong. Your work is unchanged.";
+  const parts = extractCharacterServerText(input);
+  const status = parts.status;
+  const serverError = parts.serverError;
+  const hay = String(serverError || input).toLowerCase();
+  try {
+    const shared = friendlyError(input) || friendlyError(serverError);
+    if (shared) return shared;
+  } catch {}
+  if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
+  if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
+  if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
+  if (status === 409 || hay.indexOf("already running") >= 0) return "Research is already running for this draft on the server. Wait, then use Check again - do not start a second run.";
+  if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer research") >= 0 || hay.indexOf("changed during research") >= 0 || hay.indexOf("advisor profile changed") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
+  if (status === 502 || status === 503 || status === 504 || status === 499 || hay.indexOf("provider") >= 0 || hay.indexOf("model") >= 0 || hay.indexOf("deadline") >= 0 || hay.indexOf("time bound") >= 0 || hay.indexOf("research failed") >= 0 || hay.indexOf("research start failed") >= 0) return "Research could not complete because the text service had a problem. Your draft and brief are unchanged - retry, or edit the paragraphs directly.";
+  if (status === 0 && input.length < 300 && input.indexOf("{") < 0) return input;
+  if (status === 400 && serverError && serverError.length < 300 && serverError.indexOf("{") < 0) return serverError;
+  return "That request did not complete. Your draft and text are unchanged - retry, or edit directly.";
+}
 
 // CreateAdvisor — the single character-based advisor creation flow, plus
 // CharacterEditor for later roster-edit reuse (central App owner mounts it;
@@ -710,6 +805,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
       return "Request failed.";
     }
   }
+
 
   function stopClocks() {
     if (timer.current !== null) {
@@ -1736,7 +1832,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
       )}
       {error && (
         <div className="cc-err" role="alert">
-          {error}{" "}
+          <FriendlyError friendly={characterFriendlyError(error) || "That request did not complete. Your draft and text are unchanged - retry, or edit directly."} technical={error} />{" "}
           {(researchStatus === "failed" || researchStatus === "stale" || researchStatus === "incomplete") && (
             <button type="button" onClick={() => void runResearch()} disabled={busy}>
               Retry research
@@ -2043,7 +2139,7 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
       </div>
       {error && (
         <div className="cc-err" role="alert">
-          {error}
+          <FriendlyError friendly={characterFriendlyError(error) || "That request did not complete. Your work is unchanged - retry."} technical={error} />
         </div>
       )}
 

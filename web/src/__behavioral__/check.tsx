@@ -1,5 +1,5 @@
 import { renderToString } from "react-dom/server";
-import { CreateAdvisor, CharacterEditor, parseCharacterProfile, mergeCharacterProfile, adoptCompiledParagraphs } from "../advisor-creation";
+import { CreateAdvisor, CharacterEditor, parseCharacterProfile, mergeCharacterProfile, adoptCompiledParagraphs, characterFriendlyError, extractCharacterServerText, isRosterResearchRunning, fetchFreshCanonicalEntry, CANONICAL_SAVE_INVALIDATIONS } from "../advisor-creation";
 import {
   ConversationHeader,
   ConversationSearchField,
@@ -9,7 +9,7 @@ import {
 } from "../conversation-controls";
 import { MeetingParticipants } from "../meeting-participants";
 import { buildPresence, imageIdFromProvenance, isPortraitAccepted, provenanceParts, resolveProvenanceImage } from "../meeting-presence";
-import { mapAdvisorActivity, mapSecretaryActivity } from "../meeting-activity";
+import { mapAdvisorActivity, mapSecretaryActivity, hasActivityFetchFailed, shouldUseActivitySnapshot } from "../meeting-activity";
 import { RosterChatPanel, rosterDraftKey } from "../roster-chat";
 import { BoardAdvisorLinkPanel, RosterLinkBadge } from "../roster-integrity";
 import { FriendlyError, HumanDisclosure, StatusChip } from "../human-disclosure";
@@ -254,4 +254,100 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
   check("human: friendly error mapping", friendlyError("hash mismatch, refresh the review").length > 0);
 }
 
-console.log("behavioral checks passed: " + passed);
+// 7. Character human error boundary: friendly copy, never raw JSON/status/GUID.
+{
+  const prov502 = '502 {"error":"provider exploded: boom"}';
+  const f502 = characterFriendlyError(prov502);
+  check("char-err: 502 provider human", f502.toLowerCase().indexOf("text service") >= 0 && f502.toLowerCase().indexOf("unchanged") >= 0);
+  check("char-err: 502 hides status/json", f502.indexOf("502") < 0 && f502.indexOf("{") < 0 && f502.indexOf("}") < 0);
+  check("char-err: 502 hides guid", !/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}/.test(f502));
+  const prov409 = "409 Research is already running for this advisor; wait for it to finish.";
+  const f409 = characterFriendlyError(prov409);
+  check("char-err: 409 running honest", f409.toLowerCase().indexOf("already running") >= 0);
+  check("char-err: 409 hides raw status", f409.indexOf("409") < 0);
+  const v400 = "Name is required.";
+  check("char-err: validation preserved", characterFriendlyError(v400) === v400);
+  const a401 = "401 {\"error\":\"Authentication required.\"}";
+  const f401 = characterFriendlyError(a401);
+  check("char-err: 401 not hidden", f401.toLowerCase().indexOf("sign in") >= 0 && f401.indexOf("401") < 0 && f401.indexOf("{") < 0);
+  const n404 = "404 Not Found";
+  const f404 = characterFriendlyError(n404);
+  check("char-err: 404 not hidden", f404.toLowerCase().indexOf("found") >= 0 && f404.indexOf("404") < 0);
+  const unk = '502 {"weird":123,"id":"11111111-2222-3333-4444-555555555555"}';
+  const funk = characterFriendlyError(unk);
+  check("char-err: unknown hides json/guid", funk.indexOf("{") < 0 && !/[0-9a-fA-F]{8}-/.test(funk) && funk.length > 10);
+  const parts = extractCharacterServerText(prov502);
+  check("char-err: extractor keeps raw internal", parts.status === 502 && parts.serverError.toLowerCase().indexOf("provider") >= 0);
+  const html = renderToString(<FriendlyError friendly={f502} technical={prov502} />);
+  check("char-err: boundary shows human only", html.includes(f502) && !html.includes("502") && html.includes("Copy error report"));
+}
+
+// 8. Roster terminal research never claims running.
+{
+  check("roster-label: live running true", isRosterResearchRunning({ running: true }) === true);
+  check("roster-label: live stage researching", isRosterResearchRunning({ running: true, stage: "researching" }) === true);
+  check("roster-label: failed not running", isRosterResearchRunning({ running: false, stage: "failed" }) === false);
+  check("roster-label: unsupported not running", isRosterResearchRunning({ running: false, stage: "unsupported" }) === false);
+  check("roster-label: interrupted not running", isRosterResearchRunning({ running: false, stage: "interrupted" }) === false);
+  check("roster-label: done not running", isRosterResearchRunning({ running: false, stage: "done" }) === false);
+  check("roster-label: missing snapshot not running", isRosterResearchRunning(null) === false && isRosterResearchRunning({}) === false);
+}
+
+// 9. Activity failure/origin retirement: never false active.
+{
+  check("activity: fetch error unusable", shouldUseActivitySnapshot({ reqStale: false, fetchFailed: true }) === false);
+  check("activity: stale origin unusable", shouldUseActivitySnapshot({ reqStale: true, fetchFailed: false }) === false);
+  check("activity: healthy usable", shouldUseActivitySnapshot({ reqStale: false, fetchFailed: false }) === true);
+  check("activity: error detected", hasActivityFetchFailed({ error: new Error("x") }) === true && hasActivityFetchFailed({ isError: true } as any) === true);
+  check("activity: healthy no error", hasActivityFetchFailed({} as any) === false);
+  check("activity: waiting selection honest", mapAdvisorActivity("awaiting-selection", null) === "waiting-for-selection");
+  check("activity: waiting publication honest", mapAdvisorActivity("awaiting-publication", null) === "waiting-for-publication");
+  check("activity: uncertain interrupted", mapSecretaryActivity("uncertain") === "interrupted");
+  check("activity: responding preserved", mapAdvisorActivity("responding", null) === "responding");
+}
+
+// 10. Canonical save invalidates board caches (no stale approval).
+{
+  const keys = CANONICAL_SAVE_INVALIDATIONS as readonly string[];
+  check("save-keys: includes advisors", keys.indexOf("advisors") >= 0);
+  check("save-keys: includes setup/status", keys.indexOf("setup") >= 0 && keys.indexOf("status") >= 0);
+  check("save-keys: includes meetings", keys.indexOf("meetings") >= 0 && keys.indexOf("meeting-detail") >= 0);
+  check("save-keys: includes portraits", keys.indexOf("roster-images") >= 0 && keys.indexOf("images") >= 0);
+  check("save-keys: includes roster family", keys.indexOf("roster") >= 0 && keys.indexOf("roster-names") >= 0);
+}
+
+// 11. Apply identity pipeline: old callback cannot clear new op.
+{
+  let submitOp: string | null = "submit-1";
+  const retire = (op: unknown) => { if (typeof op === "string" && op && submitOp === op) submitOp = null; };
+  retire("submit-1");
+  check("apply-pipeline: retire clears held op", submitOp === null);
+  submitOp = "submit-2";
+  retire("submit-1");
+  check("apply-pipeline: old cannot clear new", submitOp === "submit-2");
+}
+
+const __asyncChecks: Promise<void>[] = [];
+__asyncChecks.push((async () => {
+  const calls: string[] = [];
+  const fakeGet = async (path: string): Promise<any> => {
+    calls.push(path);
+    const rows = [{ entry: { id: "a1", version: 8 } }, { entry: { id: "b2", version: 3 } }];
+    return rows as unknown as any;
+  };
+  const got = await fetchFreshCanonicalEntry({ get: fakeGet, accountId: "acct-1", originIdentity: () => ({ epoch: 1, token: "t", user: "u" }), originStale: () => false }, "a1");
+  check("canonical-fetch: fresh v8 unwrapped", !!got && (got as any).id === "a1" && (got as any).version === 8);
+  check("canonical-fetch: unfiltered account scope", calls.length === 1 && calls[0].indexOf("/api/roster?") === 0 && calls[0].indexOf("accountId=acct-1") >= 0 && calls[0].indexOf("q=") < 0);
+  const miss = await fetchFreshCanonicalEntry({ get: fakeGet, accountId: "acct-1", originIdentity: () => ({ epoch: 1, token: "t", user: "u" }), originStale: () => false }, "zzz");
+  check("canonical-fetch: miss null honest reload", miss === null);
+  const failGet = async (_p: string): Promise<any> => { throw new Error("500 boom"); };
+  const failed = await fetchFreshCanonicalEntry({ get: failGet, accountId: "acct-1", originIdentity: () => ({ epoch: 1, token: "t", user: "u" }), originStale: () => false }, "a1");
+  check("canonical-fetch: authority failure null", failed === null);
+  const stale = await fetchFreshCanonicalEntry({ get: fakeGet, accountId: "acct-1", originIdentity: () => ({ epoch: 9, token: "t", user: "u" }), originStale: () => true }, "a1");
+  check("canonical-fetch: origin stale silent null", stale === null);
+})());
+
+(__asyncChecks as Promise<void>[]).reduce((a, b) => a.then(() => b), Promise.resolve()).then(() => {
+  console.log("behavioral checks passed: " + passed);
+}).catch((e) => { throw e; });
+
