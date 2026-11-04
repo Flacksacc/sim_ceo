@@ -530,7 +530,7 @@ public static class CharacterResearch
             // marked complete and review stays ineligible until grounded.
             draftStatus = grounded ? "done" : "unsupported",
             note = !grounded
-              ? "No grounded evidence completed (no search, no citations, or every owner URL failed to fetch). The draft below is editable but UNSUPPORTED: not marked complete, not eligible for approval. Rerun research with better inputs, or proceed without research-gated approval."
+              ? "Research finished, but no claims could be matched to the retrieved passages. The draft is editable but cannot be approved yet. Review the description or source links, then research again."
               : "Snippet-level claims need cross-checking against independent sources before approval. Draft paragraphs are editable; explicit PUT save required before they take effect.",
           };
           try

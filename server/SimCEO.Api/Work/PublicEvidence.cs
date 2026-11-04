@@ -413,16 +413,17 @@ public sealed class PublicEvidenceFetcher
         anc = anc.Parent;
       }
       var sb = new StringBuilder(8192);
-      var stack = new Stack<(INode Node, bool Hidden)>();
-      stack.Push((bodyEl, IsHiddenElement(bodyEl)));
+      if (IsHiddenElement(bodyEl)) return (title, "");
+      var stack = new Stack<(INode Node, bool EndBlock)>();
+      stack.Push((bodyEl, false));
       int visited = 0;
       while (stack.Count > 0)
       {
         if ((visited++ % 256) == 0) ct.ThrowIfCancellationRequested();
         if (visited > 60000) return (title, "");
-        if (sb.Length > 200000) return (title, "");
-        var (node, hidden) = stack.Pop();
-        if (hidden) continue;
+        if (sb.Length >= 200000) break;
+        var (node, endBlock) = stack.Pop();
+        if (endBlock) { sb.Append('\n'); continue; }
         if (node is IElement el)
         {
           var tag = el.TagName;
@@ -433,6 +434,11 @@ public sealed class PublicEvidenceFetcher
           bool nowHidden = IsHiddenElement(el);
           if (nowHidden) continue;
           if (IsChallengeContainer(el)) continue;
+          // Retain block boundaries: a punctuation-free infobox must not
+          // swallow the article's first paragraph before excerpt clipping.
+          bool block = tag is "P" or "DIV" or "TR" or "LI" or "SECTION" or "ARTICLE"
+            or "H1" or "H2" or "H3" or "H4" or "H5" or "H6";
+          if (block) { sb.Append('\n'); stack.Push((node, true)); }
           var children = el.ChildNodes;
           for (int i = children.Length - 1; i >= 0; i--)
             stack.Push((children[i], false));
@@ -442,19 +448,29 @@ public sealed class PublicEvidenceFetcher
           var t = node.TextContent;
           if (!string.IsNullOrWhiteSpace(t))
           {
-            sb.Append(t);
-            sb.Append(' ');
+            var text = CollapseWhitespace(t);
+            var room = 200000 - sb.Length;
+            if (room > 1) {
+              sb.Append(text.AsSpan(0, Math.Min(text.Length, room - 1)));
+              sb.Append(' ');
+            }
           }
         }
       }
-      visible = CollapseWhitespace(sb.ToString());
+      visible = sb.ToString();
     }
     catch (OperationCanceledException) { throw; }
     catch { return (title, ""); }
     if (visible.Length < 20) return (title, "");
     var tokens = GetSalientTokens(subject, maxTokens);
     if (tokens.Length == 0) return (title, "");
-    var sentences = SplitSentences(visible, ct);
+    var sentences = new List<string>();
+    foreach (var block in visible.Split('\n'))
+    {
+      ct.ThrowIfCancellationRequested();
+      var text = CollapseWhitespace(block);
+      if (text.Length > 0) sentences.AddRange(SplitSentences(text, ct));
+    }
     if (sentences.Count == 0)
     {
       return (title, "");
