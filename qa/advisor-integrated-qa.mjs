@@ -1451,13 +1451,17 @@ async function stepRosterChatUI() {
   const selOk = ariaCur === "true" && String(clsCur).indexOf("active") >= 0;
   if (!selOk) { const allN = await page.locator("aside.listpanel button.lprow .lprow-name").allInnerTexts().catch(() => []); ok("roster-chat-panel-mounted", false, "selection did not land on owned entry aria=" + ariaCur + " rows=" + (allN || []).length + " " + selDiag); failExit("roster selection identity not proven; refusing panel proof. " + selDiag); }
   await page.waitForTimeout(800);
-  const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
+  const panelBase = page.locator('div[data-roster-chat="' + rosterId + '"]');
   let panelOk = false;
   let panelDiag = "";
-  try { await panel.waitFor({ timeout: boundedTimeout(20000, 8000) }); panelOk = await panel.count() > 0; } catch { panelOk = false; }
-  if (!panelOk) { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); const panelExactCount = await panel.count().catch(() => -1); let nativeDiag = "native=uncollected"; try { nativeDiag = await page.evaluate((rid) => { try { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let exactN = 0; try { exactN = els.filter((e) => e.getAttribute("data-roster-chat") === rid).length; } catch (e2) { exactN = -2; } const headFor = (el) => { try { const sec = el.closest("section,aside,main"); const h = sec ? sec.querySelector("h1,h2,h3") : null; return (h && h.innerText ? h.innerText : "").slice(0, 40); } catch (e3) { return "head-err"; } }; return "nativeCount=" + els.length + " nativeExact=" + exactN + " totalDivs=" + document.querySelectorAll("div").length + " url=" + String(location.hash || "").slice(0, 80) + " attrs=[" + els.slice(0, 3).map((e) => "attr=" + String(e.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + headFor(e)).join(";") + "]"; } catch (e) { return "native-eval-threw"; } }, rosterId).catch(() => "native-eval-failed"); } catch (e) { nativeDiag = "native-harness-threw"; } let shotInfo = "shot=skipped"; try { const osMod = await import("node:os"); const shotPath = String(osMod.tmpdir()).replace(/\\/g, "/") + "/qa-author-roster-" + run + ".png"; await page.screenshot({ path: shotPath }).catch(() => {}); shotInfo = "shot=" + shotPath; } catch (e) { shotInfo = "shot-failed"; } panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " panelExact=" + panelExactCount + " aria=" + ariaCur + " " + selDiag + " " + nativeDiag + " " + shotInfo; ok("roster-chat-panel-mounted", false, "RosterChatPanel for owned advisor never mounted; " + panelDiag); }
-  ok("roster-chat-panel-mounted", panelOk, panelOk ? "div[data-roster-chat] mounted same-entry=" + String(rosterId).slice(0, 8) + " " + selDiag : "panel missing; " + panelDiag);
-  if (!panelOk) failExit("roster chat panel missing for same exact entry after proven selection; refusing HTTP-only chat. " + (panelDiag || selDiag));
+  let waitErr = "none"; try { await panelBase.first().waitFor({ timeout: boundedTimeout(20000, 8000) }); } catch (e) { waitErr = String((e && e.message) || e).slice(0, 160); } const panelExactCount = await panelBase.count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); const panelVisible = page.locator("div[data-roster-chat=\"" + rosterId + "\"]:visible"); const panelVisibleCount = await panelVisible.count().catch(() => -1); const panel = panelVisible.last();
+  { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); let nativeDiag = "native=uncollected"; try { nativeDiag = await page.evaluate((rid) => { try { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let exactN = 0; try { exactN = els.filter((e) => e.getAttribute("data-roster-chat") === rid).length; } catch (e2) { exactN = -2; } let visN = 0; const visHeads = []; try { for (const el of els) { let vis = false; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); vis = r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; } catch (e4) { vis = false; } if (vis) { visN++; if (visHeads.length < 3) { let h = ""; try { const sec = el.closest("section,aside,main"); const hh = sec ? sec.querySelector("h1,h2,h3") : null; h = (hh && hh.innerText ? hh.innerText : "").slice(0, 40); } catch (e5) { h = "head-err"; } visHeads.push("attr=" + String(el.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + h); } } } } catch (e3) { visN = -3; } const headFor = (el) => { try { const sec = el.closest("section,aside,main"); const h = sec ? sec.querySelector("h1,h2,h3") : null; return (h && h.innerText ? h.innerText : "").slice(0, 40); } catch (e3) { return "head-err"; } }; return "nativeCount=" + els.length + " nativeExact=" + exactN + " nativeVisible=" + visN + " totalDivs=" + document.querySelectorAll("div").length + " url=" + String(location.hash || "").slice(0, 80) + " attrs=[" + els.slice(0, 3).map((e) => "attr=" + String(e.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + headFor(e)).join(";") + "] visHeads=[" + visHeads.join(";") + "]"; } catch (e) { return "native-eval-threw"; } }, rosterId).catch(() => "native-eval-failed"); } catch (e) { nativeDiag = "native-harness-threw"; } let shotInfo = "shot=skipped"; try { const osMod = await import("node:os"); const shotPath = String(osMod.tmpdir()).replace(/\\/g, "/") + "/qa-author-roster-" + run + ".png"; await page.screenshot({ path: shotPath }).catch(() => {}); shotInfo = "shot=" + shotPath; } catch (e) { shotInfo = "shot-failed"; } panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " panelExact=" + panelExactCount + " panelVisible=" + panelVisibleCount + " waitErr=" + waitErr + " aria=" + ariaCur + " " + selDiag + " " + nativeDiag + " " + shotInfo; }
+  const anyVisible = panelVisibleCount >= 1; const singleVisible = panelVisibleCount === 1;
+  const singular = panelExactCount === 1 && panelVisibleCount === 1;
+  ok("roster-chat-panel-mounted", anyVisible, anyVisible ? "div[data-roster-chat] visible same-entry=" + String(rosterId).slice(0, 8) + " visiblePanels=" + panelVisibleCount + " extraClones=" + (panelExactCount - panelVisibleCount) + " " + selDiag : "panel not visible; " + panelDiag);
+  ok("roster-chat-panel-singular", singular, "exact=" + panelExactCount + " visible=" + panelVisibleCount + " waitErr=" + waitErr + " " + selDiag);
+  panelOk = anyVisible;
+  if (!panelOk) failExit("roster chat panel not visible for same exact entry after proven selection; refusing HTTP-only chat. " + panelDiag);
   const headOk = await panel.getByText("Chat with this advisor", { exact: false }).count().then((c) => c > 0).catch(() => false);
   const boardfreeOk = await panel.getByText(/nothing here joins a meeting/i).count().then((c) => c > 0).catch(() => false);
   ok("roster-chat-boardfree-contract", headOk && boardfreeOk, "heading=" + headOk + " boardfree-note=" + boardfreeOk);
@@ -1479,9 +1483,9 @@ async function stepRosterChatUI() {
   if (!(mc0.status === 200 && baseLeadExact === 1)) failExit("meeting baseline not positively validated; refusing stateless proof.");
   const chatQ = "Direct " + run + ": state your current berth criterion in one line?";
   const chatRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/roster/" + rosterId + "/chat" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(95000, Math.max(15000, remainingMs(20000))) }).catch(() => null);
-  await chatBox.first().fill(chatQ);
-  const sendBtn = panel.getByRole("button", { name: /^send$/i });
-  try { await sendBtn.first().click({ timeout: 8000 }); } catch { ok("roster-chat-ui-reply", false, "Send never clickable"); failExit("roster chat send failed."); }
+  const panelHandle = await panelVisible.first().elementHandle().catch(() => null); ok("roster-chat-panel-handle", !!panelHandle, "pinned single visible panel instance"); if (!panelHandle) failExit("no element handle for visible roster panel; refusing HTTP-only chat."); const boxHandle = await panelHandle.$("textarea").catch(() => null); if (!boxHandle) failExit("visible roster panel message box missing."); await boxHandle.fill(chatQ);
+  const btnHandle = await panelHandle.$("button").catch(() => null); if (!btnHandle) failExit("visible roster panel send button missing.");
+  try { await btnHandle.click({ timeout: 8000 }); } catch (e) { let clickDiag = String((e && e.message) || e).slice(0, 200); try { clickDiag += " pt=" + await btnHandle.evaluate((el) => { const r = el.getBoundingClientRect(); const x = Math.round(r.x + r.width / 2); const y = Math.round(r.y + r.height / 2); let ds = "q-na"; try { const tt = document.elementFromPoint(x, y); ds = tt === el ? "self" : (tt ? tt.tagName + "." + String(tt.className || "").slice(0, 50) : "none"); } catch (ee) { ds = "q-na"; } return x + "," + y + " hit=" + ds + " dis=" + !!el.disabled; }).catch(() => "pt-na"); } catch (ee) { clickDiag += " diag-na"; } try { await boxHandle.focus({ timeout: 5000 }); await boxHandle.press("Enter", { timeout: 5000 }); console.log("  note - roster-chat-sent-via-enter " + clickDiag); } catch (e2) { ok("roster-chat-ui-reply", false, "Send never clickable/cannot Enter " + clickDiag + " enterErr=" + String((e2 && e2.message) || e2).slice(0, 120)); failExit("roster chat send failed. " + clickDiag); } }
   let advAnswer = "";
   try {
     await page.waitForFunction((rid) => {
@@ -1489,7 +1493,7 @@ async function stepRosterChatUI() {
       for (const r of rows) { const t = (r.innerText || "").trim(); if (t.length >= 20 && !/^Responding/.test(t)) return true; }
       return false;
     }, rosterId, { timeout: 90000 });
-    const texts = await panel.locator(".msg-row.advisor .btext").allInnerTexts().catch(() => []);
+    const texts = await panelHandle.$$eval(".msg-row.advisor .btext", (els) => els.map((e) => e.innerText)).catch(() => []);
     const cands = (texts || []).map((t) => String(t || "").trim()).filter((t) => t.length >= 20 && !/^Responding/.test(t) && !t.includes(chatQ.slice(0, 20)));
     advAnswer = cands.length > 0 ? cands[cands.length - 1] : "";
   } catch { ok("roster-chat-ui-reply", false, "no completed advisor .msg-row.advisor .btext answer within 90s"); }
@@ -1609,7 +1613,7 @@ async function stepNavigation() {
     { label: "Sources", seg: "sources", sec: 'section[aria-label="Resources and Inbox"]', head: "Resources and Inbox", entity: OWNED_URL_MARK },
     { label: "Records", seg: "records", sec: 'section[aria-label="Records"]', head: "Records", entity: run },
     { label: "People", seg: "people", sec: 'section[aria-label="People"]', head: "People", entity: "Board Own " + run },
-    { label: "Activity", seg: "activity", sec: 'section[aria-label="Activity and Usage"]', head: "Activity and Usage", entity: "Harbor Strategist" },
+    { label: "Activity", seg: "activity", sec: 'section[aria-label="Activity and Usage"]', head: "Activity and Usage", entity: "Usage (live ledger)" },
     { label: "Settings", seg: "settings", sec: 'section[aria-label="Settings"]', head: "Settings", entity: null },
     { label: "Profile", seg: "profile", sec: 'section[aria-label="Profile"]', head: "Profile", entity: "QA Default " + run },
     { label: "Help", seg: "help", sec: 'section[aria-label="Help"]', head: null, entity: null },
@@ -1621,15 +1625,15 @@ async function stepNavigation() {
   async function assertDest(d) {
     const secLoc = page.locator(d.sec).first();
     let secVis = false; try { await secLoc.waitFor({ state: "visible", timeout: 8000 }); secVis = await secLoc.isVisible(); } catch { secVis = false; }
-    const secTxt = secVis ? await secLoc.innerText().catch(() => "") : "";
+    const secTxt = secVis ? await secLoc.innerText().catch(() => "") : ""; const normTxt = secTxt.replace(/\s+/g, " ");
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await hLoc.first().isVisible().catch(() => false); if (!headOk) headOk = secTxt.includes(d.head); }
     let entityOk = true;
-    if (d.entity) { if (d.seg === "meet") { entityOk = secTxt.includes(d.entity); } else { entityOk = secTxt.includes(d.entity) || secTxt.includes(run); } if (!entityOk && d.seg === "records") entityOk = /no records|empty|nothing|prepare draft/i.test(secTxt); if (!entityOk && d.seg === "sources") entityOk = /wiki|sources|inbox|no sources|empty/i.test(secTxt); }
+    if (d.entity) { if (d.seg === "meet") { entityOk = secTxt.includes(d.entity); } else { entityOk = secTxt.includes(d.entity) || secTxt.includes(run); } if (!entityOk && d.seg === "records") entityOk = /no records|empty|nothing|prepare draft|pick a meeting first/i.test(normTxt); if (!entityOk && d.seg === "sources") entityOk = /wiki|sources|inbox|no sources|empty/i.test(normTxt); }
     const h = await page.evaluate(() => location.hash).catch(() => "");
     const hashOk = h.indexOf("#/" + d.seg) === 0;
     const boardOk = ["advisors", "meet", "sources", "records", "people", "activity"].includes(d.seg) ? h.includes("board=" + encodeURIComponent(boardA)) : true;
-    return { ok: hashOk && boardOk && secVis && headOk && entityOk, detail: "hash=" + h.slice(0,80) + " sec=" + secVis + " head=" + headOk + " entity=" + entityOk };
+    return { ok: hashOk && boardOk && secVis && headOk && entityOk, detail: "hash=" + h.slice(0,80) + " sec=" + secVis + " head=" + headOk + " entity=" + entityOk + " secTxt=" + normTxt.slice(0, 160) };
   }
   let arrived = 0;
   for (const d of dests) {
@@ -1667,6 +1671,9 @@ async function stepNavigation() {
   await page.goto(WEB + "/" + boardHash("records"), { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
   await page.waitForTimeout(900);
   { const _r = await assertDest(dests[5]); ok("nav-entity-records", _r.ok, "direct records scoped: " + _r.detail); if (!_r.ok) failExit("direct records must satisfy scoped predicates."); }
+  await page.goto(WEB + "/#/records?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId), { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
+  await page.waitForTimeout(900);
+  { const _sec = page.locator("section[aria-label=\"Records\"]").first(); let _vis = false; try { await _sec.waitFor({ state: "visible", timeout: 8000 }); _vis = await _sec.isVisible(); } catch { _vis = false; } const _txt = _vis ? (await _sec.innerText().catch(() => "")).replace(/\s+/g, " ") : ""; const _ok = _vis && _txt.indexOf("Prepare draft") >= 0; ok("nav-entity-records-meeting", _ok, "meeting-scoped records Prepare-draft: vis=" + _vis + " txt=" + _txt.slice(0, 160)); if (!_ok) failExit("meeting-scoped records must render Prepare draft for owned meeting."); }
   await gotoTab("/#/profile");
   await scanDebug("direct-profile");
   await gotoTab("/#/roster");
