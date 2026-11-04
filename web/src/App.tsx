@@ -3199,7 +3199,7 @@ const rosterCount = useQuery({
     enabled: !sessGate && !anonPrivateBlocked,
 });
 const tabCount = (k: Tab): number | null => {
-  if (k === "boards") return boards.data ? boards.data.length : null;
+  if (k === "boards") return boards.data ? scopeRows.length : null;
   if (k === "roster") return rosterCount.data ? rosterCount.data.total : null;
   return null;
 };
@@ -6496,12 +6496,21 @@ const testModel = useMutation({
             {tab === "roster" && (rosterNames.data ?? []).length === 0 && (
               <div className="sub-empty">Roster is empty</div>
             )}{" "}
-            {tab === "roster" && (
+          </div>{" "}
+          {tab === "boards" && !showBoardMeetings && (
+            <div className="listpanel-actions">
+              <button type="button" className="lprow create" onClick={() => setTab("wizard")}>
+                <span className="lprow-name">+ Create board</span>
+              </button>
+            </div>
+          )}
+          {tab === "roster" && (
+            <div className="listpanel-actions">
               <button type="button" className="lprow create" onClick={openCreate}>{" "}
                 <span className="lprow-name">+ Create new Advisor</span>{" "}
               </button>
-            )}{" "}
-          </div>{" "}
+            </div>
+          )}{" "}
         </aside>
       )}{" "}
 
@@ -6900,19 +6909,6 @@ const testModel = useMutation({
                   >
                     {" "}
                     Create your first board{" "}
-                  </button>{" "}
-                </div>
-              )}{" "}
-              {(boards.data ?? []).length > 0 && (
-                <div className="meetctl">
-                  {" "}
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => setTab("wizard")}
-                  >
-                    {" "}
-                    New board{" "}
                   </button>{" "}
                 </div>
               )}{" "}
