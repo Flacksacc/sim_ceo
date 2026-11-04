@@ -230,6 +230,13 @@ public static class RosterOps
   // selected image. Legacy/empty reviews are pending, never implicitly accepted.
   // Explicit invitation compatibility is preserved: this gate does not itself
   // force the Approved boolean; lane B enforces approval unless explicitly invited.
+  public static string? ParticipationGate(InMemoryStore s, BoardAdvisor advisor)
+  {
+    if (advisor.Removed) return "removed";
+    if (!s.Roster.TryGetValue(advisor.RosterEntryId, out var entry) || entry.Archived) return "archived-entry";
+    return DataCompleteness(s, entry.Id).complete ? null : "profile-incomplete";
+  }
+
   public static string? ApprovalGate(InMemoryStore s, BoardAdvisor a)
   {
     if (a.Removed) return "removed";
@@ -1424,7 +1431,7 @@ public static class RosterEndpoints
           BoardAdvisor? selAdv = null;
           if (img.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(img.BoardAdvisorId.Value, out var adv0)) { bid = adv0.BoardId; selAdv = adv0; }
           if (bid != Guid.Empty && string.Equals(img.Review ?? "", "accepted", StringComparison.OrdinalIgnoreCase)
-            && selAdv is not null && selAdv.BoardId == bid && !selAdv.Removed && selAdv.Approved
+            && selAdv is not null && selAdv.BoardId == bid && !selAdv.Removed && RosterOps.ParticipationGate(s, selAdv) is null
             && string.Equals(img.RosterEntryId, selAdv.RosterEntryId))
           {
             var mids = PeopleOps.GuestMeetingIds(s, iu, bid);

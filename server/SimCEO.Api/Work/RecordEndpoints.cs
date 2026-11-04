@@ -1373,7 +1373,7 @@ public static partial class RecordsOps
       var me = PeopleOps.UserOf(s, req);
       var owned = !string.IsNullOrWhiteSpace(ent.OwnerKey) && string.Equals(ent.OwnerKey, me, StringComparison.OrdinalIgnoreCase);
       var demoOwner = !PeopleOps.IsSecure(s) && PeopleOps.IsOwner(req);
-      var approvedLink = links.Any(a => a.Approved);
+      var approvedLink = links.Any(a => RosterOps.ParticipationGate(s, a) is null);
       if (!approvedLink && !owned && !demoOwner) return false;
       if (!RosterEndpoints.CanReadRoster(s, req, ent)) return false;
       return true;

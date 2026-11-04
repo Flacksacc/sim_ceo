@@ -6,7 +6,7 @@ export function mapAdvisorActivity(state: any, reason: any): string {
   if (String(reason ?? "") === "not-selected") return "not-selected";
   const s = String(state ?? "");
   const r = String(reason ?? "");
-  if (r === "reapproval-required") return "needs-approval";
+  if (r === "reapproval-required") return "idle";
   if (s === "queued") return "queued";
   if (s === "awaiting-selection") return "waiting-for-selection";
   if (s === "considering") return "considering";

@@ -395,8 +395,8 @@ public static class LeadSetup
         var hasLead = ResolveLeadForBoard(s, cur) is not null;
         if (!hasLead)
           throw new InvalidOperationException("nolead");
-        var approved = s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed && a.Approved
-          && RosterOps.ApprovalGate(s, a) is null);
+        var approved = s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed
+          && RosterOps.ParticipationGate(s, a) is null);
         if (approved < 1)
           throw new InvalidOperationException("noadvisor");
         if (string.IsNullOrWhiteSpace(wantHash))
@@ -425,7 +425,7 @@ public static class LeadSetup
     }
     catch (InvalidOperationException iox) when (iox.Message == "noadvisor")
     {
-      return (null, "At least one eligible approved advisor is required before activation.", 409);
+      return (null, "Select at least one advisor with a complete profile before activation.", 409);
     }
     catch (InvalidOperationException iox) when (iox.Message == "nohash")
     {

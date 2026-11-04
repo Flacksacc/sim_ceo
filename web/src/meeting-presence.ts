@@ -155,8 +155,7 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
     let activity: ParticipantActivity = "idle";
     if (restricted && !included.has(a.id)) {
       activity = "excluded";
-    } else if (!a.approved) {
-      activity = "needs-approval";
+
     } else if (!live) {
       activity = availSeat;
     } else if (input.snapshot) {

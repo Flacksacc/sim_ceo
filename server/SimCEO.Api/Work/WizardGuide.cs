@@ -320,7 +320,7 @@ public static class WizardGuide
         return Results.Ok(new
         {
           board = prior, advisors = priorAdvisors, resumed = true,
-          portraitReview = "Review the selected roster advisors before approving them for meetings",
+          portraitReview = "The selected roster advisors are ready for meetings",
         });
       }
       // Creation requires the owner's saved profile; draft leader fields are ignored.
@@ -371,7 +371,7 @@ public static class WizardGuide
           return Results.Created("/api/boards/" + board.Id, new
           {
             board, advisors = created,
-            portraitReview = "Review the selected roster advisors before approving them for meetings",
+            portraitReview = "The selected roster advisors are ready for meetings",
           });
         });
       }

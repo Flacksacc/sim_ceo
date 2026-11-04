@@ -473,7 +473,7 @@ public static class MeetingActivity
     if (adv is null || adv.BoardId != boardId || adv.Removed) return false;
     try
     {
-      var gate = SimCEO.Api.RosterOps.ApprovalGate(s, adv);
+      var gate = SimCEO.Api.RosterOps.ParticipationGate(s, adv);
       if (gate is not null)
       {
         reason = string.Equals(gate, "stale-version", StringComparison.OrdinalIgnoreCase) ? "stale-profile" : "not-eligible";
@@ -481,7 +481,6 @@ public static class MeetingActivity
       }
     }
     catch { return false; }
-    if (!adv.Approved) return false;
     return true;
   }
 

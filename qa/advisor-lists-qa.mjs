@@ -28,9 +28,7 @@ try{
  const availableTarget=available.locator('.advisor-member-choice').filter({hasText:target.rosterName});
  await availableTarget.getByRole('checkbox').click();
  await page.waitForFunction(()=>document.querySelectorAll('[aria-label="Selected advisors"] input[type=checkbox]').length===10);
- await targetRow.getByRole('button',{name:'Approve for meetings',exact:true}).click();
- await targetRow.getByRole('button',{name:'Approve for meetings',exact:true}).waitFor({state:'detached'});
- assert.equal((await get(`/api/boards/${board.id}/advisors`)).find(a=>a.rosterEntryId===target.rosterEntryId).approved,true,'Required meeting approval remains available inline');
+ assert.equal(await selected.getByRole('button',{name:/approv/i}).count(),0,'Advisor selection has no approval step');
  await page.screenshot({path:'.tmp/advisor-lists-board.png',fullPage:true,animations:'disabled'});
  await page.goto(base+'/#/roster');await page.waitForFunction(()=>document.querySelectorAll('.roster-person').length===210);
  assert.equal(await page.locator('.roster-person .advisor-summary-description').count(),210);
@@ -50,4 +48,4 @@ try{
  await ctx.close();
 }finally{await browser.close();}
 assert.deepEqual(errors,[]);
-console.log(JSON.stringify({passed:true,checks:['selected and available lists only','portraits and descriptions in all four advisor lists','lazy image loading and missing image initials','full paginated roster','remove and re-add','inline approval remains functional','meeting settings and team strip'],errors}));
+console.log(JSON.stringify({passed:true,checks:['selected and available lists only','portraits and descriptions in all four advisor lists','lazy image loading and missing image initials','full paginated roster','remove and re-add','no approval step or labels','meeting settings and team strip'],errors}));

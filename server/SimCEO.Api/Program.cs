@@ -1425,7 +1425,7 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
   foreach (var mid in meetings)
     if (s.Meetings.TryGetValue(mid, out var mm))
       try { using var d = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(mm.ParticipantIdsJson) ? "[]" : mm.ParticipantIdsJson); foreach (var e in d.RootElement.EnumerateArray()) if (e.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)) parts.Add(g); } catch { }
-  var list = s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed && a.Approved);
+  var list = s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed && RosterOps.ParticipationGate(s, a) is null);
   if (parts.Count > 0) list = list.Where(a => parts.Contains(a.Id));
   return Results.Ok(list.Select(a =>
   {
@@ -1481,43 +1481,10 @@ app.MapPost("/api/boards/{boardId:guid}/advisors/{advisorId:guid}/approve", (InM
 {
   if (!PeopleOps.Can(s, req, boardId, null, "manage")) return PeopleOps.Denied();
   if (!s.Advisors.TryGetValue(advisorId, out var a) || a.BoardId != boardId || a.Removed) return Results.NotFound();
-  var gate = RosterOps.ApprovalGate(s, a);
-  if (gate is not null) return Results.Json(new { error = gate switch
-  {
-    "stale-version" => "Roster changed since this copy; update from roster, review, then approve.",
-    "research-pending" => "Research is still running for this advisor.",
-    "research-failed" => "Research failed for this advisor; rerun research, then review and approve.",
-    "research-interrupted" => "Research was interrupted for this advisor; rerun research, then review and approve.",
-    "research-unsupported" => "Research completed without grounded evidence; rerun research with better inputs to ground it before approval.",
-    "no-evidence" => "No supporting evidence yet; run research again or add sources first.",
-    "portrait-pending" => "An accepted portrait is required before approving (upload one, then accept it).",
-    "archived-entry" => "Roster entry is archived.",
-    "recovered-incomplete" => "Recovered entry is an incomplete placeholder: complete the profile (or run research to evidence) before approving.",
-    _ => "Advisor is not eligible for approval.",
-  } }, statusCode: 409);
-  // ONE durable unit: recheck CURRENT authority + eligibility inside the commit so a
-  // concurrent revocation cannot approve; storage failure returns 500, not false Ok.
-  try
-  {
-    lock (s.SetupLock)
-    {
-      Atomic.Run(s, () =>
-      {
-        if (PeopleOps.Check(s, req, boardId, null, "manage") is not null) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
-        if (!s.Advisors.TryGetValue(advisorId, out var a2) || a2.BoardId != boardId || a2.Removed) throw new InvalidOperationException("Advisor is gone.");
-        var gate2 = RosterOps.ApprovalGate(s, a2);
-        if (gate2 is not null) throw new InvalidOperationException("gate:" + gate2);
-        a2.Approved = true;
-      });
-    }
-  }
-  catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-  catch (InvalidOperationException iox) when (iox.Message == "Advisor is gone.") { return Results.NotFound(); }
-  catch (InvalidOperationException iox) when (iox.Message.StartsWith("gate:")) { return Results.Json(new { error = "Advisor became ineligible (" + iox.Message["gate:".Length..] + "); review, then approve." }, statusCode: 409); }
-  catch (Exception ex) { return Results.Json(new { error = "Approval could not be stored: " + ex.Message }, statusCode: 500); }
-  if (!s.Advisors.TryGetValue(advisorId, out var done)) return Results.NotFound();
-  Atomic.Audit(s, new AuditEvent { BoardId = boardId, Action = "advisor.approve", Detail = JsonSerializer.Serialize(new { advisor = advisorId, role = done.BoardRole }) });
-  return Results.Ok(done);
+  // Compatibility endpoint for older clients. Advisor selection is sufficient;
+  // no approval state or portrait/research review is required to participate.
+  var gate = RosterOps.ParticipationGate(s, a);
+  return gate is null ? Results.Ok(a) : Results.Json(new { error = "Advisor profile is not ready: " + gate }, statusCode: 409);
 });
 
 app.MapGet("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest req, Guid boardId, string? q, string? state) =>

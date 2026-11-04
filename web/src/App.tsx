@@ -4737,7 +4737,7 @@ const testModel = useMutation({
     post<unknown>("/api/boards/import", { snapshot: expText, hash: expHash, accountId })
       .then(() => {
         refresh("boards");
-        notify("Imported as a new board; advisors need re-approval.");
+        notify("Imported as a new board.");
       })
       .catch((e) => toastErr(e));
   const [bakText, setBakText] = useState("");
@@ -4850,14 +4850,6 @@ const testModel = useMutation({
       toastErr(e);
     } finally { setBoardAdvisorBusy(false); }
   };
-  const approveListedAdvisor = useMutation({
-    mutationFn: async (advisor: AdvisorFull) => {
-      await post(`/api/boards/${boardId}/advisors/${advisor.id}/sync-roster`, {});
-      await post(`/api/boards/${boardId}/advisors/${advisor.id}/approve`, {});
-    },
-    onSuccess: () => refresh("advisors", "setup"),
-    onError: (e) => toastErr(e),
-  });
   const [meetPicks, setMeetPicks] = useState<string[]>([]);
   const toggleMeetPick = (id: string) => {
     const all = (advisors.data ?? []).map((a) => a.id);
@@ -5035,7 +5027,7 @@ const testModel = useMutation({
     if (hay.includes("already in progress")) return "A response run is already in progress for this meeting. Wait for it to finish.";
     if (hay.includes("no advisors available")) {
       if (p.serverFixes.some((x) => x.toLowerCase().includes("re-pick"))) return "No selected participants can respond. Re-pick participants from this board\u2019s current advisors, then retry.";
-      return "No approved advisors yet. Approve at least one advisor on this board, then retry.";
+      return "No advisors are ready to respond. Select advisors with complete profiles on this board, then retry.";
     }
     if (hay.includes("paused")) return "Meeting is paused. Resume it, then retry responses.";
     if (hay.includes("interrupted")) return "The run was interrupted by a meeting change or a new message. Review the latest messages, then retry responses.";
@@ -6680,9 +6672,9 @@ const testModel = useMutation({
                         </li>{" "}
                         <li>
                           {" "}
-                          {setup.data.advisors.approved >= 1
-                            ? `✓ ${setup.data.advisors.approved} approved advisor(s)`
-                            : "✗ At least one approved advisor"}{" "}
+                          {setup.data.advisors.total >= 1
+                            ? `✓ ${setup.data.advisors.total} selected advisor(s)`
+                            : "✗ At least one selected advisor"}{" "}
                         </li>{" "}
                       </ul>{" "}
                       <p>
@@ -6723,7 +6715,7 @@ const testModel = useMutation({
                       </label>{" "}
                       {canManageBoard && (<button onClick={doImport}>
                         {" "}
-                        Import as new board (advisors unapproved){" "}
+                        Import as new board{" "}
                       </button>)}{" "}
                       {canManageBoard && (<>
                       <h3>Common settings</h3>{" "}
@@ -6905,8 +6897,8 @@ const testModel = useMutation({
                     </li>{" "}
                     <li>
                       {" "}
-                      {status.data.advisors.approved >= 1
-                        ? `✓ Advisors ${status.data.advisors.approved}/${status.data.advisors.total} approved`
+                      {status.data.advisors.total >= 1
+                        ? `✓ Advisors ${status.data.advisors.total} selected`
                         : `✗ Advisors (${status.data.advisors.total}/10)`}{" "}
                     </li>{" "}
                     <li>
@@ -7350,7 +7342,7 @@ const testModel = useMutation({
                       })()}
                       {(selImages.data ?? []).length > 0 ? (
                         <div aria-label="Portraits awaiting review">
-                          <h4>Portraits - accept one before approval</h4>
+                          <h4>Portraits - choose a picture</h4>
                           {(selImages.data ?? []).map((im) => {
                             const status = !im.review || im.review === "accepted" ? "accepted" : im.review === "pending" ? "pending" : "rejected";
                             return (
@@ -7464,13 +7456,12 @@ const testModel = useMutation({
                     const name = row?.entry.name ?? a.rosterName ?? a.boardRole;
                     return <div className="advisor-membership-row" key={a.id}>
                       <label className="advisor-member-choice">
-                        <input type="checkbox" checked disabled={!canManageBoard || boardAdvisorBusy || approveListedAdvisor.isPending}
+                        <input type="checkbox" checked disabled={!canManageBoard || boardAdvisorBusy}
                           onChange={() => void toggleBoardAdvisor(a.rosterEntryId)} />
                         <AdvisorSummary name={name} description={row?.entry.description ?? a.description}
                           portrait={<RosterListPortrait id={a.rosterEntryId} name={name} identity={originRevision()} />} />
                       </label>
-                      {!a.approved && <span className="advisor-row-action"><small>Not enabled for meetings</small>{canManageBoard &&
-                        <button type="button" disabled={approveListedAdvisor.isPending || boardAdvisorBusy} onClick={() => approveListedAdvisor.mutate(a)}>Approve for meetings</button>}</span>}
+
                     </div>;
                   })}
                   {!advisors.isLoading && (advisors.data ?? []).length === 0 && <p>No advisors selected.</p>}
@@ -7479,7 +7470,7 @@ const testModel = useMutation({
                   <h3>Available advisors</h3>
                   {(rosterNames.data ?? []).filter(row => !(advisors.data ?? []).some(a => a.rosterEntryId === row.entry.id)).map(row => (
                     <label className="advisor-member-choice" key={row.entry.id}>
-                      <input type="checkbox" checked={false} disabled={!canManageBoard || boardAdvisorBusy || approveListedAdvisor.isPending || (advisors.data ?? []).length >= 10 || !row.complete}
+                      <input type="checkbox" checked={false} disabled={!canManageBoard || boardAdvisorBusy || (advisors.data ?? []).length >= 10 || !row.complete}
                         onChange={() => void toggleBoardAdvisor(row.entry.id)} />
                       <AdvisorSummary name={row.entry.name} description={row.entry.description}
                         portrait={<RosterListPortrait id={row.entry.id} name={row.entry.name} identity={originRevision()} />}>

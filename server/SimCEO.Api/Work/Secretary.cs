@@ -221,7 +221,7 @@ public static class SecretaryContext
     secTexts.Sort(StringComparer.Ordinal);
     var evTextHash = Hashing.HashOf(string.Join("\n", secTexts));
     var dossierBits = new List<string>();
-    foreach (var a in s.Advisors.Values.Where(x => x.BoardId == m.BoardId && !x.Removed && x.Approved).OrderBy(x => x.Id.ToString()))
+    foreach (var a in s.Advisors.Values.Where(x => x.BoardId == m.BoardId && !x.Removed && RosterOps.ParticipationGate(s, x) is null).OrderBy(x => x.Id.ToString()))
     {
       s.Roster.TryGetValue(a.RosterEntryId, out var rent);
       dossierBits.Add(a.Id + ":" + a.RosterEntryId + ":rv" + a.RosterVersion + ":" + (a.BoardRole ?? "") + ":" + (rent is null ? "missing" : (rent.Name ?? "") + "|v" + rent.Version + "|" + Hashing.HashOf(rent.ProfileJson ?? "")));
@@ -416,7 +416,7 @@ public static class SecretaryContext
         if (!Guid.TryParse(r.Ref, out var eid)) continue;
         if (!s.Roster.TryGetValue(eid, out var ent) || ent is null) continue;
         if (r.Version.HasValue && r.Version.Value != ent.Version) continue;
-        var link = s.Advisors.Values.FirstOrDefault(a => a.BoardId == boardId && a.RosterEntryId == eid && !a.Removed && a.Approved);
+        var link = s.Advisors.Values.FirstOrDefault(a => a.BoardId == boardId && a.RosterEntryId == eid && !a.Removed);
         if (link is null) continue;
         string dossierText = (link.BoardRole ?? "") + " " + (ent.Name ?? "") + " " + (ent.ProfileJson ?? "");
         if (string.IsNullOrWhiteSpace(dossierText)) continue;
@@ -850,7 +850,7 @@ public static class EvidenceAvailability
         return new Status(false, "dossier removed");
       if (r.Version.HasValue && r.Version.Value != ent.Version)
         return new Status(false, "dossier superseded by v" + ent.Version);
-      var link = s.Advisors.Values.FirstOrDefault(a => a.BoardId == boardId && a.RosterEntryId == eid && !a.Removed && a.Approved);
+      var link = s.Advisors.Values.FirstOrDefault(a => a.BoardId == boardId && a.RosterEntryId == eid && !a.Removed);
       if (link is null) return new Status(false, "advisor not currently assigned");
       return new Status(true, "current");
     }
@@ -1066,7 +1066,7 @@ public static class SecretaryEndpoints
           __secEpoch = s.RestoreEpochId;
           var setupFixes = new List<string>();
           { var __sb = s.Boards.TryGetValue(cur0.BoardId, out var __sbb) ? __sbb : null; var __sl = __sb is null ? LeadSetup.ResolveLeadFor(s, cur0.BoardId) : LeadSetup.ResolveLeadForBoard(s, __sb); if (__sl is null) setupFixes.Add("Save the board-lead profile."); }
-          if (!s.Advisors.Values.Any(a => a.BoardId == cur0.BoardId && !a.Removed && a.Approved && RosterOps.ApprovalGate(s, a) is null)) setupFixes.Add("Approve at least one eligible advisor on this board.");
+          if (!s.Advisors.Values.Any(a => a.BoardId == cur0.BoardId && !a.Removed && RosterOps.ParticipationGate(s, a) is null)) setupFixes.Add("Select at least one advisor with a complete profile on this board.");
           if (setupFixes.Count > 0) return Results.Json(new { error = "Board setup is incomplete.", fixes = setupFixes }, statusCode: 409);
           if (PeopleOps.Guard(gw, req) is { } capped) return capped;
           if (cur0.State is not (MeetingState.Active or MeetingState.AwaitingBrief)) return Results.Json(new { error = "Meeting is not active." }, statusCode: 409);

@@ -1333,7 +1333,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setResearchStatus("incomplete");
         setStatusNote(
           ds === "unsupported"
-            ? "Research finished without grounded evidence — the compiled draft below is editable but marked incomplete, not done. Nothing is approved."
+            ? "Research finished without grounded evidence — the compiled draft below is editable but marked incomplete, not done."
             : "Research returned a compiled draft but WITHOUT supported evidence — marked incomplete, not done. Edit with care or retry."
         );
       }
@@ -1470,7 +1470,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
           setStatusNote("Research failed on the server; the entry was left pending. Your draft and brief are unchanged.");
         } else if (gds === "unsupported") {
           setResearchStatus("incomplete");
-          setStatusNote("Research finished without grounded evidence \u2014 editable draft below is marked incomplete, not done. Nothing is approved.");
+          setStatusNote("Research finished without grounded evidence \u2014 editable draft below is marked incomplete, not done.");
         } else {
           setResearchStatus("stale");
           setStatusNote("The draft changed while research ran (a newer version cleared this result). Review the current draft, then run research again if needed.");
@@ -1799,7 +1799,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setVerifyUnknown(true);
         setSupported(false);
         if (statusRef.current === "done") setResearchStatus("stale");
-        setStatusNote("Draft saved. Research state could not be verified - use Check again to refresh. Still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. Research state could not be verified - use Check again to refresh. Add this advisor to a board when you are ready.");
         if (staleKind(myOp, opId) === "ok") props.onSaved?.(updated);
         return;
       }
@@ -1817,7 +1817,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setResearchStatus("done");
         setSnapshotClearedNote("");
         setVerifyUnknown(false);
-        setStatusNote("Draft saved. The server kept the research proof with your paragraphs — still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. The server kept the research proof with your paragraphs — Add this advisor to a board when you are ready.");
       } else if (ds === "unsupported" || ((ds === "draft" || ds === "done" || ds === "saved") && !after.researchedAt)) {
         setClaims(stored.claims);
         setSources(stored.sources.length > 0 ? stored.sources : afterSources);
@@ -1827,7 +1827,7 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setSnapshotClearedNote("");
         setVerifyUnknown(false);
         adoptSavedDraft(after);
-        setStatusNote("Draft saved. Research remains unsupported (no grounded evidence) — still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. Research remains unsupported (no grounded evidence) — Add this advisor to a board when you are ready.");
       } else if (ds === "failed" || ds === "superseded") {
         setCompiled({ ...EMPTY_PARAGRAPHS });
         setHasCompiled(false);
@@ -1845,14 +1845,14 @@ export function CharacterEditor(props: CharacterEditorProps) {
         setSources([]);
         setResearchNote("");
         setHasCompiled(false);
-        setStatusNote("Draft saved. Still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. Add this advisor to a board when you are ready.");
       } else if (hadProof) {
         setSupported(false);
         if (statusRef.current === "done") setResearchStatus("stale");
         setStatusNote("Draft saved, but the research snapshot state is unclear — use Check again to refresh it. Your saved paragraphs are unchanged and canonical.");
         setVerifyUnknown(true);
       } else {
-        setStatusNote("Draft saved. Still unapproved and not attached to any board.");
+        setStatusNote("Draft saved. Add this advisor to a board when you are ready.");
       }
       observeCanon(opId, updated.version);
       if (after && typeof after.version === "number") observeCanon(opId, after.version);

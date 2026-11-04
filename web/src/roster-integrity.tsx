@@ -79,8 +79,7 @@ export function BoardAdvisorLinkPanel({ advisor }: { advisor: CanonicalAdvisor }
       {advisor.stale && (
         <p className="ri-warn">
           This roster entry changed since review. Pending old context is invalid \u2014
-          approve the new version before this advisor runs again. New research facts
-          are never silently approved.
+          use the current roster profile for future replies. Research evidence remains visible in References.
         </p>
       )}
     </section>

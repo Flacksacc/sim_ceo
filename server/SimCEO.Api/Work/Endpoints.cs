@@ -210,7 +210,7 @@ public static class SimCEOEndpoints
       if (policy is not ("focused" or "balanced" or "open")) policy = "balanced";
       s.Boards.TryGetValue(snapM.BoardId, out runBoard);
       lead = runBoard is null ? LeadSetup.ResolveLeadFor(s, snapM.BoardId) : LeadSetup.ResolveLeadForBoard(s, runBoard);
-      candidates = s.Advisors.Values.Where(a => a.BoardId == snapM.BoardId && !a.Removed && a.Approved).ToList();
+      candidates = s.Advisors.Values.Where(a => a.BoardId == snapM.BoardId && !a.Removed).ToList();
       try
       {
         using var pdoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(snapM.ParticipantIdsJson) ? "[]" : snapM.ParticipantIdsJson);
@@ -225,7 +225,7 @@ public static class SimCEOEndpoints
       catch (JsonException) { }
       foreach (var cand in candidates)
       {
-        var gate = RosterOps.ApprovalGate(s, cand);
+        var gate = RosterOps.ParticipationGate(s, cand);
         if (gate is null) eligible.Add(cand);
         else yielded.Add(new { advisor = cand.BoardRole, reason = gate });
       }
@@ -1578,9 +1578,7 @@ public static class SimCEOEndpoints
               // Lane B: fresh-fetch; a sync or edit/review during generation yields/discards the stale response.
               if (!s.Advisors.TryGetValue(adv.Id, out var freshAdv) || freshAdv.Removed || freshAdv.BoardId != cur.BoardId)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
-              if (!invitedIds.Contains(adv.Id) && !freshAdv.Approved)
-                { yielded.Add(new { advisor = adv.BoardRole, reason = "reapproval-required" }); continue; }
-              if (RosterOps.ApprovalGate(s, freshAdv) is { } gate)
+              if (RosterOps.ParticipationGate(s, freshAdv) is { } gate)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
               if (!laneBPrints.TryGetValue(adv.Id, out var laneBWanted) || !string.Equals(LaneBFingerprint(freshAdv), laneBWanted, StringComparison.Ordinal))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "stale-profile" }); continue; }

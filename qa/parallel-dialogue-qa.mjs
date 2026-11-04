@@ -16,7 +16,7 @@ assert.deepEqual(await (await fetch(fake + '/__log')).json(), []);
 let profile = await ok('POST','/api/profile', { name:'CEO Context', roleLabel:'Board Lead', background:'CEO-BACKGROUND-ONLY: six weeks of cash and no hiring experience.', familiarTopics:'Sales', simplerTopics:'Cash flow', commPrefs:'Conversational advice with a practical next step.' });
 const board = await ok('POST','/api/boards', { name:'Parallel dialogue QA', mission:'Hiring without exhausting runway', stage:'Early business', discussionPolicy:'balanced' });
 const advisors = [];
-for (const role of ['Operator Fast','Finance Slow','Designer Outside','Observer Pending']) {
+for (const role of ['Operator Fast','Finance Slow','Designer Outside','Observer Outside']) {
   const roster = await ok('POST','/api/roster', { name:role, description:'A fictional experienced advisor for focused advice.', profileJson:JSON.stringify({ background:'BACKSTORY ' + role + ': distinctive experience addressing hiring and runway decisions.', contributionCriteria:'Contribute when ' + role + ' can add a useful perspective.', reasoningApproach:'Use the experience of ' + role + ' to identify concrete tradeoffs.', responseStyle:'Speak conversationally and challenge assumptions with reasons.' }) });
   const form = new FormData();
   form.set('file', new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6kWQAAAAASUVORK5CYII=','base64')], {type:'image/png'}),'portrait.png');
@@ -25,9 +25,9 @@ for (const role of ['Operator Fast','Finance Slow','Designer Outside','Observer 
   const image = await uploaded.json();
   await ok('POST',`/api/images/${image.id}/review`,{decision:'accept'});
   const advisor = await ok('POST',`/api/roster/${roster.id}/copy`,{boardId:board.id,boardRole:role});
-  if (role !== 'Observer Pending') await ok('POST',`/api/boards/${board.id}/advisors/${advisor.id}/approve`);
   advisors.push({...advisor,rosterId:roster.id,role});
 }
+assert.ok((await ok('GET',`/api/boards/${board.id}/advisors`)).every(a=>a.approved===false),'No advisor approval calls or legacy flags are needed');
 async function meeting(title) { return ok('POST',`/api/boards/${board.id}/meetings`,{title,brief:'Assess hiring with six weeks of runway.',participantIds:[]}); }
 async function lead(m, question) { return ok('POST',`/api/meetings/${m.id}/messages`,{sender:'lead',content:question}); }
 async function activity(m) { return (await ok('GET',`/api/meetings/${m.id}/activity`)).discussion; }
@@ -73,7 +73,7 @@ const log = await (await fetch(fake+'/__log')).json();
 const selection = log.find(p=>p.full.includes('SELECT-MEETING-ADVISORS.'));
 assert.ok(selection.full.includes('CEO-BACKGROUND-ONLY'));
 assert.ok(selection.full.includes('Designer Outside'));
-assert.ok(!selection.full.includes('Observer Pending'));
+assert.ok(selection.full.includes('Observer Outside'),'Legacy approval flags do not exclude selected board members');
 for(const role of ['Operator Fast','Finance Slow']) {
   const first = log.find(p=>p.full.includes('YOUR TURN')&&!p.full.includes('PEER-REVIEW TURN:')&&p.full.includes('BOARD ROLE (board-specific, not canonical): '+role));
   assert.ok(first.full.includes('CEO-BACKGROUND-ONLY')&&first.full.includes('BACKSTORY '+role));
@@ -95,7 +95,7 @@ const explicitQuestion='QA-PARALLEL-DIALOGUE QA-SELECT-NONE: Have Designer Outsi
 await lead(explicit,explicitQuestion);
 await ok('POST',`/api/meetings/${explicit.id}/run`,{prompt:explicitQuestion});
 assert.deepEqual((await replies(explicit)).map(r=>r.advisorName),['Designer Outside']);
-console.log('PASS explicit advisor/output request overrides relevance decline without admitting unapproved advisors');
+console.log('PASS explicit advisor/output request overrides relevance decline while respecting the selected meeting participants');
 const abstain = await meeting('Optional peer review');
 const abstainQuestion='QA-PARALLEL-DIALOGUE QA-REVIEW-ABSTAIN: advise on hiring.';
 await lead(abstain,abstainQuestion); await ok('POST',`/api/meetings/${abstain.id}/run`,{prompt:abstainQuestion});

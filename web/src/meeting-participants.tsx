@@ -58,7 +58,7 @@ const LABEL: Record<ParticipantActivity, string> = {
   failed: "Response failed",
   interrupted: "Interrupted",
   excluded: "Not in this meeting",
-  "needs-approval": "Needs approval",
+  "needs-approval": "Listening",
   pending: "Waiting for reply",
   checking: "Checking activity",
   unavailable: "Activity unavailable",
@@ -79,7 +79,7 @@ const COUNT: Record<ParticipantActivity, string> = {
   failed: "failed",
   interrupted: "interrupted",
   excluded: "not in this meeting",
-  "needs-approval": "needs approval",
+  "needs-approval": "listening",
   pending: "waiting for reply",
   checking: "checking activity",
   unavailable: "activity unavailable",
@@ -156,6 +156,7 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
             return (
               <li key={m.key} data-activity={m.activity} title={m.displayName + ": " + LABEL[m.activity]} className={"mp-seat act-" + m.activity + (m.isSecretary ? " is-sec" : "")}>
                 <span className="mp-avatar" data-active={LIVE_DOT[m.activity] ? "true" : "false"}>
+                  <span className="mp-avatar-crop">
                   {hasPortrait ? (
                     <img src={m.portraitUrl as string} alt={"Portrait of " + m.displayName} loading="lazy" />
                   ) : (
@@ -163,6 +164,7 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
                       className={"mp-fallback" + (m.isSecretary ? " sec" : "")}
                       aria-hidden="true">{m.isSecretary ? "S" : initials(m.displayName)}</span>
                   )}
+                  </span>
                   {LIVE_DOT[m.activity] && <span className="mp-pulse" aria-hidden="true" />}
                 </span>
                 <span className="mp-meta">
