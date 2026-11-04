@@ -52,7 +52,7 @@ function chatContent(prompt) {
     if (prompt.includes("QA-REVIEW-ABSTAIN")) return { content: "ABSTAIN" };
     const raw = prompt.split("FIRST REPLIES (quoted discussion data):\n")[1]?.split("\nYOUR TURN")[0]?.trim();
     const peers = JSON.parse(raw?.split("\n")[0] || "[]");
-    const role = /BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1];
+    const role = /BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1]?.trim();
     const peer = peers.find(p => p.AdvisorName !== role);
     return { content: peer ? `[reply-to: ${peer.Sequence}] QA peer review from ${role}: this is an additional experience-based implication. [stance: Disagrees]` : "ABSTAIN" };
   }
@@ -93,7 +93,7 @@ function chatContent(prompt) {
   if (prompt.includes("YOUR TURN")) {
     if (prompt.includes("QA-REPLYERR")) return { status: 500, body: "qa reply failure" };
     if (prompt.includes("QA-ABSTAIN")) return { content: "ABSTAIN" };
-    if (prompt.includes("QA-PARALLEL-DIALOGUE")) return { content: "QA first reply from " + (/BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1] || "advisor") + ": with six weeks of cash, protect runway before adding fixed costs. [stance: Raises risk]" };
+    if (prompt.includes("QA-PARALLEL-DIALOGUE")) return { content: "QA first reply from " + (/BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1]?.trim() || "advisor") + ": with six weeks of cash, protect runway before adding fixed costs. [stance: Raises risk]" };
     return { content: "QA advisor reply with a clear position. [stance: Agrees]" };
   }
   if (prompt.includes("You guide Sim CEO board setup")) {
