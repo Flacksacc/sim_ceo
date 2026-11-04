@@ -140,10 +140,7 @@ function procIdentity(pid) {
   if (!r || r.error) return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: String((r && r.error && r.error.message) || "spawn-error").slice(0, 80) };
   if (r.signal) return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "signal" };
   const out = String((r.stdout || "")).trim();
-  if (r.status !== 0) {
-    if (out === "") return { status: "absent", pid: pid, creation: "", cmd: "", exe: "" };
-    return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-exit-" + r.status };
-  }
+  if (r.status !== 0) { return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-exit-" + r.status }; }
   if (out === "" || out === "null") return { status: "absent", pid: pid, creation: "", cmd: "", exe: "" };
   let j = null;
   try { j = JSON.parse(out); } catch (e) { return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-parse" }; }
@@ -176,6 +173,7 @@ function validateInitialIdentity(kind, ident, expectedAbs) {
   const expLower = String(expectedAbs || "").toLowerCase();
   if (!expLower || !path.isAbsolute(String(expectedAbs))) return false;
   if (cmdLower.indexOf(expLower) < 0) return false;
+  if (kind === "fake") { const portFlag = "--port " + String(FAKE_PORT); const portEq = "--port=" + String(FAKE_PORT); if (cmdLower.indexOf(portFlag) < 0 && cmdLower.indexOf(portEq) < 0) return false; }
   return true;
 }
 function identityMatches(recorded, current, wantKind) {
@@ -227,7 +225,7 @@ function listFilesRecursive(dir, exts) {
         if (en.isDirectory()) stack.push(full);
         else if (en.isFile()) {
           const low = en.name.toLowerCase();
-          if (exts.some((x) => low.endsWith(x))) out.push(full);
+          if (exts.length === 0 || exts.some((x) => low.endsWith(x))) out.push(full);
         }
       }
     }
@@ -238,17 +236,26 @@ function listFilesRecursive(dir, exts) {
 function prodInputFiles() {
   const files = [];
   const pushIf = (p) => { try { if (fs.statSync(p).isFile()) files.push(p); } catch (e) {} };
+  pushIf(path.join(REPO, "SimCEO.sln"));
+  pushIf(path.join(REPO, "NuGet.Config"));
   pushIf(path.join(REPO, "server", "SimCEO.Api", "SimCEO.Api.csproj"));
   pushIf(path.join(REPO, "server", "SimCEO.Api", "Program.cs"));
+  pushIf(path.join(REPO, "server", "SimCEO.Postgres", "SimCEO.Postgres.csproj"));
   pushIf(path.join(REPO, "web", "package.json"));
+  pushIf(path.join(REPO, "web", "package-lock.json"));
+  pushIf(path.join(REPO, "web", "tsconfig.json"));
   pushIf(path.join(REPO, "web", "vite.config.ts"));
   pushIf(path.join(REPO, "web", "index.html"));
   pushIf(path.join(REPO, "web", "boardroom-template.html"));
-  for (const sub of ["Data", "Domain", "Hubs", "Work"]) {
-    const d = path.join(REPO, "server", "SimCEO.Api", sub);
-    let entries = [];
-    try { entries = fs.readdirSync(d); } catch (e) {}
-    for (const f of entries) { if (/\.cs$/i.test(f)) pushIf(path.join(d, f)); }
+  pushIf(path.join(REPO, "web", "human-mount.html"));
+  try { for (const f of fs.readdirSync(path.join(REPO, "web", "public"))) pushIf(path.join(REPO, "web", "public", f)); } catch (e) {}
+  try { for (const f of fs.readdirSync(path.join(REPO, "web"))) { if (/^vite\..*\.config\.ts$/i.test(f)) pushIf(path.join(REPO, "web", f)); } } catch (e) {}
+  for (const srv of [path.join(REPO, "server", "SimCEO.Api"), path.join(REPO, "server", "SimCEO.Postgres")]) {
+    for (const f of listFilesRecursive(srv, [".cs", ".csproj", ".props", ".targets"])) {
+      const n = String(f).replace(/\\/g, "/");
+      if (n.includes("/bin/") || n.includes("/obj/")) continue;
+      files.push(f);
+    }
   }
   const webSrc = path.join(REPO, "web", "src");
   for (const f of listFilesRecursive(webSrc, [".ts", ".tsx", ".js", ".jsx", ".css"])) files.push(f);
@@ -280,7 +287,11 @@ function publishOutputInventory() {
     }
   } catch (e) {}
   appsettings.sort();
-  return { dll, dllSha, dllSize, deps, depsSha: sha256File(deps), rc, rcSha: sha256File(rc), idx, idxSha: sha256File(idx), jsFiles, js: hashMap(jsFiles, API_DIR), cssFiles, css: hashMap(cssFiles, API_DIR), appsettings, appsettingsHashes: hashMap(appsettings, API_DIR) };
+  const dllTop = [];
+  try { for (const f of fs.readdirSync(API_DIR)) { if (/\.dll$/i.test(f)) dllTop.push(path.join(API_DIR, f)); } } catch (e) {}
+  dllTop.sort();
+  const allWww = listFilesRecursive(path.join(API_DIR, "wwwroot"), []);
+  return { dll, dllSha, dllSize, deps, depsSha: sha256File(deps), rc, rcSha: sha256File(rc), idx, idxSha: sha256File(idx), jsFiles, js: hashMap(jsFiles, API_DIR), cssFiles, css: hashMap(cssFiles, API_DIR), appsettings, appsettingsHashes: hashMap(appsettings, API_DIR), dlls: hashMap(dllTop, API_DIR), wwwrootAll: hashMap(allWww, API_DIR) };
 }
 function hasKestrelKeyWalk(v) {
   const seen = new Set();
@@ -319,10 +330,11 @@ function verifyPublishedEndpointConfigStrict() {
     if (flatHits.length > 0 && hasKestrelKeyWalk(j)) { console.log("FATAL published flattened endpoint config in " + f); process.exit(2); }
   }
 }
-function writeBuildManifest(success, extra) {
-  const commit = sourceCommit();
-  const dirty = sourceDirtyList();
-  const inputs = prodInputFiles();
+function writeBuildManifest(success, extra, pre) {
+  const commit = (pre && pre.commit) || sourceCommit();
+  const dirty = (pre && pre.dirty) || sourceDirtyList();
+  const inputs = (pre && pre.inputs) || prodInputFiles();
+  const inputsCaptured = (pre && pre.inputs) ? "pre-build" : "at-write";
   const inv = publishOutputInventory();
   const qaFile = path.join(REPO, "qa", "advisor-integrated-qa.mjs");
   const fakeFile = EXPECTED_FAKE_JS;
@@ -335,7 +347,8 @@ function writeBuildManifest(success, extra) {
     commit: commit, dirty: dirty.dirty, dirtyFiles: dirty.files,
     nodeVersion: nodeV, dotnetVersion: dotnetV, builderPid: process.pid,
     inputs: hashMap(inputs, REPO),
-    outputs: { dllSha: inv.dllSha, dllSize: inv.dllSize, depsSha: inv.depsSha, rcSha: inv.rcSha, wwwrootSha: inv.idxSha, js: inv.js, css: inv.css, appsettings: inv.appsettingsHashes },
+    inputsCaptured: inputsCaptured,
+    outputs: { dllSha: inv.dllSha, dllSize: inv.dllSize, depsSha: inv.depsSha, rcSha: inv.rcSha, wwwrootSha: inv.idxSha, js: inv.js, css: inv.css, appsettings: inv.appsettingsHashes, dlls: inv.dlls, wwwrootAll: inv.wwwrootAll },
     qaSha: sha256File(qaFile), fakeSha: sha256File(fakeFile), helperSha: sha256File(helperFile),
     error: (extra && extra.error) || ""
   };
@@ -358,6 +371,15 @@ function verifyBuildManifestForStart() {
   const curCss = JSON.stringify(inv.css), recCss = JSON.stringify(b.outputs.css || {});
   if (curCss !== recCss) { console.log("FATAL current served CSS differs from build manifest (rebuild before start)"); process.exit(2); }
   const curQa = sha256File(path.join(REPO, "qa", "advisor-integrated-qa.mjs"));
+  if (!b.inputs || typeof b.inputs !== "object" || Array.isArray(b.inputs)) { console.log("FATAL build manifest missing production input hashes (rebuild before start)"); process.exit(2); }
+  const curInputs = hashMap(prodInputFiles(), REPO);
+  if (JSON.stringify(curInputs) !== JSON.stringify(b.inputs)) { console.log("FATAL current production inputs differ from successful build manifest (rebuild before start)"); process.exit(2); }
+  if (!inv.depsSha || inv.depsSha !== b.outputs.depsSha) { console.log("FATAL current deps.json differs from build manifest (rebuild before start)"); process.exit(2); }
+  if (!inv.rcSha || inv.rcSha !== b.outputs.rcSha) { console.log("FATAL current runtimeconfig differs from build manifest (rebuild before start)"); process.exit(2); }
+  const curApps = JSON.stringify(inv.appsettingsHashes), recApps = JSON.stringify(b.outputs.appsettings || {});
+  if (curApps !== recApps) { console.log("FATAL current appsettings differ from build manifest (rebuild before start)"); process.exit(2); }
+  if (JSON.stringify(inv.dlls) !== JSON.stringify(b.outputs.dlls || {})) { console.log("FATAL current publish DLL set differs from build manifest (rebuild before start)"); process.exit(2); }
+  if (JSON.stringify(inv.wwwrootAll) !== JSON.stringify(b.outputs.wwwrootAll || {})) { console.log("FATAL current served wwwroot files differ from build manifest (rebuild before start)"); process.exit(2); }
   const curFake = sha256File(EXPECTED_FAKE_JS);
   const curHelper = sha256File(path.join(REPO, "qa", "own-local-stack.mjs"));
   if (!curQa || curQa !== b.qaSha) { console.log("FATAL current QA differs from build manifest (rebuild before start)"); process.exit(2); }
@@ -446,6 +468,11 @@ async function cmdBuild() {
   const buildLogPath = path.join(LOGDIR, "build-own.log");
   function logBoth(s) { console.log(s); try { fs.appendFileSync(buildLogPath, "[" + new Date().toISOString() + "] " + s + "\n"); } catch (e) {} }
   logBoth("own build start commit=" + sourceCommit());
+  const preCommit = sourceCommit();
+  const preDirty = sourceDirtyList();
+  const preInputs = prodInputFiles();
+  const pre = { commit: preCommit, dirty: preDirty, inputs: preInputs };
+  logBoth("pre-build inputs hashed n=" + preInputs.length + " commit=" + String(preCommit).slice(0, 12));
   const webLog = path.join(LOGDIR, "build-web.log");
   let npmCmd = "npm.cmd";
   let npmCli = "";
@@ -468,9 +495,9 @@ async function cmdBuild() {
         ci.stderr.on("data", (d) => { ciErr += String(d); });
         const ciCode = await new Promise((resolve) => { const to = setTimeout(() => { try { ci.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); ci.on("close", (c) => { clearTimeout(to); resolve(c); }); ci.on("error", () => { clearTimeout(to); resolve(127); }); });
         try { fs.appendFileSync(webLog, ciOut + "\n" + ciErr); } catch (e) {}
-        if (ciCode !== 0) { logBoth("FATAL npm ci failed code=" + ciCode); writeBuildManifest(false, { error: "npm-ci-" + ciCode }); process.exit(2); }
+        if (ciCode !== 0) { logBoth("FATAL npm ci failed code=" + ciCode); writeBuildManifest(false, { error: "npm-ci-" + ciCode }, pre); process.exit(2); }
       } else { logBoth("skip npm ci (node_modules fresh)"); }
-    } catch (e) { logBoth("FATAL npm ci threw: " + String((e && e.message) || e).slice(0, 160)); writeBuildManifest(false, { error: "npm-ci-throw" }); process.exit(2); }
+    } catch (e) { logBoth("FATAL npm ci threw: " + String((e && e.message) || e).slice(0, 160)); writeBuildManifest(false, { error: "npm-ci-throw" }, pre); process.exit(2); }
     logBoth("step web build (controlled npm.cmd absolute, windowsHide, bounded args, no shell)");
     const wArgs = npmCli ? [npmCli, "--prefix", "web", "run", "build"] : ["--prefix", "web", "run", "build"];
     const wExe = npmCli ? process.execPath : npmCmd;
@@ -480,8 +507,8 @@ async function cmdBuild() {
     w.stderr.on("data", (d) => { wErr += String(d); });
     const wCode = await new Promise((resolve) => { const to = setTimeout(() => { try { w.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); w.on("close", (c) => { clearTimeout(to); resolve(c); }); w.on("error", () => { clearTimeout(to); resolve(127); }); });
     try { fs.appendFileSync(webLog, wOut + "\n" + wErr); } catch (e) {}
-    if (wCode !== 0) { logBoth("FATAL web build failed code=" + wCode); writeBuildManifest(false, { error: "web-build-" + wCode }); process.exit(2); }
-    if (Date.now() >= deadline) { logBoth("FATAL build budget exceeded after web"); writeBuildManifest(false, { error: "budget-web" }); process.exit(2); }
+    if (wCode !== 0) { logBoth("FATAL web build failed code=" + wCode); writeBuildManifest(false, { error: "web-build-" + wCode }, pre); process.exit(2); }
+    if (Date.now() >= deadline) { logBoth("FATAL build budget exceeded after web"); writeBuildManifest(false, { error: "budget-web" }, pre); process.exit(2); }
     logBoth("step dotnet publish (controlled, windowsHide, bounded args)");
     const a = spawn("dotnet", ["publish", "server/SimCEO.Api/SimCEO.Api.csproj", "-c", "Release", "-o", API_DIR], { cwd: REPO, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let aOut = "", aErr = "";
@@ -489,22 +516,22 @@ async function cmdBuild() {
     a.stderr.on("data", (d) => { aErr += String(d); });
     const aCode = await new Promise((resolve) => { const to = setTimeout(() => { try { a.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); a.on("close", (c) => { clearTimeout(to); resolve(c); }); a.on("error", () => { clearTimeout(to); resolve(127); }); });
     try { fs.appendFileSync(apiLog, aOut + "\n" + aErr); } catch (e) {}
-    if (aCode !== 0) { logBoth("FATAL dotnet publish failed code=" + aCode); writeBuildManifest(false, { error: "dotnet-publish-" + aCode }); process.exit(2); }
+    if (aCode !== 0) { logBoth("FATAL dotnet publish failed code=" + aCode); writeBuildManifest(false, { error: "dotnet-publish-" + aCode }, pre); process.exit(2); }
     const distDir = path.join(REPO, "web", "dist");
     const wwwDir = path.join(API_DIR, "wwwroot");
     try {
-      if (!fs.existsSync(path.join(distDir, "index.html"))) { logBoth("FATAL web dist missing index.html"); writeBuildManifest(false, { error: "dist-missing" }); process.exit(2); }
+      if (!fs.existsSync(path.join(distDir, "index.html"))) { logBoth("FATAL web dist missing index.html"); writeBuildManifest(false, { error: "dist-missing" }, pre); process.exit(2); }
       try { fs.rmSync(wwwDir, { recursive: true, force: true }); } catch (e) {}
       fs.mkdirSync(wwwDir, { recursive: true });
       copyDir(distDir, wwwDir);
       logBoth("staged wwwroot from web/dist");
-    } catch (e) { logBoth("FATAL wwwroot stage failed: " + String((e && e.message) || e).slice(0, 160)); writeBuildManifest(false, { error: "wwwroot-stage" }); process.exit(2); }
+    } catch (e) { logBoth("FATAL wwwroot stage failed: " + String((e && e.message) || e).slice(0, 160)); writeBuildManifest(false, { error: "wwwroot-stage" }, pre); process.exit(2); }
     verifyPublishedEndpointConfigStrict();
-    const m = writeBuildManifest(true, {});
+    const m = writeBuildManifest(true, {}, pre);
     logBoth("own build ok commit=" + m.commit.slice(0,12) + " dll=" + String(m.outputs.dllSha).slice(0,12) + " wwwroot=" + String(m.outputs.wwwrootSha).slice(0,12) + " elapsed=" + (Date.now() - t0));
   } catch (e) {
     logBoth("FATAL build threw: " + String((e && e.message) || e).slice(0, 200));
-    try { writeBuildManifest(false, { error: "throw" }); } catch (ee) {}
+    try { writeBuildManifest(false, { error: "throw" }, pre); } catch (ee) {}
     process.exit(2);
   }
 }
@@ -551,6 +578,7 @@ async function cmdStart() {
   async function failCleanupAndExit(reason, code) {
     if (stopping) return;
     stopping = true; supervisionActive = false;
+    for (const c of owned) { try { if (!c.killed && c.exitCode === null) c.kill(); } catch (e) {} }
     const rec = { apiPid: api ? api.pid : 0, fakePid: fake ? fake.pid : 0, apiIdent: null, fakeIdent: null };
     try { rec.apiIdent = api ? procIdentity(api.pid) : { status: "absent" }; } catch (e) { rec.apiIdent = { status: "unavailable" }; }
     try { rec.fakeIdent = fake ? procIdentity(fake.pid) : { status: "absent" }; } catch (e) { rec.fakeIdent = { status: "unavailable" }; }
@@ -579,6 +607,7 @@ async function cmdStart() {
     if (stopping) return;
     stopping = true; supervisionActive = false;
     console.log("signal cleanup " + sig);
+    for (const c of owned) { try { if (!c.killed && c.exitCode === null) c.kill(); } catch (e) {} }
     cleanupFresh("signal-" + sig, { apiPid: api ? api.pid : 0, fakePid: fake ? fake.pid : 0, apiIdent: api ? procIdentity(api.pid) : null, fakeIdent: fake ? procIdentity(fake.pid) : null }).then((ok) => {
       if (!ok) { console.log("FATAL signal cleanup incomplete"); process.exit(2); }
       process.exit(0);

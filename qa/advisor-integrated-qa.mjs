@@ -299,10 +299,10 @@ const CLEANUP_BUDGET_MS = 20000;
 const realSleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 let retainedPending = [];
 function localCap(localEnd, want) { const g = remainingMs(); const l = (typeof localEnd === "number" ? localEnd : DEADLINE_MS) - Date.now(); const cap = Math.min(want, g, l); if (!(cap > 0)) throw new Error("LOCAL DEADLINE EXCEEDED (want=" + want + " globalRem=" + g + " localRem=" + l + "); aborting into cleanup."); return cap; }
-async function ev(fn, arg, tag) { assertDeadline("evaluate:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at evaluate:" + (tag || "anon")); return await ev(fn, arg); }
-async function wft(ms, tag) { assertDeadline("wait:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) return; await wft(Math.min(ms, rem)); }
-async function respJson(r, tag) { assertDeadline("respbody:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at respbody:" + (tag || "anon")); return await r.json(); }
-async function pev(pg, fn, arg, tag) { assertDeadline("probe-evaluate:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at probe-evaluate:" + (tag || "anon")); return await pg.evaluate(fn, arg); }
+async function ev(fn, arg, tag) { assertDeadline("evaluate:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at evaluate:" + (tag || "anon")); if (typeof page === "undefined" || !page || page.isClosed()) throw new Error("evaluate without live page at " + (tag || "anon")); const cap = Math.min(15000, rem); const op = (async () => await page.evaluate(fn, arg))(); trackPromise(op); return await Promise.race([op, realSleep(cap).then(() => { throw new Error("evaluate timeout " + cap + "ms at " + (tag || "anon")); })]); }
+async function wft(ms, tag) { assertDeadline("wait:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) return; const want = Math.max(0, Number(ms) || 0); await sleep(Math.min(want, rem)); }
+async function respJson(r, tag) { assertDeadline("respbody:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at respbody:" + (tag || "anon")); if (!r || typeof r.json !== "function") throw new Error("respbody without json at " + (tag || "anon")); const cap = Math.min(15000, rem); const op = (async () => await r.json())(); trackPromise(op); return await Promise.race([op, realSleep(cap).then(() => { throw new Error("respbody timeout " + cap + "ms at " + (tag || "anon")); })]); }
+async function pev(pg, fn, arg, tag) { assertDeadline("probe-evaluate:" + (tag || "anon")); const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at probe-evaluate:" + (tag || "anon")); if (!pg || pg.isClosed()) throw new Error("probe-evaluate without live probe page at " + (tag || "anon")); const cap = Math.min(15000, rem); const op = (async () => await pg.evaluate(fn, arg))(); trackPromise(op); return await Promise.race([op, realSleep(cap).then(() => { throw new Error("probe-evaluate timeout " + cap + "ms at " + (tag || "anon")); })]); }
 const M1 = "QA-CRIT-" + run, M2 = "QA-REAS-" + run, M3 = "QA-STYLE-" + run;
 const N1 = "QA-CRIT2-" + run, N2 = "QA-REAS2-" + run, N3 = "QA-STYLE2-" + run;
 const OWNED_URL_MARK = "doc-seed-" + run;
@@ -512,22 +512,39 @@ async function stepSetup() {
     const pidRec = pidBind ? pidBind.record : null;
     const pidNonce = pidRec ? String(pidRec.nonce || (pidRec.manifest && pidRec.manifest.nonce) || "") : "";
     const pidCommit = pidRec ? String(pidRec.commit || (pidRec.manifest && pidRec.manifest.commit) || "") : "";
-    const nonceTieOk = !!pidRec && pidNonce === String(m ? m.nonce : "") && pidNonce.length >= 4 && pidCommit === String(m ? m.commit : "");
+    const pidController = pidRec ? String(pidRec.controllerPid || (pidRec.manifest && pidRec.manifest.controllerPid) || "") : "";
+    const mController = m ? String(m.controllerPid || "") : "";
+    const pidApiPid = pidRec ? Number(pidRec.apiPid || (pidRec.manifest && pidRec.manifest.apiPid) || 0) : 0;
+    const pidFakePid = pidRec ? Number(pidRec.fakePid || (pidRec.manifest && pidRec.manifest.fakePid) || 0) : 0;
+    const mApiPid = m ? Number(m.apiPid || 0) : 0;
+    const mFakePid = m ? Number(m.fakePid || 0) : 0;
+    const recApiIdent = pidRec ? (pidRec.apiIdent || (pidRec.manifest && pidRec.manifest.apiIdent) || null) : null;
+    const recFakeIdent = pidRec ? (pidRec.fakeIdent || (pidRec.manifest && pidRec.manifest.fakeIdent) || null) : null;
+    const mApiIdent = m ? (m.apiIdent || null) : null;
+    const mFakeIdent = m ? (m.fakeIdent || null) : null;
+    function identWellFormed(x) { return !!x && x.status === "alive" && String(x.creation || "").length > 0 && String(x.cmd || "").length > 0 && String(x.exe || "").length > 0; }
+    const ctrlOk = !!pidRec && !!m && pidController !== "" && mController !== "" && pidController === mController;
+    const childPidOk = !!pidRec && !!m && Number.isInteger(pidApiPid) && pidApiPid > 0 && pidApiPid === mApiPid && Number.isInteger(pidFakePid) && pidFakePid > 0 && pidFakePid === mFakePid;
+    const childIdentOk = identWellFormed(recApiIdent) && identWellFormed(recFakeIdent) && identWellFormed(mApiIdent) && identWellFormed(mFakeIdent) && String(recApiIdent.cmd || "") === String(mApiIdent.cmd || "") && String(recFakeIdent.cmd || "") === String(mFakeIdent.cmd || "") && String(recApiIdent.creation || "") === String(mApiIdent.creation || "") && String(recFakeIdent.creation || "") === String(mFakeIdent.creation || "");
+    const nonceTieOk = !!pidRec && pidNonce === String(m ? m.nonce : "") && pidNonce.length >= 4 && pidCommit === String(m ? m.commit : "") && ctrlOk && childPidOk && childIdentOk;
     const atOk = !!m && Number.isFinite(Number(m.at)) && Number(m.at) > 0 && Number(m.at) <= Date.now() + 60000;
     let servedOk = false, servedDetail = "unverified";
     try {
       const idxRes = await get("/");
       const idxText = typeof idxRes.text === "string" ? idxRes.text : "";
-      servedOk = idxRes.status === 200 && idxText.length > 500;
-      servedDetail = "index status=" + idxRes.status + " len=" + idxText.length;
+      const idxSha = (() => { try { return crypto.createHash("sha256").update(Buffer.from(idxText, "utf8")).digest("hex"); } catch (e2) { return ""; } })();
+      const shaEq = !!idxSha && !!m && String(idxSha).toLowerCase() === String(m.wwwrootSha || "").toLowerCase();
+      servedOk = idxRes.status === 200 && idxText.length > 500 && !!shaEq;
+      servedDetail = "index status=" + idxRes.status + " len=" + idxText.length + " shaEq=" + (!!shaEq);
     } catch (e) { servedOk = false; servedDetail = "index fetch threw: " + String((e && e.message) || e).slice(0,80); }
     const bindOk = presentOk && hashOk && nonceTieOk && atOk && servedOk;
-    const identDetail = bind ? ("manifest=" + bind.path + " pid=" + (pidBind ? pidBind.path : "none") + " commit=" + String(m.commit).slice(0,12) + " nonce=" + String(m.nonce).slice(0,12) + " instance=" + String(m.instance) + " dll=" + String(m.dllSha).slice(0,12) + " wwwroot=" + String(m.wwwrootSha).slice(0,12) + " qaMatch=" + (String(m.qaSha||"").toLowerCase()===String(qaShaNow).toLowerCase()) + " fakeMatch=" + (String(m.fakeSha||"").toLowerCase()===String(fakeShaNow).toLowerCase()) + " helperMatch=" + (String(m.helperSha||"").toLowerCase()===String(helperShaNow).toLowerCase()) + " nonceTie=" + nonceTieOk + " served=" + servedDetail) : "manifest missing";
+    const identDetail = bind ? ("manifest=" + bind.path + " pid=" + (pidBind ? pidBind.path : "none") + " commit=" + String(m.commit).slice(0,12) + " nonce=" + String(m.nonce).slice(0,12) + " instance=" + String(m.instance) + " dll=" + String(m.dllSha).slice(0,12) + " wwwroot=" + String(m.wwwrootSha).slice(0,12) + " qaMatch=" + (String(m.qaSha||"").toLowerCase()===String(qaShaNow).toLowerCase()) + " fakeMatch=" + (String(m.fakeSha||"").toLowerCase()===String(fakeShaNow).toLowerCase()) + " helperMatch=" + (String(m.helperSha||"").toLowerCase()===String(helperShaNow).toLowerCase()) + " nonceTie=" + nonceTieOk + " ctrl=" + ctrlOk + " childPid=" + childPidOk + " childIdent=" + childIdentOk + " served=" + servedDetail) : "manifest missing";
     ok("setup-trusted-build-binding", bindOk, identDetail);
     ok("setup-build-input-nonce-controller-child", presentOk && nonceTieOk, "nonce/controller/child identity tied: " + identDetail.slice(0,220));
-    ok("setup-served-assets-tied", servedOk, servedDetail + " (DLL/runtime + served index bound to nonce/controller identity)");
+    ok("setup-served-assets-tied", servedOk, servedDetail + " (served index sha256 equals manifest wwwroot; DLL/runtime + served index bound to nonce/controller identity)");
     if (!bindOk) failExit("trusted build binding failed BEFORE first mutation (build-time production input + DLL/runtime/ALL served assets tied nonce/controller/child identity + QA/fake/helper hashes). " + identDetail);
     try { globalThis.__manifestNonce = String(m.nonce); globalThis.__manifestCommit = String(m.commit); } catch {}
+    ok("setup-manifest-globals-reported", String(globalThis.__manifestNonce || "") === String(m.nonce) && String(globalThis.__manifestCommit || "") === String(m.commit), "nonce=" + String(m.nonce).slice(0,12) + " commit=" + String(m.commit).slice(0,12));
   } else {
     ok("setup-trusted-build-binding", true, "legacy web " + WEB + " skips OWN manifest binding");
     ok("setup-build-input-nonce-controller-child", true, "legacy web skips OWN manifest binding");
