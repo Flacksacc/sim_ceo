@@ -2673,6 +2673,14 @@ async function stepNavigation() {
     const secLoc = page.locator(d.sec).first();
     let secVis = false; try { await locWaitFor(secLoc, "nav-wait-" + d.seg); secVis = await locVisible(secLoc, "nav-vis-" + d.seg); } catch { secVis = false; }
     let secTxt = ""; if (secVis) { try { secTxt = await ev((el) => { let t = ""; try { t = el.innerText || ""; } catch (e) { t = ""; } try { const els = Array.from(el.querySelectorAll("input,textarea,select")); for (const x of els) { try { const cs = (x.ownerDocument.defaultView || window).getComputedStyle(x); if (!cs || cs.visibility === "hidden" || cs.display === "none") continue; const r = x.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue; if ((x.value || "").length > 0) t += "\n" + x.value; } catch (e) {} } } catch (e) {} return t; }, undefined, "nav-eval-" + d.seg).catch(() => ""); if (!secTxt) secTxt = await locText(secLoc, "nav-text-" + d.seg); } catch (e) { secTxt = ""; } } const normTxt = (secTxt || "").replace(/\s+/g, " ");
+    if (secVis) {
+      if (d.seg === "profile") await waitProfileReady();
+      const fieldValues = await raceCap(secLoc.locator("input,textarea,select").evaluateAll((els) => els.filter((el) => {
+        const style = getComputedStyle(el), rect = el.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      }).map((el) => el.value || "").join("\n")), 8000, "nav-field-values-" + d.seg);
+      secTxt += "\n" + fieldValues;
+    }
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await locVisible(hLoc.first(), "nav-head-" + d.seg); if (!headOk) headOk = secTxt.includes(d.head); }
     let entityOk = true; let emptyVerified = false;
