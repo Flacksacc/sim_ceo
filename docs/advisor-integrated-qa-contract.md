@@ -2,7 +2,7 @@
 
 Companion to `qa/advisor-integrated-qa.mjs`. Read this before executing.
 No App/server changes were made for this QA; only this QA file + this doc exist.
-Closure revision addressing all 21 findings of the 3207f49 review (frontend 16b0411 in .tmp/advisor-release, server dbb698c; both read-only, no production edits).
+Closure revision addressing all 21 findings of the ce5b492 review (frontend 0e7230b+7b3986f in .tmp/advisor-final-frontend, server dbb698c; both read-only, no production edits; fake http import cb5fad4 preserved). Small function-local repairs only; primary runs actual runtime.
 This author never executed the script (node --check only); primary executes it
 against the actual compiled combined app. No runtime claims are made here. Exit 0=PASS, 1=FAIL (assertion), 2=FATAL/setup (no raw JSON or tokens in logs; redacted summaries only).
 
@@ -13,7 +13,7 @@ against the actual compiled combined app. No runtime claims are made here. Exit 
   published API wwwroot, fake-backed) or `:15180` (owned compiled Docker, real
   provider, needs `ALLOW_LIVE_PROVIDER=1`).
 - Fake prompt log at `QA_FAKE=http://127.0.0.1:15302` (dedicated
-  `qa/advisor-integrated-fake.mjs`: deterministic `COMPILE-CHARACTER-PARAGRAPHS` echoing the researched name, `YOUR TURN`/bid pacing, structured secretary JSON echoing the owned run marker, `QA-SLEEP-*` pacing; reuses research/chat schema from `qa/fake-provider.mjs` and secretary schema from `qa/secretary-fake.mjs`). Required in native 15300 mode; live 15180 mode has no prompt log (explicit UNPROVED path, fails closed). The script NEVER issues a global prompt-log DELETE: it captures a baseline timestamp at setup and filters all prompt assertions to `t >= baseline` plus owned run markers. Mode is selected explicitly by `ALLOW_LIVE_PROVIDER` (`native` vs `live`), never by log availability.
+  `qa/advisor-integrated-fake.mjs`: deterministic `COMPILE-CHARACTER-PARAGRAPHS` echoing the researched name, `YOUR TURN`/bid pacing, structured secretary JSON echoing the owned run marker, `QA-SLEEP-*` pacing; reuses research/chat schema from `qa/fake-provider.mjs` and secretary schema from `qa/secretary-fake.mjs`). Required in native 15300 mode; live 15180 mode has no prompt log (explicit UNPROVED path, fails closed). The script NEVER issues a global prompt-log DELETE: it captures a baseline timestamp at setup and filters all prompt assertions to `t >= baseline` plus owned run markers. Mode is selected explicitly by `ALLOW_LIVE_PROVIDER` (`native` vs `live`), never by log availability. Native request bodies are exact: PATCH brief is QUESTION.slice(0,800) + CAS fields without advisor ID; run body is {policy,prompt,evidenceSupported,leadVersion}; lead POST content is exactly QUESTION. Secretary completion requires completed + noteId under one deadline with correlated provisional note; direction rows are validated before the no-decision proof. Debug scanner uses independent GUID/string/object/array/primitive fixtures plus a clean negative and hidden-attribute exclusion; creation is scanned while open with visible form values.
 
 ## Assumed UI contracts (verified in source, not invented)
 
@@ -22,7 +22,7 @@ against the actual compiled combined app. No runtime claims are made here. Exit 
   roster seeds and fresh-collection readbacks.
 - Rail navigation: `nav.rail` buttons by exact name — Boards, Roster,
   Board Advisors, Meetings, Sources, Records, People, Activity, Settings,
-  Profile, Help. Board-scoped destinations (`advisors,meet,sources,records,people,activity`) require `?board=<ownedBoardA>` (App filters them board-free, `App.tsx:641-648,5731`); board-free tabs use `#/seg`. Hash arrival + board context + rendered section/entity are asserted per destination; back/forward assert exact hashes with board context. All eleven are visited; no skipped destinations.
+  Profile, Help. Board-scoped destinations (`advisors,meet,sources,records,people,activity`) require `?board=<ownedBoardA>` (App filters them board-free, `App.tsx:641-648,5731`); board-free tabs use `#/seg`. Hash arrival + board context + visible heading/section + owned entity are asserted per destination; back/forward assert the same. All eleven are visited; board context is restored via an owned board route before the rail loop; direct URLs use WEB + "/" + boardHash(seg).
 - Creation: rail button `+ Create new Advisor` opens
   `div.modal[role=dialog][aria-label="Create advisor"]` containing
   `section[aria-label="Create advisor"]` with `#cc-name`, `#cc-description`,
