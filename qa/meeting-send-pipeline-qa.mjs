@@ -119,6 +119,7 @@ async function apiStub(route) {
     const b = bodyOf(); lastPatchBody = b; patchCalls++;
     if (patchBehavior === "fail500-once") { patchBehavior = "success"; return J({ error: "brief store failed" }, 500); }
     if (patchBehavior === "fail409-brief-once") { patchBehavior = "success"; return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
+    if (patchBehavior === "fail401-once") { patchBehavior = "success"; return J({ error: "Authentication required." }, 401); }
     const mt = meetings[m[1]];
     if (mt && typeof b.brief === "string") {
       const isAuto = b.briefAutoInit === true || b.autoInit === true;
@@ -127,7 +128,7 @@ async function apiStub(route) {
         const cur = mt.brief || "";
         let expected = null;
         if (typeof b.expectedBrief === "string") expected = b.expectedBrief;
-        if (expected !== null) { if (cur !== expected && cur !== proposed) return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
+        if (expected !== null) { const expBlank = expected.trim() === ""; const curBlank = cur.trim() === ""; if (expBlank && curBlank) {} else if (cur !== expected && cur !== proposed) return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
         else { if (cur.trim() !== "" && cur !== proposed) return J({ error: "Brief was already set by a newer message; auto-init discarded. Retry responses." }, 409); }
         if (b.leadSequence !== undefined && b.leadSequence !== null) {
           const lst = messages[m[1]] || [];
@@ -757,11 +758,57 @@ async function testPatchFailureReplyFrozen() {
   ok("patchretry-prompt-frozen", lastRunBody && lastRunBody.prompt === "Patch fail lead", JSON.stringify(lastRunBody));
   ok("patchretry-still-once", countFrom(mark2, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark2, "POST", "/api/meetings/m-empty/messages"));
 }
+async function testWhitespaceBriefAutoInit() {
+  const mark = reqLog.length;
+  resetProbeState();
+  capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
+  meetings["m-empty"].brief = "   ";
+  await page.reload();
+  await openMeeting("m-empty", "Empty brief session");
+  const box = composer();
+  await box.fill("Whitespace blank lead");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("wspace-lead-once", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+  ok("wspace-patch-once", countFrom(mark, "PATCH", "/api/meetings/m-empty") === 1, "patch=" + countFrom(mark, "PATCH", "/api/meetings/m-empty"));
+  ok("wspace-run-once", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  ok("wspace-brief-set", (meetings["m-empty"] && meetings["m-empty"].brief === "Whitespace blank lead"), "brief=" + JSON.stringify(meetings["m-empty"] && meetings["m-empty"].brief));
+}
+async function testTransport401WhileHeld() {
+  const mark = reqLog.length;
+  resetProbeState();
+  capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
+  gates.patch = deferred();
+  patchBehavior = "fail401-once";
+  await page.reload();
+  await openMeeting("m-empty", "Empty brief session");
+  const box = composer();
+  await box.fill("Held 401 lead");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Requesting advisor responses...", { timeout: 30000 });
+  await sleep(400);
+  ok("held401-no-run-yet", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  gates.patch.release();
+  gates.patch = null;
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Advisor responses failed", { timeout: 30000 });
+  const cardText = await page.locator("div[role=alert]").first().innerText();
+  ok("held401-session", cardText.indexOf("Your session changed") >= 0, cardText.slice(0, 300));
+  ok("held401-lead-once", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+  ok("held401-no-run", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  await sleep(800);
+  ok("held401-no-late-run", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  const retryBtn = page.getByRole("button", { name: "Retry responses (same lead)" }).first();
+  await retryBtn.waitFor({ timeout: 15000 });
+  await retryBtn.click();
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("held401-retry-run-once", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  ok("held401-retry-no-repost", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+}
 async function main() {
   try {
     await launch();
     const only = (process.env.QA_ONLY || "").split(",").map((s) => s.trim()).filter((s) => !!s);
-    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible, testSendDeniedRequires4xx, testHeldPatchOverlapNewSurvives, testPatchFailureReplyFrozen];
+    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible, testSendDeniedRequires4xx, testHeldPatchOverlapNewSurvives, testPatchFailureReplyFrozen, testWhitespaceBriefAutoInit, testTransport401WhileHeld];
     const tests = only.length ? all.filter((t) => only.indexOf(t.name) >= 0) : all;
     for (const t of tests) {
       try { await t(); } catch (e) { fail++; const m = t.name + " threw " + String((e && e.message) || e).slice(0, 600); failures.push(m); console.log("  FAIL " + m); outLine("FAIL " + m); try { outLine("PAGE-TAIL " + (await bodyText()).slice(-2500)); } catch (e2) {} }

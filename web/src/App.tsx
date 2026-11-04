@@ -4418,7 +4418,14 @@ const testModel = useMutation({
     const definitive = status >= 400 && status < 500;
     if (status === 401 || (definitive && hay.includes("authentication required"))) return "Your session changed. Sign in again, then retry responses.";
     if (status === 403 || (definitive && (hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied") || hay.includes("contribute")))) return "Only contributors can save the brief. Ask a contributor to add a brief, then retry responses.";
-    if (status === 409) { try { const parsed = JSON.parse(m ? m[2] : raw); const se = (parsed && typeof parsed.error === "string") ? parsed.error : ""; if (se) return se; } catch {} }
+    if (status === 409) {
+      const hay409 = hay;
+      if (hay409.includes("already set") || hay409.includes("already updated")) return "The brief was already updated. Your question is saved; review the current brief, then retry responses.";
+      if (hay409.includes("superseded") || hay409.includes("newer message")) return "A newer message was sent. Your question is saved; review the latest messages, then retry responses.";
+      if (hay409.includes("meeting changed")) return "The meeting changed. Your question is saved; review and retry responses.";
+      if (hay409.includes("restored")) return "The workspace was restored. Your question is saved; reopen it from Boards, then retry responses.";
+      return "Your message was saved but the brief could not be updated. Retry responses.";
+    }
     return "Your message was saved but the brief could not be updated. Retry responses.";
   };
   const send = useMutation({

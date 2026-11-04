@@ -123,7 +123,9 @@ public static class MeetingEndpoints
           if (body.TryGetProperty("expectBriefEmpty", out var ee) && ee.ValueKind == JsonValueKind.True) expectEmpty = true;
           if (body.TryGetProperty("ExpectBriefEmpty", out var ee2) && ee2.ValueKind == JsonValueKind.True) expectEmpty = true;
           var curBriefAuto = curP.Brief ?? "";
-          if (expectedBrief != null)
+          bool curIsBlank = string.IsNullOrWhiteSpace(curBriefAuto);
+          bool requireBlank = expectEmpty || expectedBrief == null || string.IsNullOrWhiteSpace(expectedBrief);
+          if (!requireBlank && expectedBrief != null)
           {
             if (!string.Equals(curBriefAuto, expectedBrief, StringComparison.Ordinal))
             {
@@ -132,7 +134,7 @@ public static class MeetingEndpoints
           }
           else
           {
-            if (!string.IsNullOrWhiteSpace(curBriefAuto))
+            if (!curIsBlank)
             {
               if (!string.Equals(curBriefAuto, proposedBrief, StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-blank");
             }
@@ -157,14 +159,12 @@ public static class MeetingEndpoints
           var msgListAuto = s.Messages.GetOrAdd(id, _ => new List<Domain.Message>());
           Domain.Message? latestLeadAuto = null;
           foreach (var mm in msgListAuto) { if (string.Equals(mm.Sender, "lead", StringComparison.OrdinalIgnoreCase)) { if (latestLeadAuto == null || mm.Sequence > latestLeadAuto.Sequence) latestLeadAuto = mm; } }
-          if (expSeq.HasValue)
+          if (!expSeq.HasValue || expContent == null)
           {
-            if (latestLeadAuto == null || latestLeadAuto.Sequence != expSeq.Value) throw new InvalidOperationException("brief-autoinit-lead");
+            throw new InvalidOperationException("brief-autoinit-lead");
           }
-          if (expContent != null)
-          {
-            if (latestLeadAuto == null || !string.Equals(latestLeadAuto.Content ?? "", expContent ?? "", StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-lead");
-          }
+          if (latestLeadAuto == null || latestLeadAuto.Sequence != expSeq.Value) throw new InvalidOperationException("brief-autoinit-lead");
+          if (!string.Equals(latestLeadAuto.Content ?? "", expContent ?? "", StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-lead");
           if (expGen.HasValue)
           {
             if (curP.Generation != expGen.Value) throw new InvalidOperationException("brief-autoinit-generation");
