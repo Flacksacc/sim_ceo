@@ -43,6 +43,19 @@ function sleepMsOf(text, kind) {
   return m ? Math.min(Number(m[1]), 15000) : 0;
 }
 function chatContent(prompt) {
+  if (prompt.includes("SELECT-MEETING-ADVISORS.")) {
+    if (prompt.includes("QA-SELECT-BAD")) return { content: "invalid selection" };
+    const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf("\nCANDIDATES: ") + "\nCANDIDATES: ".length));
+    return { content: JSON.stringify({ selected: prompt.includes("QA-SELECT-NONE") ? [] : candidates.filter(c => !c.role.includes("Outside")).map(c => ({ advisorId: c.advisorId, reason: "QA role relevance" })) }) };
+  }
+  if (prompt.includes("PEER-REVIEW TURN:")) {
+    if (prompt.includes("QA-REVIEW-ABSTAIN")) return { content: "ABSTAIN" };
+    const raw = prompt.split("FIRST REPLIES (quoted discussion data):\n")[1]?.split("\nYOUR TURN")[0]?.trim();
+    const peers = JSON.parse(raw?.split("\n")[0] || "[]");
+    const role = /BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1];
+    const peer = peers.find(p => p.AdvisorName !== role);
+    return { content: peer ? `[reply-to: ${peer.Sequence}] QA peer review from ${role}: this is an additional experience-based implication. [stance: Disagrees]` : "ABSTAIN" };
+  }
   // Secretary structured JSON (Secretary.cs Parse: JSON object kind/title/body or question). Echoes owned run marker for correlation.
   if (prompt.includes("board secretary") || prompt.includes("OWNER REQUEST") || prompt.includes("OWNER QUESTION")) {
     var rawIdx = prompt.lastIndexOf("RAW OWNER INPUT:");
@@ -80,6 +93,7 @@ function chatContent(prompt) {
   if (prompt.includes("YOUR TURN")) {
     if (prompt.includes("QA-REPLYERR")) return { status: 500, body: "qa reply failure" };
     if (prompt.includes("QA-ABSTAIN")) return { content: "ABSTAIN" };
+    if (prompt.includes("QA-PARALLEL-DIALOGUE")) return { content: "QA first reply from " + (/BOARD ROLE \(board-specific, not canonical\): ([^\n]+)/.exec(prompt)?.[1] || "advisor") + ": with six weeks of cash, protect runway before adding fixed costs. [stance: Raises risk]" };
     return { content: "QA advisor reply with a clear position. [stance: Agrees]" };
   }
   if (prompt.includes("You guide Sim CEO board setup")) {
@@ -263,7 +277,11 @@ const server = http.createServer(async (req, res) => {
     logPrompt("chat", prompt);
     const marker = overlapMarkerOf(prompt);
     if (marker) { try { await overlapWait(marker, 120000); } catch {} }
-    const wait = gateWait(prompt, "C");
+    let wait = gateWait(prompt, "C");
+    if (prompt.includes("QA-PARALLEL-DIALOGUE")) {
+      if (prompt.includes("SELECT-MEETING-ADVISORS.")) wait = 350;
+      else if (prompt.includes("YOUR TURN")) wait = /BOARD ROLE \(board-specific, not canonical\): Finance Slow/.test(prompt) ? 1600 : 300;
+    }
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
     if (out.envelope) {

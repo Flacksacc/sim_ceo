@@ -46,7 +46,7 @@ public static class CharacterBehavior
   // so max validated essentials fit: 3x2000 behavior + question + full seed
   // description/background (4k+4k) + headers. Chat covers question(4k) + seed
   // context; bids cover question(2k) + lead message(4k) + seed context.
-  public const int ChatInputTokens = 5000;
+  public const int ChatInputTokens = 8000;
   public const int BidInputTokens = 6000;
   // Excerpt embedded in seed paragraphs: the FULL user text always stays in
   // the structured description/background fields (and research inputs); the

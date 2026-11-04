@@ -133,12 +133,12 @@ public static class SimCEOEndpoints
     }
   }
 
-  private static (string packet, CuratorManifest manifest) BuildDiscussionPacketPinned(InMemoryStore s, HttpRequest req, DiscussionCapture cap, Meeting m, BoardAdvisor adv, string prompt, Board? board, LeadProfile? lead)
+  private static (string packet, CuratorManifest manifest) BuildDiscussionPacketPinned(InMemoryStore s, HttpRequest req, DiscussionCapture cap, Meeting m, BoardAdvisor adv, string prompt, Board? board, LeadProfile? lead, string? reviewContext = null)
   {
     lock (s.RootGate)
     {
       CheckPacketFreshnessLocked(s, req, cap, m, adv);
-      return ContextCurator.BuildPacket(s, m, adv, prompt, board, lead);
+      return ContextCurator.BuildPacket(s, m, adv, prompt, board, lead, reviewContext is null ? ContextBudget.DraftTokens : ContextBudget.MaxTokens, reviewContext);
     }
   }
 
@@ -1187,6 +1187,8 @@ public static class SimCEOEndpoints
           return Results.Conflict("A discussion run is already in progress for this meeting; wait for it to finish.");
       }
       Guid activityOpId = Guid.Empty;
+      using var runCancel = CancellationTokenSource.CreateLinkedTokenSource(req.HttpContext.RequestAborted);
+      var inFlightDrafts = new List<Task<(BoardAdvisor adv, string? text, CuratorManifest? manifest, string? error)>>();
       try
       {
       // Finding 2: the authoritative context and the restore pin are captured
@@ -1262,7 +1264,7 @@ public static class SimCEOEndpoints
       {
         lock (s.MessageLock)
           return s.Messages.TryGetValue(id, out var cl) && cl is not null
-            ? cl.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor) : 0;
+            ? cl.Where(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor).Select(x => x.AdvisorId).Distinct().Count() : 0;
       }
       // P3: deferred network publication only. SyncRoundCommit (synchronous activity state) runs
       // INSIDE SetupLock/MessageLock + Atomic unit immediately after the successful commit, while
@@ -1334,44 +1336,46 @@ public static class SimCEOEndpoints
         if (laneBWriteErr is not null) return laneBWriteErr;
         return Results.Conflict("Interrupted: " + laneBReason + "; partial progress preserved in run outcome.");
       }
-      using var bidSem = new SemaphoreSlim(4);
       (BoardAdvisor adv, double score, string text, string? error)[] bidResults;
       try
       {
-        bidResults = await Task.WhenAll(eligible.Select(async adv =>
+        string selectionPacket;
+        lock (s.RootGate)
         {
-          await bidSem.WaitAsync();
-          try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "considering", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
-          try
+          foreach (var adv in eligible) CheckPacketFreshnessLocked(s, req, dx, m, adv);
+          selectionPacket = AdvisorDialogue.SelectionPacket(s, m, board, lead, eligible, prompt);
+        }
+        var selectionText = await gw.CompleteAsync(spark, "advisor-select", selectionPacket,
+          AdvisorDialogue.SelectionTokens, 2048, runCancel.Token, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
+        var selected = AdvisorDialogue.Selected(selectionText, eligible);
+        var explicitRequests = new HashSet<Guid>();
+        lock (s.RootGate)
+        {
+          foreach (var adv in eligible)
           {
-            string bidPacket;
-            try { bidPacket = BuildBidPacketPinned(s, req, dx, m, adv, prompt, board); }
-            catch (Exception pktEx) { try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, score: 0.0, text: "", error: (string?)pktEx.Message); }
-            var bidText = await gw.CompleteAsync(spark, "advisor-bid",
-              bidPacket + ContextCurator.AdvisorBidSuffix,
-              CharacterBehavior.BidInputTokens, 512, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
-            var yes = bidText.TrimStart().StartsWith("YES", StringComparison.OrdinalIgnoreCase);
-            try
-            {
-              if (yes) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "awaiting-selection", null);
-              else MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "bid-declined");
-              _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
-            }
-            catch { }
-            return (adv, score: yes ? 10.0 + (adv.BoardRole.Length % 7) : 0.0, text: bidText, error: (string?)null);
+            CheckPacketFreshnessLocked(s, req, dx, m, adv);
+            var name = s.Roster.TryGetValue(adv.RosterEntryId, out var entry) ? entry.Name : adv.BoardRole;
+            if (AdvisorDialogue.ExplicitlyRequested(prompt + "\n" + ContextCurator.LatestLeadMessage(s, id), name, adv.BoardRole))
+            { selected.Add(adv.Id); explicitRequests.Add(adv.Id); }
           }
-          catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
-          {
-            try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, score: 0.0, text: "", error: (string?)ex.Message);
-          }
-          finally { bidSem.Release(); }
-        }));
+        }
+        bidResults = eligible.Select(a => (a, score: selected.Contains(a.Id) ? (explicitRequests.Contains(a.Id) ? 100.0 : 10.0) : 0.0,
+          text: selected.Contains(a.Id) ? "orchestrator-selected" : "not-selected", error: (string?)null)).ToArray();
+        MeetingActivity.SelectionFinished(id, activityOpId);
       }
-      catch (Exception laneBEx) when (laneBEx is CapExceededException or ProviderException)
+      catch (Exception ex) when (ex is not OperationCanceledException)
       {
-        var laneBRemain = eligible.Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
-        LaneBFail("provider failure during bidding", 0, laneBRemain);
-        return PeopleOps.ModelError(laneBEx);
+        if (ex is InvalidOperationException && ex.Message is "lead-changed" or "roster-changed" or "generation-changed" or "board-changed" or "source-changed" or "directions-changed" or "records-changed")
+          return LaneBFail(ex.Message == "lead-changed" ? "lead profile changed; refresh and retry with the current version" : "context changed during advisor selection; refresh and retry", 0, eligible.Select(a => a.BoardRole).ToList());
+        MeetingActivity.FinishDiscussion(s, id, activityOpId, "failed", "Advisor selection failed; retry responses.");
+        _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+        var interrupted = LaneBFail("advisor selection failed", 0, eligible.Select(a => a.BoardRole).ToList());
+        return PublicationGuard.MapGuardFailure(ex) ?? (ex is ProviderException or CapExceededException ? PeopleOps.ModelError(ex) : Results.Json(new { error = "Could not select advisors. Retry responses; your question is saved." }, statusCode: 502));
+      }
+      catch (OperationCanceledException)
+      {
+        LaneBFail("advisor selection cancelled", 0, eligible.Select(a => a.BoardRole).ToList());
+        return Results.StatusCode(499);
       }
       { long freshGenAfterBid = gen; MeetingState freshStateAfterBid = MeetingState.Active; try { if (s.Meetings.TryGetValue(id, out var freshAfterBid) && freshAfterBid is not null) { freshGenAfterBid = freshAfterBid.Generation; freshStateAfterBid = freshAfterBid.State; } } catch { }
       if (freshStateAfterBid is not (MeetingState.Active or MeetingState.AwaitingBrief))
@@ -1419,24 +1423,49 @@ public static class SimCEOEndpoints
       foreach (var b in bidResults.Where(b => b.error is not null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "provider-error" });
       foreach (var b in bidResults.Where(b => b.score <= 0 && b.error is null)) yielded.Add(new { advisor = b.adv.BoardRole, reason = "bid-declined" });
       try { MeetingActivity.SyncSelection(id, activityOpId, bidResults.Select(b => (b.adv.Id, b.adv.BoardRole, b.score, b.error)).ToList(), selectedIds, alreadyIds); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
-      var evSupported = body.TryGetProperty("evidenceSupported", out var e) && e.GetBoolean();
-      using var draftSem = new SemaphoreSlim(4);
+      var firstWave = rounds.SelectMany(r => r).ToList();
+      rounds = firstWave.Select(a => new List<BoardAdvisor> { a }).ToList();
+      using var draftSem = new SemaphoreSlim(10);
       string? lastChallenged = null;
-      foreach (var round in rounds)
+      var firstReplies = new List<Message>();
+      for (var wave = 0; wave < 2; wave++)
       {
-        var drafts = await Task.WhenAll(round.Select(async adv =>
+        var followup = wave == 1;
+        List<BoardAdvisor> waveAdvisors;
+        if (!followup) waveAdvisors = firstWave;
+        else
         {
-          await draftSem.WaitAsync();
+          lock (s.RootGate)
+          {
+            var turnMessages = s.Messages.TryGetValue(id, out var stored) ? stored.Where(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor).ToList() : new List<Message>();
+            firstReplies = turnMessages.GroupBy(x => x.AdvisorId).Select(g => CloneDetached(g.OrderBy(x => x.Sequence).First())).ToList();
+            waveAdvisors = firstReplies.Count < 2 ? new List<BoardAdvisor>() : eligible.Where(a =>
+              turnMessages.Count(x => x.AdvisorId == a.Id) == 1 && (selectedIds.Contains(a.Id) || alreadyIds.Contains(a.Id))).ToList();
+          }
+          if (waveAdvisors.Count > 0)
+          {
+            rounds.AddRange(waveAdvisors.Select(a => new List<BoardAdvisor> { a }));
+            MeetingActivity.ReviewStarted(id, activityOpId, waveAdvisors);
+            _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+          }
+        }
+        var waveFinished = new HashSet<Guid>();
+        List<string> WaveRemaining() => waveAdvisors.Where(a => !waveFinished.Contains(a.Id)).Select(a => a.BoardRole).ToList();
+        var reviewContext = followup ? AdvisorDialogue.ReviewContext(firstReplies) : null;
+        inFlightDrafts.Clear();
+        inFlightDrafts.AddRange(waveAdvisors.Select(async adv =>
+        {
+          await draftSem.WaitAsync(runCancel.Token);
           try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
           try
           {
             string packet;
             CuratorManifest? manifest;
-            try { var built = BuildDiscussionPacketPinned(s, req, dx, m, adv, prompt, board, lead); packet = built.packet; manifest = built.manifest; }
+            try { var built = BuildDiscussionPacketPinned(s, req, dx, m, adv, prompt, board, lead, reviewContext); packet = built.packet; manifest = built.manifest; }
             catch (Exception pktEx) { try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "failed", "provider-error"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { } return (adv, text: (string?)null, manifest: (CuratorManifest?)null, error: (string?)pktEx.Message); }
             var text = await gw.CompleteAsync(spark, "advisor-reply",
               packet + ContextCurator.AdvisorReplySuffix,
-              ContextBudget.DraftTokens, 4096, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
+              followup ? ContextBudget.MaxTokens : ContextBudget.DraftTokens, 2048, runCancel.Token, ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id, truncatePrompt: false);
             try
             {
               if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "abstained");
@@ -1452,16 +1481,23 @@ public static class SimCEOEndpoints
           }
           finally { draftSem.Release(); }
         }));
+        var pendingDrafts = inFlightDrafts.ToList();
+        while (pendingDrafts.Count > 0)
+        {
+        var finished = await Task.WhenAny(pendingDrafts);
+        pendingDrafts.Remove(finished);
+        (BoardAdvisor adv, string? text, CuratorManifest? manifest, string? error) draft;
+        try { draft = await finished; }
+        catch (OperationCanceledException) { return LaneBFail("response run cancelled", rounds.Count, WaveRemaining()); }
+        var drafts = new[] { draft };
+        var round = new List<BoardAdvisor> { draft.adv };
         try { MeetingActivity.SyncDraftOutcome(id, activityOpId, drafts.Select(d => (d.adv.Id, d.adv.BoardRole, d.text, d.error)).ToList()); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         { long freshGenBetween = gen; try { if (s.Meetings.TryGetValue(id, out var freshBetween) && freshBetween is not null) freshGenBetween = freshBetween.Generation; } catch { }
         if (freshGenBetween != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
         {
-          var laneBRemainBetween = rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+          var laneBRemainBetween = WaveRemaining();
           return LaneBFail("new owner turn arrived; unsent drafts discarded", rounds.Count, laneBRemainBetween);
         } }
-        if (drafts.Any(d => d.manifest is not null && d.manifest.SourceIds.Count > 0)) evSupported = true;
-        var challenged = DiscussionPolicy.AssignChallenge(round, evSupported, a => (double)(a.BoardRole.Length % 5));
-        lastChallenged = challenged?.BoardRole ?? lastChallenged;
         // Lane B: final publication holds SetupLock THEN MessageLock (roster writers serialize on
         // SetupLock; pause/resume/end/close use MessageLock only, so this order never inverts).
         // Meeting, advisor and roster rows are fresh-fetched here; captured generation, lead sequence,
@@ -1478,7 +1514,7 @@ public static class SimCEOEndpoints
             IResult? laneBGate = null;
             Atomic.Run(s, () =>
             {
-            List<string> LaneBRemaining() => rounds.Skip(completedGroups).SelectMany(r => r).Where(a => !published.Any(p => p.AdvisorId == a.Id)).Select(a => a.BoardRole).ToList();
+            List<string> LaneBRemaining() => WaveRemaining();
             if (!s.Meetings.TryGetValue(id, out var cur) || cur.State is not (MeetingState.Active or MeetingState.AwaitingBrief))
               { laneBGate = LaneBFail("meeting state changed; unsent drafts discarded", rounds.Count, LaneBRemaining()); return; }
             if (cur.Generation != gen || MeetingTurns.LeadSeqAfter(s, id, leadFloor) > leadFloor)
@@ -1527,7 +1563,7 @@ public static class SimCEOEndpoints
             }
             var list = s.Messages.GetOrAdd(id, _ => new List<Message>());
             var next = list.Count == 0 ? 0 : list.Max(x => x.Sequence);
-            var room = Math.Max(0, commitCap - list.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor));
+            var room = Math.Max(0, commitCap * 2 - list.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor));
             var batch = new List<Message>();
             foreach (var (adv, text, manifest, error) in drafts)
             {
@@ -1542,20 +1578,24 @@ public static class SimCEOEndpoints
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "not-eligible" }); continue; }
               if (!laneBPrints.TryGetValue(adv.Id, out var laneBWanted) || !string.Equals(LaneBFingerprint(freshAdv), laneBWanted, StringComparison.Ordinal))
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "stale-profile" }); continue; }
-              if (SourcePubCheck.ManifestRevoked(s, manifest, id)) { yielded.Add(new { advisor = adv.BoardRole, reason = "evidence-revoked" }); continue; } if (list.Any(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) || batch.Any(x => x.AdvisorId == adv.Id))
-                { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // one reply per advisor per lead turn; stable advisor identity
+              if (SourcePubCheck.ManifestRevoked(s, manifest, id)) { yielded.Add(new { advisor = adv.BoardRole, reason = "evidence-revoked" }); continue; } if (list.Count(x => x.AdvisorId == adv.Id && x.Sequence > leadFloor) >= (followup ? 2 : 1) || batch.Any(x => x.AdvisorId == adv.Id))
+                { yielded.Add(new { advisor = adv.BoardRole, reason = "already-replied-this-turn" }); continue; } // at most one initial reply and one optional peer-review reply
               if (room <= 0)
                 { yielded.Add(new { advisor = adv.BoardRole, reason = "cap-omitted" }); continue; }
               room--;
             var leadSeq = list.Where(x => x.Sender == "lead").OrderByDescending(x => x.Sequence).Select(x => (long?)x.Sequence).FirstOrDefault();
-            var (clean, stance) = MessageTags.SplitStance(text);
+            var followupReply = followup ? AdvisorDialogue.Followup(text, adv.Id, firstReplies) : (Text: text, ReplyTo: (long?)null);
+            var (clean, stance) = MessageTags.SplitStance(followupReply.Text);
+            if (string.IsNullOrWhiteSpace(clean) || clean.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase))
+              { abstained.Add(adv.BoardRole); yielded.Add(new { advisor = adv.BoardRole, reason = "abstained" }); continue; }
+            if (followup && stance == "Disagrees") lastChallenged = adv.BoardRole;
             var msg = new Message
             {
               MeetingId = id, BoardId = cur.BoardId, AdvisorId = adv.Id,
               Sequence = ++next,
               Sender = "advisor", AdvisorName = adv.BoardRole,
-              Content = clean + (adv == challenged ? " [challenge: evidence-supported]" : ""),
-              ParentSequence = leadSeq,
+              Content = clean,
+              ParentSequence = followupReply.ReplyTo ?? leadSeq,
               Stance = stance,
               Status = "committed",
             };
@@ -1621,6 +1661,10 @@ public static class SimCEOEndpoints
           try { _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         }
         if (__roundGateOuter is not null) return __roundGateOuter;
+        waveFinished.Add(draft.adv.Id);
+        foreach (var message in published.Skip(__actPub0))
+          await BoardHub.PublishMeeting(hub, s, id, "message", new { meetingId = id, sequence = message.Sequence }, "read");
+        }
       }
       { Guid auditBoard = m.BoardId; try { if (s.Meetings.TryGetValue(id, out var auditMtg) && auditMtg is not null) auditBoard = auditMtg.BoardId; } catch { }
       Atomic.Audit(s, new AuditEvent { BoardId = auditBoard, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) }); }
@@ -1649,6 +1693,8 @@ public static class SimCEOEndpoints
       }
       finally
       {
+        runCancel.Cancel();
+        try { await Task.WhenAll(inFlightDrafts); } catch { }
         try { MeetingActivity.FinishIfRunning(s, id, activityOpId, "interrupted", "run ended"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         lock (s.MessageLock) { s.RunningRuns.Remove(id); }
       }

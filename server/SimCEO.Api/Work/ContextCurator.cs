@@ -93,7 +93,7 @@ public static class ContextCurator
 
   public static (string packet, CuratorManifest manifest) BuildPacket(
     InMemoryStore s, Meeting m, BoardAdvisor adv, string prompt,
-    Board? board, LeadProfile? lead, int draftTokens = 8000)
+    Board? board, LeadProfile? lead, int draftTokens = 8000, string? reviewContext = null)
   {
     var sb = new StringBuilder();
     var eff = board is null ? (name: "?", mission: "", stage: "", policy: "balanced", dataUse: "contributor") : LeadSetup.EffectiveView(s, board);
@@ -102,6 +102,8 @@ public static class ContextCurator
     sb.Append(" | STAGE: ").Append(Truncate(eff.stage, 200)).AppendLine();
     if (lead is not null)
       sb.AppendLine($"LEAD: {lead.Name} ({lead.RoleLabel}). Familiar: {Truncate(lead.FamiliarTopics, 300)}. Explain simply: {Truncate(lead.SimplerTopics, 300)}. Prefs: {Truncate(lead.CommPrefs, 300)}");
+    sb.Append(AdvisorDialogue.UserContext(lead));
+    sb.AppendLine(AdvisorDialogue.Guidance);
     sb.AppendLine($"MEETING BRIEF: {Truncate(m.Brief, 800)}");
     // Canonical roster authority: the packet embeds the CURRENT roster entry (full behavior
     // paragraphs + dossier + version pin), never a forked board copy. Roster edits therefore
@@ -123,8 +125,10 @@ public static class ContextCurator
       pktSeedProf = pktRent.ProfileJson ?? "{}";
     }
     sb.Append(behaviorSection);
+    sb.Append(AdvisorDialogue.Background(pktSeedProf, pktSeedDesc));
     sb.Append(CharacterBehavior.SeedContextSection(behaviorSection, pktSeedProf, pktSeedDesc));
     sb.Append(questionSection);
+    if (!string.IsNullOrWhiteSpace(reviewContext)) sb.AppendLine(reviewContext);
     var essentialPrefix = sb.ToString();
     // Transcript blocks (single-line, atomic): seq tracked with its rendered line.
     var recent = Recent(s, m.Id, 12);

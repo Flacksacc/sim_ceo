@@ -172,6 +172,7 @@ public sealed class ModelGateway
   {
     "model-test" => "minimal",
     "advisor-bid" => "minimal",
+    "advisor-select" => "low",
     _ => "low",
   };
 
@@ -197,6 +198,7 @@ public sealed class ModelGateway
     "wizard-interview" => "Reply with JSON only, no other text.",
     "advisor-profile" => "Reply with a single JSON object only, no code fences or commentary.",
     "advisor-reply" => "If you add nothing, reply with exactly ABSTAIN.",
+    "advisor-select" => "Return only the requested JSON selection from the eligible candidate IDs. Follow the CEO's explicit advisor requests and requested output. Do not answer as an advisor.",
     "advisor-research" => "Return at most eight concise claims, one per line, in the requested evidence format, as the final answer. Use one or two supporting references per claim. Do not reply with progress commentary.",
     _ => "Return only the requested final answer. No progress commentary.",
   };

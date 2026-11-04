@@ -4885,7 +4885,7 @@ const testModel = useMutation({
     }
     else setMeetPartDraft([...meetPartDraft, id]);
   };
-  const { advisorSnapshot, secretaryActivity, activityAvailability } = useMeetingActivity({
+  const { advisorSnapshot, secretaryActivity, activityData, activityAvailability } = useMeetingActivity({
     boardId: boardId,
     meetingId: meetingId,
     boardValid: boardValid,
@@ -4915,6 +4915,14 @@ const testModel = useMutation({
     secretaryActivity: (secretaryActivity as any) ?? null,
   }), [lead.data, advisors.data, meetPartDraft, presenceUrls, advisorSnapshot, activityAvailability, secretaryActivity]);
   const presenceWithSecretary = useMemo(() => presence, [presence]);
+  const meetingTeam = useMemo(() => {
+    const discussion = (activityData as any)?.discussion;
+    const activity = activityAvailability !== "available" ? (activityAvailability === "unavailable" ? "unavailable" : "checking")
+      : discussion?.status === "running" && discussion?.phase === "selecting" ? "considering"
+      : discussion?.status === "failed" ? "failed" : discussion?.status === "interrupted" ? "interrupted" : discussion?.status === "completed" ? "complete" : "idle";
+    return [{ key: "orchestrator", displayName: "Orchestrator", roleLabel: "Chooses advisors", portraitUrl: null, activity } as import("./meeting-participants").MeetingParticipant,
+      ...presenceWithSecretary.filter(p => p.key !== "lead")];
+  }, [presenceWithSecretary, activityData, activityAvailability]);
   const createMeeting = useMutation({
     mutationFn: () =>
       post<Meeting>(`/api/boards/${boardId}/meetings`, {
@@ -8796,6 +8804,7 @@ const testModel = useMutation({
                             {(sendPhase === "error" || sendPhase === "no-contributions") && sendRetryCtx && sendRetryCtx.meetingId === meetingId && (<div className="card" role="alert"><b>{sendPhase === "error" ? "Advisor responses failed" : "No advisor responses"}</b><div>{sendStatus}</div><div className="muted">{sendRetryCtx.saveConfirmed ? "Retry sends only the responses step for the same lead message." : "Retry sends only the advisor-responses step again."}</div><button type="button" onClick={() => retryResponses(sendRetryCtx)} disabled={runDiscussion.isPending || send.isPending}>Retry responses (same lead)</button>{" "}{sendConflict && sendConflict.kind === "lead-version" && (<span><button type="button" onClick={() => { const rc = sendRetryCtx; if (!rc || rc.meetingId !== meetingId) return; const v = lead.data ? lead.data.version : null; if (v == null) return; retryResponses({ ...rc, leadVersion: v }); }} disabled={runDiscussion.isPending || send.isPending}>Retry with current lead profile{typeof (lead.data ? lead.data.version : null) === "number" ? " (v" + String(lead.data ? lead.data.version : null) + ")" : ""}</button>{" "}</span>)}{" "}<button type="button" className="btn ghost" onClick={() => { setSendPhase("idle"); setSendStatus(""); setSendRetryCtx(null); setSendConflict(null); phaseOpRef.current = null; }}>Dismiss</button></div>)}{" "}
                             {(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) && (<div role="status" className="status-line"><span className="badge live">Secretary</span><span>Secretary working...</span></div>)}{" "}
                             <div className="composer-bar">
+                              <MeetingParticipants participants={meetingTeam} variant="composer" heading="Meeting team" live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
                               {" "}
                               <div className="topline">
                                 {" "}
@@ -8957,7 +8966,6 @@ const testModel = useMutation({
                         }
                       >
                         {" "}
-                        <MeetingParticipants participants={presenceWithSecretary} live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
                         {" "}
                         <div className="context-bar">
                           {" "}

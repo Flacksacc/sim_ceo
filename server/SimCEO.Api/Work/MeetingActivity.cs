@@ -50,6 +50,7 @@ public static class MeetingActivity
     public long Generation;
     public long LeadSeq;
     public string Status = DiscussionRunning;
+    public string Phase = "selecting";
     public string? Error;
     public DateTime UpdatedAt = DateTime.UtcNow;
     public Dictionary<Guid, AdvisorView> Advisors = new();
@@ -155,6 +156,27 @@ public static class MeetingActivity
     catch { }
   }
 
+  public static void SelectionFinished(Guid meetingId, Guid operationId)
+  {
+    if (!Discussions.TryGetValue(meetingId, out var e)) return;
+    lock (e) if (e.OperationId == operationId && e.Status == DiscussionRunning && e.Phase == "selecting")
+    { e.Phase = "responding"; e.UpdatedAt = DateTime.UtcNow; }
+  }
+
+  // An explicit second wave may move completed first replies back to queued.
+  // All first-wave tasks have finished before this call; old operations cannot reset it.
+  public static void ReviewStarted(Guid meetingId, Guid operationId, IReadOnlyList<BoardAdvisor> advisors)
+  {
+    if (!Discussions.TryGetValue(meetingId, out var e)) return;
+    lock (e)
+    {
+      if (e.OperationId != operationId || e.Status != DiscussionRunning || e.Phase != "responding") return;
+      e.Phase = "reviewing";
+      foreach (var a in advisors) e.Advisors[a.Id] = new AdvisorView(a.Id, a.BoardRole, AdvisorQueued, null, DateTime.UtcNow);
+      e.UpdatedAt = DateTime.UtcNow;
+    }
+  }
+
   // After bidding: provider errors fail, declined bids abstain, already-replied
   // advisors abstain with their exact reason, willing but unselected advisors
   // abstain with the durable cap reason. Selected willing advisors waiting for
@@ -244,6 +266,7 @@ public static class MeetingActivity
         if (e.OperationId != operationId) return false;
         if (e.Status != DiscussionRunning) return false;
         e.Status = status;
+        e.Phase = status;
         e.Error = error;
         e.UpdatedAt = DateTime.UtcNow;
         foreach (var kv in e.Advisors.ToList())
@@ -432,6 +455,7 @@ public static class MeetingActivity
   static void InterruptDiscussionEntry(DiscussionEntry e, string reason)
   {
     e.Status = DiscussionInterrupted;
+    e.Phase = DiscussionInterrupted;
     e.Error = reason;
     e.UpdatedAt = DateTime.UtcNow;
     foreach (var kv in e.Advisors.ToList())
@@ -589,6 +613,7 @@ public static class MeetingActivity
           generation = d.Generation,
           leadSeq = d.LeadSeq,
           status = d.Status,
+          phase = d.Phase,
           error = d.Error,
           meetingState = snapMeetingState,
           updatedAt = d.UpdatedAt,
@@ -657,6 +682,7 @@ public static class MeetingActivity
           generation = d.Generation,
           leadSeq = d.LeadSeq,
           status = d.Status,
+          phase = d.Phase,
           error = d.Error,
           meetingState = pubMeetingState,
           updatedAt = d.UpdatedAt,

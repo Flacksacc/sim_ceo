@@ -39,6 +39,7 @@ public static class RosterChatEndpoints
       string snapName = "";
       string snapDesc = "";
       int snapVersion = 0;
+      string userContext = "";
       (Guid epochId, long epochRev) restorePin = default;
       lock (s.RootGate)
       {
@@ -48,6 +49,7 @@ public static class RosterChatEndpoints
         snapName = snapEntry.Name;
         snapDesc = snapEntry.Description ?? "";
         snapVersion = snapEntry.Version;
+        userContext = AdvisorDialogue.UserContext(LeadSetup.ResolveDefaultForCaller(s, req));
         restorePin = PublicationGuard.Capture(s);
       }
       // Same behavior contract as meetings: the CURRENT canonical entry (all 3 paragraphs, version-pinned) drives every turn.
@@ -57,7 +59,7 @@ public static class RosterChatEndpoints
       if (body.ValueKind == JsonValueKind.Object && body.TryGetProperty("history", out var ch) && ch.ValueKind == JsonValueKind.Array)
       {
         var turns = new List<string>();
-        foreach (var te in ch.EnumerateArray())
+        foreach (var te in ch.EnumerateArray().TakeLast(10))
         {
           if (te.ValueKind != JsonValueKind.Object) continue;
           var rr = te.TryGetProperty("role", out var rrv) ? (rrv.GetString() ?? "") : "";
@@ -69,7 +71,8 @@ public static class RosterChatEndpoints
         }
       }
       string answer;
-      var essentialChat = "ROSTER ADVISOR CHAT (isolated, not a meeting message). " + behaviorSection
+      var essentialChat = "ROSTER ADVISOR CHAT (isolated, not a meeting message). " + userContext + AdvisorDialogue.Guidance + "\n" + behaviorSection
+        + AdvisorDialogue.Background(snapProfile, snapDesc)
         + "Lead says: " + message + "\nReply in character from the criteria above: agree/disagree/challenge as the character's bluntness or diplomacy; concise; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements.\n";
       var chatPacket = CharacterBehavior.FitEssentialFirst(essentialChat, historyLines.TakeLast(10).ToList(), ModelGateway.UserCharBudget("roster-chat", CharacterBehavior.ChatInputTokens));
       if (chatPacket is null)
@@ -96,6 +99,8 @@ public static class RosterChatEndpoints
         if (!RosterEndpoints.CanReadRoster(s, req, fresh)) return PeopleOps.Denied();
         if (fresh.Version != snapVersion)
           return Results.Conflict("Advisor was edited during generation; stale reply discarded, retry with the current version.");
+        if (userContext != AdvisorDialogue.UserContext(LeadSetup.ResolveDefaultForCaller(s, req)))
+          return Results.Conflict("Your profile changed during generation; retry with your current profile.");
         return Results.Ok(new
         {
           answer,
@@ -104,7 +109,7 @@ public static class RosterChatEndpoints
           indicators = new
           {
             expertiseUsed = snapName,
-            assumptions = new[] { "roster profile only; no board or meeting history" },
+            assumptions = new[] { "advisor profile and your default profile; no board or meeting history" },
             sources = new[] { "none: roster chat uses only the owner-entered roster profile" },
             withinLimits = true,
           },

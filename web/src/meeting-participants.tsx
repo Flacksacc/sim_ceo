@@ -41,6 +41,7 @@ export interface MeetingParticipantsProps {
   availability?: "available" | "loading" | "paused" | "unavailable";
   /* Optional human heading override. Defaults to In this meeting. */
   heading?: string;
+  variant?: "rail" | "composer";
 }
 
 const LABEL: Record<ParticipantActivity, string> = {
@@ -137,7 +138,7 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
     }
   }
   return (
-    <section className="meet-participants" aria-label={p.heading || "In this meeting"}>
+    <section className={"meet-participants" + (p.variant === "composer" ? " is-composer" : "")} aria-label={p.heading || "In this meeting"}>
       <div className="mp-head">
         <h3>{p.heading || "In this meeting"}</h3>
         {p.live && avail !== "unavailable" && <span className="badge live">live</span>}
@@ -150,7 +151,7 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
           {list.map((m) => {
             const hasPortrait = typeof m.portraitUrl === "string" && m.portraitUrl.length > 0;
             return (
-              <li key={m.key} className={"mp-seat act-" + m.activity + (m.isSecretary ? " is-sec" : "")}>
+              <li key={m.key} data-activity={m.activity} title={m.displayName + ": " + LABEL[m.activity]} className={"mp-seat act-" + m.activity + (m.isSecretary ? " is-sec" : "")}>
                 <span className="mp-avatar" data-active={LIVE_DOT[m.activity] ? "true" : "false"}>
                   {hasPortrait ? (
                     <img src={m.portraitUrl as string} alt={"Portrait of " + m.displayName} loading="lazy" />
