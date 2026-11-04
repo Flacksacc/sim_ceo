@@ -1274,10 +1274,15 @@ export default function App() {
     queryFn: () => get<Board[]>("/api/boards?includeArchived=true"),
     enabled: !sessGate && !anonPrivateBlocked,
   });
+  // Profile operation revision: retired synchronously by every private-state
+  // purge (expiry, revocation, leave) BEFORE any held save/reload callback can
+  // resolve, so stale completions can never repopulate cleared state.
+  const profileOpRef = useRef(0);
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
     try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
+    try { profileOpRef.current++; } catch {}
     try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort?.abort(); } catch {}
     try { for (const u of ((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs ?? [])) { try { URL.revokeObjectURL(u); } catch {} } } catch {}
     try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = []; } catch {}
@@ -1946,6 +1951,17 @@ export default function App() {
     enabled: !!boardId && boardOk && !sessGate && (tab === "boards" || tab === "meet" || tab === "settings"),
     retry: false,
   });
+  // Fresh session-gate read for async profile completions: the render-time
+  // sessGate const can be stale after a purge, so callbacks consult the live
+  // session cache and token instead of closing over render scope.
+  const profileGatedNow = (): boolean => {
+    try {
+      if (!currentToken()) return false;
+      const sess = qc.getQueryData(["sess"]) as { authenticated?: boolean } | undefined;
+      if (!sess) return true;
+      return !sess.authenticated;
+    } catch { return true; }
+  };
   const profile = useQuery({
     queryKey: ["profile"],
     queryFn: () => get<Lead>("/api/profile"),
@@ -1966,7 +1982,6 @@ export default function App() {
   const [saveErr, setSaveErr] = useState("");
   const profileEditRev = useRef(0);
   const profileSnap = useRef("");
-  const profileHeld = useRef<null | { rev: number; epoch: number; token: string; user: string }>(null);
   const profileWho = useRef("");
   const bumpProfileEdit = (next: { name: string; roleLabel: string; background: string; familiarTopics: string; simplerTopics: string; commPrefs: string }) => {
     profileEditRev.current += 1;
@@ -1974,105 +1989,193 @@ export default function App() {
   };
   const profileSnapNow = JSON.stringify(leadForm);
   const profileDirty = profileSnap.current !== "" && profileSnapNow !== profileSnap.current;
+  const [profileConflict, setProfileConflict] = useState<null | { id: string; version: number }>(null);
+  const [profileReloading, setProfileReloading] = useState(false);
+  type ProfileSaveAttempt = {
+    name: string;
+    roleLabel: string;
+    background: string;
+    familiarTopics: string;
+    simplerTopics: string;
+    commPrefs: string;
+    baseId: string;
+    baseVersion: number;
+    op: number;
+    editRev: number;
+    epoch: number;
+    token: string;
+    user: string;
+  };
+  const profileResolved = profile.isSuccess || isNotFound(profile.error);
+  const profileLookupFailed = !sessGate && profile.isError && !isNotFound(profile.error) && !profileResolved;
+  const profileFieldsDisabled = sessGate || !profileResolved || profileReloading;
   useEffect(() => {
     const whoNow = String(epochNow()) + "|" + currentToken() + "|" + canonicalUser();
     if (profileWho.current !== whoNow) {
       profileWho.current = whoNow;
-      profileHeld.current = null;
       profileEditRev.current = 0;
       const fresh = { name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS };
       setLeadForm(fresh);
       profileSnap.current = JSON.stringify(fresh);
       setProfileLoaded("");
       setProfileBase({ id: "", version: 0 });
+      setProfileConflict(null);
+      setProfileReloading(false);
       setSaveMsg("");
       setSaveErr("");
       return;
     }
     if (sessGate) return;
-    if (saveLead.isPending || profileHeld.current) return;
-    const key = profile.data ? profile.data.id + ":" + String(profile.data.version) : "";
-    if (!profile.data) {
+    if (saveLead.isPending) return;
+    if (profileReloading) return;
+    const remote = profile.data;
+    const key = remote ? remote.id + ":" + String(remote.version) : "";
+    if (!remote) {
       if ((profile.isSuccess || isNotFound(profile.error)) && profileLoaded !== "" && !profileDirty) {
         const fresh = { name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS };
         setLeadForm(fresh);
         profileSnap.current = JSON.stringify(fresh);
         setProfileLoaded("");
         setProfileBase({ id: "", version: 0 });
+        setProfileConflict(null);
       }
       return;
     }
     if (key !== profileLoaded) {
-      setProfileBase({ id: profile.data.id, version: profile.data.version });
-      setProfileLoaded(key);
       if (!profileDirty) {
         const adopted = {
-          name: profile.data.name ?? "",
-          roleLabel: profile.data.roleLabel || "Board Lead",
-          background: profile.data.background ?? "",
-          familiarTopics: profile.data.familiarTopics ?? "",
-          simplerTopics: profile.data.simplerTopics ?? "",
-          commPrefs: profile.data.commPrefs ?? "",
+          name: remote.name ?? "",
+          roleLabel: remote.roleLabel || "Board Lead",
+          background: remote.background ?? "",
+          familiarTopics: remote.familiarTopics ?? "",
+          simplerTopics: remote.simplerTopics ?? "",
+          commPrefs: remote.commPrefs ?? "",
         };
+        setProfileBase({ id: remote.id, version: remote.version });
+        setProfileLoaded(key);
         setLeadForm(adopted);
         profileSnap.current = JSON.stringify(adopted);
+        setProfileConflict(null);
+      } else if (remote.id !== profileBase.id || remote.version > profileBase.version) {
+        if (!profileConflict || profileConflict.id !== remote.id || profileConflict.version !== remote.version) {
+          setProfileConflict({ id: remote.id, version: remote.version });
+          setSaveErr("Another saved version arrived while you were editing. Your edits are kept and nothing was overwritten. Saving is paused until you reload the saved profile, review it, and reapply your changes.");
+        }
       }
     }
-  }, [profile.data, profile.isSuccess, profile.error, profileLoaded, profileDirty, sessGate]);
+  }, [profile.data, profile.isSuccess, profile.error, profileLoaded, profileDirty, profileBase, profileConflict, profileReloading, sessGate]);
   const saveLead = useMutation({
-    mutationFn: () =>
-      post<Lead>("/api/profile", {
-        ...leadForm,
-        version: profileBase.version,
-      }),
-    onMutate: () => {
+    mutationFn: async (attempt: ProfileSaveAttempt) => {
+      if (attempt.op !== profileOpRef.current || profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) {
+        throw Object.assign(new Error("stale save discarded (identity changed)"), { stale: true });
+      }
+      return post<Lead>("/api/profile", {
+        name: attempt.name,
+        roleLabel: attempt.roleLabel,
+        background: attempt.background,
+        familiarTopics: attempt.familiarTopics,
+        simplerTopics: attempt.simplerTopics,
+        commPrefs: attempt.commPrefs,
+        version: attempt.baseVersion,
+      });
+    },
+    onMutate: (attempt) => {
       setSaveMsg("");
       setSaveErr("");
-      profileHeld.current = { rev: profileEditRev.current, epoch: epochNow(), token: currentToken(), user: canonicalUser() };
+      return { attempt };
     },
-    onSuccess: (r) => {
-      const held = profileHeld.current;
-      profileHeld.current = null;
-      if (held && (epochNow() !== held.epoch || currentToken() !== held.token || canonicalUser() !== held.user)) {
+    onSuccess: (response, attempt) => {
+      if (attempt.op !== profileOpRef.current) return;
+      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) {
         setSaveErr("Account changed during save; the response was discarded. Review and save again.");
         return;
       }
-      const rr = r as Lead | undefined;
+      const rr = response;
       if (!rr || !rr.id) return;
-      try { qc.setQueryData(["profile"], rr); } catch { /* keep server truth on next refetch */ }
       const nkey = rr.id + ":" + String(rr.version);
+      const acknowledged = {
+        name: rr.name ?? "",
+        roleLabel: rr.roleLabel || "Board Lead",
+        background: rr.background ?? "",
+        familiarTopics: rr.familiarTopics ?? "",
+        simplerTopics: rr.simplerTopics ?? "",
+        commPrefs: rr.commPrefs ?? "",
+      };
       setProfileBase({ id: rr.id, version: rr.version });
       setProfileLoaded(nkey);
-      if (held && profileEditRev.current !== held.rev) {
-        setSaveMsg("Saved version " + String(rr.version) + " as your account default. Your newer typing was kept; save again to apply it.");
+      profileSnap.current = JSON.stringify(acknowledged);
+      setProfileConflict(null);
+      if (profileEditRev.current !== attempt.editRev) {
+        setSaveMsg("Saved as your account default. Your newer edits are still in the form; save again to apply them.");
       } else {
-        const adopted = {
-          name: rr.name ?? "",
-          roleLabel: rr.roleLabel || "Board Lead",
-          background: rr.background ?? "",
-          familiarTopics: rr.familiarTopics ?? "",
-          simplerTopics: rr.simplerTopics ?? "",
-          commPrefs: rr.commPrefs ?? "",
-        };
-        setLeadForm(adopted);
-        profileSnap.current = JSON.stringify(adopted);
-        setSaveMsg("Profile saved as your account default for all boards. Version " + String(rr.version) + ".");
+        setLeadForm(acknowledged);
+        setSaveMsg("Profile saved as your account default for all boards.");
       }
+      try { qc.setQueryData(["profile"], rr); } catch { /* keep server truth on next refetch */ }
       refresh("profile", "lead", "setup");
     },
-    onError: (e) => {
-      profileHeld.current = null;
+    onError: (error, attempt) => {
+      if (attempt.op !== profileOpRef.current) return;
       setSaveMsg("");
-      if (e instanceof Error && e.message.startsWith("409")) {
-        setSaveErr("Another save landed first. Your text is kept; the latest saved version loads behind your edits. Re-apply your change and save again.");
-        refresh("profile");
-      } else if (e instanceof Error && (e as { stale?: boolean }).stale) {
+      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) {
+        setSaveErr("Account changed; the save was discarded. Review and save again.");
+        return;
+      }
+      if (error instanceof Error && error.message.startsWith("409")) {
+        setProfileConflict({ id: attempt.baseId, version: attempt.baseVersion });
+        setSaveErr("Another save landed first. Your edits are kept and nothing was overwritten. Saving is paused until you reload the saved profile, review it, and reapply your changes.");
+        return;
+      } else if (error instanceof Error && (error as { stale?: boolean }).stale) {
         setSaveErr("Account changed; the save was discarded. Review and save again.");
       } else {
-        setSaveErr("Save rejected (your text is kept): " + String(e));
+        setSaveErr("Save was rejected. Your text is kept. Try again.");
       }
     },
   });
+  const reloadSavedProfile = async () => {
+    if (profileConflict === null || sessGate || profile.isFetching || profileReloading) return;
+    if (!window.confirm("Reload the saved profile? This discards your unsaved edits.")) return;
+    const origin = { op: profileOpRef.current, rev: profileEditRev.current, epoch: epochNow(), token: currentToken(), user: canonicalUser() };
+    setProfileReloading(true);
+    let latest: Lead | undefined;
+    try {
+      latest = await get<Lead>("/api/profile");
+    } catch {
+      latest = undefined;
+    }
+    if (origin.op !== profileOpRef.current || profileGatedNow() || epochNow() !== origin.epoch || currentToken() !== origin.token || canonicalUser() !== origin.user) {
+      setProfileReloading(false);
+      setSaveErr("Account changed; the reload was discarded. Your edits are kept.");
+      return;
+    }
+    if (profileEditRev.current !== origin.rev) {
+      setProfileReloading(false);
+      setSaveErr("Newer edits were typed during reload. They are kept — confirm reload again to discard them, or keep editing.");
+      return;
+    }
+    if (!latest || !latest.id) {
+      setProfileReloading(false);
+      setSaveErr("Could not reload the saved profile. Your edits are kept. Try reloading again.");
+      return;
+    }
+    const adopted = {
+      name: latest.name ?? "",
+      roleLabel: latest.roleLabel || "Board Lead",
+      background: latest.background ?? "",
+      familiarTopics: latest.familiarTopics ?? "",
+      simplerTopics: latest.simplerTopics ?? "",
+      commPrefs: latest.commPrefs ?? "",
+    };
+    setLeadForm(adopted);
+    profileSnap.current = JSON.stringify(adopted);
+    setProfileBase({ id: latest.id, version: latest.version });
+    setProfileLoaded(latest.id + ":" + String(latest.version));
+    setProfileConflict(null);
+    setProfileReloading(false);
+    setSaveMsg("Reloaded the saved profile. Reapply any changes, then save.");
+    setSaveErr("");
+    try { qc.setQueryData(["profile"], latest); } catch { /* reload already adopted locally */ }
+  };
 
   const [boardForm, setBoardForm] = useState({
     name: "",
@@ -6612,19 +6715,32 @@ const testModel = useMutation({
                 <p role="status">
                   {" "}
                   {profile.data
-                    ? `Saved version ${profile.data.version} · updated ${profile.data.updatedAt}`
-                    : "No saved profile yet — saving creates version 1."}{" "}
+                    ? "Saved profile loaded."
+                    : "No saved profile yet."}{" "}
                 </p>{" "}
                 <p>
                   {" "}
                   Saving here updates your account default immediately for future meeting
                   context on all your boards. Boards with their own saved profile keep that profile.{" "}
                 </p>{" "}
+                {(!profileResolved && !sessGate && !profile.isError) && (
+                  <p role="status">Loading the saved profile. Fields and Save stay disabled until the current profile is confirmed.</p>
+                )}{" "}
+                {profileLookupFailed && (
+                  <div className="meetctl">
+                    {" "}
+                    <button type="button" onClick={() => { void profile.refetch(); }}>
+                      {" "}
+                      Retry profile lookup{" "}
+                    </button>{" "}
+                  </div>
+                )}{" "}
                 <label>
                   {" "}
                   Name{" "}
                   <input
                     value={leadForm.name}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, name: e.target.value })
                     }
@@ -6635,6 +6751,7 @@ const testModel = useMutation({
                   Role label{" "}
                   <select
                     value={leadForm.roleLabel}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, roleLabel: e.target.value })
                     }
@@ -6662,6 +6779,7 @@ const testModel = useMutation({
                     rows={3}
                     className="profile-area"
                     value={leadForm.background}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, background: e.target.value })
                     }
@@ -6674,6 +6792,7 @@ const testModel = useMutation({
                     rows={3}
                     className="profile-area"
                     value={leadForm.familiarTopics}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({
                         ...leadForm,
@@ -6689,6 +6808,7 @@ const testModel = useMutation({
                     rows={3}
                     className="profile-area"
                     value={leadForm.simplerTopics}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({
                         ...leadForm,
@@ -6704,6 +6824,7 @@ const testModel = useMutation({
                     rows={4}
                     className="profile-area"
                     value={leadForm.commPrefs}
+                    disabled={profileFieldsDisabled}
                     onChange={(e) =>
                       bumpProfileEdit({ ...leadForm, commPrefs: e.target.value })
                     }
@@ -6712,13 +6833,43 @@ const testModel = useMutation({
                 <div className="meetctl">
                   {" "}
                   <button
-                    onClick={() => saveLead.mutate()}
-                    disabled={!leadForm.name.trim() || saveLead.isPending || sessGate}
+                    onClick={() => {
+                      if (profileConflict !== null || !profileResolved || sessGate) return;
+                      const attempt: ProfileSaveAttempt = {
+                        name: leadForm.name,
+                        roleLabel: leadForm.roleLabel,
+                        background: leadForm.background,
+                        familiarTopics: leadForm.familiarTopics,
+                        simplerTopics: leadForm.simplerTopics,
+                        commPrefs: leadForm.commPrefs,
+                        baseId: profileBase.id,
+                        baseVersion: profileBase.version,
+                      op: profileOpRef.current,
+                        editRev: profileEditRev.current,
+                        epoch: epochNow(),
+                        token: currentToken(),
+                        user: canonicalUser(),
+                      };
+                      saveLead.mutate(attempt);
+                    }}
+                    disabled={!leadForm.name.trim() || saveLead.isPending || sessGate || !profileResolved || profileConflict !== null}
                   >
                     {" "}
                     {saveLead.isPending ? "Saving..." : "Save profile"}{" "}
                   </button>{" "}
                 </div>{" "}
+                {profileConflict !== null && (
+                  <div className="meetctl">
+                    {" "}
+                    <button type="button" onClick={() => { void reloadSavedProfile(); }} disabled={profile.isFetching || sessGate || profileReloading}>
+                      {" "}
+                      Reload saved profile{" "}
+                    </button>{" "}
+                  </div>
+                )}{" "}
+                {profileConflict !== null && (
+                  <p role="status">Reloading discards unsaved edits after confirmation.</p>
+                )}{" "}
                 {profileDirty && !saveLead.isPending && (
                   <p role="status">Unsaved changes.</p>
                 )}{" "}
