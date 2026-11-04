@@ -1226,6 +1226,45 @@ findings (`.tmp/advisor-streaming-independent-review.txt`); primary independentl
 inspected integration, authorization, bounded parsing, accounting and rendering.
 Owned QA processes stopped. No live user meetings changed by QA.
 
+### 2026-11-04 — Portraits included in advisor creation
+
+Implementation `eba3170`: creation starts one image request in parallel with
+research, showing a 160px portrait at the top of the form and saved profile.
+Generate replacement, upload and URL import remain available. Generated and
+uploaded images become usable immediately; legacy pending pictures are visible,
+while previously rejected pictures stay excluded. No portrait approval controls
+remain in the profile. Missing/unapproved pictures never make a profile
+incomplete or prevent board attachment. Legacy image selection/review/deletion
+also no longer reset advisor approval. Roster replacements propagate to boards.
+
+Generation deduplicates concurrent requests, reuses existing images during
+automatic creation, preserves newer uploads, and checks current authorization,
+archive state and character input before storing. Background normalization by
+research does not falsely invalidate a concurrent portrait. Uploads use the
+existing bounded raster decoder. No schema changes or live advisor rewrites.
+
+Release/frontend builds and `qa/advisor-portrait-creation-qa.mjs` pass, covering
+concurrent research/image creation, compiled paragraphs, prominent rendering,
+replacement propagation, deduplication, image-failure isolation and 390px layout.
+Parallel dialogue and streaming regressions pass. Auth QA also verifies image
+bytes require authentication and revoked generation cannot publish. Evidence:
+`.tmp/advisor-portrait-qa.log`, `.tmp/advisor-portrait-auth-qa.log`,
+`.tmp/advisor-stream-qa/{portrait-build,portrait-dialogue,portrait-streaming}.log`.
+Separate read-only Muse review returned no remaining findings after corrections
+and authorization context; primary independently inspected changes and found
+and fixed the research/background normalization race in integration testing.
+`.tmp/advisor-portrait-independent-review.txt` contains the review. Image content
+in these tests is a deterministic raster fixture, not a real-model quality claim.
+Owned QA services stopped; tmp.txt preserved; broader parity goal remains paused.
+
+Live portrait deployment: image
+`sha256:53a71d31b4853818ca4c28b109448c9ece71308779a4982e27c1d35a7e959b0c`;
+backup `.tmp/update-20261104-225229-UTC-cc00cb4d`. Original PostgreSQL container
+and volumes preserved, healthy app and PostgreSQL readiness verified. Read-only
+live browser checks confirm the prominent profile portrait, absence of approval,
+and updated creation flow with no browser errors or domain writes
+(`.tmp/advisor-portrait-live-ui.log`).
+
 Live deployment verified: image
 `sha256:4e75320f565a766a9e98293b245a67de6ef989db40a57a860b52d8b23bc0ee40`;
 backup `.tmp/update-20261104-221903-UTC-b5b21afd`. Original PostgreSQL container
