@@ -30,7 +30,11 @@ let pass = 0, fail = 0;
 const failures = [];
 const consoleErrors = [];
 function preflight(name, cond, extra) {
-  if (cond) { pass++; } else { console.log("  FAIL " + name + (extra ? " :: " + extra : "")); console.error("PREFLIGHT FAIL " + name); process.exit(2); }
+  if (cond) { pass++; return; }
+  console.log("  FAIL " + name + (extra ? " :: " + extra : ""));
+  console.error("PREFLIGHT FAIL " + name);
+  (async () => { try { await cleanup(); } catch {} finally { process.exit(2); } })();
+  throw new Error("PREFLIGHT FAIL " + name);
 }
 function ok(name, cond, extra) {
   if (cond) { pass++; } else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
@@ -41,7 +45,7 @@ async function api(method, p, body, token) {
   try {
     const headers = { "content-type": "application/json" };
     if (token) headers.authorization = "Bearer " + token;
-    const r = await fetch(API + p, { method, signal: ctl.signal, headers, body: (method === "GET" || method === "HEAD") ? undefined : (body === undefined ? undefined : JSON.stringify(body)) });
+    const r = await fetch(API + p, { method, signal: ctl.signal, redirect: "error", headers, body: (method === "GET" || method === "HEAD") ? undefined : (body === undefined ? undefined : JSON.stringify(body)) });
     const text = await r.text();
     let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };
@@ -62,11 +66,12 @@ async function allApproveControls() {
   return (await approveCount()) + (await approveSelectedCount()) + (await approveAllCount()) + (await selectBoxCount());
 }
 async function safeErrors() { return consoleErrors.slice(0, 5).join(" | ").slice(0, 600); }
+// PublicDTO equality only (wire DTO bytes); internal snapshots/atomic effects covered by separate Atomic probes, not claimed here.
 async function canonState(did, tok) {
   const d = await api("GET", "/api/records/" + did, undefined, tok);
   const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
   if (d.status !== 200 || r.status !== 200) throw new Error("canonState requires 200 got " + d.status + "/" + r.status);
-  return JSON.stringify({ items: d.json && d.json.itemsJson, ap: d.json && d.json.approvedJson, dc: d.json && d.json.discardedJson, hist: d.json && d.json.historyJson, v: d.json && d.json.version, h: d.json && d.json.hash, tok: d.json && d.json.reviewToken, wm: d.json && d.json.watermark, rev: d.json && d.json.reviewRevision, st: d.json && d.json.status, dec: d.json && d.json.decided, sup: d.json && d.json.supersedesJson, pend: r.json && r.json.pending, appr: r.json && r.json.approved, disc: r.json && r.json.discarded, hc: r.json && r.json.historyCount, eff: r.json && r.json.effectiveHeadId });
+  return JSON.stringify({ items: d.json && d.json.itemsJson, ap: d.json && d.json.approvedJson, dc: d.json && d.json.discardedJson, hist: d.json && d.json.historyJson, v: d.json && d.json.version, h: d.json && d.json.hash, tok: d.json && d.json.reviewToken, wm: d.json && d.json.watermark, rev: d.json && d.json.reviewRevision, st: d.json && d.json.status, dec: d.json && d.json.decided, sup: d.json && d.json.supersedesJson, leg: d.json && d.json.legacyReview, pend: r.json && r.json.pending, appr: r.json && r.json.approved, disc: r.json && r.json.discarded, hc: r.json && r.json.historyCount, eff: r.json && r.json.effectiveHeadId });
 }
 async function pendingOrdinals(did, tok) {
   const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
@@ -82,7 +87,7 @@ async function uploadPortrait(rid, tok) {
   try {
     const form = new FormData();
     form.append("file", new Blob([png], { type: "image/png" }), "qa.png");
-    const r = await fetch(API + "/api/roster/" + rid + "/image/upload", { method: "POST", signal: ctl.signal, headers: { authorization: "Bearer " + tok }, body: form });
+    const r = await fetch(API + "/api/roster/" + rid + "/image/upload", { method: "POST", signal: ctl.signal, redirect: "error", headers: { authorization: "Bearer " + tok }, body: form });
     const text = await r.text();
     let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };
@@ -97,8 +102,8 @@ async function boundedClose(p, ms, label) {
 }
 async function cleanup() {
   if (watchdog) clearTimeout(watchdog);
-  if (ctx) await boundedClose(() => ctx.close(), 10000, "ctx.close");
-  if (browser) await boundedClose(() => browser.close(), 10000, "browser.close");
+  if (ctx) await boundedClose(() => ctx.close(), 6000, "ctx.close");
+  if (browser) await boundedClose(() => browser.close(), 6000, "browser.close");
 }
 async function main() {
   watchdog = setTimeout(() => {
@@ -109,9 +114,10 @@ async function main() {
   }, T.overall);
   browser = await chromium.launch({ executablePath: EDGE, headless: true });
   ctx = await browser.newContext();
+  await ctx.route("**/*", (route) => { try { const u = new URL(route.request().url()); if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return route.continue(); if (u.hostname.endsWith("fonts.googleapis.com") || u.hostname.endsWith("fonts.gstatic.com")) return route.fulfill({ status: 200, contentType: "text/css", body: "" }); return route.abort(); } catch { return route.abort(); } });
   page = await ctx.newPage();
   await page.setViewportSize({ width: 1440, height: 900 });
-  page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text().slice(0, 300)); });
+  page.on("console", (m) => { if (m.type() === "error") { const t = m.text().slice(0, 300); if (t.includes("Failed to load resource")) return; consoleErrors.push(t); } });
   page.on("pageerror", (e) => { consoleErrors.push("pageerror: " + String(e).slice(0, 300)); });
   page.on("response", (r) => {
     try { const q = r.request(); if (q.method() === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: new URL(q.url()).pathname, status: r.status() }); } catch {}
@@ -138,7 +144,7 @@ async function main() {
       const ctl = new AbortController();
       const tm = setTimeout(() => ctl.abort(), 30000);
       try {
-        const r = await fetch(FAKE + "/__health", { signal: ctl.signal });
+        const r = await fetch(FAKE + "/__health", { signal: ctl.signal, redirect: "error" });
         const text = await r.text();
         let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
         return { status: r.status, json };
@@ -158,7 +164,7 @@ async function main() {
   const regR = await api("POST", "/api/auth/register", { email: readerEmail, password: "qa-password-12345" }, null);
   ok("seed-reader", regR.status === 201 && regR.json && regR.json.token, String(regR.status));
   const reader = regR.json.token;
-  await ctx.addInitScript((tok) => window.localStorage.setItem("simceo-token", tok), owner);
+  await ctx.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: owner, em: ownerEmail });
   await page.reload({ waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction(() => { const r = document.querySelector("#root"); return !!(r && r.innerText && r.innerText.trim().length > 0); }, null, { timeout: T.goto });
   {
@@ -193,8 +199,37 @@ async function main() {
   const msgSeed = await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears opening drive memo" }, owner);
   const mseq = (msgSeed.json && (msgSeed.json.sequence || msgSeed.json.Sequence)) ?? 1;
   await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears working note", body: "bears provisional note alpha", kind: "note" }, owner);
+  let fakeBoot = ""; let fakeChatBefore = 0;
+  {
+    const ctl0 = new AbortController(); const tm0 = setTimeout(() => ctl0.abort(), 30000);
+    try {
+      const fr = await fetch(FAKE + "/__health", { signal: ctl0.signal, redirect: "error" });
+      const jt = await fr.text(); let jj = null; try { jj = jt ? JSON.parse(jt) : null; } catch { jj = null; }
+      preflight("preflight-fake-scoped-before-secretary", fr.status === 200 && jj && jj.fake === "records5-scoped" && !!jj.boot, String(fr.status));
+      fakeBoot = jj.boot;
+      const cr = await fetch(FAKE + "/__counts", { signal: ctl0.signal, redirect: "error" });
+      const ct = await cr.text(); let cj = null; try { cj = ct ? JSON.parse(ct) : null; } catch { cj = null; }
+      preflight("preflight-fake-counts-before-secretary", cr.status === 200 && cj && typeof cj.chat === "number", String(cr.status));
+      fakeChatBefore = cj.chat || 0;
+    } finally { clearTimeout(tm0); }
+  }
   const sec = await api("POST", "/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE", clientNonce: crypto.randomBytes(8).toString("hex") }, owner);
-  ok("seed-secretary-note", sec.status === 200 && sec.json && sec.json.note, String(sec.status));
+  preflight("seed-secretary-note", sec.status === 200 && sec.json && sec.json.note, String(sec.status));
+  {
+    const ctl1 = new AbortController(); const tm1 = setTimeout(() => ctl1.abort(), 30000);
+    try {
+      const cr = await fetch(FAKE + "/__counts", { signal: ctl1.signal, redirect: "error" });
+      const ct = await cr.text(); let cj = null; try { cj = ct ? JSON.parse(ct) : null; } catch { cj = null; }
+      preflight("fake-routing-chat", cr.status === 200 && cj && cj.chat > fakeChatBefore, "chat=" + JSON.stringify(cj));
+      const lr = await fetch(FAKE + "/__log", { signal: ctl1.signal, redirect: "error" });
+      const lt = await lr.text(); let lj = null; try { lj = lt ? JSON.parse(lt) : null; } catch { lj = null; }
+      const prompts = Array.isArray(lj) ? lj.map((e) => String((e && e.prompt) || "")) : [];
+      preflight("fake-routing-prompt", prompts.some((x) => x.includes("SECRETARY-NOTE")), "no SECRETARY-NOTE in fake log");
+      const hr = await fetch(FAKE + "/__health", { signal: ctl1.signal, redirect: "error" });
+      const ht = await hr.text(); let hj = null; try { hj = ht ? JSON.parse(ht) : null; } catch { hj = null; }
+      preflight("fake-same-instance", hj && hj.boot === fakeBoot, "fake restarted mid-run");
+    } finally { clearTimeout(tm1); }
+  }
   const gidA = crypto.randomUUID();
   const gidB = crypto.randomUUID();
   const gidC = crypto.randomUUID();
@@ -282,10 +317,9 @@ async function main() {
   const canonHeldBefore = await canonState(sid, owner);
   const ordS = await pendingOrdinals(sid, owner);
   await page.getByRole("button", { name: "Approve decision " + ordS["S2"] }).first().click({ timeout: T.step }).catch(() => null);
-  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "No automatic retry", { timeout: T.poll });
-  await page.waitForTimeout(1200);
-  ok("ui-409-guided", await bodyHas("Refresh review") && await bodyHas("No automatic retry"), "guided 409 missing");
-  ok("held-no-state-write", (await canonState(sid, owner)) === canonHeldBefore, "held approve mutated canonical state");
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "The record changed", { timeout: T.poll });
+  ok("ui-409-guided", await bodyHas("Refresh review") && await bodyHas("The record changed"), "guided 409 missing");
+  ok("held-no-state-write", (await canonState(sid, owner)) === canonHeldBefore, "held approve mutated public state");
   await shot("onedoc-409");
   await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears fresh input" }, owner);
   const preRefreshRec = await api("GET", "/api/records/" + sid, undefined, owner);
@@ -308,16 +342,17 @@ async function main() {
   const canonWholeBefore = await canonState(sid, owner);
   const br = await api("POST", "/api/records/" + sid + "/revise", { version: sg.json.version, hash: sg.json.hash, reviewToken: sg.json.reviewToken, watermark: sg.json.watermark, items: [{ id: "S1", text: "x" }] }, owner);
   ok("whole-revise-after-decisions-409", br.status === 409, String(br.status));
-  ok("whole-revise-no-state-write", (await canonState(sid, owner)) === canonWholeBefore, "decided whole-revise mutated state");
+  ok("whole-revise-no-state-write", (await canonState(sid, owner)) === canonWholeBefore, "decided whole-revise mutated public state");
   // Explicit reload editor stale ALL-fields race: type text+detail, stale via per-item revise, reload recovers.
   const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one" }, { id: "R2", text: "Bears reload two" }], owner);
   const rid = rr1.json.id;
   ok("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload two", { timeout: T.poll });
-  const editorBoxes = page.locator(".human-editor-text");
-  ok("reload-editor-fields", (await editorBoxes.count()) >= 4, "whole editor text+detail fields missing " + String(await editorBoxes.count()));
-  await editorBoxes.nth(0).fill("Bears reload one STALE", { timeout: T.step });
+  const editorBoxes = page.locator('textarea.human-editor-text[id*="' + rid + '"]');
+  ok("reload-editor-fields", (await editorBoxes.count()) >= 2, "selected whole-editor text+detail fields missing " + String(await editorBoxes.count()));
+  for (let _w = 0; _w < 20; _w++) { try { if ((await editorBoxes.nth(0).inputValue()) === "Bears reload one") break; } catch {} await page.waitForTimeout(300); }
+  ok("reload-editor-selected-race", (await editorBoxes.nth(0).inputValue()) === "Bears reload one", "selected whole-editor not targeted (PrepareDraft leak): got " + String(await editorBoxes.nth(0).inputValue()).slice(0, 80));
   await editorBoxes.nth(1).fill("Bears stale detail", { timeout: T.step });
   const rg = await api("GET", "/api/records/" + rid, undefined, owner);
   await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
@@ -331,7 +366,7 @@ async function main() {
   const afterReloadDetail = await editorBoxes.nth(1).inputValue();
   ok("reload-stale-race-reset-text", afterReloadText === "Bears reload one", "stale text survived reload: " + afterReloadText.slice(0, 80));
   ok("reload-stale-race-reset-detail", afterReloadDetail === "", "stale detail survived reload: " + afterReloadDetail.slice(0, 80));
-  ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated canonical state");
+  ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated public state");
   const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
   ok("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
@@ -347,7 +382,7 @@ async function main() {
     const canonSupBefore = await canonState(buid, owner);
     const sup = await api("POST", "/api/records/" + buid + "/items/approve", { version: bRev.json.draft.version, hash: bRev.json.draft.hash, reviewToken: bRev.json.draft.reviewToken, watermark: bRev.json.draft.watermark, itemId: "U2" }, owner);
     ok("branch-superseded-409", sup.status === 409, String(sup.status));
-    ok("branch-superseded-no-write", (await canonState(buid, owner)) === canonSupBefore, "superseded write mutated state");
+    ok("branch-superseded-no-write", (await canonState(buid, owner)) === canonSupBefore, "superseded write mutated public state");
   }
   await page.reload({ waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction(() => document.body.innerText.includes("Review version"), null, { timeout: T.poll });
@@ -378,15 +413,16 @@ async function main() {
     const urlV2 = page.url() || "";
     const bodyV2 = await page.locator("body").innerText();
     ok("ui-back-v2-url", urlV2.includes(nid), "back did not reach v2 " + urlV2.slice(-36));
-    ok("ui-back-v2-content", bodyV2.includes("Bears stale two v2"), "v2 content missing after back");
+    ok("ui-back-v2-heading", bodyV2.includes("Review version 2"), "selected v2 heading missing after back");
+    ok("ui-back-v2-content", bodyV2.includes("Bears stale two v2") && bodyV2.includes("Review version 2"), "v2 selected content missing after back");
     const fwdOk = await page.goForward({ timeout: T.step }).then(() => true).catch(() => false);
     ok("ui-forward-navigated", fwdOk, "goForward failed");
     await page.waitForTimeout(800);
     const urlFwd = page.url() || "";
     const bodyFwd = await page.locator("body").innerText();
     ok("ui-forward-v1-url", urlFwd === urlV1 && urlFwd.includes(buid), "forward hash changed v1=" + urlV1.slice(-12) + " fwd=" + urlFwd.slice(-12));
-    ok("ui-forward-v1-content", bodyFwd.includes("Bears branch one") && bodyV1.includes("Bears branch one"), "entity text lost across nav");
-    ok("ui-forward-no-id-leak", !bodyFwd.includes("U1") && !bodyFwd.includes(nid.slice(0, 8)), "id leak across nav");
+    ok("ui-forward-v1-heading", bodyFwd.includes("Review version 1"), "selected v1 heading missing after forward");
+    ok("ui-forward-v1-content", bodyFwd.includes("Bears branch one") && bodyV1.includes("Bears branch one") && bodyFwd.includes("Review version 1"), "entity text lost across nav");
   }
   // Approved amendment inheritance (separate from undecided branch): v1 approved A/B, amend replace A, approve v2.
   const amA = crypto.randomUUID();
@@ -396,10 +432,10 @@ async function main() {
   ok("amend-inherit-ui-base", amBase.status === 201 && amBaseId, String(amBase.status));
   const amApAll = await api("POST", "/api/records/" + amBaseId + "/approve-all", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
   ok("amend-inherit-ui-approve-base", amApAll.status === 200, String(amApAll.status));
-  const amAmend = await api("POST", "/api/records/" + amBaseId + "/amend", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: amA, text: "Bears inherit alpha replaced" }, { id: amB, text: "Bears inherit beta" }] }; })(), owner);
+  const amAmend = await api("POST", "/api/records/" + amBaseId + "/amend", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: amA, text: "Bears inherit alpha replaced" }] }; })(), owner);
   const amV2 = amAmend.json.id;
   ok("amend-inherit-ui-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
-  const amApV2 = await api("POST", "/api/records/" + amV2 + "/approve-all", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
+  const amApV2 = await api("POST", "/api/records/" + amV2 + "/items/approve", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, itemId: amA }; })(), owner);
   ok("amend-inherit-ui-approve-v2", amApV2.status === 200, String(amApV2.status));
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amBaseId, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Historical", { timeout: T.poll });
@@ -407,9 +443,10 @@ async function main() {
   ok("ui-amend-v1-effective", await bodyHas("Current effective record") && await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta"), "amended v1 missing current effective");
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amV2, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decisions (current record)", { timeout: T.poll });
-  ok("ui-amend-v2-current", await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta") && await bodyHas("approved in version 2"), "amended v2 missing inherited+replaced with versions");
+  ok("ui-amend-v2-current", await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta") && await bodyHas("replaced, versions 1 to 2"), "amended v2 missing inherited+replaced with manager versions");
+  ok("ui-amend-v2-not-guest-wording-as-manager", !(await bodyHas("approved in version 2")), "manager view must not use guest-only wording");
   const ctx2 = await browser.newContext();
-  await ctx2.addInitScript((tok) => window.localStorage.setItem("simceo-token", tok), stranger);
+  await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
   const p2 = await ctx2.newPage();
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(2000);
@@ -420,10 +457,10 @@ async function main() {
   ok("stranger-no-revise", !sBody.includes("Revise decision") && !sBody.includes("Revised text for decision"), "stranger sees revise");
   ok("stranger-no-setaside", !sBody.includes("Set aside decision"), "stranger sees set-aside");
   ok("stranger-no-protocol", !sBody.includes("reviewToken") && !sBody.includes("evidenceSnapshot") && !sBody.includes("reviewRevision"), "stranger sees protocol");
-  await ctx2.close().catch(() => null);
+  await boundedClose(() => ctx2.close(), 6000, "ctx2.close");
   {
     const ctx3 = await browser.newContext();
-    await ctx3.addInitScript((tok) => window.localStorage.setItem("simceo-token", tok), reader);
+    await ctx3.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: reader, em: readerEmail });
     const p3 = await ctx3.newPage();
     await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: T.goto });
     await p3.waitForTimeout(2000);

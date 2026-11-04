@@ -3337,8 +3337,8 @@ const tabCount = (k: Tab): number | null => {
   const recVisitRef = useRef(0);
   // Record view visits: leaving or (re)entering the Records tab retires held record callbacks even when the record ID is unchanged (A-away-A). Operation-owned settlement still protects newer operations.
   useEffect(() => { recVisitRef.current++; }, [recId, tab]);
-  const liveSelRef = useRef({ boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") });
-  liveSelRef.current = { boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") };
+  const liveSelRef = useRef({ boardId, meetingId, recId, user: canonicalUser() });
+  liveSelRef.current = { boardId, meetingId, recId, user: canonicalUser() };
   // Immutable origin identity for async callbacks: the effective session
   // identity when a session exists, else the demo act-as label. Epoch and
   // token are captured so a later account switch or re-login invalidates
@@ -3506,7 +3506,7 @@ const tabCount = (k: Tab): number | null => {
     if (revTextRev.current === 0) return false;
     return b.version !== d.version || (b.hash ?? "") !== (d.hash ?? "") || (b.reviewToken ?? "") !== (d.reviewToken ?? "") || (b.watermark ?? 0) !== (d.watermark ?? 0) || (b.revision ?? 0) !== (d.reviewRevision ?? 0);
   })();
-  const canReloadEditor = recOk && !!recReview.data && !recReview.isError && canActMeeting && revEditorStale;
+  const canReloadEditor = recOk && !!recReview.data && !recReview.isError && canActMeeting && (revEditorStale || (showReviewError && revTextRev.current !== 0));
   const ordinalOf = (itemId: string): number => reviewPending.indexOf(itemId) + 1;
   const ordinalLabel = (itemId: string): string => { const n = ordinalOf(itemId); return n > 0 ? "decision " + String(n) : "decision"; };
   useEffect(() => {
@@ -8906,7 +8906,7 @@ const testModel = useMutation({
                             <div key={m.sequence} className="human-item">
                               <div className="human-item-body">
                                 <span className="human-item-text">{m.advisorName ? m.advisorName : m.sender === "lead" ? "Meeting lead" : m.sender}</span>{" "}
-                                <p>{m.content}</p>{" "}
+                                <p>{humanNoteBody(m.content) === "" ? "(no text)" : humanNoteBody(m.content)}</p>{" "}
                               </div>
                             </div>
                           ))}{" "}
@@ -9010,7 +9010,6 @@ const testModel = useMutation({
                       })()}{" "}
                       {" "}
                                             {(() => {
-                        if (isActionableReview) return null;
                         const ad = authDraft as RecordDraft;
                         const isGuest = !(recReview.data && ("stateValid" in (recReview.data as object)));
                         const approvedSet = new Set(((recReview.data?.approved ?? []) as string[]));
@@ -9039,8 +9038,10 @@ const testModel = useMutation({
                             version: typeof e.approvedBy?.version === "number" ? (e.approvedBy.version as number) : 0,
                           })).filter((e) => e.text !== "");
                         } catch { effGuest = []; }
+                        const hasApprovedContent = hist.length > 0 || effects.length > 0 || effGuest.length > 0;
+                        if (isActionableReview && !(isHead && hasApprovedContent)) return null;
                         if (hist.length === 0 && effects.length === 0 && effGuest.length === 0) return null;
-                        if (isHead && reviewDecided) {
+                        if (isHead && (reviewDecided || hasApprovedContent)) {
                           const effAllText = isGuest ? effGuest.map((e) => e.text) : effects.map((e) => e.text);
                           const all = effAllText.length > 0 ? effAllText : hist;
                           if (all.length === 0) return null;

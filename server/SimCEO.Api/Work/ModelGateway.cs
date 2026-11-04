@@ -56,7 +56,7 @@ public sealed class UsageStorageException(string message, Exception? inner = nul
 public sealed class ModelGateway
 {
   private readonly InMemoryStore _store;
-  private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(180) };
+  private static readonly HttpClient _http = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(180) };
   private readonly PublicEvidenceFetcher _evidence;
   private readonly HttpClient _httpClient;
   // Instance-scoped whole-operation deadline override for QA fault injection.

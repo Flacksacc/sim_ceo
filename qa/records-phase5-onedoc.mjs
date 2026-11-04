@@ -34,7 +34,7 @@ async function req(method, path, body, token) {
   try {
     const headers = { "content-type": "application/json" };
     if (token) headers.authorization = "Bearer " + token;
-    const r = await fetch(API + path, { method, signal: ctl.signal, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const r = await fetch(API + path, { method, signal: ctl.signal, redirect: "error", headers, body: body === undefined ? undefined : JSON.stringify(body) });
     const text = await r.text();
     let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };
@@ -46,12 +46,13 @@ async function fakeFetch(path, opts) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), 30000);
   try {
-    const r = await fetch(FAKE + path, { signal: ctl.signal, ...(opts || {}) });
+    const r = await fetch(FAKE + path, { redirect: "error", signal: ctl.signal, ...(opts || {}) });
     const text = await r.text();
     let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };
   } finally { clearTimeout(tm); }
 }
+// PublicDTO equality only: compares wire review DTO bytes (items/approved/discarded/history/version/hash/revision/status/decided/supersedes/token/watermark + pending/approved/discarded/historyCount). It does not observe internal evidence snapshots, orphan successors, or other atomic effects; those are covered by separate Atomic probes (see qa/RecordAtomicProbe), not claimed here.
 async function canonState(did, tok) {
   const d = await get("/api/records/" + did, tok);
   const r = await get("/api/records/" + did + "/review", tok);
@@ -59,7 +60,7 @@ async function canonState(did, tok) {
   return JSON.stringify({
     items: camel(d.json, "itemsJson"), ap: camel(d.json, "approvedJson"), dc: camel(d.json, "discardedJson"),
     hist: camel(d.json, "historyJson"), v: camel(d.json, "version"), h: camel(d.json, "hash"),
-    rev: camel(d.json, "reviewRevision"), st: camel(d.json, "status"), dec: camel(d.json, "decided"), sup: camel(d.json, "supersedesJson"),
+    rev: camel(d.json, "reviewRevision"), st: camel(d.json, "status"), dec: camel(d.json, "decided"), sup: camel(d.json, "supersedesJson"), leg: camel(d.json, "legacyReview"),
     tok: camel(d.json, "reviewToken"), wm: camel(d.json, "watermark"),
     pend: r.json ? r.json.pending : null, appr: r.json ? r.json.approved : null,
     disc: r.json ? r.json.discarded : null, hc: r.json ? r.json.historyCount : null,
@@ -172,12 +173,12 @@ const secKind = camel(sec.json.note, "kind") || "";
 ok("setup-secretary-kind", secKind.indexOf("secretary") >= 0, secKind);
 {
   const fc = await fakeFetch("/__counts");
-  ok("fake-routing-chat", fc.status === 200 && fc.json && fc.json.chat > globalThis.__fakeChatBefore, "chat=" + JSON.stringify(fc.json));
+  preflight("fake-routing-chat", fc.status === 200 && fc.json && fc.json.chat > globalThis.__fakeChatBefore, "chat=" + JSON.stringify(fc.json));
   const lg = await fakeFetch("/__log");
   const prompts = Array.isArray(lg.json) ? lg.json.map((e) => String((e && e.prompt) || "")) : [];
-  ok("fake-routing-prompt", prompts.some((s) => s.includes("SECRETARY-NOTE")), "no SECRETARY-NOTE in fake log");
+  preflight("fake-routing-prompt", prompts.some((s) => s.includes("SECRETARY-NOTE")), "no SECRETARY-NOTE in fake log");
   const fh = await fakeFetch("/__health");
-  ok("fake-same-instance", fh.json && fh.json.boot === globalThis.__fakeBoot, "fake restarted mid-run");
+  preflight("fake-same-instance", fh.json && fh.json.boot === globalThis.__fakeBoot, "fake restarted mid-run");
 }
 const gidA = crypto.randomUUID();
 const gidB = crypto.randomUUID();
@@ -267,7 +268,7 @@ ok("all-discarded-set", JSON.stringify([...rev3.json.discarded].sort()) === JSON
 const canonDecidedBefore = await canonState(did, ownerT);
 const again = await post("/api/records/" + did + "/items/approve", { ...(await guards(did, ownerT)), itemId: gidB }, ownerT);
 ok("decided-approve-409", again.status === 409, String(again.status));
-ok("decided-no-state-write", (await canonState(did, ownerT)) === canonDecidedBefore, "decided write mutated state");
+ok("decided-no-state-write", (await canonState(did, ownerT)) === canonDecidedBefore, "decided write mutated public state");
 const s1 = await post("/api/meetings/" + mid + "/record/draft", [{ id: "S1", text: "Bears stale one" }, { id: "S2", text: "Bears stale two" }], ownerT);
 const sid = camel(s1.json, "id");
 const g0 = await guards(sid, ownerT);
@@ -279,7 +280,7 @@ ok("stale-approve-409", stale.status === 409, String(stale.status));
 ok("stale-guided-refresh", /refresh/i.test(stale.text), stale.text.slice(0, 240));
 ok("stale-server-has-no-client-wording", !/no automatic retry/i.test(stale.text), "server leaks client wording");
 ok("conflict-no-history-write", histOf((await get("/api/records/" + sid, ownerT)).json).length === hBefore, "failed click wrote history");
-ok("conflict-no-state-write", (await canonState(sid, ownerT)) === canonStaleBefore, "failed approve mutated canonical state");
+ok("conflict-no-state-write", (await canonState(sid, ownerT)) === canonStaleBefore, "failed approve mutated public state");
 await post("/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears fresh input moves watermark" }, ownerT);
 const g1 = await guards(sid, ownerT);
 const itemsBeforeRefresh = camel((await get("/api/records/" + sid, ownerT)).json, "itemsJson");
@@ -294,7 +295,7 @@ ok("refresh-preserves-items", camel((await get("/api/records/" + sid, ownerT)).j
 const canonWholeBefore = await canonState(did, ownerT);
 const wholeRev = await post("/api/records/" + did + "/revise", { ...(await guards(did, ownerT)), items: [{ id: "S1", text: "x" }] }, ownerT);
 ok("whole-revise-after-decisions-409", wholeRev.status === 409, String(wholeRev.status));
-ok("whole-revise-no-state-write", (await canonState(did, ownerT)) === canonWholeBefore, "decided whole-revise mutated state");
+ok("whole-revise-no-state-write", (await canonState(did, ownerT)) === canonWholeBefore, "decided whole-revise mutated public state");
 const u1 = await post("/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], ownerT);
 const buid = camel(u1.json, "id");
 ok("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
@@ -308,7 +309,7 @@ ok("new-predecessor-listed", (newRev.json.predecessors || []).includes(buid), JS
 const canonSupBefore = await canonState(buid, ownerT);
 const oldAp = await post("/api/records/" + buid + "/items/approve", { ...(await guards(buid, ownerT)), itemId: "U2" }, ownerT);
 ok("superseded-approve-409", oldAp.status === 409, String(oldAp.status));
-ok("superseded-no-state-write", (await canonState(buid, ownerT)) === canonSupBefore, "superseded write mutated state");
+ok("superseded-no-state-write", (await canonState(buid, ownerT)) === canonSupBefore, "superseded write mutated public state");
 const effEmpty = await get("/api/records/" + nid + "/effective", ownerT);
 ok("effective-404-before-approvals", effEmpty.status === 404, String(effEmpty.status));
 const apNew = await post("/api/records/" + nid + "/items/approve", { ...(await guards(nid, ownerT)), itemId: "U1" }, ownerT);
@@ -325,17 +326,17 @@ const amAp = await post("/api/records/" + amBaseId + "/approve-all", await guard
 ok("amend-inherit-approve-base", amAp.status === 200, String(amAp.status));
 const amHeadBefore = await get("/api/records/" + amBaseId + "/effective", ownerT);
 ok("amend-inherit-head-is-base", amHeadBefore.status === 200 && camel(amHeadBefore.json, "head") === amBaseId, JSON.stringify(amHeadBefore.json).slice(0, 200));
-const amAmend = await post("/api/records/" + amBaseId + "/amend", { ...(await guards(amBaseId, ownerT)), items: [{ id: amA, text: "Bears inherit alpha replaced" }, { id: amB, text: "Bears inherit beta" }] }, ownerT);
+const amAmend = await post("/api/records/" + amBaseId + "/amend", { ...(await guards(amBaseId, ownerT)), items: [{ id: amA, text: "Bears inherit alpha replaced" }] }, ownerT);
 const amV2 = camel(amAmend.json, "id");
 ok("amend-inherit-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
 const amMgrV1 = await get("/api/records/" + amBaseId + "/review", ownerT);
 ok("amend-inherit-v1-still-head-with-pending-child", amMgrV1.json.effectiveHeadId === amBaseId, JSON.stringify(amMgrV1.json.effectiveHeadId));
-const amAp2 = await post("/api/records/" + amV2 + "/approve-all", await guards(amV2, ownerT), ownerT);
+const amAp2 = await post("/api/records/" + amV2 + "/items/approve", { ...(await guards(amV2, ownerT)), itemId: amA }, ownerT);
 ok("amend-inherit-approve-v2", amAp2.status === 200, String(amAp2.status));
 const amMgrV2 = await get("/api/records/" + amV2 + "/review", ownerT);
 const amEff = (amMgrV2.json.lineageEffects || []);
 ok("amend-inherit-replaced-A", amEff.some((e) => e.id === amA && e.status === "replaced" && String(e.text).includes("replaced") && e.fromVersion === 1 && e.toVersion === 2), JSON.stringify(amEff).slice(0, 400));
-ok("amend-inherit-kept-B", amEff.some((e) => e.id === amB), JSON.stringify(amEff).slice(0, 400));
+ok("amend-inherit-inherited-B", amEff.some((e) => e.id === amB && e.status === "inherited" && e.fromVersion === 1 && String(e.text).includes("beta")), JSON.stringify(amEff).slice(0, 600));
 ok("amend-inherit-head-is-v2", amMgrV2.json.effectiveHeadId === amV2 && amMgrV2.json.effectiveHeadVersion === 2, JSON.stringify({ h: amMgrV2.json.effectiveHeadId, v: amMgrV2.json.effectiveHeadVersion }));
 const amMgrV1After = await get("/api/records/" + amBaseId + "/review", ownerT);
 ok("amend-inherit-v1-historical-after-approval", amMgrV1After.json.effectiveHeadId === amV2, JSON.stringify(amMgrV1After.json.effectiveHeadId));
@@ -343,7 +344,8 @@ const amGuestV1 = await get("/api/records/" + amBaseId + "/review", readerT);
 ok("amend-inherit-guest-v1-historical", amGuestV1.status === 200 && String(amGuestV1.json.draft?.effective?.headId) === amV2 && String(amGuestV1.json.draft?.effective?.headVersion) === "2", JSON.stringify(amGuestV1.json.draft?.effective).slice(0, 300));
 const amGuestV2 = await get("/api/records/" + amV2 + "/review", readerT);
 const amGItems = ((amGuestV2.json.draft?.effective?.approvedItems) || []);
-ok("amend-inherit-guest-v2-current", amGuestV2.status === 200 && amGItems.some((e) => e.text === "Bears inherit alpha replaced" && e.approvedBy?.version === 2) && amGItems.some((e) => e.text === "Bears inherit beta"), JSON.stringify(amGItems).slice(0, 400));
+ok("amend-inherit-guest-v2-current", amGuestV2.status === 200 && amGItems.some((e) => e.text === "Bears inherit alpha replaced" && e.approvedBy?.version === 2) && amGItems.some((e) => e.text === "Bears inherit beta" && e.approvedBy?.version === 1), JSON.stringify(amGItems).slice(0, 600));
+preflight("amend-inherit-effective-contains-B", (() => { try { const ee = amMgrV2.json; return Array.isArray(ee.effectiveIds) && ee.effectiveIds.includes(amB); } catch { return false; } })(), "effectiveIds missing inherited B");
 const c0 = await post("/api/meetings/" + mid + "/record/draft", [{ id: "C0", text: "Bears chain base" }], ownerT);
 let cid = camel(c0.json, "id");
 ok("chain-base", c0.status === 201 && cid, String(c0.status));

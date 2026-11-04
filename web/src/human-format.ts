@@ -296,18 +296,27 @@ function projectNestedString(s: string, cap: number): string {
   try {
     const v: unknown = JSON.parse(tt);
     const hit = projectJson(v, cap, "");
-    return hit !== "" ? hit : scrubIds(tt).slice(0, cap);
-  } catch { return scrubIds(tt).slice(0, cap); }
+    return hit !== "" ? hit : "";
+  } catch { return ""; }
 }
 function projectObject(o: Record<string, unknown>, cap: number): string {
   const bits: string[] = [];
-  if (typeof o.question === "string" && o.question.trim() !== "") bits.push("Question: " + scrubIds(o.question.trim()));
-  if (typeof o.title === "string" && (o.title as string).trim() !== "") bits.push(scrubIds((o.title as string).trim()));
+  if (typeof o.question === "string" && o.question.trim() !== "") {
+    const qt = (o.question as string).trim();
+    const qp = (qt.startsWith("{") || qt.startsWith("[")) ? projectNestedString(qt, 160) : scrubIds(qt);
+    if (qp !== "") bits.push("Question: " + qp);
+  }
+  if (typeof o.title === "string" && (o.title as string).trim() !== "") {
+    const tt2 = ((o.title as string).trim());
+    const tp = (tt2.startsWith("{") || tt2.startsWith("[")) ? projectNestedString(tt2, 160) : scrubIds(tt2);
+    if (tp !== "") bits.push(tp);
+  }
   for (const k of TEXT_FIELDS) {
     if (k === "question" || k === "title") continue;
     const v = o[k];
     if (typeof v === "string" && v.trim() !== "") {
       const vv = (v.trim().startsWith("{") || v.trim().startsWith("[")) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
+      if (vv === "") continue;
       const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : humanKeyLabel(k) + ": ";
       bits.push(label + vv);
     } else if (Array.isArray(v) && v.length > 0) {
@@ -327,7 +336,7 @@ function projectJson(raw: unknown, cap: number, fallback: string): string {
     if (raw.length === 0) return fallback;
     const bits = raw.map((e) => {
       if (e === null || e === undefined) return "";
-      if (typeof e === "string") return scrubIds(e.trim());
+      if (typeof e === "string") { const et = (e as string).trim(); if (et.startsWith("{") || et.startsWith("[")) return projectNestedString(et, 160); return scrubIds(et); }
       if (typeof e === "object" && !Array.isArray(e)) return projectObject(e as Record<string, unknown>, 160);
       return valueToText(e);
     }).filter((s) => s !== "");
@@ -347,8 +356,16 @@ function extractTruncatedFields(s: string, cap: number): string {
   while ((m = re.exec(s ?? "")) !== null && bits.length < 6) {
     try {
       const raw = m[2].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+      const rt = raw.trim();
+      if (rt.startsWith("{") || rt.startsWith("[")) {
+        const proj = projectNestedString(rt, 160);
+        if (proj === "") continue;
+        const label2 = m[1] === "text" || m[1] === "body" || m[1] === "content" || m[1] === "excerpt" ? "" : humanKeyLabel(m[1]) + ": ";
+        bits.push(label2 + proj.slice(0, 160));
+        continue;
+      }
       const label = m[1] === "text" || m[1] === "body" || m[1] === "content" || m[1] === "excerpt" ? "" : humanKeyLabel(m[1]) + ": ";
-      const clean = scrubIds(raw.trim());
+      const clean = scrubIds(rt);
       if (clean !== "") bits.push(label + clean.slice(0, 160));
     } catch { /* keep scanning */ }
   }
