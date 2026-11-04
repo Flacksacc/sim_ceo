@@ -572,6 +572,41 @@ Backup `.tmp/update-20261104-165635-UTC-f777dced`; rollback
 Database/volumes preserved, owned browsers closed, no coding agents or test
 servers used. Full parity remains paused.
 
+### 2026-11-04 — Bottom Profile and shared Settings
+
+`28d75cb` removes People/Activity from board sidebar pages and removes the upper
+Profile entry. One generic Profile button is available at the rail bottom;
+login/account controls remain hidden. Settings loads without a selected board
+or an installation-admin role. Model status, save and test APIs accept demo
+visitors and any valid secure-mode session. Invalid/missing secure sessions
+remain rejected, including rechecks inside mutation/publication boundaries.
+Existing policy validation, atomic writes, restore/configuration freshness and
+credential masking remain. This intentionally supersedes the previous admin
+restriction for model settings only. `8dd264d` also makes an empty API-key field
+preserve the stored key, matching its existing hint.
+
+Native frontend and full release builds passed. Dedicated integration test
+`qa/settings-access-qa.mjs` passed against a fresh in-memory/fake stack: demo
+non-owner and secure non-admin read/save/test, actual browser Save/Test without
+a board, key preservation, invalid-payload atomicity, revoked/invalid-session
+rejection and masked responses. Evidence: `.tmp/shared-settings-access-final.log`.
+C: exhaustion initially blocked the build; automatic review refused cache
+deletions, so no caches were removed. Verification ran from the identical
+checkout at `D:/Temp/sim-ceo-shared-settings-20261104/app`; logs remain there.
+
+Final live checks passed in both themes and narrow layout: grouped navigation,
+sole bottom Profile, Settings without board/admin, history and filtering,
+zero domain writes/page errors and preserved board/meeting/roster/advisor data.
+Evidence: `.tmp/shared-settings-live-check-final.log`; screenshots:
+`output/shared-settings-review/2026-11-04`.
+
+Healthy on 5173, image
+`sha256:bfd08603ce7288009aeb0b2d222b64ec93a6bedd46f8e061155aee33ac6b0751`.
+Backup `.tmp/update-20261104-170833-UTC-641f1515`; rollback
+`simceo-essentials-app:rollback-20261104-170833-641f1515`.
+Original database/volumes retained. Owned QA services/browser exited; no coding
+agents used, user `tmp.txt` untouched. Full parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
