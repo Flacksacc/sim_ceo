@@ -2,13 +2,17 @@
 
 ## Current meeting layout (2026-11-04)
 
-The meeting team and attachment drop zone occupy a sticky right-hand panel on
-desktop. The team list scrolls independently when necessary; uploading documents
-stays available while the conversation scrolls. Hiding the brief never hides the
-team or drop target. On tablet and phone widths, the panel sits above the
-conversation and remains pinned; the advisor list scrolls horizontally. On phones
-it clears the top toolbar and leaves whole advisor cards visible. The brief
-remains in the meeting header and General settings on these narrow layouts.
+The 280px meeting team and attachment panel stays pinned on the right on desktop.
+Advisors use ten fixed slots arranged in two rows of five, with 44px portraits;
+unused slots show open seats. The Orchestrator and Secretary appear separately
+below the ten advisor slots. Names, activity and hover descriptions remain
+available. Long conversations scroll independently of the panel.
+
+The full meeting header (name, brief, status and search) spans the conversation
+and tools, and stays pinned above them. A ResizeObserver keeps the tools below
+the current header height during resize or renaming. The duplicate sidebar brief
+and its Hide/Show control are removed. Narrow layouts place tools below the pinned
+header, retain the same two-row grid, and clear the phone toolbar.
 
 Meeting settings lives next to the microphone in the composer. Its existing
 command menu keeps keyboard navigation, focus return and viewport placement.

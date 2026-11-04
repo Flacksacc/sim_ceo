@@ -41,7 +41,7 @@ export interface MeetingParticipantsProps {
   availability?: "available" | "loading" | "paused" | "unavailable";
   /* Optional human heading override. Defaults to In this meeting. */
   heading?: string;
-  variant?: "rail" | "composer";
+  variant?: "rail" | "composer" | "grid";
 }
 
 const LABEL: Record<ParticipantActivity, string> = {
@@ -140,41 +140,51 @@ export function MeetingParticipants(p: MeetingParticipantsProps) {
       statusLine = list.length + " members: " + parts.join(", ") + ".";
     }
   }
+  const advisorSeats = list.filter(m => m.key !== "orchestrator" && !m.isSecretary);
+  const assistants = list.filter(m => m.key === "orchestrator" || m.isSecretary);
+  const renderSeat = (m: MeetingParticipant) => {
+    const hasPortrait = typeof m.portraitUrl === "string" && m.portraitUrl.length > 0;
+    return (
+      <li key={m.key} data-activity={m.activity} title={m.displayName + ": " + LABEL[m.activity] + (m.roleLabel ? " — " + m.roleLabel : "")} className={"mp-seat act-" + m.activity + (m.isSecretary ? " is-sec" : "")}>
+        <span className="mp-avatar" data-active={LIVE_DOT[m.activity] ? "true" : "false"}>
+          <span className="mp-avatar-crop">
+          {hasPortrait ? (
+            <img src={m.portraitUrl as string} alt={"Portrait of " + m.displayName} loading="lazy" />
+          ) : (
+            <span
+              className={"mp-fallback" + (m.isSecretary ? " sec" : "")}
+              aria-hidden="true">{m.isSecretary ? "S" : initials(m.displayName)}</span>
+          )}
+          </span>
+          {LIVE_DOT[m.activity] && <span className="mp-pulse" aria-hidden="true" />}
+        </span>
+        <span className="mp-meta">
+          <span className="mp-name">{m.displayName}{m.isSecretary ? " (Secretary)" : ""}</span>
+          {m.roleLabel && <span className="mp-role muted">{m.roleLabel}</span>}
+          <span className={"badge mp-badge st-" + m.activity}>{LABEL[m.activity]}</span>
+        </span>
+      </li>
+    );
+  };
   return (
-    <section className={"meet-participants" + (p.variant === "composer" ? " is-composer" : "")} aria-label={p.heading || "In this meeting"}>
+    <section className={"meet-participants" + (p.variant === "composer" ? " is-composer" : p.variant === "grid" ? " is-grid" : "")} aria-label={p.heading || "In this meeting"}>
       <div className="mp-head">
         <h3>{p.heading || "In this meeting"}</h3>
         {p.live && avail !== "unavailable" && <span className="badge live">live</span>}
       </div>
       <p className="muted mp-status" role="status">{statusLine}</p>
-      {list.length === 0 ? (
+      {p.variant === "grid" ? <>
+        <ul className="mp-rail mp-advisor-grid" aria-label="Advisor activity">
+          {advisorSeats.map(renderSeat)}
+          {Array.from({ length: Math.max(0, 10 - advisorSeats.length) }, (_, i) =>
+            <li key={"empty-" + i} className="mp-empty" aria-label="Open advisor seat"><span className="mp-avatar" aria-hidden="true">+</span><span>Open seat</span></li>)}
+        </ul>
+        <ul className="mp-systems" aria-label="Meeting assistants">{assistants.map(renderSeat)}</ul>
+      </> : list.length === 0 ? (
         <p className="muted">Participants appear here once the meeting has members.</p>
       ) : (
         <ul className="mp-rail" aria-label="Participant activity">
-          {list.map((m) => {
-            const hasPortrait = typeof m.portraitUrl === "string" && m.portraitUrl.length > 0;
-            return (
-              <li key={m.key} data-activity={m.activity} title={m.displayName + ": " + LABEL[m.activity]} className={"mp-seat act-" + m.activity + (m.isSecretary ? " is-sec" : "")}>
-                <span className="mp-avatar" data-active={LIVE_DOT[m.activity] ? "true" : "false"}>
-                  <span className="mp-avatar-crop">
-                  {hasPortrait ? (
-                    <img src={m.portraitUrl as string} alt={"Portrait of " + m.displayName} loading="lazy" />
-                  ) : (
-                    <span
-                      className={"mp-fallback" + (m.isSecretary ? " sec" : "")}
-                      aria-hidden="true">{m.isSecretary ? "S" : initials(m.displayName)}</span>
-                  )}
-                  </span>
-                  {LIVE_DOT[m.activity] && <span className="mp-pulse" aria-hidden="true" />}
-                </span>
-                <span className="mp-meta">
-                  <span className="mp-name">{m.displayName}{m.isSecretary ? " (Secretary)" : ""}</span>
-                  {m.roleLabel && <span className="mp-role muted">{m.roleLabel}</span>}
-                  <span className={"badge mp-badge st-" + m.activity}>{LABEL[m.activity]}</span>
-                </span>
-              </li>
-            );
-          })}
+          {list.map(renderSeat)}
         </ul>
       )}
     </section>

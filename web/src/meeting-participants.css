@@ -66,3 +66,18 @@
 .st-waiting-for-publication{background:var(--panel-2);color:var(--ink);border:1px dashed var(--info)}
 .st-interrupted{background:var(--panel-2);color:var(--danger);border:1px dashed var(--danger)}
 .st-needs-approval{background:var(--accent-soft);color:var(--ink);border:1px solid var(--accent)}
+
+/* Ten advisor slots, two rows of five; assistants remain separate. */
+.meeting-tools .is-grid .mp-advisor-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); grid-template-rows:repeat(2,104px); gap:4px; overflow:visible; padding:4px 2px; }
+.meeting-tools .is-grid .mp-advisor-grid .mp-seat, .mp-empty { min-width:0; min-height:0; padding:5px 0; flex-direction:column; align-items:center; text-align:center; gap:3px; border:0; background:transparent; }
+.meeting-tools .is-grid .mp-advisor-grid .mp-meta { width:100%; align-items:center; gap:2px; }
+.meeting-tools .is-grid .mp-advisor-grid .mp-name { font-size:.6rem; line-height:1.2; white-space:normal; height:25px; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+.meeting-tools .is-grid .mp-advisor-grid .mp-role { display:none; }
+.meeting-tools .is-grid .mp-advisor-grid .mp-badge { align-self:center; font-size:.52rem; line-height:1.15; padding:2px 3px; max-width:100%; white-space:normal; }
+.mp-empty { display:flex; color:var(--muted); font-size:.6rem; }
+.mp-empty .mp-avatar { border-style:dashed; opacity:.5; font-size:1.1rem; }
+.mp-systems { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; list-style:none; margin:10px 0 0; padding:8px 0 0; border-top:1px solid var(--line); }
+.meeting-tools .mp-systems .mp-seat { min-width:0; padding:5px; gap:5px; }
+.meeting-tools .mp-systems .mp-name { white-space:normal; font-size:.65rem; }
+.meeting-tools .mp-systems .mp-role { display:none; }
+.meeting-tools .mp-systems .mp-badge { font-size:.55rem; white-space:normal; }

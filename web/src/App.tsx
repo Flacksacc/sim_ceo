@@ -2253,7 +2253,16 @@ export default function App() {
   const [contextTab, setContextTab] = useState<
     "members" | "context" | "decisions"
   >(route0.ctab);
-  const [contextCollapsed, setContextCollapsed] = useState(false);
+  const [meetingTop, setMeetingTop] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!meetingTop) return;
+    const room = meetingTop.parentElement;
+    const update = () => room?.style.setProperty("--meeting-top-height", `${meetingTop.getBoundingClientRect().height}px`);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(meetingTop);
+    return () => observer.disconnect();
+  }, [meetingTop]);
   const [meetingControlsHost, setMeetingControlsHost] = useState<HTMLDivElement | null>(null);
   const [recordFlash, setRecordFlash] = useState(false);
   const prevRecordKey = useRef("");
@@ -7555,8 +7564,7 @@ const testModel = useMutation({
                     meetingId ? (
                       <>
                         {" "}
-                        <div className="meet-center">
-                        {" "}
+                        <div className="meeting-top" ref={setMeetingTop}>
                         <ConversationHeader key={meetingId + ":" + canonicalUser()}
                           controlsTarget={meetingControlsHost}
                           meetingTitle={curMeeting?.title ?? "Meeting"}
@@ -7594,6 +7602,10 @@ const testModel = useMutation({
                             const rc = sendRetryCtx; if (rc && (rc as any).meetingId === meetingId) { retryResponses(rc); return; } requestFreshResponses();
                           }}
                         />{" "}
+                            <ConversationSearchField value={sq} onChange={setSq} onSearch={searchMsgs} resultCount={hits.length > 0 ? hits.length : null} />{" "}
+                        </div>
+                        <div className="meet-center">
+                        {" "}
                         <MeetingSettingsDialog
                           open={settingsOpen}
                           title={mtitle}
@@ -7893,7 +7905,6 @@ const testModel = useMutation({
                         </MeetingSettingsDialog>{" "}
 
 
-                            <ConversationSearchField value={sq} onChange={setSq} onSearch={searchMsgs} resultCount={hits.length > 0 ? hits.length : null} />{" "}
                             {hits.length > 0 && (
                               <ul className="search-hits" aria-label="Conversation search results">
                                 {" "}
@@ -8287,37 +8298,8 @@ const testModel = useMutation({
                       <aside className="meet-right meeting-tools" aria-label="Meeting tools">
                               <MeetingAttachments key={boardId + meetingId + originRevision()} boardId={boardId} meetingId={meetingId} canUpload={canActMeeting} transport={{ get, upload }} />
                         <div className="meeting-rail-team">
-                              <MeetingParticipants participants={meetingTeam} variant="rail" heading="Meeting team" live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
+                              <MeetingParticipants participants={meetingTeam} variant="grid" heading="Meeting team" live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
                         </div>
-                        <div className="context-bar">
-                          {" "}
-                          <span className="muted">Meeting context</span>{" "}
-                          <button
-                            type="button"
-                            className="btn ghost icon"
-                            onClick={() => setContextCollapsed(value => !value)}
-                            aria-label={contextCollapsed ? "Show meeting context" : "Hide meeting context"}
-                          >
-                            {" "}
-                            {contextCollapsed ? "Show" : "Hide"}{" "}
-                          </button>{" "}
-                        </div>{" "}
-                        {!contextCollapsed && (
-                          <div className="context-body">
-                            {" "}
-
-                            {" "}
-                                {" "}
-                                <div className="card">
-                                  {" "}
-                                  <h3>Brief</h3>{" "}
-                                  <p>
-                                    {" "}
-                                    {curMeeting?.brief || "No brief yet."}{" "}
-                                  </p>{" "}
-                                </div>{" "}
-                          </div>
-                        )}{" "}
                       </aside>{" "}
                     </>
                     ) : (
