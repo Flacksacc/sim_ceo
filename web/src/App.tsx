@@ -6147,19 +6147,10 @@ const testModel = useMutation({
         {" "}
         <h1 className="brand rail-logo">
           {" "}
-          <button
-            type="button"
-            className="rail-home"
-            onClick={() => {
-              setTab("boards");
-              setNavOpen(false);
-            }}
-            aria-label="Sim CEO — go to Boards"
-            title="Boards"
-          >
+          <span className="rail-brand-icon">
             {" "}
-            <img src="/logo.webp" alt="" width="32" height="32" className="brand-logo" />{" "}
-          </button>{" "}
+            <img src="/logo.webp" alt="Sim CEO" width="32" height="32" className="brand-logo" />{" "}
+          </span>{" "}
         </h1>{" "}
 
         <div className="rail-items" ref={railListRef}>

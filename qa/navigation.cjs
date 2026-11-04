@@ -938,9 +938,9 @@ async function mobileSuite(browser) {
     await page.screenshot({ path: path.join(SHOTDIR, "shot-mobile-nav-open.png") });
     // genuine arrow-key travel: focus must MOVE between rail destinations
     const focusedLabel = () => page.evaluate(() => { const ae = document.activeElement; return ae ? (ae.getAttribute("aria-label") || "") : ""; });
-    await page.locator("nav.rail button.rail-home").focus();
+    await page.locator('nav.rail .navitem button[aria-label="Boards"]').focus();
     const first = await focusedLabel();
-    await check(page, "rail home focusable for arrow travel", async () => (await focusedLabel()).length > 0 && (await focusInNav()));
+    await check(page, "Boards destination focusable for arrow travel", async () => (await focusedLabel()) === "Boards" && (await focusInNav()));
     await page.keyboard.press("ArrowDown");
     const second = await focusedLabel();
     await check(page, "arrow key moves focus to next destination", async () => (await focusInNav()) && second !== first && second.length > 0);
@@ -1012,7 +1012,7 @@ async function resizeSuite(browser) {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForFunction(() => !document.querySelector("nav.rail").hasAttribute("inert"), null, { timeout: 8000 }).catch(() => {});
     await check(page, "shrinking with open drawer keeps it usable", async () => (await railProbe()).inert === false);
-    await page.locator("nav.rail button.rail-home").focus();
+    await page.locator('nav.rail .navitem button[aria-label="Boards"]').focus();
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.waitForFunction(() => !document.querySelector("nav.rail").hasAttribute("inert"), null, { timeout: 8000 }).catch(() => {});
     await page.setViewportSize({ width: 390, height: 844 });
