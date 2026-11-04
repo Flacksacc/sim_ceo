@@ -1097,3 +1097,38 @@ Backup `.tmp/update-20261104-210154-UTC-1a00445f`; original DB container and vol
 retained. `/health` and `/ready` pass with PostgreSQL. Source pushed to
 Flacksacc/sim_ceo. Owned QA services and browsers stopped; Muse used for images
 only. tmp.txt untouched; broader parity goal remains paused.
+
+
+### Two-row advisor grid and pinned meeting header - 2026-11-04
+
+Delivered `42b1e27`. The right panel retains its 280px width and 44px portraits.
+Ten advisor slots form exactly two rows of five, with open-seat placeholders
+when the board has fewer members. The Orchestrator and Secretary sit separately
+below the advisor grid, preserving all ten board advisors. Names and live status
+remain visible; hover descriptions retain each advisor's brief description.
+The duplicate sidebar brief and its Hide/Show controls are removed.
+
+The meeting name, brief, status and conversation search now span the top of the
+meeting and remain sticky during conversation scrolling. A ResizeObserver adjusts
+the tools' offset to the header's current height, including renaming and resize.
+Phone layouts clear the top toolbar. Very long headers have bounded internal
+scrolling to preserve access to the conversation. Meeting commands remain beside
+dictation and retain their existing dispatch, permissions and draft guards.
+
+Frontend/release builds passed. Native `qa/meeting-grid-header-qa.mjs` verifies
+all ten advisors, separate assistants, exactly five icons per row in two rows,
+pinned title/brief/search through long scrolls, retained drop uploads and actual
+responding animations, menu bounds/focus, and light/dark desktop/tablet/phone.
+Attachment QA also verifies the nine open seats for a one-advisor board; ordinary
+upload/context/error checks pass. Command-menu and rename regressions pass.
+Evidence: `.tmp/meeting-grid-qa/{build,grid,attachments,menu,rename}.log`.
+The previous pinned-tools QA entry point now delegates to the current grid test.
+
+Live desktop/390px checks pass portraits, ten grid slots, no duplicate sidebar
+brief, search inside the pinned header, composer commands, no errors and no
+mutations (`.tmp/meeting-grid-live-check.log`). Healthy localhost:5173 image:
+`sha256:fdaa0f22f0b105173e0e648632ef4535434a805cf11c2e8f294b993a0fbc268b`.
+Backup `.tmp/update-20261104-210924-UTC-f40b2b84`; original database container and
+volumes retained. `/health` and `/ready` pass with PostgreSQL. Source published to
+Flacksacc/sim_ceo. Owned QA services and browsers stopped; tmp.txt untouched;
+broader parity goal remains paused.
