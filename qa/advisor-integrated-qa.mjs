@@ -2704,6 +2704,10 @@ async function stepNavigation() {
     let entityOk = true; let emptyVerified = false;
     if (d.entity) { entityOk = secTxt.includes(d.entity); if (!entityOk && (d.seg === "records" || d.seg === "sources")) { const emptyRe = d.seg === "records" ? /pick a meeting first|no records|nothing here yet/i : /no sources|nothing here yet/i; if (emptyRe.test(normTxt) && secVis && headOk) { emptyVerified = true; entityOk = true; } } }
     const h = await ev(() => location.hash).catch(() => "");
+    // Selecting a sidebar meeting now retains that meeting in Records.
+    // Its scoped draft controls identify the destination; the title lives
+    // in the sidebar, rather than inside the Records section.
+    if (d.seg === "records" && secVis && headOk && secTxt.includes("Prepare draft") && h.includes("meeting=" + encodeURIComponent(meetingId))) entityOk = true;
     const hashOk = h.indexOf("#/" + d.seg) === 0;
     const boardOk = ["advisors", "meet", "sources", "records", "people", "activity"].includes(d.seg) ? h.includes("board=" + encodeURIComponent(boardA)) : true;
     return { ok: hashOk && boardOk && secVis && headOk && entityOk, detail: "hash=" + h.slice(0,80) + " sec=" + secVis + " head=" + headOk + " entity=" + entityOk + " emptyVerified=" + emptyVerified + " secTxt=" + normTxt.slice(0, 160) };
