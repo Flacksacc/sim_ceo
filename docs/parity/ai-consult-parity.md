@@ -896,3 +896,40 @@ Healthy localhost:5173 image
 Backup `.tmp/update-20261104-192103-UTC-60c9904e`; original DB/volumes preserved.
 No coding agents or QA services left running; browser contexts closed;
 `tmp.txt` untouched; broader parity goal remains paused.
+
+### 2026-11-04 — Advisor membership lists, shared summaries and public GitHub
+
+Implemented `d5df406` with narrow-layout refinement `f121125`. Board Advisors
+contains selected and available membership lists, with no create-advisor button,
+individual profile/version cards or portrait editing tools. Required approval
+remains an inline selected-row action using the existing sync/approval gates.
+All advisor lists now show portraits (initials on missing/failed images) and
+brief descriptions: roster sidebar, board creation, board membership, meeting
+settings and meeting team strip. Roster pagination is shared across these views;
+portrait metadata/bytes load as rows approach the viewport. Board-advisor DTOs
+include canonical name/description, including only the already-authorized subset
+of approved advisors for meeting guests; private research/profile bodies remain
+excluded from that minimal projection.
+
+Frontend/backend/release builds passed. Isolated tests passed:
+`.tmp/advisor-lists-wizard-qa.log`, `.tmp/advisor-lists-qa.log`, and
+`.tmp/advisor-lists-dialogue-qa.log`. These cover 211-entry paging, membership
+remove/re-add, inline approval, all advisor-list summaries/portraits, missing
+portraits, setup/retry behavior, parallel meeting replies and context guards.
+Live desktop light/dark and 390px mobile checks passed with zero domain writes
+or page errors, including readable selected-row text on mobile:
+`.tmp/advisor-lists-live-check.log` and corresponding screenshots.
+
+Healthy localhost:5173 image:
+`sha256:dec139ea5d2bea1af588d62661e4c9cb8a2e1bd4eb23e41289c428c665ad51e0`.
+Backup `.tmp/update-20261104-193411-UTC-5f96e856`; original database and volumes
+preserved. Owned QA services and browsers closed; no coding agents used;
+`tmp.txt` untouched. Broader parity goal remains paused.
+
+At the user's request, created public GitHub repository
+https://github.com/Flacksacc/sim_ceo and configured local origin/main tracking.
+Published main history and the completed changes. A credential-pattern scan of
+1,991 tracked text blobs across Git history found no matches; private environment
+files, live app data, scratch output and untracked tmp.txt were excluded from the
+upload. Repository visibility and remote main commit were verified using GitHub
+and git. Scan metadata: `.tmp/public-repo-source-scan.json`.
