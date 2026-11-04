@@ -86,7 +86,7 @@ import { chromium } from "playwright-core";
 const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15300").trim();
 const LIVE = process.env.ALLOW_LIVE_PROVIDER === "1";
 const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15302").trim();
-const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application.exe";
+const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
 const REQ_TIMEOUT = 30000;
 const RESEARCH_TIMEOUT = 185000;
 const RUN_TIMEOUT = 150000;

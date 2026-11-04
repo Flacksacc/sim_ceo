@@ -729,7 +729,7 @@ async function scenarioAuthUnknown(browser) {
   await page.getByRole("button", { name: "Run research on this draft" }).click();
   await waitText(page, "#cc-research-status", /Research status: (failed|stale)/, 30000);
   const errBox = (await page.locator(".cc-err").count()) ? await page.locator(".cc-err").textContent() : "";
-  ok("browser: stale auth surfaced not swallowed", /401/.test(errBox || ""), (errBox || "").slice(0, 200));
+  ok("browser: stale auth surfaced not swallowed", /sign in again/i.test(errBox || "") && /session changed/i.test(errBox || "") && !/401/.test(errBox || ""), (errBox || "").slice(0, 200));
   await page.locator("#cc-contribute").fill("AUTH-OWNER");
   await page.getByRole("button", { name: "Save draft changes" }).click();
   await waitText(page, "#cc-research-status", /could not be verified|Draft saved\./, 20000);
