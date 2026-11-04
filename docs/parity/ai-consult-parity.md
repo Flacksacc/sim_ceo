@@ -1059,3 +1059,41 @@ Healthy localhost:5173 image:
 Backup `.tmp/update-20261104-201016-UTC-90cd4762`; original DB/volumes retained.
 Source pushed to Flacksacc/sim_ceo. Owned QA services and browsers stopped;
 no agents used; tmp.txt untouched; broader parity goal remains paused.
+
+
+### Pinned meeting tools and stylized system portraits - 2026-11-04
+
+Delivered in `b53439c` and compact-panel refinement `ff18cc5`. The attachment drop
+zone and complete meeting team now live in a sticky right-hand panel. Long
+conversations scroll separately; the advisor list scrolls within the panel as
+needed, leaving document drops accessible. Desktop brief Hide/Show affects only
+the brief. Tablet/phone layouts pin a horizontal team strip and drop zone above
+the conversation; the phone panel clears the toolbar and shows whole advisor
+cards. The brief remains available in the header and General settings.
+
+Meeting settings is next to dictation in the composer, using the existing
+command handlers through a React portal. All eight commands, draft preservation,
+keyboard behavior, focus return, permissions and menu viewport positioning are
+preserved. Command overlays appear above the pinned panel when necessary.
+
+Two actual Muse Image (`muse-image-1.0`) generations replace photographic system
+portraits with 3D cartoon avatars in the style of the Sim CEO logo. Installed
+assets are `web/public/portraits/orchestrator-v2.webp` and `secretary-v2.webp`;
+prompts/provenance are in `generated-muse-v2.json`. Existing advisor portraits
+are unchanged.
+
+Release/frontend builds passed. `qa/pinned-meeting-tools-qa.mjs` verifies ten
+advisors plus both system agents, long-message scrolling, independent team
+scrolling, upload by drop while pinned, actual responding animations, settings
+beside the microphone, menu focus/bounds, light/dark desktop, tablet and phone,
+including whole-card visibility. Existing attachment and command-menu regressions
+passed. Evidence: `.tmp/pinned-team-qa/{build,attachments,menu,pinned}.log`.
+Live `.tmp/pinned-tools-live-check.log` passes portraits, drop zone, composer
+placement, desktop/390px, light/dark, no page errors and no domain mutations.
+
+Healthy localhost:5173 image:
+`sha256:feb60a7136e99973997272f031d4a0a717cd4a33f259f7e4ede66d9065e77b23`.
+Backup `.tmp/update-20261104-210154-UTC-1a00445f`; original DB container and volumes
+retained. `/health` and `/ready` pass with PostgreSQL. Source pushed to
+Flacksacc/sim_ceo. Owned QA services and browsers stopped; Muse used for images
+only. tmp.txt untouched; broader parity goal remains paused.

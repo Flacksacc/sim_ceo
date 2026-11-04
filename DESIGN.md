@@ -1,5 +1,21 @@
 # Sim CEO boardroom design template
 
+## Current meeting layout (2026-11-04)
+
+The meeting team and attachment drop zone occupy a sticky right-hand panel on
+desktop. The team list scrolls independently when necessary; uploading documents
+stays available while the conversation scrolls. Hiding the brief never hides the
+team or drop target. On tablet and phone widths, the panel sits above the
+conversation and remains pinned; the advisor list scrolls horizontally. On phones
+it clears the top toolbar and leaves whole advisor cards visible. The brief
+remains in the meeting header and General settings on these narrow layouts.
+
+Meeting settings lives next to the microphone in the composer. Its existing
+command menu keeps keyboard navigation, focus return and viewport placement.
+Orchestrator and Secretary use Muse-generated 3D cartoon avatars matching the
+Sim CEO logo, rather than photographic people. Existing advisor portraits remain
+unchanged. The schematic below is an older design reference.
+
 ## Layout schematic
 
 ```text
