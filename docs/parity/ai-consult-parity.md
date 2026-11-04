@@ -591,7 +591,7 @@ non-owner and secure non-admin read/save/test, actual browser Save/Test without
 a board, key preservation, invalid-payload atomicity, revoked/invalid-session
 rejection and masked responses. Evidence: `.tmp/shared-settings-access-final.log`.
 C: exhaustion initially blocked the build; automatic review refused cache
-deletions, so no caches were removed. Verification ran from the identical
+deletions; npm cache cleanup also reported ENOSPC. Verification ran from the identical
 checkout at `D:/Temp/sim-ceo-shared-settings-20261104/app`; logs remain there.
 
 Final live checks passed in both themes and narrow layout: grouped navigation,
