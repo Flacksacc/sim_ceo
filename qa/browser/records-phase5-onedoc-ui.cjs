@@ -59,12 +59,12 @@ async function allApproveControls() {
 }
 async function safeErrors() { return consoleErrors.slice(0, 5).join(" | ").slice(0, 600); }
 async function canonState(did, tok) {
-  const d = await api("GET", "/api/records/" + did, tok);
-  const r = await api("GET", "/api/records/" + did + "/review", tok);
+  const d = await api("GET", "/api/records/" + did, undefined, tok);
+  const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
   return JSON.stringify({ items: d.json && d.json.itemsJson, ap: d.json && d.json.approvedJson, dc: d.json && d.json.discardedJson, hist: d.json && d.json.historyJson, v: d.json && d.json.version, h: d.json && d.json.hash, tok: d.json && d.json.reviewToken, wm: d.json && d.json.watermark, pend: r.json && r.json.pending, appr: r.json && r.json.approved, hc: r.json && r.json.historyCount });
 }
 async function pendingOrdinals(did, tok) {
-  const r = await api("GET", "/api/records/" + did + "/review", tok);
+  const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
   const pend = (r.json && r.json.pending) || [];
   const map = {};
   pend.forEach((id, i) => { map[id] = i + 1; });
@@ -165,7 +165,7 @@ async function main() {
   const qrid = quick.json.id || (quick.json.entry && quick.json.entry.id);
   const up = await uploadPortrait(qrid, owner);
   ok("seed-portrait-upload", up.status === 201, String(up.status) + " " + up.text.slice(0, 160));
-  const imgs = await api("GET", "/api/roster/" + qrid + "/images", owner);
+  const imgs = await api("GET", "/api/roster/" + qrid + "/images", undefined, owner);
   const imgId = (imgs.json && imgs.json[0] && (imgs.json[0].id || imgs.json[0].Id)) || null;
   ok("seed-portrait-list", !!imgId, JSON.stringify(imgs.json).slice(0, 160));
   const imgRev = await api("POST", "/api/images/" + imgId + "/review", { decision: "accept" }, owner);
@@ -212,34 +212,34 @@ async function main() {
   await page.waitForTimeout(1200);
   ok("ui-revise-QB", await bodyHas("Bears UI revised beta"), "revised text missing");
   {
-    const det = await api("GET", "/api/records/" + did, owner);
+    const det = await api("GET", "/api/records/" + did, undefined, owner);
     let itemsText = "";
     try { itemsText = JSON.stringify(JSON.parse(det.json.itemsJson).map((e) => e.text)); } catch { itemsText = ""; }
     ok("api-revise-exact-text", det.status === 200 && itemsText.includes("Bears UI revised beta") && itemsText.includes("Bears UI approve alpha"), itemsText.slice(0, 200));
-    const hh = await api("GET", "/api/records/" + did, owner);
+    const hh = await api("GET", "/api/records/" + did, undefined, owner);
     let hist = []; try { hist = JSON.parse(hh.json.historyJson); } catch { hist = []; }
     ok("api-revise-history-exact", hist.some((e) => e.action === "revise" && e.itemId === gidB && e.newText === "Bears UI revised beta"), "revise history entry wrong");
   }
-  const rev1 = await api("GET", "/api/records/" + did + "/review", owner);
+  const rev1 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-revise-kept-pending", (rev1.json.pending || []).includes(gidB), "revise wrong");
   ok("ui-history-shows-revise", await bodyHas("Decision history") && await bodyHas("Revised"), "history missing");
   await page.getByRole("button", { name: "Set aside decision " + ordC }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
-  const rev2 = await api("GET", "/api/records/" + did + "/review", owner);
+  const rev2 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-discard-QC", (rev2.json.discarded || []).includes(gidC), "discard wrong");
   await page.getByRole("button", { name: "Approve decision " + ordA }).first().click({ timeout: T.step });
   await page.waitForFunction(() => document.body.innerText.includes("Approved decision " + ordA), null, { timeout: T.poll }).catch(() => null);
   await page.waitForTimeout(1200);
-  const rev3 = await api("GET", "/api/records/" + did + "/review", owner);
+  const rev3 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-approve-QA", (rev3.json.approved || []).includes(gidA), "approve wrong");
   await page.getByRole("button", { name: /Approve all/ }).first().click({ timeout: T.step });
   await page.waitForTimeout(2000);
-  const rev4 = await api("GET", "/api/records/" + did + "/review", owner);
+  const rev4 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-all-decided", (rev4.json.pending || []).length === 0, "not decided");
   ok("api-all-decided-sets", JSON.stringify([...rev4.json.approved].sort()) === JSON.stringify([gidA, gidB].sort()) && (rev4.json.discarded || []).includes(gidC), JSON.stringify({ a: rev4.json.approved, d: rev4.json.discarded }));
   ok("ui-all-decided-no-approve", (await allApproveControls()) === 0 && (await reviseCount()) === 0 && (await setAsideCount()) === 0, "controls present after decide: approve=" + (await approveCount()) + " sel=" + (await approveSelectedCount()) + " all=" + (await approveAllCount()) + " box=" + (await selectBoxCount()));
   {
-    const gr = await api("GET", "/api/records/" + did + "/review", reader);
+    const gr = await api("GET", "/api/records/" + did + "/review", undefined, reader);
     ok("guest-approved-positive", gr.status === 200 && (gr.json.approved || []).includes(gidA), String(gr.status));
     const gtexts = ((gr.json.draft && gr.json.draft.approvedItems) || []).map((e) => e.text);
     ok("guest-approved-text", gtexts.includes("Bears UI approve alpha") && gtexts.includes("Bears UI revised beta"), JSON.stringify(gtexts).slice(0, 240));
@@ -257,7 +257,7 @@ async function main() {
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + sid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction(() => document.body.innerText.includes("Bears stale two"), null, { timeout: T.poll });
   await page.waitForTimeout(800);
-  const g0 = await api("GET", "/api/records/" + sid, owner);
+  const g0 = await api("GET", "/api/records/" + sid, undefined, owner);
   const g0g = { version: g0.json.version, hash: g0.json.hash, reviewToken: g0.json.reviewToken, watermark: g0.json.watermark };
   await api("POST", "/api/records/" + sid + "/items/revise", { ...g0g, itemId: "S1", text: "Bears other-client revision" }, owner);
   const canonHeldBefore = await canonState(sid, owner);
@@ -269,21 +269,21 @@ async function main() {
   ok("held-no-state-write", (await canonState(sid, owner)) === canonHeldBefore, "held approve mutated canonical state");
   await shot("onedoc-409");
   await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears fresh input" }, owner);
-  const itemsBeforeRefresh = (await api("GET", "/api/records/" + sid, owner)).json.itemsJson;
+  const itemsBeforeRefresh = (await api("GET", "/api/records/" + sid, undefined, owner)).json.itemsJson;
   await page.getByRole("button", { name: "Refresh review" }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
   ok("ui-refresh-reloads", await bodyHas("Bears other-client revision"), "fresh authority missing");
   {
-    const after = await api("GET", "/api/records/" + sid, owner);
+    const after = await api("GET", "/api/records/" + sid, undefined, owner);
     ok("refresh-preserves-items", after.json.itemsJson === itemsBeforeRefresh, "refresh rewrote items");
     ok("refresh-rotates-token-ui", after.json.reviewToken !== g0g.reviewToken, "token unchanged after refresh");
   }
   const ordS2 = await pendingOrdinals(sid, owner);
   await page.getByRole("button", { name: "Approve decision " + ordS2["S2"] }).first().click({ timeout: T.step });
   await page.waitForTimeout(1200);
-  const revS = await api("GET", "/api/records/" + sid + "/review", owner);
+  const revS = await api("GET", "/api/records/" + sid + "/review", undefined, owner);
   ok("ui-deliberate-approve", (revS.json.approved || []).includes("S2"), "deliberate approve wrong");
-  const sg = await api("GET", "/api/records/" + sid, owner);
+  const sg = await api("GET", "/api/records/" + sid, undefined, owner);
   const canonWholeBefore = await canonState(sid, owner);
   const br = await api("POST", "/api/records/" + sid + "/revise", { version: sg.json.version, hash: sg.json.hash, reviewToken: sg.json.reviewToken, watermark: sg.json.watermark, items: [{ id: "S1", text: "x" }] }, owner);
   ok("whole-revise-after-decisions-409", br.status === 409, String(br.status));
@@ -291,13 +291,13 @@ async function main() {
   const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
   ok("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
-  const sgU = await api("GET", "/api/records/" + buid, owner);
+  const sgU = await api("GET", "/api/records/" + buid, undefined, owner);
   const br2 = await api("POST", "/api/records/" + buid + "/revise", { version: sgU.json.version, hash: sgU.json.hash, reviewToken: sgU.json.reviewToken, watermark: sgU.json.watermark, items: [{ id: "U1", text: "Bears other-client revision" }, { id: "U2", text: "Bears stale two v2" }] }, owner);
   ok("branch-v2", (br2.status === 201 || br2.status === 200) && br2.json.id, String(br2.status));
   const nid = br2.json.id;
   {
-    const bRev = await api("GET", "/api/records/" + buid + "/review", owner);
-    const nRev = await api("GET", "/api/records/" + nid + "/review", owner);
+    const bRev = await api("GET", "/api/records/" + buid + "/review", undefined, owner);
+    const nRev = await api("GET", "/api/records/" + nid + "/review", undefined, owner);
     ok("branch-old-successor", (bRev.json.successors || []).includes(nid), JSON.stringify(bRev.json.successors));
     ok("branch-new-predecessor", (nRev.json.predecessors || []).includes(buid), JSON.stringify(nRev.json.predecessors));
     const canonSupBefore = await canonState(buid, owner);
@@ -312,7 +312,7 @@ async function main() {
   await page.waitForTimeout(1500);
   ok("ui-v2-shows-predecessor", await bodyHas("Open version 1"), "predecessor missing");
   {
-    const det2 = await api("GET", "/api/records/" + nid, owner);
+    const det2 = await api("GET", "/api/records/" + nid, undefined, owner);
     ok("singular-v2-version", det2.status === 200 && det2.json.version === 2, String(det2.status));
     ok("ui-v2-hash", (page.url() || "").includes(nid), "v2 hash missing " + page.url());
     ok("ui-v2-text", await bodyHas("Bears stale two v2"), "v2 text missing");
