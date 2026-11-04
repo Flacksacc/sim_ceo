@@ -144,7 +144,7 @@ export default function WikiResources(props: {
       if (path === "/sync") setNotice("Manual sync finished; only the current successful sync pages are usable.");
     } catch (e) {
       if (boardRef.current !== opBoard) return;
-      setRowErrors((m) => ({ ...m, [id]: safeRowHelp(path) }));
+      setRowErrors((m) => ({ ...m, [id]: safeRowHelp(path, String(e)) }));
       return;
     }
     finally { if (boardRef.current === opBoard) { await refresh(); notifyChanged(); } }
@@ -153,8 +153,7 @@ export default function WikiResources(props: {
     <div className="card" aria-label="Wiki.js connector resources">
       <h3>Wiki.js 2.x connector (read-only GraphQL)</h3>
       <p>
-        Pinned protocol: pages.list + pages.single over POST /graphql with Bearer token.
-        No mutations are ever emitted. No Wiki.js 3 REST claim. Disabled by default; blank allowlist denies all;
+        Read-only connector. Imported pages enter the review inbox as pending and stay pending until explicitly approved. Disabled by default; blank allowlist denies all;
         exclusions win. Locale exact, every required tag must match. Failed or disabled resources block all cached
         connector evidence until a successful current sync; history stays inspectable. Credentials are server-held only.
       </p>
@@ -192,7 +191,7 @@ export default function WikiResources(props: {
         <label>Credential token (never echoed; cleared after submit) <input aria-label="Wiki token" type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" /></label>
       </div>
       <div className="meetctl"><button onClick={create}>Create disabled resource</button></div>
-      {(items ?? []).map((r) => (
+      {(items ?? []).map((r, ri, rarr) => (
         <div key={r.id} data-resource-id={r.id} style={{ borderTop: "1px solid var(--line)", marginTop: 8, paddingTop: 8 }}>
           <b>{r.description || r.baseUrl}</b> <span className="badge">{wikiScopeLabel(r.scope, meetingTitle(meetings, r.meetingId))}</span> {r.description && r.description !== r.baseUrl ? <span className="muted">{r.baseUrl}</span> : null}
           <span className="badge">{"Revision " + r.configRevision}</span>
@@ -206,11 +205,11 @@ export default function WikiResources(props: {
           {r.status === "failed" && <p role="alert">{safeSyncHelp()}</p>}
           {rowErrors[r.id] && <p role="alert">{rowErrors[r.id]}</p>}
           <div className="meetctl">
-            <button aria-label={actionLabel("Enable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId)))} onClick={() => op(r.id, "/enable")}>Enable</button>
-            <button aria-label={actionLabel("Disable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId)))} onClick={() => op(r.id, "/disable")}>Disable</button>
-            <button aria-label={actionLabel("Sync connector now", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId)))} onClick={() => op(r.id, "/sync")}>Sync now</button>
-            <button aria-label={actionLabel(editing[r.id] ? "Close editor for" : "Edit connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId)))} onClick={() => setEditing((m) => ({ ...m, [r.id]: !m[r.id] }))}>{editing[r.id] ? "Close editor" : "Edit resource"}</button>
-            <button aria-label={actionLabel("Delete connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId)))} onClick={() => { if (confirm("Delete this Wiki resource? Cached evidence becomes unavailable; history stays.")) op(r.id, "", "del"); }}>Delete</button>
+            <button aria-label={actionLabel("Enable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/enable")}>Enable</button>
+            <button aria-label={actionLabel("Disable connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/disable")}>Disable</button>
+            <button aria-label={actionLabel("Sync connector now", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => op(r.id, "/sync")}>Sync now</button>
+            <button aria-label={actionLabel(editing[r.id] ? "Close editor for" : "Edit connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => setEditing((m) => ({ ...m, [r.id]: !m[r.id] }))}>{editing[r.id] ? "Close editor" : "Edit resource"}</button>
+            <button aria-label={actionLabel("Delete connector", resourceLabel(r.description, r.baseUrl, r.scope, meetingTitle(meetings, r.meetingId), ri + 1, rarr.length))} onClick={() => { if (confirm("Delete this Wiki resource? Cached evidence becomes unavailable; history stays.")) op(r.id, "", "del"); }}>Delete</button>
           </div>
           <details><summary>Rules + membership</summary>
             <div>Allowed paths: {(r.allowlist ?? []).length ? (r.allowlist ?? []).join(", ") : "none - nothing can sync until paths are added"}</div>

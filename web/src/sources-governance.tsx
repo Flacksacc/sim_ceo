@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { contextSummary, historyText, indexLabel, meetingTitle, originLabel, recallKindLabel, recallTitle, reviewLabel, safeIndexHelp, safeRequestMessage, scopeLabel } from "./human-source-format";
+import { contextSummary, currentLabel, historyText, indexLabel, meetingTitle, originLabel, promotedGroupLabel, promotedLabel, recallExcerpt, recallKindLabel, recallTitle, reviewLabel, safeIndexHelp, safeRequestMessage, scopeLabel, sourceActionLabel, usableLabel, visibilityLabel } from "./human-source-format";
 
 type GovSource = {
   id: string; boardId: string; fileName: string; contentHash: string; version: number;
@@ -242,26 +242,29 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
       {(groups ?? []).map((g) => (
         <div className="card" key={g.familyKey}>
           <b>{g.fileName}</b> <span className="badge">{scopeLabel(g.scope, meetingTitle(meetings, g.meetingId))}</span> <span className="badge">{originLabel(g.origin)}</span>
-          {g.hasCurrent ? <span className="badge ok">{"Current: version " + (g.versions.find((v) => v.isCurrent)?.version ?? "")}</span> : <span className="badge">No current version - excluded files never fall back to an older one</span>}
-          {g.versions.map((s) => (
+          {g.hasCurrent ? <span className="badge ok">{currentLabel(true, g.versions.find((v) => v.isCurrent)?.version ?? null)}</span> : <span className="badge">{currentLabel(false)}</span>}
+          {(() => { const head = g.versions.find((v) => v.isHead); const label = promotedGroupLabel(head ? head.version : null); return label ? <span className="badge">{label}</span> : null; })()}
+          {g.versions.map((s, vi, varr) => (
             <div key={s.id} style={{ borderTop: "1px solid var(--line)", marginTop: 8, paddingTop: 8 }}>
-              <span className="badge">{"Version " + s.version}</span> <span className="badge">{reviewLabel(s.reviewState, s.excluded).label}</span>
+              <span className="badge">{"Version " + s.version}</span> <span className="badge">{reviewLabel(s.reviewState, s.excluded).label}</span> <span className="badge">{visibilityLabel(s.excluded).label}</span>
+              {promotedLabel(s.isHead) ? <span className="badge">{promotedLabel(s.isHead)}</span> : null}
+              {usableLabel(s.isCurrent) ? <span className="badge ok">{usableLabel(s.isCurrent)}</span> : null}
 
               <span className="badge">{indexLabel(s.indexState, s.isCurrent)}</span>
 
 
               {s.indexState === "failed" && <span className="badge">Search unavailable</span>}
               <div className="meetctl">
-                {canManagePolicy && (<button onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
-                {canManagePolicy && (<button onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Approve", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "approve")} disabled={s.reviewState !== "pending"}>Approve</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Reject", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "reject")} disabled={s.reviewState !== "pending"}>Reject</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Exclude", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "exclude")} disabled={s.excluded}>Exclude</button>)}
+                {canManagePolicy && (<button aria-label={sourceActionLabel("Restore", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "restore")} disabled={!s.excluded}>Restore</button>)}
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
-                {canWrite && (<button onClick={() => act(s.id, "reindex")}>Reindex</button>)}
-                {canWrite && (<button onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
-                <button onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
-                <button onClick={() => loadHist(s.id)}>History</button>
-                <button onClick={() => loadSecs(s.id)}>Sections</button>
+                {canWrite && (<button aria-label={sourceActionLabel("Reindex", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "reindex")}>Reindex</button>)}
+                {canWrite && (<button aria-label={sourceActionLabel("Retry extraction for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
+                <button aria-label={sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length)} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
+                <button aria-label={sourceActionLabel("Show history for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => loadHist(s.id)}>History</button>
+                <button aria-label={sourceActionLabel("Show sections for", s.fileName, s.version, vi + 1, varr.length)} onClick={() => loadSecs(s.id)}>Sections</button>
               </div>
               {hist[s.id] && (
                 <details open><summary>Version history ({hist[s.id].length})</summary>
@@ -286,7 +289,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
         <button onClick={runRecall}>Recall</button>
         {recallHits.length === 0 && <p role="status">No recall results yet.</p>}
         {recallHits.map((h, i) => (
-          <div key={i}><span className="badge">{recallKindLabel(h.kind)}</span> {recallTitle(h.kind, h.ref) ? <b>{recallTitle(h.kind, h.ref)}</b> : <span>Relevant material</span>} <span>{h.text}</span></div>
+          <div key={i}><span className="badge">{recallKindLabel(h.kind)}</span> {recallTitle(h.kind, h.ref) ? <b>{recallTitle(h.kind, h.ref)}</b> : <span>Relevant material</span>} <span>{recallExcerpt(h.kind, h.text)}</span></div>
         ))}
         <p>External hits that cannot resolve to eligible sources are dropped server-side and never become evidence.</p>
       </div>
