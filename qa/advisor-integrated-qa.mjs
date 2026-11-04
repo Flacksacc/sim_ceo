@@ -2656,7 +2656,7 @@ async function stepNavigation() {
     { label: "Roster", seg: "roster", sec: 'section[aria-label="My Advisor Roster"]', head: null, entity: rosterName },
     { label: "Board Advisors", seg: "advisors", sec: 'section[aria-label="This Board\'s Advisors"]', head: null, entity: "Harbor Strategist" },
     { label: "Meetings", seg: "meet", sec: '[aria-label="Meetings and conversation"]', head: null, entity: run + " harbor call" },
-    { label: "Sources", seg: "sources", sec: 'section[aria-label="Resources and Inbox"]', head: "Resources and Inbox", entity: OWNED_URL_MARK },
+    { label: "Sources", seg: "sources", sec: 'section[aria-label="Resources and Inbox"]', head: "Resources and Inbox", entity: "qa-eligible-" + run + ".md" },
     { label: "Records", seg: "records", sec: 'section[aria-label="Records"]', head: "Records", entity: run + " harbor call" },
     { label: "People", seg: "people", sec: 'section[aria-label="People"]', head: "People", entity: authedEmail },
     { label: "Activity", seg: "activity", sec: 'section[aria-label="Activity and Usage"]', head: "Activity and Usage", entity: "Usage (live ledger)" },
