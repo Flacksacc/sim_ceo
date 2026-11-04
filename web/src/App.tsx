@@ -7797,11 +7797,7 @@ const testModel = useMutation({
             <section aria-label="My Advisor Roster">
               {" "}
               <h2>{createOpen ? "Create advisor" : selRow ? selRow.entry.name : "My Advisor Roster (unlimited)"}{" "}</h2>{" "}
-              <p>
-                {" "}
-                Roster entries are reusable profile templates. Profile changes apply across boards;
-                messages and sources stay scoped to their board.{" "}
-              </p>{" "}
+              {!createOpen && <p>Choose an advisor to view their profile, make changes, or start a conversation.</p>}{" "}
                 <div className="roster-detail" aria-label="Selected advisor">
                   {" "}
                   {createOpen ? (
