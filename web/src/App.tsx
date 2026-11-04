@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
-import { SHOW_ACCOUNT_UI } from "./demo-ui";
+import { SHOW_ACCOUNT_UI, SHOW_HELP_UI } from "./demo-ui";
 import { AdvisorSections, AdvisorReferences } from "./advisor-sections";
 import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
@@ -708,7 +708,7 @@ function parseHash(): NavRoute {
     const path = (qi >= 0 ? raw.slice(0, qi) : raw).replace(/\/+$/, "") || "/";
     const params = new URLSearchParams(qi >= 0 ? raw.slice(qi + 1) : "");
     const seg = path.split("/").filter(Boolean)[0] ?? "";
-    const tab = (ALL_TABS as string[]).includes(seg) ? (seg as Tab) : "boards";
+    const tab = (ALL_TABS as string[]).includes(seg) && (seg !== "help" || SHOW_HELP_UI) ? (seg as Tab) : "boards";
     const mraw = params.get("mtab") ?? "";
     const mtab = (MEET_VIEWS as readonly string[]).includes(mraw)
       ? (mraw as NavRoute["mtab"])
@@ -2301,7 +2301,7 @@ export default function App() {
         const i = e.key === "0" ? 9 : Number(e.key) - 1;
         const visible = navGroups
           .flatMap((g) => g.items)
-          .filter(([k]) => !needsBoard.includes(k));
+          .filter(([k]) => !needsBoard.includes(k) && (SHOW_HELP_UI || k !== "help"));
         if (i < visible.length) {
           e.preventDefault();
           setTab(visible[i][0]);
@@ -4343,7 +4343,7 @@ const testModel = useMutation({
   const cmds = useQuery({
     queryKey: ["commands"],
     queryFn: () => get<Cmd[]>("/api/commands"),
-    enabled: tab === "help",
+    enabled: SHOW_HELP_UI && tab === "help",
   });
   const [hq, setHq] = useState("");
   const me = useQuery({
@@ -6157,7 +6157,7 @@ const testModel = useMutation({
           />{" "}
           {navGroups.map((g, gi) => {
             const items = g.items.filter(
-              ([k]) => !needsBoard.includes(k),
+              ([k]) => !needsBoard.includes(k) && (SHOW_HELP_UI || k !== "help"),
             );
             if (items.length === 0) return null;
             return (
@@ -7568,10 +7568,10 @@ const testModel = useMutation({
                 </p>}{" "}
                 <div className="meetctl">
                   {" "}
-                  <button type="button" onClick={() => setTab("help")}>
+                  {SHOW_HELP_UI && <button type="button" onClick={() => setTab("help")}>
                     {" "}
                     Help{" "}
-                  </button>{" "}
+                  </button>}{" "}
                   <button
                     type="button"
                     onClick={() =>
@@ -10050,7 +10050,7 @@ const testModel = useMutation({
               </>)}{" "}
             </section>
           )}{" "}
-          {tab === "help" && (
+          {SHOW_HELP_UI && tab === "help" && (
             <section aria-label="Help">
               {" "}
               <h2>Help — command coverage</h2>{" "}
