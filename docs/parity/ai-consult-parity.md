@@ -881,3 +881,18 @@ Healthy localhost:5173 image:
 Backup `.tmp/update-20261104-191827-UTC-f6e14ac9`; original database and volumes
 preserved. Owned QA services and browser contexts closed; no coding agents used.
 `tmp.txt` untouched. Broader parity goal remains paused.
+
+### 2026-11-04 — Remove Starting shape; retain meaningful Stage context
+
+Implemented `c71d1b5`: removed the unused Starting shape selector. Board creation
+now has name, expanding mission and stage, followed by the roster checklist.
+Confirmed Stage is included in ContextCurator advisor packets (up to 200 chars),
+AdvisorDialogue selection packets and Secretary board context via EffectiveView.
+It supplies descriptive context; it does not impose phase-specific workflow rules.
+Frontend/release builds passed. Live desktop light/dark and mobile checks passed
+without domain writes or page errors (`.tmp/remove-starting-shape-live-check.log`).
+Healthy localhost:5173 image
+`sha256:08434923fb442807bc551a975a2ffe6137b7e4a820bc01430c32d0ad4746e5e6`.
+Backup `.tmp/update-20261104-192103-UTC-60c9904e`; original DB/volumes preserved.
+No coding agents or QA services left running; browser contexts closed;
+`tmp.txt` untouched; broader parity goal remains paused.
