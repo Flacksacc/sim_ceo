@@ -1410,6 +1410,7 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
       {
         a.Id, a.BoardId, a.RosterEntryId, a.RosterVersion, a.BoardRole, a.Approved, a.Removed, a.ImageProvenance, a.CreatedAt,
         rosterName = view is null ? (string?)null : view.Name,
+        description = s.Roster.TryGetValue(a.RosterEntryId, out var summaryEntry) ? summaryEntry.Description : "",
         rosterVersionCurrent = view is null ? (int?)null : view.CurrentVersion,
         stale = view is null || view.Stale,
         unlinked = view is null,
@@ -1429,7 +1430,8 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
   return Results.Ok(list.Select(a =>
   {
     var guestDisplayId = RosterDisplayOps.ResolveDisplayPortrait(s, a)?.Id;
-    return new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId, displayPortraitImageId = (Guid?)guestDisplayId };
+    var entry = s.Roster.TryGetValue(a.RosterEntryId, out var guestEntry) ? guestEntry : null;
+    return new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, rosterName = entry?.Name, description = entry?.Description, approved = a.Approved, rosterEntryId = a.RosterEntryId, displayPortraitImageId = (Guid?)guestDisplayId };
   }).ToList());
 });
 

@@ -1,0 +1,53 @@
+// Run after wizard-roster-qa.mjs on the owned in-memory stack only.
+import assert from 'node:assert/strict';
+import { chromium } from 'playwright-core';
+const base='http://127.0.0.1:15396';
+async function get(path){const r=await fetch(base+path);assert.ok(r.ok,`${path}: ${r.status}`);return r.json();}
+assert.equal((await get('/health')).instance,'qa-author-15396');
+assert.equal((await get('/ready')).store,'inmemory');
+const board=(await get('/api/boards')).find(b=>b.name==='Roster selection QA');assert.ok(board);
+const members=await get(`/api/boards/${board.id}/advisors`);assert.equal(members.length,10);
+assert.ok(members.every(a=>a.description==='An existing fictional specialist.'));
+const target=members[0];
+const browser=await chromium.launch({executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',headless:true});const errors=[];
+try{
+ const ctx=await browser.newContext({viewport:{width:1440,height:1000}});await ctx.grantPermissions(['local-network-access'],{origin:base});
+ const page=await ctx.newPage();page.on('pageerror',e=>errors.push(String(e)));
+ await page.goto(`${base}/#/advisors?board=${board.id}`);
+ const selected=page.getByRole('group',{name:'Selected advisors',exact:true}),available=page.getByRole('group',{name:'Available advisors',exact:true});
+ await page.waitForFunction(()=>document.querySelectorAll('[aria-label="Selected advisors"] input[type=checkbox]').length===10);
+ assert.equal(await selected.locator('.advisor-summary-description').count(),10);
+ assert.equal(await available.getByRole('checkbox').count(),200,'Available list includes entries beyond the first API page');
+ const section=page.getByRole('region',{name:'Board advisors',exact:true});
+ for(const name of ['Create new Advisor','Update from roster','Generate 2 options','Import URL'])assert.equal(await section.getByRole('button',{name,exact:true}).count(),0);
+ assert.equal(await section.locator('.card').count(),0,'No individual advisor cards or portrait editing panels');
+ await selected.locator('img').first().waitFor();
+ const targetRow=selected.locator('.advisor-membership-row').filter({hasText:target.rosterName});
+ await targetRow.getByRole('checkbox').click();
+ await page.waitForFunction(()=>document.querySelectorAll('[aria-label="Selected advisors"] input[type=checkbox]').length===9);
+ const availableTarget=available.locator('.advisor-member-choice').filter({hasText:target.rosterName});
+ await availableTarget.getByRole('checkbox').click();
+ await page.waitForFunction(()=>document.querySelectorAll('[aria-label="Selected advisors"] input[type=checkbox]').length===10);
+ await targetRow.getByRole('button',{name:'Approve for meetings',exact:true}).click();
+ await targetRow.getByRole('button',{name:'Approve for meetings',exact:true}).waitFor({state:'detached'});
+ assert.equal((await get(`/api/boards/${board.id}/advisors`)).find(a=>a.rosterEntryId===target.rosterEntryId).approved,true,'Required meeting approval remains available inline');
+ await page.screenshot({path:'.tmp/advisor-lists-board.png',fullPage:true,animations:'disabled'});
+ await page.goto(base+'/#/roster');await page.waitForFunction(()=>document.querySelectorAll('.roster-person').length===210);
+ assert.equal(await page.locator('.roster-person .advisor-summary-description').count(),210);
+ await page.locator('.roster-person img').first().waitFor();
+ const unfinished=page.locator('.roster-person').filter({hasText:'Unfinished 199'});await unfinished.scrollIntoViewIfNeeded();
+ assert.equal(await unfinished.locator('[data-portrait-state="placeholder"]').count(),1,'Missing portraits show initials');
+ await page.goto(base+'/#/wizard');await page.getByRole('group',{name:'Roster advisors'}).waitFor();
+ const picks=page.locator('.wizard-roster-option');assert.equal(await picks.count(),210);
+ assert.equal(await picks.locator('.advisor-summary-description').count(),210);await picks.locator('img').first().waitFor();
+ const response=await fetch(base+`/api/boards/${board.id}/meetings`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'Advisor list QA',brief:'Review list presentation',participantIds:[]})});assert.ok(response.ok);const meeting=await response.json();
+ await page.goto(`${base}/#/meet?board=${board.id}&meeting=${meeting.id}`);await page.locator('.composer-bar .mp-seat').first().waitFor();
+ assert.equal(await page.locator('.composer-bar .mp-seat').count(),12);
+ assert.equal(await page.locator('.composer-bar .mp-role').filter({hasText:'An existing fictional specialist.'}).count(),10);
+ await page.getByRole('button',{name:'Meeting settings',exact:true}).click();
+ const dialog=page.locator('.conv-settings');await dialog.waitFor();assert.equal(await dialog.locator('.conv-picks .advisor-summary-description').count(),10);await dialog.locator('.conv-picks img').first().waitFor();
+ await page.screenshot({path:'.tmp/advisor-lists-settings.png',fullPage:true,animations:'disabled'});
+ await ctx.close();
+}finally{await browser.close();}
+assert.deepEqual(errors,[]);
+console.log(JSON.stringify({passed:true,checks:['selected and available lists only','portraits and descriptions in all four advisor lists','lazy image loading and missing image initials','full paginated roster','remove and re-add','inline approval remains functional','meeting settings and team strip'],errors}));

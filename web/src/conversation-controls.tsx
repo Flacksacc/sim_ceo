@@ -1,3 +1,4 @@
+import { AdvisorSummary } from "./advisor-summary";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -35,7 +36,7 @@ export function meetingStateLabel(state: MeetingLifecycleState | number): string
   return String(state).replace(/([a-z])([A-Z])/g, "$1 $2");
 }
 
-export interface ParticipantPick { id: string; role: string; included: boolean; locked?: boolean; }
+export interface ParticipantPick { id: string; role: string; description?: string; portraitUrl?: string | null; included: boolean; locked?: boolean; }
 
 export interface LifecycleProps {
   meetingTitle: string;
@@ -206,8 +207,8 @@ export function MeetingSettingsDialog(p: SettingsProps) {
         <fieldset className="conv-picks">
           <legend>Allowed advisors for this meeting (all when untouched)</legend>
           {p.participants.map((a) => (
-            <label key={a.id} className="checkline">
-              <input type="checkbox" checked={a.included} disabled={!p.canManageMeeting || a.locked === true} title={a.locked === true ? "At least one advisor stays included — an empty list would silently mean everyone. Use Include everyone below to reopen the meeting to all." : undefined} onChange={() => p.onToggleParticipant(a.id)} /> {a.role}
+            <label key={a.id} className="checkline advisor-member-choice">
+              <input type="checkbox" checked={a.included} disabled={!p.canManageMeeting || a.locked === true} title={a.locked === true ? "At least one advisor stays included — an empty list would silently mean everyone. Use Include everyone below to reopen the meeting to all." : undefined} onChange={() => p.onToggleParticipant(a.id)} /> <AdvisorSummary name={a.role} description={a.description} portraitUrl={a.portraitUrl} />
             </label>
           ))}
           <div className="meetctl">

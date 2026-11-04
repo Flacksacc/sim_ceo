@@ -49,10 +49,10 @@
 .act-interrupted .mp-avatar{border-color:var(--danger);border-style:dashed}
 .act-needs-approval .mp-avatar{border-color:var(--accent)}
 .is-composer .mp-rail{flex-direction:row;overflow-x:auto;padding:5px 2px 8px;gap:8px}
-.is-composer .mp-seat{flex:0 0 92px;flex-direction:column;align-items:center;text-align:center;gap:5px;padding:8px 4px}
+.is-composer .mp-seat{flex:0 0 128px;flex-direction:column;align-items:center;text-align:center;gap:5px;padding:8px 4px}
 .is-composer .mp-meta{align-items:center;width:100%}
 .is-composer .mp-name{font-size:.72rem;max-width:100%;white-space:normal;line-height:1.25}
-.is-composer .mp-role{display:none}
+.is-composer .mp-role{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;white-space:normal;font-size:.68rem;line-height:1.3}
 .is-composer .mp-badge{align-self:center;font-size:.64rem;max-width:100%;white-space:normal}
 .is-composer .mp-status{font-size:.72rem}
 .is-composer .mp-head h3{font-size:.82rem}

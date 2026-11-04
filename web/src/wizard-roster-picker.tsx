@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { AdvisorSummary } from "./advisor-summary";
 
 export interface WizardRosterChoice {
   entry: { id: string; name: string; description: string; profileJson?: string; tags?: string };
   complete: boolean;
 }
 
-export function WizardRosterPicker({ rows, selected, disabled, loading, error, onRetry, onToggle }: {
+export function WizardRosterPicker({ rows, selected, disabled, loading, error, onRetry, onToggle, renderPortrait }: {
   rows: WizardRosterChoice[];
   selected: { rosterEntryId?: string; name: string; role: string }[];
   disabled: boolean;
@@ -13,6 +14,7 @@ export function WizardRosterPicker({ rows, selected, disabled, loading, error, o
   error: boolean;
   onRetry(): void;
   onToggle(id: string, checked: boolean): void;
+  renderPortrait?(entry: WizardRosterChoice["entry"]): ReactNode;
 }) {
   const [search, setSearch] = useState("");
   const choices = selected.filter(s => !!s.rosterEntryId);
@@ -32,8 +34,9 @@ export function WizardRosterPicker({ rows, selected, disabled, loading, error, o
           return <label key={row.entry.id} className={"wizard-roster-option" + (checked ? " selected" : "")}>
             <input type="checkbox" checked={checked} disabled={disabled || (!checked && (!row.complete || choices.length >= 10))}
               onChange={e => onToggle(row.entry.id, e.target.checked)} />
-            <span><strong>{row.entry.name}</strong><span className="muted">{row.entry.description}</span>
-              {!row.complete && <small>Finish this advisor's profile in the roster before adding them.</small>}</span>
+            <AdvisorSummary name={row.entry.name} description={row.entry.description} portrait={renderPortrait?.(row.entry)}>
+              {!row.complete && <small>Finish this advisor's profile in the roster before adding them.</small>}
+            </AdvisorSummary>
           </label>;
         })}
         {rows.length === 0 && <p>Your roster is empty. Create an advisor in the Roster first.</p>}

@@ -16,7 +16,7 @@ import {
 import "./conversation-controls.css";
 import { RosterChatPanel } from "./roster-chat";
 import "./roster-chat.css";
-import { BoardAdvisorLinkPanel, RosterLinkBadge } from "./roster-integrity";
+import { AdvisorSummary, advisorBrief } from "./advisor-summary";
 import { MeetingParticipants } from "./meeting-participants";
 import "./meeting-participants.css";
 import { buildPresence, messageAdvisorKey, normalizeDisplayImageId } from "./meeting-presence";
@@ -189,6 +189,9 @@ type AdvisorFull = Advisor & {
   rosterVersion: number;
   imageProvenance: string;
   displayPortraitImageId?: string | null;
+  rosterName?: string;
+  description?: string;
+  stale?: boolean;
 };
 type MeetingFull = Meeting & { brief: string; boardId: string; participantIdsJson?: string };
 const DEFAULT_COMM_PREFS = "Be clear and direct. Explain unfamiliar terms, use practical examples, and finish with actionable next steps.";
@@ -1174,8 +1177,18 @@ function MessagePortrait({ name, url }: { name: string; url: string | null }) {
   </span>;
 }
 function RosterListPortrait({ id, name, identity }: { id: string; name: string; identity: string }) {
+  const node = useRef<HTMLSpanElement>(null);
+  const [nearby, setNearby] = useState(false);
+  useEffect(() => {
+    const el = node.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(entries => { if (entries.some(e => e.isIntersecting)) setNearby(true); }, { rootMargin: "160px" });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
   const images = useQuery({
     queryKey: ["roster-images", id],
+    enabled: nearby,
     queryFn: () => get<{ id: string; review: string }[]>(`/api/roster/${id}/images`),
     refetchOnWindowFocus: "always",
     retry: false,
@@ -1199,7 +1212,7 @@ function RosterListPortrait({ id, name, identity }: { id: string; name: string; 
   const visible = loaded?.key === key && imageId ? loaded.url : "";
   const words = name.trim().split(/\s+/).filter(Boolean);
   const initials = words.length > 1 ? words[0][0] + words[words.length - 1][0] : words[0]?.slice(0, 2) || "?";
-  return <span className="roster-row-avatar" aria-hidden="true" data-portrait-state={visible ? "image" : "placeholder"}>
+  return <span ref={node} className="roster-row-avatar" aria-hidden="true" data-portrait-state={visible ? "image" : "placeholder"}>
     {visible ? <img src={visible} alt="" onError={() => { URL.revokeObjectURL(visible); setLoaded(null); }} /> : initials.toUpperCase()}
   </span>;
 }
@@ -3057,15 +3070,7 @@ export default function App() {
   };
 const rosterNames = useQuery({
   queryKey: ["roster-names", accountId],
-  queryFn: () =>
-    get<RosterRow[]>(
-      `/api/roster?${new URLSearchParams({ accountId })}`,
-    ),
-    enabled: !sessGate && !anonPrivateBlocked,
-});
-const wizardRoster = useQuery({
-  queryKey: ["wizard-roster", accountId],
-  enabled: tab === "wizard" && !sessGate && !anonPrivateBlocked,
+  enabled: !sessGate && !anonPrivateBlocked,
   queryFn: async () => {
     const identity = { epoch: epochNow(), token: currentToken(), user: currentUser() };
     const found = new Map<string, RosterRow>();
@@ -3079,6 +3084,7 @@ const wizardRoster = useQuery({
     return [...found.values()].sort((a, b) => a.entry.name.localeCompare(b.entry.name));
   },
 });
+const wizardRoster = rosterNames;
 const selectedWizardSeats = wizard.seats.filter(s => !!s.rosterEntryId);
 const wizardSelectionsValid = selectedWizardSeats.length > 0 && selectedWizardSeats.length <= 10 &&
   wizard.seats.length === selectedWizardSeats.length && !wizardRoster.isError && wizardRoster.isSuccess &&
@@ -4826,19 +4832,32 @@ const testModel = useMutation({
       if (ver !== null) prevResearchVerRef.current = ver;
     } catch {}
   }, [selResearchData, selRow?.entry.id]);
-  const toggleBoardAdvisor = async (row: RosterRow) => {
-    const existing = (advisors.data ?? []).find((a) => a.rosterEntryId === row.entry.id);
+  const [boardAdvisorBusy, setBoardAdvisorBusy] = useState(false);
+  const toggleBoardAdvisor = async (rosterEntryId: string) => {
+    if (boardAdvisorBusy) return;
+    const existing = (advisors.data ?? []).find((a) => a.rosterEntryId === rosterEntryId);
+    const row = rosterNames.data?.find(r => r.entry.id === rosterEntryId);
+    setBoardAdvisorBusy(true);
     try {
       if (existing) {
         await del<unknown>(`/api/boards/${boardId}/advisors/${existing.id}`);
       } else {
-        await post<unknown>(`/api/roster/${row.entry.id}/copy`, { boardId, boardRole: row.entry.name });
+        if (!row) throw new Error("This advisor is no longer available in your roster.");
+        await post<unknown>(`/api/roster/${rosterEntryId}/copy`, { boardId, boardRole: row.entry.name });
       }
       refresh("advisors", "roster", "roster-names", "setup");
     } catch (e) {
       toastErr(e);
-    }
+    } finally { setBoardAdvisorBusy(false); }
   };
+  const approveListedAdvisor = useMutation({
+    mutationFn: async (advisor: AdvisorFull) => {
+      await post(`/api/boards/${boardId}/advisors/${advisor.id}/sync-roster`, {});
+      await post(`/api/boards/${boardId}/advisors/${advisor.id}/approve`, {});
+    },
+    onSuccess: () => refresh("advisors", "setup"),
+    onError: (e) => toastErr(e),
+  });
   const [meetPicks, setMeetPicks] = useState<string[]>([]);
   const toggleMeetPick = (id: string) => {
     const all = (advisors.data ?? []).map((a) => a.id);
@@ -4902,7 +4921,7 @@ const testModel = useMutation({
   const presence = useMemo(() => buildPresence({
     leadName: lead.data?.name ?? "",
     leadRoleLabel: lead.data ? lead.data.roleLabel + " \u00B7 You" : "Board lead",
-    advisors: (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ id: a.id, boardRole: a.boardRole, approved: a.approved, portraitUrl: presenceUrls.get(a.id) ?? null }))),
+    advisors: (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ id: a.id, boardRole: a.rosterName || a.boardRole, description: advisorBrief(a.description), approved: a.approved, portraitUrl: presenceUrls.get(a.id) ?? null }))),
     includedIds: meetPartDraft,
     snapshot: advisorSnapshot as any,
     availability: (activityAvailability as any) ?? "available",
@@ -6388,13 +6407,10 @@ const testModel = useMutation({
                   aria-current={r.entry.id === selRoster ? "true" : undefined}
                 >
                   {" "}
-                  <RosterListPortrait id={r.entry.id} name={r.entry.name} identity={originRevision()} />
-                  <span className="roster-person-copy">
-                  <span className="lprow-name">{r.entry.name}</span>{" "}
-                  <span className="lprow-sub">
-                    {r.boards.length === 1 ? "1 board" : `${r.boards.length} boards`}
-                  </span>{" "}
-                  </span>
+                  <AdvisorSummary name={r.entry.name} description={r.entry.description}
+                    portrait={<RosterListPortrait id={r.entry.id} name={r.entry.name} identity={originRevision()} />}>
+                    <span className="lprow-sub">{r.boards.length === 1 ? "1 board" : `${r.boards.length} boards`}</span>
+                  </AdvisorSummary>
                 </button>
               ))}{" "}
             {tab === "roster" && (rosterNames.data ?? []).length === 0 && (
@@ -6950,7 +6966,8 @@ const testModel = useMutation({
                 <WizardRosterPicker rows={wizardRoster.data ?? []} selected={wizard.seats}
                   disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
                   loading={wizardRoster.isLoading} error={wizardRoster.isError}
-                  onRetry={() => { void wizardRoster.refetch(); }} onToggle={toggleWizardAdvisor} />
+                  onRetry={() => { void wizardRoster.refetch(); }} onToggle={toggleWizardAdvisor}
+                  renderPortrait={entry => <RosterListPortrait id={entry.id} name={entry.name} identity={originRevision()} />} />
                 <p>{profile.isSuccess ? `Your saved profile (${profile.data.name}) will be used automatically.` : profile.isLoading ? "Loading your saved profile…" : "Save your profile before creating this board."}
                   {!profile.isLoading && !profile.isSuccess && <button type="button" className="btn ghost" onClick={() => setTab("profile")}>Open Your Profile</button>}
                 </p>
@@ -7435,152 +7452,45 @@ const testModel = useMutation({
             </section>
           )}{" "}
           {tab === "advisors" && (
-            <section aria-label="This Board's Advisors">
-              {" "}
-              <h2>
-                {" "}
-                This Board's Advisors — {(advisors.data ?? []).length}/10{" "}
-              </h2>{" "}
-              {!boardId && <p>Pick a board first.</p>}{" "}
-              <div className="card">{" "}
-                <h3>{" "}Board seats — pick from your roster{" "}</h3>{" "}
-                <p>{" "}Check to add, uncheck to remove. Only complete entries (description, profile, portrait) can join.{" "}</p>{" "}
-                {!boardId ? (
-                  <p>No board open — pick a board to see seats.</p>
-                ) : (
-                  <>
-                {(rosterNames.data ?? []).map((row) => {
-                  const attached = (advisors.data ?? []).find((a) => a.rosterEntryId === row.entry.id);
-                  const full = (advisors.data ?? []).length >= 10;
-                  return (
-                    <label key={row.entry.id} className="checkline">{" "}
-                      <input type="checkbox" disabled={!boardId || !canManageBoard || (!attached && (full || !row.complete))} checked={!!attached} onChange={() => toggleBoardAdvisor(row)} />{" "}
-                      {row.entry.name}{" "}{attached ? (attached.approved ? "(approved)" : "(pending approval)") : row.complete ? "" : "(incomplete: " + row.missing.join(", ") + ")"}{" "}
-                    </label>
-                  );
-                })}{" "}
-                  </>
-                )}{" "}
-                {canManageBoard && (<button type="button" onClick={() => setTab("roster")}>{" "}Create new Advisor{" "}</button>)}{" "}
-              </div>{" "}
-              {(advisors.data ?? []).length >= 10 && (
-                <p>Remove an advisor to add another.</p>
-              )}{" "}
-              {(advisors.data ?? []).map((a) => (
-                <div className="card" key={a.id} data-advisor-id={a.id} data-roster-entry-id={a.rosterEntryId}>
-                  {" "}
-                  {a.boardRole}{" "}
-                  <span className="badge">
-                    {" "}
-                    {a.approved ? "approved" : "pending"} · roster v{a.rosterVersion}{" "}
-                  </span>{" "}
-                  {(() => {
-                    const re = (rosterNames.data ?? []).find((r) => r.entry.id === a.rosterEntryId);
-                    const current = re ? re.entry.version : a.rosterVersion;
-                    const stale = current > a.rosterVersion;
-                    const link = { advisorId: a.id, boardId, rosterEntryId: a.rosterEntryId, pinnedVersion: a.rosterVersion, currentVersion: current, stale, name: a.boardRole, boardRole: a.boardRole, approved: a.approved, portraitFingerprint: a.imageProvenance, behaviorFingerprint: "roster v" + current };
-                    return (
-                      <>
-                        {" "}
-                        <RosterLinkBadge advisor={link} />{" "}
-                        <BoardAdvisorLinkPanel advisor={link} />{" "}
-                        {stale && (<p role="status">{" "}The roster profile changed since this board copy was pinned — update from the roster and re-review before approving.{" "}</p>)}{" "}
-                      </>
-                    );
-                  })()}{" "}
-                  {!a.approved && canManageBoard && (
-                    <button
-                      onClick={() =>
-                        post<unknown>(
-                          `/api/boards/${boardId}/advisors/${a.id}/approve`,
-                          {},
-                        ).then(() => refresh("advisors", "setup")).catch((e) => toastErr(e))
-                      }
-                    >
-                      {" "}
-                      Approve{" "}
-                    </button>
-                  )}{" "}
-                  <button
-                    title="Pull the newest roster template version into this board copy"
-                    onClick={() => syncRoster.mutate(a)}
-                  >
-                    {" "}
-                    Update from roster{" "}
-                  </button>{" "}
+            <section aria-label="Board advisors">
+              <h2>Board Advisors ({(advisors.data ?? []).length}/10)</h2>
+              {!boardId ? <p>Pick a board first.</p> : <>
+                {(rosterNames.isLoading || advisors.isLoading) && <p role="status">Loading advisors…</p>}
+                {(rosterNames.isError || advisors.isError) && <p role="alert">Could not load the advisor lists. <button type="button" onClick={() => refresh("advisors", "roster-names")}>Try again</button></p>}
+                <div className="advisor-membership-list" role="group" aria-label="Selected advisors">
+                  <h3>Selected advisors</h3>
+                  {(advisors.data ?? []).map(a => {
+                    const row = rosterNames.data?.find(r => r.entry.id === a.rosterEntryId);
+                    const name = row?.entry.name ?? a.rosterName ?? a.boardRole;
+                    return <div className="advisor-membership-row" key={a.id}>
+                      <label className="advisor-member-choice">
+                        <input type="checkbox" checked disabled={!canManageBoard || boardAdvisorBusy || approveListedAdvisor.isPending}
+                          onChange={() => void toggleBoardAdvisor(a.rosterEntryId)} />
+                        <AdvisorSummary name={name} description={row?.entry.description ?? a.description}
+                          portrait={<RosterListPortrait id={a.rosterEntryId} name={name} identity={originRevision()} />} />
+                      </label>
+                      {!a.approved && <span className="advisor-row-action"><small>Not enabled for meetings</small>{canManageBoard &&
+                        <button type="button" disabled={approveListedAdvisor.isPending || boardAdvisorBusy} onClick={() => approveListedAdvisor.mutate(a)}>Approve for meetings</button>}</span>}
+                    </div>;
+                  })}
+                  {!advisors.isLoading && (advisors.data ?? []).length === 0 && <p>No advisors selected.</p>}
                 </div>
-              ))}{" "}
-<div className="card">
-                {" "}
-                <h3>
-                  {" "}
-                  Portraits (explicit choices only — nothing generates
-                  automatically){" "}
-                </h3>{" "}
-                <label>
-                  {" "}
-                  Board advisor{" "}
-                  <select
-                    value={selAdv}
-                    onChange={(e) => setSelAdv(e.target.value)}
-                  >
-                    {" "}
-                    <option value="">—</option>{" "}
-                    {(advisors.data ?? []).map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {" "}
-                        {a.boardRole}{" "}
-                      </option>
-                    ))}{" "}
-                  </select>{" "}
-                </label>{" "}
-                {selAdv && (
-                  <>
-                    {" "}
-                    <label>
-                      {" "}
-                      Upload image{" "}
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={(e) => uploadImg(e.target.files?.[0])}
-                      />{" "}
-                    </label>{" "}
-                    <label>
-                      {" "}
-                      Use image URL{" "}
-                      <input
-                        value={imgUrl}
-                        onChange={(e) => setImgUrl(e.target.value)}
-                        placeholder="https://…"
-                      />{" "}
-                    </label>{" "}
-                    <button disabled={!imgUrl} onClick={() => urlImg.mutate()}>
-                      {" "}
-                      Import URL{" "}
-                    </button>{" "}
-                    <button
-                      title="Opt-in: starts image generation"
-                      onClick={() => genImg.mutate()}
-                    >
-                      {" "}
-                      Generate 2 options{" "}
-                    </button>{" "}
-                    {imgMsg && <p role="status">{imgMsg}</p>}{" "}
-                    {(imgList.data ?? []).map((img) => (
-                      <div key={img.id}>
-                        {" "}
-                        <span className="badge">{img.kind === "generated" ? "Generated" : img.kind === "url" ? "Link" : "Uploaded"}</span>{" "}
-                        <span className="muted">{img.kind === "generated" ? "Generated for this advisor" : img.kind === "url" ? "Imported from a link" : "Uploaded by the owner"}</span>{" "}
-                        <button onClick={() => selectImg.mutate(img.id)}>
-                          {" "}
-                          Use this image{" "}
-                        </button>{" "}
-                      </div>
-                    ))}{" "}
-                  </>
-                )}{" "}
-              </div>{" "}
+                <div className="advisor-membership-list" role="group" aria-label="Available advisors">
+                  <h3>Available advisors</h3>
+                  {(rosterNames.data ?? []).filter(row => !(advisors.data ?? []).some(a => a.rosterEntryId === row.entry.id)).map(row => (
+                    <label className="advisor-member-choice" key={row.entry.id}>
+                      <input type="checkbox" checked={false} disabled={!canManageBoard || boardAdvisorBusy || approveListedAdvisor.isPending || (advisors.data ?? []).length >= 10 || !row.complete}
+                        onChange={() => void toggleBoardAdvisor(row.entry.id)} />
+                      <AdvisorSummary name={row.entry.name} description={row.entry.description}
+                        portrait={<RosterListPortrait id={row.entry.id} name={row.entry.name} identity={originRevision()} />}>
+                        {!row.complete && <small>Finish this advisor's profile in the roster before adding them.</small>}
+                      </AdvisorSummary>
+                    </label>
+                  ))}
+                  {!rosterNames.isLoading && (rosterNames.data ?? []).every(row => (advisors.data ?? []).some(a => a.rosterEntryId === row.entry.id)) && <p>No other advisors available.</p>}
+                  {(advisors.data ?? []).length >= 10 && <p>Remove an advisor to add another.</p>}
+                </div>
+              </>}
             </section>
           )}{" "}
           {tab === "meet" && (
@@ -7673,7 +7583,7 @@ const testModel = useMutation({
                             const wouldEmpty = meetPartDraft.length === 0
                               ? (advisors.data ?? []).length <= 1
                               : (meetPartDraft.length === 1 && meetPartDraft.includes(a.id));
-                            return { id: a.id, role: a.boardRole, included, locked: included && wouldEmpty };
+                            return { id: a.id, role: a.rosterName || a.boardRole, description: a.description, portraitUrl: presenceUrls.get(a.id) ?? null, included, locked: included && wouldEmpty };
                           })}
                           canManageMeeting={canManageMeeting}
                           meetingSelected={!!meetingId}

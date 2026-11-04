@@ -18,6 +18,7 @@ import type { MeetingParticipant, ParticipantActivity } from "./meeting-particip
 import type { ActivityAvailability } from "./meeting-activity";
 
 export interface PresenceAdvisor {
+  description?: string;
   id: string;
   boardRole: string;
   approved: boolean;
@@ -165,6 +166,7 @@ export function buildPresence(input: PresenceInput): MeetingParticipant[] {
     seats.push({
       key: a.id,
       displayName: a.boardRole || "Advisor",
+      roleLabel: a.description,
       portraitUrl: a.portraitUrl,
       activity,
     });
