@@ -37,3 +37,11 @@
   .cc-spinner { animation: none; }
 }
 .cc-count { font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; }
+.advisor-portrait { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; padding: 18px; margin: 12px 0 20px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.advisor-portrait-picture { flex: 0 0 160px; width: 160px; height: 160px; border-radius: var(--radius); overflow: hidden; background: var(--accent-soft); display: grid; place-items: center; }
+.advisor-portrait-picture img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.advisor-portrait-placeholder { font-size: 2.5rem; color: var(--muted); }
+.advisor-portrait-controls { flex: 1 1 220px; min-width: 0; }
+.advisor-portrait-controls h4 { margin: 0 0 8px; }
+.advisor-portrait-upload { display: grid; gap: 4px; font-size: .85rem; min-width: 0; }
+.advisor-portrait-upload input { max-width: 100%; }

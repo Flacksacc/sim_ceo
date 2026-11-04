@@ -1,0 +1,73 @@
+// Isolated owned stack only; no real model calls or live user data.
+import assert from 'node:assert/strict';
+import {chromium} from 'playwright-core';
+const base='http://127.0.0.1:15396', fake='http://127.0.0.1:15398';
+async function call(method,path,body){const r=await fetch(base+path,{method,headers:body?{'content-type':'application/json'}:{},body:body?JSON.stringify(body):undefined});const t=await r.text();let data;try{data=JSON.parse(t);}catch{data=t;}return {status:r.status,data};}
+async function ok(method,path,body){const r=await call(method,path,body);assert.ok(r.status>=200&&r.status<300,`${path}: ${r.status} ${JSON.stringify(r.data).slice(0,200)}`);return r.data;}
+async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await new Promise(r=>setTimeout(r,100));}throw Error('Timed out');}
+assert.equal((await ok('GET','/health')).instance,'qa-author-15396');
+assert.equal((await ok('GET','/ready')).store,'inmemory');
+const profile=JSON.stringify({contributionCriteria:'Advise on product decisions and concrete tradeoffs.',reasoningApproach:'Compare evidence, constraints, costs and uncertainty.',responseStyle:'Concise, clear and direct with actionable next steps.'});
+const entry=await ok('POST','/api/roster',{name:'QA-PORTRAIT-SLOW Expert',description:'A fictional product advisor with a thoughtful expression.',profileJson:profile});
+assert.equal((await ok('GET',`/api/roster/${entry.id}/completeness`)).complete,true,'No picture must not mean incomplete');
+const board=await ok('POST','/api/boards',{name:'Portrait QA',mission:'Check optional automatic portraits.'});
+const advisor=await ok('POST',`/api/roster/${entry.id}/copy`,{boardId:board.id});
+const countBefore=(await(await fetch(fake+'/__counts')).json()).images;
+const first=call('POST',`/api/roster/${entry.id}/image/generate`,{count:1,onlyIfMissing:true});
+await until(async()=> (await(await fetch(fake+'/__counts')).json()).images>countBefore);
+assert.equal((await call('POST',`/api/roster/${entry.id}/image/generate`,{count:1,onlyIfMissing:true})).status,409,'Concurrent generation is deduplicated');
+assert.equal((await first).status,200);
+const pictures=await ok('GET',`/api/roster/${entry.id}/images`);assert.equal(pictures.length,1);assert.equal(pictures[0].review,'accepted');
+await ok('POST',`/api/roster/${entry.id}/image/generate`,{count:1,onlyIfMissing:true});
+assert.equal((await(await fetch(fake+'/__counts')).json()).images,countBefore+1,'Reload does not regenerate');
+let members=await ok('GET',`/api/boards/${board.id}/advisors`);assert.equal(members.find(a=>a.id===advisor.id).displayPortraitImageId,pictures[0].id);
+const generatedBytes=await(await fetch(base+`/api/images/${pictures[0].id}`)).arrayBuffer();
+const form=new FormData();form.set('file',new Blob([generatedBytes],{type:'image/png'}),'replacement.png');
+assert.equal((await fetch(base+`/api/roster/${entry.id}/image/upload`,{method:'POST',body:form})).status,201);
+const replacement=(await ok('GET',`/api/roster/${entry.id}/images`))[0];assert.notEqual(replacement.id,pictures[0].id);
+members=await ok('GET',`/api/boards/${board.id}/advisors`);assert.equal(members.find(a=>a.id===advisor.id).displayPortraitImageId,replacement.id);
+assert.equal((await ok('GET',`/api/roster/${entry.id}/completeness`)).complete,true);
+const late=call('POST',`/api/roster/${entry.id}/image/generate`,{count:1});
+await until(async()=> (await(await fetch(fake+'/__counts')).json()).images>countBefore+1);
+const another=new FormData();another.set('file',new Blob([generatedBytes],{type:'image/png'}),'newer.png');
+assert.equal((await fetch(base+`/api/roster/${entry.id}/image/upload`,{method:'POST',body:another})).status,201);
+await late;assert.equal((await ok('GET',`/api/roster/${entry.id}/images`)).length,3,'Late generation cannot overwrite upload');
+const failure=await ok('POST','/api/roster',{name:'QA-PORTRAIT-FAIL Expert',description:'A fictional advisor used to test image service failures.',profileJson:profile});
+assert.equal((await call('POST',`/api/roster/${failure.id}/image/generate`,{count:1})).status,502);
+assert.equal((await ok('GET',`/api/roster/${failure.id}/completeness`)).complete,true);
+const browser=await chromium.launch({executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',headless:true});
+try {
+ const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+ let createdId='', researchAt=0, imageAt=0;
+ page.on('request',r=>{if(r.method()==='POST'&&r.url().endsWith('/research'))researchAt=Date.now();if(r.method()==='POST'&&r.url().endsWith('/image/generate'))imageAt=Date.now();});
+ page.on('response',async r=>{if(r.request().method()==='POST'&&r.url().endsWith('/roster/quick')&&r.ok())createdId=(await r.json()).id;});
+ page.on('dialog',d=>d.accept());
+ await page.goto(base+'/#/roster');await page.getByRole('button',{name:'+ Create new Advisor',exact:true}).click();
+ await page.getByLabel('Name (required)',{exact:true}).fill('QA-PORTRAIT-SLOW Creator');
+ await page.locator('#cc-description').fill('A fictional product advisor for testing automatic portrait creation.');
+ await page.getByRole('button',{name:'Create draft',exact:true}).click();
+ const portrait=page.getByRole('region',{name:'Advisor portrait',exact:true});
+ await portrait.getByRole('img',{name:'QA-PORTRAIT-SLOW Creator portrait'}).waitFor();
+ await until(async()=>!!researchAt&&!!imageAt);assert.ok(Math.abs(researchAt-imageAt)<1500,'Image and research start together');
+ await until(async()=> !(await page.locator('.cc-editor textarea').first().isDisabled()));
+ assert.ok((await page.locator('.cc-editor textarea').first().inputValue()).includes('QA-CRITERIA'),'Research fills the paragraphs while portrait is created');
+ const img=portrait.locator('img');await img.evaluate(i=>i.decode());assert.equal(await img.evaluate(i=>i.naturalWidth),64);
+ assert.ok((await img.boundingBox()).width>=150,'Prominent portrait');
+ assert.equal(await page.getByRole('button',{name:'Accept portrait',exact:true}).count(),0);
+ await page.screenshot({path:'.tmp/portrait-creation-desktop.png'});
+ const beforeReplace=(await ok('GET',`/api/roster/${createdId}/images`))[0].id;
+ await portrait.getByRole('button',{name:'Generate a different portrait',exact:true}).click();
+ await until(async()=> (await ok('GET',`/api/roster/${createdId}/images`))[0]?.id!==beforeReplace);
+ await portrait.getByText('Your portrait is ready.',{exact:false}).waitFor();
+ await page.setViewportSize({width:390,height:844});await portrait.scrollIntoViewIfNeeded();
+ assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+ await page.screenshot({path:'.tmp/portrait-creation-mobile.png'});
+ await page.reload();await page.getByRole('button',{name:'+ Create new Advisor',exact:true}).click();
+ await page.getByLabel('Name (required)',{exact:true}).fill('QA-PORTRAIT-FAIL Creator');
+ await page.locator('#cc-description').fill('A fictional advisor whose portrait fails but text remains editable.');
+ await page.getByRole('button',{name:'Create draft',exact:true}).click();
+ await page.getByRole('alert').filter({hasText:'The portrait could not be generated.'}).waitFor();
+ assert.equal(await page.locator('.cc-editor textarea').count(),3,'Editable paragraphs remain mounted');
+ assert.deepEqual(errors,[]);
+ console.log('PASS picture optional, automatic accepted portrait, deduplication, canonical board propagation, upload replacement/late result race, generation failure isolation, concurrent creation/research, prominent image, no approval UI, 390px layout');
+} finally {await browser.close();}

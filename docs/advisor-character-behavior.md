@@ -1,5 +1,23 @@
 # Advisor character and meeting behavior
 
+## Portraits during creation (2026-11-04)
+
+Creating an advisor starts one portrait generation alongside character research.
+The name, description and optional background inform the image. A prominent
+160px portrait appears at the top of the creation form and saved profile.
+Users can generate a replacement, upload a PNG/JPEG/WebP, or import an image link.
+New portraits become usable immediately; legacy pending portraits need no
+approval. Previously rejected portraits remain excluded. Replacements update
+the canonical roster portrait and attached boards without advisor reapproval.
+
+Pictures are optional and do not affect profile completeness, board attachment,
+or participation. Image failures preserve the text and offer a separate retry.
+Concurrent generation is deduplicated; automatic creation reuses an existing
+portrait, and a late generated image cannot overwrite a newer upload. Identity,
+archive, subject-change and storage checks still apply before publication.
+This direction supersedes older separate Generate-images and portrait-approval
+requirements in the original product overview.
+
 ## Independent judgment and constructive challenge (2026-11-04)
 
 Every meeting answer, optional peer follow-up, roster chat answer and audition

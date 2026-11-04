@@ -420,8 +420,12 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/images/generations") {
     counts.images++;
+    const request = JSON.parse(rawBuf.toString('utf8'));
+    logPrompt('images', request.prompt || '');
+    if ((request.prompt || '').includes('QA-PORTRAIT-SLOW')) await sleep(1000);
+    if ((request.prompt || '').includes('QA-PORTRAIT-FAIL')) { res.writeHead(502, { 'content-type':'application/json' }); res.end(JSON.stringify({error:'qa image failure'})); return; }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" }] }));
+    res.end(JSON.stringify({ data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAgElEQVR4nNXOQREAIAzAsFJxKEEOohGxB9coyNrnUiZxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEufvwNQDrygBtjpJMM0AAAAASUVORK5CYII=" }] }));
     return;
   }
   res.writeHead(404, { "content-type": "application/json" });

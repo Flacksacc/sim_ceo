@@ -24,8 +24,7 @@ public static class RosterOps
   // Single attach choke point: every board attach (advisor POST, roster copy)
   // routes through RosterIntegrity.CheckAttach, so a board advisor can ONLY
   // link an authorized, existing, non-archived roster entry. The portrait
-  // completeness rule stays here: a roster entry without an image is still
-  // not board-usable (ApprovalGate parity).
+  // is optional; only the character information gates board use.
   public static (BoardAdvisor? advisor, string? error, int status) TryCopy(
     InMemoryStore s, Guid rosterId, Guid boardId, string role,
     bool callerCanReadRoster = true, bool canAttachBoard = true)
@@ -122,7 +121,6 @@ public static class RosterOps
     var pj = (entry.ProfileJson ?? "").Trim();
     if (pj.Length < 20) missing.Add("profile");
     if (entry.ResearchRequested && entry.ResearchedAt is null && RosterOps.ResearchTerminalStatus(entry) != "unsupported") missing.Add(RosterOps.ResearchMissingReason(s, entry));
-    if (!s.Images.Values.Any(i => i.RosterEntryId == rosterId)) missing.Add("portrait");
     return (missing.Count == 0, missing);
   }
 
@@ -144,7 +142,26 @@ public static class RosterOps
   }
 
   public static bool IsPortraitAccepted(AdvisorImage img) =>
-    img.Review == "accepted" || img.Review == "grandfathered";
+    !string.Equals(img.Review, "rejected", StringComparison.OrdinalIgnoreCase);
+
+  public static string PortraitBackground(RosterEntry entry)
+  {
+    var background = CharacterBehavior.ParseInputs(entry.ResearchInputsJson).Background;
+    // Research stores the description as its default background when none was
+    // supplied. That normalization is not a character edit during generation.
+    return string.IsNullOrWhiteSpace(background) ? entry.Description ?? "" : background;
+  }
+
+  // A portrait is a visual choice, never a profile-approval requirement.
+  // Called inside the image transaction so roster and board displays agree.
+  public static void UsePortrait(InMemoryStore s, AdvisorImage image)
+  {
+    foreach (var advisor in s.Advisors.Values.Where(a => a.RosterEntryId == image.RosterEntryId && !a.Removed).ToList())
+    {
+      advisor.ImageProvenance = image.Kind + ":" + image.Id;
+      s.Advisors[advisor.Id] = advisor;
+    }
+  }
 
   // Exact selected portrait identity: actual provenance selection first, then
   // linked rows. A full-ID provenance match within the same roster scope wins
@@ -201,7 +218,7 @@ public static class RosterOps
       return "portrait:invalid:" + a.ImageProvenance;
     var legacy = s.Images.Values
       .Where(i => i.RosterEntryId == a.RosterEntryId && IsPortraitAccepted(i))
-      .OrderBy(i => i.CreatedAt).ThenBy(i => i.Id)
+      .OrderByDescending(i => i.CreatedAt).ThenBy(i => i.Id)
       .FirstOrDefault();
     if (legacy is not null)
       return "legacy:" + legacy.Id + ":review:" + legacy.Review + ":prov:" + legacy.Provenance + ":kind:" + legacy.Kind;
@@ -225,9 +242,7 @@ public static class RosterOps
     return "roster:" + rent.Id + ":v:" + rent.Version + ":profile:" + profileHash + ":subject:" + subject + ":job:" + rent.ResearchJobId + ":base:" + rent.ResearchBaseVersion + ":req:" + rent.ResearchRequested + ":at:" + researchedAt + ":ev:" + rent.EvidenceCount + ":arch:" + rent.Archived + ":portrait:[" + portraitFp + "]";
   }
 
-  // Approval binds to the reviewed portrait/profile: an explicitly accepted
-  // portrait (Review == "accepted" or grandfathered) is required for the exact
-  // selected image. Legacy/empty reviews are pending, never implicitly accepted.
+  // Compatibility gate for older setup clients. Portrait choices never block it.
   // Explicit invitation compatibility is preserved: this gate does not itself
   // force the Approved boolean; lane B enforces approval unless explicitly invited.
   public static string? ParticipationGate(InMemoryStore s, BoardAdvisor advisor)
@@ -259,19 +274,6 @@ public static class RosterOps
       return "research-pending";
     }
     if (rent.ResearchRequested && rent.EvidenceCount < 1) return "no-evidence";
-    var sel = ResolveSelectedImage(s, a);
-    if (sel is not null)
-    {
-      if (sel.RosterEntryId != a.RosterEntryId) return "portrait-pending";
-      if (!IsPortraitAccepted(sel)) return "portrait-pending";
-      return null;
-    }
-    if (HasExplicitPortraitSelection(a)) return "portrait-pending";
-    var legacy = s.Images.Values
-      .Where(i => i.RosterEntryId == a.RosterEntryId && IsPortraitAccepted(i))
-      .OrderBy(i => i.CreatedAt).ThenBy(i => i.Id)
-      .FirstOrDefault();
-    if (legacy is null) return "portrait-pending";
     return null;
   }
 
@@ -452,6 +454,7 @@ public static class RosterOps
 
 public static class RosterEndpoints
 {
+  private static readonly ConcurrentDictionary<Guid, byte> CreatingPortraits = new();
 
   // Resource ownership/readability for direct roster reads: owner, installation admin,
   // or a board-level read on a board the entry is attached to.
@@ -1102,11 +1105,14 @@ public static class RosterEndpoints
         return Results.BadRequest("Only image uploads are accepted.");
       using var ms = new MemoryStream();
       await file.CopyToAsync(ms);
+      var imageBytes = ms.ToArray();
+      ct = ImageValidation.IsPngStrict(imageBytes) ? "image/png" : ImageValidation.IsJpegStrict(imageBytes) ? "image/jpeg" : ImageValidation.IsWebPStrict(imageBytes) ? "image/webp" : "";
+      if (ct.Length == 0) return Results.BadRequest("Choose a valid PNG, JPEG or WebP image.");
       var img = new AdvisorImage
       {
         RosterEntryId = id, Kind = "upload",
-        Review = "pending",
-        Provenance = $"upload:{file.FileName}", ContentType = ct, Data = ms.ToArray(),
+        Review = "accepted",
+        Provenance = $"upload:{file.FileName}", ContentType = ct, Data = imageBytes,
       };
       var newImg = img;
       try
@@ -1116,7 +1122,7 @@ public static class RosterEndpoints
           if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
           if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
           s.Images[newImg.Id] = newImg;
-          RosterOps.UnapproveBoardCopies(s, id);
+          RosterOps.UsePortrait(s, newImg);
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
@@ -1146,7 +1152,7 @@ public static class RosterEndpoints
         var img = new AdvisorImage
         {
           RosterEntryId = id, Kind = "url",
-        Review = "pending",
+        Review = "accepted",
           Provenance = $"url:{url} source:{source}", ContentType = ct, Data = bytes,
         };
         var newImg2 = img;
@@ -1157,7 +1163,7 @@ public static class RosterEndpoints
             if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
             if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
             s.Images[newImg2.Id] = newImg2;
-            RosterOps.UnapproveBoardCopies(s, id);
+            RosterOps.UsePortrait(s, newImg2);
           });
         }
         catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
@@ -1171,21 +1177,32 @@ public static class RosterEndpoints
     app.MapPost("/api/roster/{id:guid}/image/generate", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badGen) return badGen;
-      if (!s.Roster.TryGetValue(id, out var entry)) return Results.NotFound();
+      if (!s.Roster.TryGetValue(id, out var entry) || entry.Archived) return Results.NotFound();
       if (!RosterOps.CanWriteRoster(s, req, entry)) return PeopleOps.Denied();
       var count = body.TryGetProperty("count", out var c) ? c.GetInt32() : 0;
       if (count is not (1 or 2 or 4))
-        return Results.BadRequest("Choose Generate 1, 2, or 4 options with an explicit click.");
+        return Results.BadRequest("Choose 1, 2, or 4 portraits.");
+      var onlyIfMissing = body.TryGetProperty("onlyIfMissing", out var automatic) && automatic.ValueKind == JsonValueKind.True;
+      if (onlyIfMissing && count != 1) return Results.BadRequest("Creation generates one portrait.");
+      if (!CreatingPortraits.TryAdd(id, 0)) return Results.Conflict("A portrait is already being generated for this advisor.");
+      try
+      {
+      var existingIds = s.Images.Values.Where(i => i.RosterEntryId == id && RosterOps.IsPortraitAccepted(i)).Select(i => i.Id).ToHashSet();
+      if (onlyIfMissing && existingIds.Count > 0) return Results.Ok(Array.Empty<object>());
+      var subjectName = entry.Name ?? "";
+      var subjectDescription = entry.Description ?? "";
+      var subjectBackground = RosterOps.PortraitBackground(entry);
       if (PeopleOps.Guard(gw, req) is { } capped) return capped;
       var prompt = body.TryGetProperty("prompt", out var p) && !string.IsNullOrWhiteSpace(p.GetString())
         ? p.GetString()!
-        : $"Professional portrait of a fictional advisor: {entry.Name}. {entry.ProfileJson[..Math.Min(500, entry.ProfileJson.Length)]}. Must not resemble any real person.";
+        : $"Create a polished square editorial portrait for the simulated advisor {subjectName}. {subjectDescription[..Math.Min(1500, subjectDescription.Length)]}. Background: {subjectBackground[..Math.Min(1000, subjectBackground.Length)]}. Centered head and shoulders, expressive face, refined illustration, uncluttered background, no text or lettering. Reflect the character and their described background.";
       List<byte[]> images;
       try
       {
-        images = await gw.GenerateImagesAsync(prompt, count, ownerOverride: PeopleOps.IsOwner(req));
+        images = await gw.GenerateImagesAsync(prompt, count, ct: req.HttpContext.RequestAborted, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (ProviderException ex) { return PeopleOps.ProviderError(ex); }
+      if (images.Count == 0) return Results.Json(new { error = "The portrait service returned no image. Please try again." }, statusCode: 502);
       var created = new List<object>();
       var genImgs = new List<AdvisorImage>();
       foreach (var bytes in images)
@@ -1193,7 +1210,7 @@ public static class RosterEndpoints
         genImgs.Add(new AdvisorImage
         {
           RosterEntryId = id, Kind = "generated",
-          Review = "pending",
+          Review = "accepted",
           Provenance = $"generated:muse-image prompt:{prompt[..Math.Min(120, prompt.Length)]}",
           ContentType = "image/png", Data = bytes,
         });
@@ -1204,19 +1221,25 @@ public static class RosterEndpoints
         {
           if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
           if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+          if ((cur.Name ?? "") != subjectName || (cur.Description ?? "") != subjectDescription || RosterOps.PortraitBackground(cur) != subjectBackground) throw new InvalidOperationException("portrait-subject-changed");
+          // A replacement uploaded while generation ran wins over the late result.
+          if (s.Images.Values.Any(i => i.RosterEntryId == id && RosterOps.IsPortraitAccepted(i) && !existingIds.Contains(i.Id))) return;
           foreach (var gi in genImgs)
           {
             s.Images[gi.Id] = gi;
             created.Add(new { gi.Id, gi.Kind, gi.Provenance });
           }
-          if (created.Count > 0) RosterOps.UnapproveBoardCopies(s, id);
+          if (genImgs.Count > 0) RosterOps.UsePortrait(s, genImgs.OrderByDescending(i => i.CreatedAt).ThenBy(i => i.Id).First());
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
+      catch (InvalidOperationException iox) when (iox.Message == "portrait-subject-changed") { return Results.Conflict("The advisor changed during portrait generation. Please try again."); }
       catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
       catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Image generation", iox); }
       catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Image generation") ?? Results.Json(new { error = "Image generation store failed; no state changed: " + ex.Message }, statusCode: 500); }
       return Results.Ok(created);
+      }
+      finally { CreatingPortraits.TryRemove(id, out _); }
     });
 
     app.MapGet("/api/roster/{id:guid}/images", (InMemoryStore s, HttpRequest req, Guid id) =>
@@ -1225,7 +1248,7 @@ public static class RosterEndpoints
       if (!s.Roster.TryGetValue(id, out var __ie) || __ie.Archived) return Results.NotFound();
       if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, __ie)) return PeopleOps.Denied();
       return Results.Ok(s.Images.Values.Where(i => i.RosterEntryId == id)
-        .Select(i => new { i.Id, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt }).OrderByDescending(i => i.CreatedAt));
+        .Select(i => new { i.Id, i.Kind, i.Provenance, i.ContentType, i.Review, i.CreatedAt }).OrderByDescending(i => i.CreatedAt).ThenBy(i => i.Id));
     });
 
     app.MapDelete("/api/images/{imgId:guid}", (InMemoryStore s, HttpRequest req, Guid imgId) =>
@@ -1265,7 +1288,6 @@ public static class RosterEndpoints
             : (curBoard != Guid.Empty && PeopleOps.Can(s, req, curBoard, null, "manage"));
           if (!allowedNow) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
           s.Images.TryRemove(delImgId, out _);
-          if (cur.RosterEntryId.HasValue) RosterOps.UnapproveBoardCopies(s, cur.RosterEntryId.Value);
         });
       }
       catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
@@ -1306,14 +1328,9 @@ public static class RosterEndpoints
               other.BoardAdvisorId = null;
               s.Images[other.Id] = other;
             }
-          // Per-board selection only: record identity (link + provenance) and
-          // require re-approval of this copy, but never mutate the shared
-          // global Review. A pending/rejected image stays pending/rejected, so
-          // approval remains blocked until an explicit review accept with the
-          // full roster-write scope. Only explicit review accept changes Review.
+          // Legacy per-board selection remains an optional visual override.
             cur.BoardAdvisorId = a2.Id;
             s.Images[cur.Id] = cur;
-            a2.Approved = false;
             a2.ImageProvenance = cur.Kind + ":" + cur.Id.ToString();
             s.Images[cur.Id] = cur;
             s.Advisors[a2.Id] = a2;
@@ -1383,12 +1400,6 @@ public static class RosterEndpoints
             if (!allowedNow) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
             cur.Review = dec == "accept" ? "accepted" : "rejected";
             s.Images[cur.Id] = cur;
-            if (curEntry is not null) RosterOps.UnapproveBoardCopies(s, curEntry.Id);
-            if (cur.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(cur.BoardAdvisorId.Value, out var revAdv))
-            {
-              revAdv.Approved = false;
-              s.Advisors[revAdv.Id] = revAdv;
-            }
             savedImg = cur;
           });
         }
@@ -1424,30 +1435,22 @@ public static class RosterEndpoints
         if (!ok && img.RosterEntryId.HasValue && s.Roster.TryGetValue(img.RosterEntryId.Value, out var re2) && CanReadRoster(s, req, re2)) ok = true;
         if (!ok)
         {
-          // Meeting guests: only the accepted, selected portrait of an approved
-          // participant in one of their own meetings. No other meeting scope,
-          // no pending/unselected/shared-pool reads.
-          Guid bid = Guid.Empty;
-          BoardAdvisor? selAdv = null;
-          if (img.BoardAdvisorId.HasValue && s.Advisors.TryGetValue(img.BoardAdvisorId.Value, out var adv0)) { bid = adv0.BoardId; selAdv = adv0; }
-          if (bid != Guid.Empty && string.Equals(img.Review ?? "", "accepted", StringComparison.OrdinalIgnoreCase)
-            && selAdv is not null && selAdv.BoardId == bid && !selAdv.Removed && RosterOps.ParticipationGate(s, selAdv) is null
-            && string.Equals(img.RosterEntryId, selAdv.RosterEntryId))
+          // Guests may see only the displayed portrait of an included advisor
+          // in a meeting granted to them, including canonical roster portraits.
+          foreach (var advisor in s.Advisors.Values.Where(a => !a.Removed && a.RosterEntryId == img.RosterEntryId))
           {
-            var mids = PeopleOps.GuestMeetingIds(s, iu, bid);
-            foreach (var gmid in mids)
+            if (RosterOps.ParticipationGate(s, advisor) is not null || RosterDisplayOps.ResolveDisplayPortrait(s, advisor)?.Id != img.Id) continue;
+            foreach (var meetingId in PeopleOps.GuestMeetingIds(s, iu, advisor.BoardId))
             {
-              if (!s.Meetings.TryGetValue(gmid, out var gmtg)) continue;
-              var parts = new System.Collections.Generic.HashSet<Guid>();
+              if (!s.Meetings.TryGetValue(meetingId, out var meeting)) continue;
               try
               {
-                using var dd = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(gmtg.ParticipantIdsJson) ? "[]" : gmtg.ParticipantIdsJson);
-                foreach (var ee in dd.RootElement.EnumerateArray())
-                  if (ee.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(ee.GetString(), out var gg)) parts.Add(gg);
+                var participants = JsonSerializer.Deserialize<Guid[]>(string.IsNullOrWhiteSpace(meeting.ParticipantIdsJson) ? "[]" : meeting.ParticipantIdsJson);
+                if (participants is not null && (participants.Length == 0 || participants.Contains(advisor.Id))) { ok = true; break; }
               }
-              catch { }
-              if (parts.Count == 0 || (selAdv is not null && parts.Contains(selAdv.Id))) { ok = true; break; }
+              catch (JsonException) { }
             }
+            if (ok) break;
           }
         }
         if (!ok) return PeopleOps.Denied();

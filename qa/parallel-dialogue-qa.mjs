@@ -19,7 +19,7 @@ const advisors = [];
 for (const role of ['Operator Fast','Finance Slow','Designer Outside','Observer Outside']) {
   const roster = await ok('POST','/api/roster', { name:role, description:'A fictional experienced advisor for focused advice.', profileJson:JSON.stringify({ background:'BACKSTORY ' + role + ': distinctive experience addressing hiring and runway decisions.', contributionCriteria:'Contribute when ' + role + ' can add a useful perspective.', reasoningApproach:'Use the experience of ' + role + ' to identify concrete tradeoffs.', responseStyle:'Speak conversationally and challenge assumptions with reasons.' }) });
   const form = new FormData();
-  form.set('file', new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6kWQAAAAASUVORK5CYII=','base64')], {type:'image/png'}),'portrait.png');
+  form.set('file', new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAgElEQVR4nNXOQREAIAzAsFJxKEEOohGxB9coyNrnUiZxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEufvwNQDrygBtjpJMM0AAAAASUVORK5CYII=','base64')], {type:'image/png'}),'portrait.png');
   const uploaded = await fetch(base + `/api/roster/${roster.id}/image/upload`, {method:'POST',body:form});
   assert.equal(uploaded.status,201);
   const image = await uploaded.json();

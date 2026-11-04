@@ -1214,7 +1214,7 @@ function RosterListPortrait({ id, name, identity }: { id: string; name: string; 
     retry: false,
   });
   const accepted = !images.isError && !images.isFetching && Array.isArray(images.data)
-    ? images.data.find(image => (image?.review === "accepted" || image?.review === "grandfathered") && normalizeDisplayImageId(image.id)) : undefined;
+    ? images.data.find(image => image?.review !== "rejected" && normalizeDisplayImageId(image.id)) : undefined;
   const imageId = normalizeDisplayImageId(accepted?.id) ?? "";
   const key = identity + ":" + imageId + ":" + images.dataUpdatedAt;
   const [loaded, setLoaded] = useState<{ key: string; url: string } | null>(null);
@@ -1247,6 +1247,57 @@ function AuthedImg({ id, alt, className }: { id: string; alt: string; className?
   }, [id]);
   if (!url) return <span className="muted">loading portrait�</span>;
   return <img src={url} alt={alt} className={className} />;
+}
+
+function AdvisorPortrait({ id, name, identity, autoGenerate = false }: { id: string; name: string; identity: string; autoGenerate?: boolean }) {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [imageLink, setImageLink] = useState("");
+  const started = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const fresh = () => mounted.current && identity === String(epochNow()) + "|" + currentToken() + "|" + canonicalUser();
+  const pictures = useQuery({ queryKey: ["roster-images", id], queryFn: () => get<{ id: string; review: string }[]>(`/api/roster/${id}/images`) });
+  const picture = pictures.data?.find(p => p.review !== "rejected");
+  async function change(file?: File, automatic = false, url?: string) {
+    if (busy || !fresh()) return;
+    setBusy(true); setError("");
+    try {
+      if (url) await post(`/api/roster/${id}/image/url`, { url, source: "owner-provided" });
+      else if (file) {
+        const form = new FormData(); form.append("file", file);
+        await upload(`/api/roster/${id}/image/upload`, form);
+      } else await post(`/api/roster/${id}/image/generate`, { count: 1, onlyIfMissing: automatic });
+      if (!fresh()) return;
+      setImageLink("");
+      for (const key of CANONICAL_SAVE_INVALIDATIONS) void qc.invalidateQueries({queryKey:[key]});
+      await pictures.refetch();
+    } catch {
+      if (fresh()) setError(url ? "The picture could not be imported. Check the public image link and try again." : file ? "The image could not be uploaded. Choose a PNG, JPEG or WebP image smaller than 5 MB and try again." : "The portrait could not be generated. Your advisor information is safe. Try again or upload a picture.");
+    } finally { if (fresh()) setBusy(false); }
+  }
+  useEffect(() => {
+    if (autoGenerate && !started.current) { started.current = true; void change(undefined, true); }
+  }, [autoGenerate]);
+  return <section className="advisor-portrait" aria-label="Advisor portrait">
+    <div className="advisor-portrait-picture">
+      {picture ? <AuthedImg key={picture.id + identity} id={picture.id} alt={`${name} portrait`} /> : <span className="advisor-portrait-placeholder" aria-hidden="true">{name.trim().slice(0,2).toUpperCase()}</span>}
+    </div>
+    <div className="advisor-portrait-controls">
+      <h4>Profile picture</h4>
+      <p role="status">{busy ? <><span className="cc-spinner" aria-hidden="true" /> {picture ? "Updating your portrait…" : "Creating your portrait alongside the research…"}</> : picture ? "Your portrait is ready. You can change it whenever you like." : "A portrait is optional. Your advisor can be used without one."}</p>
+      {error && <p role="alert">{error}</p>}
+      <div className="meetctl">
+        <button type="button" disabled={busy} onClick={() => void change()}>{busy ? "Creating portrait…" : picture ? "Generate a different portrait" : "Generate portrait"}</button>
+        <label className="advisor-portrait-upload">Upload a picture<input type="file" accept="image/png,image/jpeg,image/webp" disabled={busy} onChange={e => { const file=e.target.files?.[0]; e.target.value=""; if(file) void change(file); }} /></label>
+      </div>
+      <details><summary>Use an image link</summary>
+        <label>Image URL<input type="url" value={imageLink} onChange={e=>setImageLink(e.target.value)} placeholder="https://…" disabled={busy} /></label>
+        <button type="button" disabled={busy || !imageLink.trim()} onClick={()=>void change(undefined,false,imageLink.trim())}>Import picture</button>
+      </details>
+    </div>
+  </section>;
 }
 // Presence portraits via authorized advisors DTO displayPortraitImageId
 // (server RosterDisplayOps.ResolveDisplayPortrait, same authority as reviewed identity).
@@ -3099,12 +3150,6 @@ export default function App() {
   });
   const rosterRows = rosterList.data ?? [];
   const [selRoster, setSelRoster] = useState("");
-  const selImages = useQuery({
-    queryKey: ["roster-images", selRoster],
-    queryFn: () =>
-      get<{ id: string; kind: string; provenance: string; review: string }[]>(`/api/roster/${selRoster}/images`),
-    enabled: !!selRoster && !sessGate,
-  });
   const [createOpen, setCreateOpen] = useState(false);
   const [advisorDirty, setAdvisorDirty] = useState(false);
   const canLeaveAdvisor = () => !advisorDirty || window.confirm("Leave this advisor? Your unsaved changes will be lost.");
@@ -3117,12 +3162,7 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [advisorDirty]);
   const [portraitRev, setPortraitRev] = useState(0);
-  const reviewImg = useMutation({
-    mutationFn: (args: { id: string; decision: string }) =>
-      post<unknown>(`/api/images/${args.id}/review`, { decision: args.decision }),
-    onSuccess: () => { try { setPortraitRev((v) => v + 1); } catch {} refresh("roster-images", "roster", "roster-names", "advisors"); },
-    onError: (e) => toastErr(e),
-  });
+
   const selectRoster = (id: string) => {
     if (!createOpen && id === selRoster) return;
     if (!canLeaveAdvisor()) return;
@@ -3230,39 +3270,6 @@ const tabCount = (k: Tab): number | null => {
     onSuccess: () => refresh("roster", "roster-count", "roster-names"),
   });
   const createNameRef = useRef<HTMLInputElement | null>(null);
-  const [portraitUrl, setPortraitUrl] = useState("");
-  const [portraitMsg, setPortraitMsg] = useState("");
-  const uploadPortrait = async (f: File | undefined) => {
-    if (!f || !selRow) return;
-    const fd = new FormData();
-    fd.append("file", f);
-    try {
-      await upload<unknown>(`/api/roster/${selRow.entry.id}/image/upload`, fd);
-      setPortraitMsg("Portrait added.");
-      refresh("roster", "roster-images");
-    } catch (e) {
-      setPortraitMsg(String(e));
-    }
-  };
-  const urlPortrait = useMutation({
-    mutationFn: (url: string) =>
-      post<unknown>(`/api/roster/${selRow?.entry.id}/image/url`, { url, source: "owner-provided" }),
-    onSuccess: () => {
-      setPortraitUrl("");
-      setPortraitMsg("Portrait added.");
-      refresh("roster", "roster-images");
-    },
-    onError: (e) => setPortraitMsg(String(e)),
-  });
-  const genPortrait = useMutation({
-    mutationFn: () =>
-      post<unknown>(`/api/roster/${selRow?.entry.id}/image/generate`, { count: 1 }),
-    onSuccess: () => {
-      setPortraitMsg("Portrait generated.");
-      refresh("roster", "roster-images");
-    },
-    onError: (e) => setPortraitMsg(String(e)),
-  });
   const [audId, setAudId] = useState("");
   const [aq, setAq] = useState("");
   const [audResult, setAudResult] = useState("");
@@ -7369,6 +7376,7 @@ const testModel = useMutation({
                   {" "}
                   {createOpen ? (
                     <CreateAdvisor
+                      renderPortrait={entry => <AdvisorPortrait key={entry.id + originRevision()} id={entry.id} name={entry.name} identity={originRevision()} autoGenerate />}
                       accountId={accountId}
                       get={get}
                       post={post}
@@ -7390,6 +7398,7 @@ const testModel = useMutation({
                     <div className="card" data-roster-entry-id={selRow.entry.id}>{" "}
                       <AdvisorSections key={selRow.entry.id + ":" + canonicalUser()} profile={<>
                       <h3>{selRow.entry.name}</h3>{" "}
+                      <AdvisorPortrait key={selRow.entry.id + originRevision()} id={selRow.entry.id} name={selRow.entry.name} identity={originRevision()} />
                       <span className="badge">{" "}{selRow.complete ? "complete" : "incomplete: " + selRow.missing.join(", ")}{" "}</span>{" "}
                       <span className="badge">{" "}{selRow.imageCount} portrait{selRow.imageCount === 1 ? "" : "s"}{" "}</span>{" "}
                       <span className="badge">{" "}v{selRow.entry.version}{" "}</span>{" "}
@@ -7424,39 +7433,10 @@ const testModel = useMutation({
                         if (selRow.entry.researchRequested) return (<p className="muted">{" "}Research requested \u2014 not running. Open the editor below for its result and retry if needed.{" "}</p>);
                         return (<p className="muted">{" "}No research yet \u2014 use Research dossier below to gather evidence.{" "}</p>);
                       })()}
-                      {(selImages.data ?? []).length > 0 ? (
-                        <div aria-label="Portraits awaiting review">
-                          <h4>Portraits - choose a picture</h4>
-                          {(selImages.data ?? []).map((im) => {
-                            const status = !im.review || im.review === "accepted" ? "accepted" : im.review === "pending" ? "pending" : "rejected";
-                            return (
-                              <div className="card portrait-review" key={im.id} data-portrait-id={im.id} data-roster-entry-id={selRow.entry.id}>
-                                <AuthedImg id={im.id} alt="Portrait option" className="portrait-thumb" />
-                                <div>
-                                  <div>
-                                    <span className="badge">{im.kind === "generated" ? "Generated" : im.kind === "url" ? "Link" : "Uploaded"}</span>
-                                    <span className={status === "accepted" ? "badge ok" : status === "pending" ? "badge live" : "badge warn"}>{status === "pending" ? "needs review" : status === "rejected" ? "needs replacement" : "accepted"}</span>
-                                  </div>
-                                  <p className="muted">{im.kind === "generated" ? "Generated for this advisor" : im.kind === "url" ? "Imported from a link" : "Uploaded by the owner"}</p>
-                                  {status !== "accepted" && (
-                                    <div className="meetctl">
-                                      <button disabled={reviewImg.isPending} onClick={() => reviewImg.mutate({ id: im.id, decision: "accept" })}>Accept portrait</button>
-                                      <button disabled={reviewImg.isPending} onClick={() => reviewImg.mutate({ id: im.id, decision: "retry" })}>Request new</button>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <p role="status">{" "}No portrait yet - add one to complete this advisor.{" "}</p>
-                      )}{" "}
                       <div className="meetctl">
                         {" "}
                         <button disabled={!boardId || !canManageBoard || !selRow.complete} title={!boardId ? "Pick a board first" : selRow.complete ? "Attach to current board" : "Complete this entry first: " + selRow.missing.join(", ")} onClick={() => copyAdv.mutate(selRow)}>{" "}Add to current board{" "}</button>{" "}
                         <button onClick={() => { archiveRoster.mutate(selRow); setSelRoster(""); }}>{" "}Archive{" "}</button>{" "}
-                        <button onClick={() => { try { document.getElementById("roster-portrait")?.scrollIntoView({ block: "nearest" }); } catch { /* noop */ } }}>{" "}Add portrait{" "}</button>{" "}
                       </div>{" "}
                       <h4>{" "}Audition (never a meeting message){" "}</h4>{" "}
                       <label>{" "}Sample question{" "}
@@ -7466,19 +7446,6 @@ const testModel = useMutation({
                       <h4>{" "}Research dossier{" "}</h4>{" "}
                       <button onClick={() => research(selRow.entry.id)}>{" "}Research dossier{" "}</button>{" "}
                       <DossierView raw={dossier} />{" "}
-                      <div className="card" id="roster-portrait">{" "}
-                        <h4>{" "}Add a portrait{" "}</h4>{" "}
-                        <p className="muted">{" "}Portraits are explicit choices only — nothing generates automatically.{" "}</p>{" "}
-                        <label>{" "}Upload image{" "}
-                          <input type="file" accept="image/*" onChange={(e) => uploadPortrait(e.target.files?.[0])} />{" "}</label>{" "}
-                        <label>{" "}Use image URL{" "}
-                          <input value={portraitUrl} onChange={(e) => setPortraitUrl(e.target.value)} placeholder="https://..." />{" "}</label>{" "}
-                        <div className="meetctl">{" "}
-                          <button disabled={!portraitUrl || urlPortrait.isPending} onClick={() => urlPortrait.mutate(portraitUrl)}>{" "}Import URL{" "}</button>{" "}
-                          <button disabled={genPortrait.isPending} onClick={() => genPortrait.mutate()}>{" "}Generate portrait{" "}</button>{" "}
-                        </div>{" "}
-                        {portraitMsg && <p role="status">{portraitMsg}</p>}{" "}
-                      </div>{" "}
                       {selRow && (
                         <CharacterEditor
                           key={'character-editor-' + selRow.entry.id}

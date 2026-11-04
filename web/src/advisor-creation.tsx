@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes, type ReactNode } from "react";
 import "./advisor-creation.css";
 import { FriendlyError } from "./human-disclosure";
 import { SHOW_ACCOUNT_UI } from "./demo-ui";
@@ -313,6 +313,7 @@ function originDead(api: { originStale?: (o: OriginIdentity) => boolean }, o: Or
 }
 
 export interface CreateAdvisorProps extends CreateAdvisorApi {
+  renderPortrait?: (entry: RosterEntryDto) => ReactNode;
   onDirtyChange?: (dirty: boolean) => void;
   onCreated?: (entry: RosterEntryDto) => void;
   onInvalidated?: () => void;
@@ -2195,9 +2196,10 @@ export function CreateAdvisor(props: CreateAdvisorProps) {
       <h3>Create advisor</h3>
       <p className="cc-lede">
         Tell us who you would like advice from and what you would like help with.
-        We will research your advisor and fill in three short paragraphs for you to
-        review. Make any finishing touches, then save your advisor.
+        We will research your advisor, create a portrait, and fill in three short
+        paragraphs for you to review. Make any finishing touches, then save your advisor.
       </p>
+      {entry && props.renderPortrait?.(entry)}
 
       <fieldset className="cc-step" disabled={busy || briefLocked}>
         <legend>Step 1 — Brief</legend>

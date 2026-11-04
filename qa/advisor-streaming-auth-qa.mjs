@@ -9,7 +9,7 @@ const credentials={email:'assessment-qa@example.test',password:'Assessment-QA-On
 await ok('POST','/api/profile',{name:'Fixture CEO',background:'A fixture business leader.',commPrefs:'Brief honest advice.'});
 const board=await ok('POST','/api/boards',{name:'Auth assessment fixture',mission:'Never publish after session revocation.'});
 const entry=await ok('POST','/api/roster',{name:'Auth Expert',description:'A fictional advisor.',profileJson:JSON.stringify({background:'An experienced fictional expert.',contributionCriteria:'Evaluate relevant claims.',reasoningApproach:'Use evidence and practical tradeoffs.',responseStyle:'Concise and direct.'})});
-const form=new FormData();form.set('file',new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6kWQAAAAASUVORK5CYII=','base64')],{type:'image/png'}),'portrait.png');assert.equal((await fetch(base+`/api/roster/${entry.id}/image/upload`,{method:'POST',headers:{Authorization:'Bearer '+token},body:form})).status,201);
+const form=new FormData();form.set('file',new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAgElEQVR4nNXOQREAIAzAsFJxKEEOohGxB9coyNrnUiZxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEufvwNQDrygBtjpJMM0AAAAASUVORK5CYII=','base64')],{type:'image/png'}),'portrait.png');assert.equal((await fetch(base+`/api/roster/${entry.id}/image/upload`,{method:'POST',headers:{Authorization:'Bearer '+token},body:form})).status,201);
 await ok('POST',`/api/roster/${entry.id}/copy`,{boardId:board.id,boardRole:entry.name});
 const meeting=await ok('POST',`/api/boards/${board.id}/meetings`,{title:'Revoke during assessment',brief:'Evaluate the proposal.'});const prompt='QA-ASSESSMENT-AUTH-RACE: evaluate the supplied idea.';await ok('POST',`/api/meetings/${meeting.id}/messages`,{sender:'lead',content:prompt});
 const pending=call('POST',`/api/meetings/${meeting.id}/run`,{prompt});
@@ -28,4 +28,17 @@ assert.ok(response.ok&&response.headers.get('content-type').includes('text/event
 const reader=response.body.getReader(),decoder=new TextDecoder();let wire='',revoked=false;
 while(true){const next=await reader.read();if(next.done)break;wire+=decoder.decode(next.value,{stream:true});if(!revoked&&wire.includes('event: delta')){await ok('POST','/api/auth/logout',{});revoked=true;}}
 assert.ok(revoked&&wire.includes('event: error')&&wire.includes('"status":401'));assert.ok(!wire.includes('event: done'));
+// A revoked image request must not publish a new canonical portrait.
+token=(await ok('POST','/api/auth/login',credentials)).token;
+const previousImages=await ok('GET',`/api/roster/${entry.id}/images`);
+assert.equal((await fetch(base+`/api/images/${previousImages[0].id}`)).status,401);
+const beforeImageCalls=(await(await fetch(fake+'/__counts')).json()).images;
+const pendingImage=call('POST',`/api/roster/${entry.id}/image/generate`,{count:1,prompt:'QA-PORTRAIT-SLOW auth revocation test'});
+const imageStart=Date.now();
+while((await(await fetch(fake+'/__counts')).json()).images===beforeImageCalls){assert.ok(Date.now()-imageStart<10000);await new Promise(r=>setTimeout(r,25));}
+await ok('POST','/api/auth/logout',{});
+assert.ok([401,403].includes((await pendingImage).status));
+token=(await ok('POST','/api/auth/login',credentials)).token;
+assert.equal((await ok('GET',`/api/roster/${entry.id}/images`)).length,previousImages.length);
+console.log('PASS image bytes require authentication and revocation during generation cannot publish a portrait');
 console.log('PASS private direct-chat SSE revocation after headers returns error 401 without a completed answer');
