@@ -176,7 +176,7 @@ ok("research-fetch-succeeded", !!excerp, "owner URL must actually fetch (no cond
   const respInputs = log.filter((e) => e.path === "responses").map((e) => e.full).join("\n");
   ok("research-fetch-grounded", respInputs.includes(excerp.slice(0, 60)), "excerpt not found in grounded prompt");
   const compileCalls = log.filter((e) => e.path === "chat" && (e.full || "").includes("COMPILE-CHARACTER-PARAGRAPHS"));
-  ok("research-compile-dossier", compileCalls.length >= 1 && compileCalls.every((c) => c.full.includes("Dossier") && c.full.includes("QA grounded claim line one")), "compile calls=" + compileCalls.length);
+  ok("research-compile-dossier", compileCalls.length >= 1 && compileCalls.every((c) => c.full.includes("Verified grounded claims") && c.full.includes("QA grounded claim line one") && c.full.includes("Explicit limits")), "compile calls=" + compileCalls.length);
 }
 // ---------- 3: F1 save preserves pinned research (no endless loop) ----------
 console.log("3: F1 save preserves pinned research");

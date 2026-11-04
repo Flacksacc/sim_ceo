@@ -479,7 +479,28 @@ export interface ResearchSource {
 export interface ResearchClaim {
   angle: string;
   text: string;
+  kind?: string;
+  verified?: boolean;
   sources: { url: string; title?: string }[];
+  refs?: { url: string; title?: string; excerpt?: string; fetched?: boolean; origin?: string }[];
+}
+
+function claimDisplayKind(c: ResearchClaim): string {
+  const angle = String((c as unknown as Record<string, unknown>).angle || "");
+  const kind = String(c.kind || "").toLowerCase();
+  if (angle.indexOf("[unverified]") >= 0 || c.verified === false && (!c.refs || c.refs.length === 0) && (!c.sources || c.sources.length === 0)) return "Unsupported";
+  if (angle.indexOf("[interpretation]") >= 0 || kind === "interpretation") return "Interpretation";
+  if (angle.indexOf("[citation]") >= 0 || kind === "citation") return "Cited passage";
+  return "Fact";
+}
+
+function claimProvenanceNote(c: ResearchClaim): string {
+  const refs = Array.isArray(c.refs) ? c.refs : [];
+  const linked = refs.filter((r) => String(r.excerpt || "").trim().length > 0);
+  if (linked.length === 0) return "No quote-linked passage — treat as unsupported until cross-checked.";
+  const fetched = linked.some((r) => r.fetched === true);
+  // Provenance only: a matching quote shows the passage was retrieved, not that the claim is true.
+  return fetched ? "Quote-linked passage retrieved by fetch (provenance only — still needs cross-check)." : "Quote-linked search passage (provenance only — not an application fetch; still needs cross-check).";
 }
 
 function asString(v: unknown): string {
@@ -1967,7 +1988,8 @@ export function CharacterEditor(props: CharacterEditorProps) {
             <ul className="cc-sources">
               {claims.slice(0, 12).map((c, i) => (
                 <li key={i}>
-                  [{c.angle}] {c.text}
+                  [{claimDisplayKind(c)}] {c.text}
+                  <div className="cc-excerpt">{claimProvenanceNote(c)}</div>
                 </li>
               ))}
             </ul>

@@ -739,7 +739,7 @@ async function stepCreateAdvisor() {
     const dossierTexts = Array.isArray(log0) ? dossierHits(log0, OWNED_URL_MARK).map((e) => logText(e)) : [];
     const compileTexts = Array.isArray(log0) ? ownedLog(log0).filter((e) => logText(e).includes("COMPILE-CHARACTER-PARAGRAPHS") && logText(e).includes(rosterName)).map((e) => logText(e)) : [];
     const excerptInDossier = excerptFrag.length >= 8 && dossierTexts.some((t) => t.includes(excerptFrag));
-    const compileHasDossier = compileTexts.some((c) => c.includes("Dossier (grounded evidence")); 
+    const compileHasDossier = compileTexts.some((c) => c.includes("Verified grounded claims") && c.includes("Explicit limits")); 
     const excerptLenOk = excerpt.length >= 20;
     ok("research-excerpt-dossier-compile", excerptLenOk && excerptInDossier && dossierTexts.length >= 1 && compileTexts.length >= 1 && compileHasDossier, "excerptLen=" + excerpt.length + " inDossier=" + excerptInDossier + " dossierN=" + dossierTexts.length + " compileN=" + compileTexts.length + " compileHasDossier=" + compileHasDossier);
     if (!(excerptLenOk && excerptInDossier && dossierTexts.length >= 1 && compileTexts.length >= 1 && compileHasDossier)) failExit("grounded transfer must prove fetched excerpt in dossier prompt and dossier carried in compile prompt.");

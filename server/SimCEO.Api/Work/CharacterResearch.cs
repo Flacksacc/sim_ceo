@@ -223,35 +223,13 @@ public static class CharacterResearch
         }
 
         // Step 2 (model call 1 of 2): single grounded dossier call.
-        var focusTag = string.IsNullOrWhiteSpace(focus) ? "" : " Focus: " + focus.Trim() + ".";
-        var bgTag = string.IsNullOrWhiteSpace(background) ? "" : " Owner background: " + background.Trim() + ".";
         var sidMap = ClaimEvidenceMapper.BuildSidMap(reqUrls);
-        var fetchTag = "";
-        if (reqUrls.Count > 0)
-        {
-          var parts = new List<string>();
-          for (var si = 0; si < reqUrls.Count; si++)
-          {
-            var u = reqUrls[si];
-            var sid = "S" + (si + 1);
-            if (fetchedExcerpts.TryGetValue(u, out var fe) && !string.IsNullOrWhiteSpace(fe.Excerpt))
-              parts.Add("[" + sid + "] " + u + " :: \"" + fe.Excerpt + "\"");
-            else
-              parts.Add("[" + sid + "] " + u + " :: (fetch failed; do not cite as verified)");
-          }
-          fetchTag = " Owner sources (cite by SID or full URL; quotes must be exact whitespace-normalized substrings of the excerpt): "
-            + string.Join(" | ", parts.Take(5));
-        }
+        var dossierPrompt = BuildDossierPrompt(startSubject, focus, startDesc, background, reqUrls, fetchedExcerpts);
         ModelGateway.GroundedResult dossier;
         try
         {
           dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkStandard, "advisor-research",
-            "Advisor dossier research. Subject: " + startSubject + "." + focusTag + bgTag
-              + " Seed description: " + startDesc + "." + fetchTag
-              + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage."
-              + " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <S1|full-url> :: \"<exact supporting quote>\" [ ;; <S1|full-url> :: \"<exact quote>\" ]"
-              + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
-              + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source's retrieved excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only.",
+            dossierPrompt,
             4000, 2048, ct, ownerOverride: PeopleOps.IsOwner(req));
         }
         catch (OperationCanceledException) { throw; }
@@ -264,30 +242,59 @@ public static class CharacterResearch
         var claims = new List<object>();
         var responseIds = new List<string>();
         if (g.ResponseId is not null) responseIds.Add(g.ResponseId);
-        var citedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var pool = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var u in reqUrls) citedUrls.Add(u);
+        var citedUrls = new List<string>();
+        void AddCitedUrl(string u)
+        {
+          var trimmed = (u ?? "").Trim();
+          if (trimmed.Length == 0) return;
+          foreach (var e in citedUrls) { if (ClaimEvidenceMapper.UrlsMatch(e, trimmed)) return; }
+          citedUrls.Add(trimmed);
+        }
+        var multiPool = new Dictionary<string, List<PoolPassage>>(StringComparer.Ordinal);
+        var fetchedUrlList = new List<string>();
+        void MarkFetched(string u)
+        {
+          var trimmed = (u ?? "").Trim();
+          if (trimmed.Length == 0) return;
+          foreach (var e in fetchedUrlList) { if (ClaimEvidenceMapper.UrlsMatch(e, trimmed)) return; }
+          fetchedUrlList.Add(trimmed);
+        }
+        bool IsFetched(string u)
+        {
+          var trimmed = (u ?? "").Trim();
+          foreach (var e in fetchedUrlList) { if (ClaimEvidenceMapper.UrlsMatch(e, trimmed)) return true; }
+          return false;
+        }
+        void AddPassage(string u, string title, string excerpt, bool fetched, string origin)
+        {
+          var trimmed = (u ?? "").Trim();
+          if (trimmed.Length == 0) return;
+          string key = trimmed;
+          foreach (var k in new List<string>(multiPool.Keys)) { if (ClaimEvidenceMapper.UrlsMatch(k, trimmed)) { key = k; break; } }
+          if (!multiPool.TryGetValue(key, out var list)) { list = new List<PoolPassage>(); multiPool[key] = list; }
+          list.Add(new PoolPassage(title ?? "", excerpt ?? "", fetched, origin ?? ""));
+        }
+        foreach (var u in reqUrls) AddCitedUrl(u);
         foreach (var kv in fetchedExcerpts)
         {
-          pool[kv.Key] = (kv.Value.Title ?? "", kv.Value.Excerpt ?? "");
+          if (!string.IsNullOrWhiteSpace(kv.Value.Excerpt))
+          {
+            AddPassage(kv.Key, kv.Value.Title ?? "", kv.Value.Excerpt ?? "", true, "owner-fetch");
+            MarkFetched(kv.Key);
+          }
         }
         foreach (var cite in g.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
         {
-          citedUrls.Add(cite.Url);
+          AddCitedUrl(cite.Url);
           if (!string.IsNullOrWhiteSpace(cite.Excerpt))
           {
-            if (pool.TryGetValue(cite.Url, out var existing))
-            {
-              if (string.IsNullOrWhiteSpace(existing.Excerpt))
-                pool[cite.Url] = (cite.Title ?? existing.Title ?? "", cite.Excerpt ?? "");
-            }
-            else pool[cite.Url] = (cite.Title ?? "", cite.Excerpt ?? "");
+            AddPassage(cite.Url, cite.Title ?? "", cite.Excerpt ?? "", false, "provider-search");
           }
         }
         var rawLines = g.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
         try
         {
-          var needFetch = ClaimEvidenceMapper.CollectUnfetchedUrls(rawLines, pool, sidMap).Take(3).ToList();
+          var needFetch = ClaimEvidenceMapper.CollectUnfetchedUrls(rawLines, multiPool, sidMap).Take(3).ToList();
           if (needFetch.Count > 0)
           {
             ct.ThrowIfCancellationRequested();
@@ -299,20 +306,37 @@ public static class CharacterResearch
             foreach (var h in hydrated)
             {
               if (!string.IsNullOrWhiteSpace(h.Excerpt))
-                pool[h.Url] = (h.Title ?? "", h.Excerpt ?? "");
+              {
+                AddPassage(h.Url, h.Title ?? "", h.Excerpt ?? "", true, "hydrated-fetch");
+                MarkFetched(h.Url);
+                AddCitedUrl(h.Url);
+              }
             }
           }
         }
         catch (OperationCanceledException) { throw; }
         catch { }
-        var validated = ClaimEvidenceMapper.MapAll(rawLines, pool, sidMap);
+        var validated = ClaimEvidenceMapper.MapAll(rawLines, multiPool, sidMap);
         var citedExcerpts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in pool)
-          if (!string.IsNullOrWhiteSpace(kv.Value.Excerpt)) citedExcerpts[kv.Key] = kv.Value.Excerpt;
+        foreach (var kv in multiPool)
+        {
+          string? pick = null;
+          foreach (var passage in kv.Value)
+          {
+            if (string.IsNullOrWhiteSpace(passage.Excerpt)) continue;
+            if (passage.Fetched) { pick = passage.Excerpt; break; }
+            pick ??= passage.Excerpt;
+          }
+          if (!string.IsNullOrWhiteSpace(pick)) citedExcerpts[kv.Key] = pick;
+        }
+        bool IsUrlFetched(string u) { return IsFetched(u); }
         foreach (var vc in validated)
         {
           if (vc.Verified)
-            claims.Add(new { angle = "dossier", text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote }).ToList() });
+          {
+            var vAngle = string.Equals(vc.Kind, "interpretation", StringComparison.OrdinalIgnoreCase) ? "dossier [interpretation]" : "dossier";
+            claims.Add(new { angle = vAngle, text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote, fetched = r.Fetched, origin = r.Origin }).ToList() });
+          }
           else
             claims.Add(new { angle = "dossier [unverified]", text = vc.Text, kind = vc.Kind, verified = false, sources = new List<object>(), refs = new List<object>() });
         }
@@ -415,15 +439,43 @@ public static class CharacterResearch
             if (staleCleanupErr is not null) return staleCleanupErr;
             return Results.Conflict("Advisor profile changed during research; rerun research on the new version.");
           }
+          string PoolTitleFor(string u)
+          {
+            foreach (var kv in multiPool)
+            {
+              if (!ClaimEvidenceMapper.UrlsMatch(kv.Key, u)) continue;
+              foreach (var passage in kv.Value)
+                if (!string.IsNullOrWhiteSpace(passage.Title)) return passage.Title;
+            }
+            foreach (var c in g.Citations)
+              if (ClaimEvidenceMapper.UrlsMatch(c.Url ?? "", u) && !string.IsNullOrWhiteSpace(c.Title)) return c.Title!;
+            return "";
+          }
+          string PoolOriginFor(string u)
+          {
+            bool anyFetched = IsUrlFetched(u);
+            bool ownerSup = false;
+            foreach (var r in reqUrls) { if (ClaimEvidenceMapper.UrlsMatch(r, u)) { ownerSup = true; break; } }
+            if (anyFetched && ownerSup) return "owner-fetch";
+            if (anyFetched) return "hydrated-fetch";
+            foreach (var kv in multiPool)
+            {
+              if (!ClaimEvidenceMapper.UrlsMatch(kv.Key, u)) continue;
+              foreach (var passage in kv.Value)
+                if (!string.IsNullOrWhiteSpace(passage.Excerpt)) return passage.Origin ?? "provider-search";
+            }
+            return "unfetched";
+          }
           var evidenceRefs = citedUrls.Select(u => new
           {
             kind = "source",
             @ref = u,
             url = u,
-            title = fetchedExcerpts.TryGetValue(u, out var fe) ? fe.Title : g.Citations.Where(c => string.Equals(c.Url, u, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(c.Title)).Select(c => c.Title).FirstOrDefault() ?? "",
+            title = PoolTitleFor(u),
             excerpt = citedExcerpts.TryGetValue(u, out var exu) ? exu : "",
-            fetched = citedExcerpts.ContainsKey(u),
-            ownerSupplied = reqUrls.Contains(u),
+            fetched = IsUrlFetched(u),
+            origin = PoolOriginFor(u),
+            ownerSupplied = reqUrls.Any(r => ClaimEvidenceMapper.UrlsMatch(r, u)),
           }).ToList<object>();
           var built = new
           {
@@ -462,7 +514,7 @@ public static class CharacterResearch
               // and the evidence count stays zero, so approval correctly
               // requires a grounded run while the draft remains editable.
               fresh.ResearchedAt = grounded ? DateTime.UtcNow : null;
-              fresh.EvidenceCount = grounded ? validated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)).Distinct(StringComparer.OrdinalIgnoreCase).Count() : 0;
+              fresh.EvidenceCount = grounded ? CountDistinctUrls(validated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url))) : 0;
               // Grounded research with real evidence completes a recovered placeholder
               // (explicit "recovered" tag removed by the owner's own research run;
               // unsupported dossiers keep the tag and stay blocked).
@@ -603,6 +655,117 @@ public static class CharacterResearch
       var inputs = CharacterBehavior.ParseInputs(entry.ResearchInputsJson);
       return Results.Ok(new { entry.ResearchJson, entry.ResearchedAt, researchRequested = entry.ResearchRequested, evidenceCount = entry.EvidenceCount, version = entry.Version, researchBaseVersion = entry.ResearchBaseVersion, running = live, stage, stageError, sources, draftProfile, draftStatus, inputs = new { background = inputs.Background, sourceUrls = inputs.SourceUrls, focus = inputs.Focus } });
     });
+  }
+
+  public static int CountDistinctUrls(IEnumerable<string> urls)
+  {
+    var distinct = new List<string>();
+    foreach (var u in urls)
+    {
+      var trimmed = (u ?? "").Trim();
+      if (trimmed.Length == 0) continue;
+      bool dup = false;
+      foreach (var d in distinct) { if (ClaimEvidenceMapper.UrlsMatch(d, trimmed)) { dup = true; break; } }
+      if (!dup) distinct.Add(trimmed);
+    }
+    return distinct.Count;
+  }
+
+  // Dossier prompt assembly with delivered-budget reservation (P2-F8).
+  // Mandatory grammar (format + SID bindings) is reserved FIRST and never
+  // truncated: seed/background/owner excerpts trim first. Returns prompt that
+  // always ends with the complete parsing instructions. Budget mirrors the
+  // gateway truncation (inputBudget*4 = 16000 for advisor-research).
+  public const int DossierInputBudgetTokens = 4000;
+  public static int DossierPromptBudgetChars()
+  {
+    try { return ModelGateway.UserCharBudget("advisor-research", DossierInputBudgetTokens); }
+    catch { return 16000 - 200; }
+  }
+
+  public static string BuildDossierPrompt(string subject, string focus, string desc, string background, IReadOnlyList<string> reqUrls, IReadOnlyDictionary<string, (string Title, string Excerpt)> fetchedExcerpts)
+  {
+    var focusTag = string.IsNullOrWhiteSpace(focus) ? "" : " Focus: " + focus.Trim() + ".";
+    var formatBlock = " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <S1|full-url> :: \"<exact supporting quote>\" [ ;; <S1|full-url> :: \"<exact quote>\" ]"
+      + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
+      + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source retrieval excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only."
+      + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage.";
+    var head = "Advisor dossier research. Subject: " + subject + "." + focusTag;
+    var budget = DossierPromptBudgetChars();
+    // Reserve format block + head first; seed/background/owner excerpts share the remainder.
+    var room = budget - head.Length - formatBlock.Length;
+    if (room < 500) room = 500;
+    var bg = (background ?? "").Trim();
+    var seed = (desc ?? "").Trim();
+    var bgTag = string.IsNullOrWhiteSpace(bg) ? "" : " Owner background: " + bg + ".";
+    var seedTag = " Seed description: " + seed + ".";
+    var ownerParts = new System.Collections.Generic.List<string>();
+    var sidMap = ClaimEvidenceMapper.BuildSidMap(reqUrls);
+    for (var si = 0; si < reqUrls.Count && si < 5; si++)
+    {
+      var u = reqUrls[si];
+      var sid = "S" + (si + 1);
+      string part;
+      if (fetchedExcerpts.TryGetValue(u, out var fe) && !string.IsNullOrWhiteSpace(fe.Excerpt))
+        part = "[" + sid + "] " + u + " :: \"" + fe.Excerpt + "\"";
+      else
+        part = "[" + sid + "] " + u + " :: (fetch failed; do not cite as verified)";
+      ownerParts.Add(part);
+    }
+    var fetchTag = ownerParts.Count > 0
+      ? " Owner sources (cite by SID or full URL; quotes must be exact whitespace-normalized substrings of the excerpt): " + string.Join(" | ", ownerParts)
+      : "";
+    // Trim order: owner excerpts, then background, then seed. Format/head never trim.
+    var combo = seedTag + bgTag + fetchTag;
+    if (combo.Length > room)
+    {
+      // Shorten owner excerpts first (keep URLs + SIDs intact for binding accuracy).
+      if (fetchTag.Length > 0 && combo.Length > room)
+      {
+        var shortParts = new System.Collections.Generic.List<string>();
+        for (var si = 0; si < reqUrls.Count && si < 5; si++)
+        {
+          var u = reqUrls[si];
+          var sid = "S" + (si + 1);
+          string excerpt = "";
+          if (fetchedExcerpts.TryGetValue(u, out var fe)) excerpt = (fe.Excerpt ?? "").Trim();
+          if (excerpt.Length > 320) excerpt = excerpt.Substring(0, 320) + " [...excerpt trimmed for budget...]";
+          string part2;
+          if (!string.IsNullOrWhiteSpace(excerpt))
+            part2 = "[" + sid + "] " + u + " :: \"" + excerpt + "\"";
+          else
+            part2 = "[" + sid + "] " + u + " :: (fetch failed; do not cite as verified)";
+          shortParts.Add(part2);
+        }
+        fetchTag = " Owner sources (cite by SID or full URL; quotes must be exact whitespace-normalized substrings of the excerpt): " + string.Join(" | ", shortParts);
+        combo = seedTag + bgTag + fetchTag;
+      }
+      if (combo.Length > room && bgTag.Length > 0)
+      {
+        var keep = System.Math.Max(0, room - seedTag.Length - fetchTag.Length - 120);
+        if (keep < 200) { bgTag = ""; }
+        else
+        {
+          var bgt = bg;
+          if (bgt.Length > keep) bgt = bgt.Substring(0, keep) + " [...background trimmed for budget...]";
+          bgTag = " Owner background: " + bgt + ".";
+        }
+        combo = seedTag + bgTag + fetchTag;
+      }
+      if (combo.Length > room)
+      {
+        var keep2 = System.Math.Max(0, room - bgTag.Length - fetchTag.Length - 120);
+        if (keep2 < 200) { seedTag = " Seed description: (trimmed for budget)."; }
+        else
+        {
+          var sdt = seed;
+          if (sdt.Length > keep2) sdt = sdt.Substring(0, keep2) + " [...seed trimmed for budget...]";
+          seedTag = " Seed description: " + sdt + ".";
+        }
+        combo = seedTag + bgTag + fetchTag;
+      }
+    }
+    return head + combo + formatBlock;
   }
 
   // Compile prompt assembly: the grounded dossier is REQUIRED content and is

@@ -11,8 +11,20 @@ namespace SimCEO.Api.Work;
 // Unsupported/unmapped claims stay as explicit unverified notes with no refs.
 // Quote linkage proves provenance only, never automatic claim truth; semantic
 // review still verifies entailment on actual samples.
-public sealed record ValidatedRef(string Url, string Title, string Quote, string Excerpt);
+//
+// Origin honesty (P1): provenance (quote present in a retrieved passage) is
+// distinct from application fetch success. Provider search snippets may carry
+// provenance but must never be recorded as fetched. Only passages actually
+// retrieved via PublicEvidenceFetcher (owner batch or bounded post-dossier
+// hydration) count as fetched. Pool retains MULTIPLE passages per URI so a
+// provider snippet is not discarded when an owner excerpt already exists.
+// URI identity (P2): strict URI-aware matching. Scheme/host case-insensitive
+// (DNS), default-port normalized, path/query case-SENSITIVE, trailing slash
+// significant (except bare root). /Case vs /case, differing query case, and
+// /page vs /page/ are distinct resources and never share excerpts.
+public sealed record ValidatedRef(string Url, string Title, string Quote, string Excerpt, bool Fetched = false, string Origin = "");
 public sealed record ValidatedClaim(string Text, string Kind, bool Verified, List<ValidatedRef> Refs);
+public sealed record PoolPassage(string Title, string Excerpt, bool Fetched, string Origin);
 
 public static class ClaimEvidenceMapper
 {
@@ -79,6 +91,46 @@ public static class ClaimEvidenceMapper
     return false;
   }
 
+  // Strict URI-aware identity. Host/scheme case-insensitive, default ports
+  // equivalent, path/query case-SENSITIVE, trailing slash significant except
+  // bare root ("https://h" == "https://h/"). Returns false for non-http(s).
+  public static bool TryParseHttpUri(string s, out Uri uri)
+  {
+    uri = null!;
+    try
+    {
+      var u = new Uri((s ?? "").Trim(), UriKind.Absolute);
+      if (!string.Equals(u.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(u.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        return false;
+      uri = u;
+      return true;
+    }
+    catch { return false; }
+  }
+
+  public static bool UrlsMatch(string a, string b)
+  {
+    var sa = (a ?? "").Trim();
+    var sb = (b ?? "").Trim();
+    if (string.Equals(sa, sb, StringComparison.Ordinal)) return true;
+    if (!TryParseHttpUri(sa, out var ua) || !TryParseHttpUri(sb, out var ub)) return false;
+    if (!string.Equals(ua.Scheme, ub.Scheme, StringComparison.OrdinalIgnoreCase)) return false;
+    if (!string.Equals(ua.Host, ub.Host, StringComparison.OrdinalIgnoreCase)) return false;
+    var paDefault = ua.IsDefaultPort;
+    var pbDefault = ub.IsDefaultPort;
+    if (paDefault != pbDefault) return false;
+    if (!paDefault && ua.Port != ub.Port) return false;
+    var pa = ua.AbsolutePath ?? "";
+    var pb = ub.AbsolutePath ?? "";
+    var paRoot = pa == "" || pa == "/";
+    var pbRoot = pb == "" || pb == "/";
+    if (paRoot && pbRoot) pa = pb = "/";
+    if (!string.Equals(pa, pb, StringComparison.Ordinal)) return false;
+    if (!string.Equals(ua.Query ?? "", ub.Query ?? "", StringComparison.Ordinal)) return false;
+    return true;
+  }
+
   private static bool TryLookupPool(string url, IReadOnlyDictionary<string, (string Title, string Excerpt)> pool, out string canonicalUrl, out string title, out string excerpt)
   {
     canonicalUrl = "";
@@ -86,17 +138,9 @@ public static class ClaimEvidenceMapper
     excerpt = "";
     if (string.IsNullOrWhiteSpace(url)) return false;
     var u = url.Trim();
-    if (pool.TryGetValue(u, out var hit))
-    {
-      canonicalUrl = u;
-      title = hit.Title ?? "";
-      excerpt = hit.Excerpt ?? "";
-      return true;
-    }
-    var trimmed = u.TrimEnd('/');
     foreach (var kv in pool)
     {
-      if (string.Equals(kv.Key.TrimEnd('/'), trimmed, StringComparison.OrdinalIgnoreCase))
+      if (UrlsMatch(kv.Key, u))
       {
         canonicalUrl = kv.Key;
         title = kv.Value.Title ?? "";
@@ -105,6 +149,37 @@ public static class ClaimEvidenceMapper
       }
     }
     return false;
+  }
+
+  private static bool TryLookupMulti(string url, IReadOnlyDictionary<string, List<PoolPassage>> pool, out string canonicalUrl, out List<PoolPassage> passages)
+  {
+    canonicalUrl = "";
+    passages = new List<PoolPassage>();
+    if (string.IsNullOrWhiteSpace(url)) return false;
+    var u = url.Trim();
+    foreach (var kv in pool)
+    {
+      if (UrlsMatch(kv.Key, u))
+      {
+        canonicalUrl = kv.Key;
+        passages = kv.Value;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public static Dictionary<string, List<PoolPassage>> ToMultiPool(IReadOnlyDictionary<string, (string Title, string Excerpt)> legacy, string originIfExcerpt = "provider-search")
+  {
+    var multi = new Dictionary<string, List<PoolPassage>>(StringComparer.Ordinal);
+    foreach (var kv in legacy)
+    {
+      var list = new List<PoolPassage>();
+      if (!string.IsNullOrWhiteSpace(kv.Value.Excerpt))
+        list.Add(new PoolPassage(kv.Value.Title ?? "", kv.Value.Excerpt ?? "", false, originIfExcerpt));
+      multi[kv.Key] = list;
+    }
+    return multi;
   }
 
   // Parse one dossier line. Supports JSON, pipe, and legacy plain formats.
@@ -241,33 +316,68 @@ public static class ClaimEvidenceMapper
     return t;
   }
 
-  public static ValidatedClaim MapOne(string line, IReadOnlyDictionary<string, (string Title, string Excerpt)> pool, IReadOnlyDictionary<string, string> sidMap)
+  private static ValidatedClaim MapOneCore(string line, IReadOnlyDictionary<string, string> sidMap, Func<string, List<PoolPassage>?> lookup)
   {
     var (kind, text, rawRefs) = ParseClaimLine(line);
     if (string.IsNullOrWhiteSpace(text)) return new ValidatedClaim("", "unverified", false, new List<ValidatedRef>());
     if (string.Equals(kind, "unverified", StringComparison.OrdinalIgnoreCase))
       return new ValidatedClaim(text, "unverified", false, new List<ValidatedRef>());
     var refs = new List<ValidatedRef>();
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var seen = new List<string>();
     foreach (var (urlOrSid, quote) in rawRefs)
     {
-      if (!TryResolveUrl(urlOrSid, sidMap, out var url)) continue;
-      if (!TryLookupPool(url, pool, out var canon, out var title, out var excerpt)) continue;
-      if (string.IsNullOrWhiteSpace(excerpt)) continue;
-      var nExcerpt = Normalize(excerpt);
+      if (!TryResolveUrl(urlOrSid, sidMap, out var resolved)) continue;
+      var passages = lookup(resolved);
+      if (passages is null || passages.Count == 0) continue;
       var nQuote = Normalize(quote);
       if (nQuote.Length < MinQuoteChars) continue;
-      if (nExcerpt.Length < MinExcerptChars) continue;
-      if (!nExcerpt.Contains(nQuote, StringComparison.Ordinal)) continue;
-      if (!seen.Add(canon)) continue;
-      refs.Add(new ValidatedRef(canon, title ?? "", StripOuterQuotes(quote).Trim(), excerpt));
+      PoolPassage? match = null;
+      foreach (var passage in passages)
+      {
+        if (string.IsNullOrWhiteSpace(passage.Excerpt)) continue;
+        var nExcerpt = Normalize(passage.Excerpt);
+        if (nExcerpt.Length < MinExcerptChars) continue;
+        if (!nExcerpt.Contains(nQuote, StringComparison.Ordinal)) continue;
+        match = passage;
+        if (passage.Fetched) break;
+      }
+      if (match is null) continue;
+      var canon = resolved;
+      bool dup = false;
+      foreach (var s in seen) { if (UrlsMatch(s, canon)) { dup = true; break; } }
+      if (dup) continue;
+      seen.Add(canon);
+      string retainedTitle = match.Title ?? "";
+      refs.Add(new ValidatedRef(canon, retainedTitle, StripOuterQuotes(quote).Trim(), match.Excerpt ?? "", match.Fetched, match.Origin ?? ""));
     }
     if (refs.Count == 0)
       return new ValidatedClaim(text, kind, false, new List<ValidatedRef>());
     return new ValidatedClaim(text, kind, true, refs);
   }
 
+  public static ValidatedClaim MapOne(string line, IReadOnlyDictionary<string, (string Title, string Excerpt)> pool, IReadOnlyDictionary<string, string> sidMap)
+  {
+    var multi = ToMultiPool(pool);
+    return MapOne(line, (IReadOnlyDictionary<string, List<PoolPassage>>)multi, sidMap);
+  }
+
+  public static ValidatedClaim MapOne(string line, IReadOnlyDictionary<string, List<PoolPassage>> pool, IReadOnlyDictionary<string, string> sidMap)
+  {
+    return MapOneCore(line, sidMap,
+      (string resolved) =>
+      {
+        if (TryLookupMulti(resolved, pool, out _, out var passages)) return passages;
+        return null;
+      });
+  }
+
   public static List<ValidatedClaim> MapAll(IEnumerable<string> lines, IReadOnlyDictionary<string, (string Title, string Excerpt)> pool, IReadOnlyDictionary<string, string> sidMap)
+  {
+    var multi = ToMultiPool(pool);
+    return MapAll(lines, (IReadOnlyDictionary<string, List<PoolPassage>>)multi, sidMap);
+  }
+
+  public static List<ValidatedClaim> MapAll(IEnumerable<string> lines, IReadOnlyDictionary<string, List<PoolPassage>> pool, IReadOnlyDictionary<string, string> sidMap)
   {
     var result = new List<ValidatedClaim>();
     foreach (var line in lines)
@@ -282,21 +392,41 @@ public static class ClaimEvidenceMapper
     return result;
   }
 
-  // Candidate web URLs referenced by raw lines that lack verified excerpts.
-  // Used for ONE bounded post-dossier fetch round (no extra LLM call, no walk).
+  // Legacy candidate-URL helper: snippet presence only. Production MUST use
+  // the Fetched-aware overload below so provider snippets without a real
+  // fetch are still hydrated instead of being mistaken for fetches.
   public static List<string> CollectUnfetchedUrls(IEnumerable<string> lines, IReadOnlyDictionary<string, (string Title, string Excerpt)> pool, IReadOnlyDictionary<string, string> sidMap)
   {
+    var multi = ToMultiPool(pool);
+    return CollectUnfetchedUrls(lines, (IReadOnlyDictionary<string, List<PoolPassage>>)multi, sidMap);
+  }
+
+  // Honest candidate-URL helper: a URL needs fetching when NO passage for it
+  // was actually fetched (Fetched=true with nonempty excerpt). Provider-only
+  // snippets, empty excerpts, unknown URLs, and strict-identity misses all
+  // count as unfetched.
+  public static List<string> CollectUnfetchedUrls(IEnumerable<string> lines, IReadOnlyDictionary<string, List<PoolPassage>> pool, IReadOnlyDictionary<string, string> sidMap)
+  {
     var needed = new List<string>();
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var line in lines)
     {
       var (_, _, rawRefs) = ParseClaimLine(line);
       foreach (var (urlOrSid, _) in rawRefs)
       {
         if (!TryResolveUrl(urlOrSid, sidMap, out var url)) continue;
-        if (!seen.Add(url)) continue;
-        if (TryLookupPool(url, pool, out _, out _, out var ex) && !string.IsNullOrWhiteSpace(ex)) continue;
         if (!(url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))) continue;
+        bool already = false;
+        foreach (var n in needed) { if (UrlsMatch(n, url)) { already = true; break; } }
+        if (already) continue;
+        bool fetched = false;
+        if (TryLookupMulti(url, pool, out _, out var passages))
+        {
+          foreach (var passage in passages)
+          {
+            if (passage.Fetched && !string.IsNullOrWhiteSpace(passage.Excerpt)) { fetched = true; break; }
+          }
+        }
+        if (fetched) continue;
         needed.Add(url);
       }
     }

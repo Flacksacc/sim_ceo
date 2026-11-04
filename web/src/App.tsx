@@ -962,7 +962,11 @@ function DossierView({ raw }: { raw: string }) {
           const cobj = (c && typeof c === "object" && !Array.isArray(c) ? c as Record<string, unknown> : {});
           const ctextPicked = dossierPick(cobj, "text", "Text");
           const ctext = ctextPicked ? ctextPicked : "(details unavailable)";
-          const angle = dossierPick(cobj, "angle", "Angle");
+          const angleRaw = dossierPick(cobj, "angle", "Angle");
+          const kindRaw = String(dossierPick(cobj, "kind", "Kind") || "").toLowerCase();
+          const verifiedRaw = (cobj as Record<string, unknown>).verified;
+          const displayKind = angleRaw.indexOf("[unverified]") >= 0 || (verifiedRaw === false && angleRaw.indexOf("[citation]") < 0) ? "Unsupported" : (angleRaw.indexOf("[interpretation]") >= 0 || kindRaw === "interpretation" ? "Interpretation" : (angleRaw.indexOf("[citation]") >= 0 || kindRaw === "citation" ? "Cited passage" : "Fact"));
+          const provenanceCaption = "Quote shows retrieved passage only, not proof the claim is true.";
           const srcs: unknown[] = Array.isArray(cobj.sources) ? (cobj.sources as unknown[]) : (Array.isArray(cobj.Sources) ? (cobj.Sources as unknown[]) : []);
           const refs: unknown[] = Array.isArray(cobj.refs) ? (cobj.refs as unknown[]) : (Array.isArray(cobj.Refs) ? (cobj.Refs as unknown[]) : []);
           type DossierEv = { kind: string; ref: string; url: string; title: string; excerpt: string };
@@ -995,7 +999,7 @@ function DossierView({ raw }: { raw: string }) {
           const withExcerpt = evidence.filter((e) => e.excerpt.trim() !== "");
           const withoutExcerpt = evidence.filter((e) => e.excerpt.trim() === "");
           const labelFor = (e: DossierEv) => e.title ? e.title : (e.url ? e.url : (e.kind + ":" + (e.ref || "?")));
-          return (<li key={ci}>{angle ? (<b>{angle}: </b>) : null}{ctext}
+          return (<li key={ci}><b>{displayKind}: </b>{ctext}
             {withExcerpt.length > 0 && (<ul>{withExcerpt.map((e, ei) => {
               const label = labelFor(e);
               const safe = !!e.url && dossierIsSafeHttpUrl(e.url);
@@ -1007,7 +1011,8 @@ function DossierView({ raw }: { raw: string }) {
               const safe = !!e.url && dossierIsSafeHttpUrl(e.url);
               return (<li key={"u" + ei} className="muted">{safe ? (<a href={e.url} target="_blank" rel="noreferrer">{label}</a>) : (<span>{label}</span>)}<span> (no excerpt)</span></li>);
             })}</ul>)}
-            {withExcerpt.length === 0 && (<p role="note">Unsupported — no excerpt in cited evidence.</p>)}</li>);
+            {withExcerpt.length === 0 && (<p role="note">Unsupported — no quote-linked passage in cited evidence.</p>)}
+            {withExcerpt.length > 0 && (<p className="muted">{provenanceCaption}</p>)}</li>);
         })}{" "}
       </ul>{" "}
       {note && <p className="muted">{note}</p>}{" "}

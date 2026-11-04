@@ -89,6 +89,7 @@ public static class RosterOps
     return ResearchTerminalStatus(entry) switch
     {
       "failed" => "research failed (rerun research)",
+      "unsupported" => "research unsupported (editable draft, not grounded; rerun for grounding)",
       "superseded" => "research interrupted (rerun research)",
       _ => "research in progress",
     };
@@ -454,6 +455,29 @@ public static class RosterEndpoints
     catch { return false; }
   }
 
+  // ai-draft structured prompts (P1-F2): dossier requests the mapper-required
+  // KIND/EVIDENCE grammar; profile is built from VERIFIED claims only, never
+  // raw dossier text, so unsupported notes cannot steer the profile.
+  public static string BuildAiDraftDossierPrompt(string name, string role, string focus)
+  {
+    return "Research this fictional advisor persona for a business advisory board. Name: " + (name ?? "").Trim() + ". Role: " + (role ?? "").Trim() + ". Focus: " + (focus ?? "").Trim() + "."
+      + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage."
+      + " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <full-url> :: \"<exact supporting quote>\" [ ;; <full-url> :: \"<exact quote>\" ]"
+      + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
+      + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source retrieval excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only.";
+  }
+
+  public static string BuildAiDraftProfilePrompt(string name, string role, string focus, string groundedDossier)
+  {
+    var dossierPart = string.IsNullOrWhiteSpace(groundedDossier)
+      ? "(no verified grounded claims; draft from the owner seed and explicit limits only; do not invent grounding)"
+      : groundedDossier;
+    return "Draft a fictional advisor profile as ONLY a JSON object (no code fences, no commentary) with keys: background, strengths (array of 3), methods (array of 3), evidenceNeeded (array), limits (array of 3), collaboration (string). Persona: " + (name ?? "").Trim() + ", " + (role ?? "").Trim() + ", focus: " + (focus ?? "").Trim() + "."
+      + " Verified grounded claims (only these plus the seed may inform behavior; unverified notes excluded): " + dossierPart
+      + " Explicit limits: never invent real-world credentials, employment, degrees, licenses, or endorsements; abstain where evidence is missing or the topic is outside the seed."
+      + " State that the advisor is fictional with no real employment, degrees, licenses, or endorsements.";
+  }
+
   public static void MapRoster(this WebApplication app)
   {
     var gw = new ModelGateway(app.Services.GetRequiredService<InMemoryStore>());
@@ -788,18 +812,36 @@ public static class RosterEndpoints
       if (role.Trim().Length > 500) return Results.BadRequest("Role must be 500 chars or fewer.");
       if (focus.Trim().Length > CharacterBehavior.MaxFocusChars) return Results.BadRequest("Focus must be " + CharacterBehavior.MaxFocusChars + " chars or fewer.");
       ModelGateway.GroundedResult dossier;
+      string aiDossierPrompt = BuildAiDraftDossierPrompt(name, role, focus);
       try
       {
         dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkFor(s, null), "advisor-research",
-        "Research this fictional advisor persona for a business advisory board. Name: " + name + ". Role: " + role + ". Focus: " + focus + ". Return concise factual-style guidance: what such an advisor should know, typical methods, key risks they watch, and limits. One claim per line.",
+        aiDossierPrompt,
         ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
+      // Map BEFORE compiling: only verified quote-linked claims may inform the profile.
+      var aiPoolMulti = new Dictionary<string, List<SimCEO.Api.Work.PoolPassage>>(StringComparer.Ordinal);
+      foreach (var cite in dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
+      {
+        if (string.IsNullOrWhiteSpace(cite.Excerpt)) continue;
+        string akey = cite.Url.Trim();
+        foreach (var k in new List<string>(aiPoolMulti.Keys)) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(k, akey)) { akey = k; break; } }
+        if (!aiPoolMulti.TryGetValue(akey, out var alist)) { alist = new List<SimCEO.Api.Work.PoolPassage>(); aiPoolMulti[akey] = alist; }
+        alist.Add(new SimCEO.Api.Work.PoolPassage(cite.Title ?? "", cite.Excerpt ?? "", false, "provider-search"));
+      }
+      var aiSid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      var aiLines = dossier.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
+      var aiValidated = SimCEO.Api.Work.ClaimEvidenceMapper.MapAll(aiLines, aiPoolMulti, aiSid);
+      var groundedDossier = aiValidated.Any(v => v.Verified)
+        ? string.Join("\n", aiValidated.Where(v => v.Verified).Select(v => v.Kind.ToUpperInvariant() + " | " + v.Text + " || EVIDENCE: " + string.Join(" ;; ", v.Refs.Select(r => r.Url + " :: \"" + r.Quote + "\""))))
+        : "";
+      string aiProfilePrompt = BuildAiDraftProfilePrompt(name, role, focus, groundedDossier);
       string profile;
       try
       {
         profile = await gw.CompleteAsync(ModelPolicy.SparkFor(s, null), "advisor-profile",
-          "Draft a fictional advisor profile as ONLY a JSON object (no code fences, no commentary) with keys: background, strengths (array of 3), methods (array of 3), evidenceNeeded (array), limits (array of 3), collaboration (string). Persona: " + name + ", " + role + ", focus: " + focus + ". Research notes: " + dossier.Text + ". State that the advisor is fictional with no real employment, degrees, licenses, or endorsements.",
+          aiProfilePrompt,
           ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
@@ -810,24 +852,43 @@ public static class RosterEndpoints
         var pend = profile.LastIndexOf("```");
         if (pnl >= 0 && pend > pnl) profile = profile.Substring(pnl + 1, pend - pnl - 1).Trim();
       }
-      var aiPool = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
+      var aiDraftUrls = new List<string>();
       foreach (var cite in dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
-        if (!string.IsNullOrWhiteSpace(cite.Excerpt) && !aiPool.ContainsKey(cite.Url)) aiPool[cite.Url] = (cite.Title ?? "", cite.Excerpt ?? "");
-      var aiSid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-      var aiLines = dossier.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
-      var aiValidated = ClaimEvidenceMapper.MapAll(aiLines, aiPool, aiSid);
-      var draftRefs = dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)).Take(10)
-        .Select(c => new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt }).ToList();
+      {
+        var cu = cite.Url.Trim();
+        bool dup = false;
+        foreach (var e in aiDraftUrls) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(e, cu)) { dup = true; break; } }
+        if (!dup) aiDraftUrls.Add(cu);
+        if (aiDraftUrls.Count >= 10) break;
+      }
+      var draftRefs = aiDraftUrls.Select(u =>
+      {
+        var hit = dossier.Citations.FirstOrDefault(c => SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(c.Url ?? "", u));
+        return new { kind = "source", @ref = u, url = u, title = hit?.Title ?? "", excerpt = hit?.Excerpt ?? "", fetched = false, origin = string.IsNullOrWhiteSpace(hit?.Excerpt) ? "unfetched" : "provider-search", ownerSupplied = false };
+      }).ToList();
       var draftClaims = new List<object>();
       foreach (var vc in aiValidated)
       {
         if (vc.Verified)
-          draftClaims.Add(new { angle = "dossier", text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList<object>(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote }).ToList<object>() });
+        {
+          var vcAngle = string.Equals(vc.Kind, "interpretation", StringComparison.OrdinalIgnoreCase) ? "dossier [interpretation]" : "dossier";
+          draftClaims.Add(new { angle = vcAngle, text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList<object>(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote, fetched = r.Fetched, origin = r.Origin }).ToList<object>() });
+        }
         else
           draftClaims.Add(new { angle = "dossier [unverified]", text = vc.Text, kind = vc.Kind, verified = false, sources = new List<object>(), refs = new List<object>() });
       }
       foreach (var c in dossier.Citations.Take(6).Where(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
         draftClaims.Add(new { angle = "dossier [citation]", text = c.Excerpt, kind = "citation", verified = false, sources = new[] { new { url = c.Url, title = c.Title } }.ToList<object>(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList<object>() });
+      var aiSupported = aiValidated.Any(v => v.Verified);
+      var aiDistinct = new List<string>();
+      foreach (var u in aiValidated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)))
+      {
+        var tu = (u ?? "").Trim();
+        if (tu.Length == 0) continue;
+        bool dup2 = false;
+        foreach (var d in aiDistinct) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(d, tu)) { dup2 = true; break; } }
+        if (!dup2) aiDistinct.Add(tu);
+      }
       var entry = new RosterEntry
       {
         Id = Guid.NewGuid(), AccountId = accountId, OwnerKey = PeopleOps.UserOf(s, req), Type = AdvisorType.FictionalCharacter,
@@ -838,18 +899,19 @@ public static class RosterEndpoints
         {
           subject = name.Trim() + " (" + role.Trim() + ")",
           searched = dossier.SearchCalls,
-          supported = aiValidated.Any(v => v.Verified),
+          supported = aiSupported,
           claims = draftClaims,
           responseIds = dossier.ResponseId is null ? new List<string>() : new List<string> { dossier.ResponseId },
           version = 1,
           evidenceRefs = draftRefs,
-          note = aiValidated.Any(v => v.Verified)
-            ? "Snippet-level claims need cross-checking against independent sources before approval. Only claims with validated per-claim quotes are marked verified; unverified notes carry no support refs."
-            : "No completed grounded evidence: treat every claim above as unsupported, not verified research.",
+          draftStatus = aiSupported ? "done" : "unsupported",
+          note = aiSupported
+            ? "Snippet-level claims need cross-checking against independent sources before approval. Only claims with validated per-claim quotes are marked verified; unverified notes carry no support refs. Quote linkage proves passage provenance only, not claim truth."
+            : "No grounded evidence completed (no verified quote-linked claims). The draft below is editable but UNSUPPORTED: not marked complete, not eligible for approval. Rerun research with better inputs, or proceed without research-gated approval.",
         }),
-        ResearchedAt = aiValidated.Any(v => v.Verified) ? DateTime.UtcNow : null,
+        ResearchedAt = aiSupported ? DateTime.UtcNow : null,
         ResearchRequested = true,
-        EvidenceCount = aiValidated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+        EvidenceCount = aiDistinct.Count,
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       var aiEntry = entry;
@@ -862,7 +924,8 @@ public static class RosterEndpoints
         });
       }
       catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster draft") ?? Results.Json(new { error = "Roster draft failed; no state changed: " + ex.Message }, statusCode: 500); }
-      return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = dossier.RanSearch, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
+      var aiCommittedSupported = aiValidated.Any(v => v.Verified);
+      return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = aiCommittedSupported, draftStatus = aiCommittedSupported ? "done" : "unsupported", supported = aiCommittedSupported, evidenceCount = aiDistinct.Count, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
     });
 
     app.MapPost("/api/boards/{bid:guid}/advisors/{aid:guid}/chat", (InMemoryStore s, HttpRequest req, Guid bid, Guid aid) =>

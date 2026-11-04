@@ -236,7 +236,7 @@ const server = http.createServer(async (req, res) => {
     seq++;
     const noSearch = input.includes("QA-NOSEARCH");
     const output = [
-      { type: "message", content: [{ type: "output_text", text: "QA grounded claim line one.\nQA grounded claim line two." }] },
+      { type: "message", content: [{ type: "output_text", text: "FACT | QA grounded claim line one about port risk || EVIDENCE: https://qa.example/s1 :: \"QA excerpt one.\"\nINTERPRETATION | QA grounded interpretation line two about crew || EVIDENCE: https://qa.example/s2 :: \"QA excerpt two.\"" }] },
     ];
     if (!noSearch) {
       output.unshift({
