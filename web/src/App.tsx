@@ -1523,14 +1523,6 @@ export default function App() {
     stage: "",
     step: 1,
     seats: [] as WizardSeat[],
-    lead: {
-      name: "",
-      roleLabel: "Board Lead",
-      background: "",
-      familiarTopics: "",
-      simplerTopics: "",
-      commPrefs: DEFAULT_COMM_PREFS,
-    },
   });
   const [accountId] = useState(() => {
     const k = "simceo-account";
@@ -2377,7 +2369,7 @@ export default function App() {
   const profile = useQuery({
     queryKey: ["profile"],
     queryFn: () => get<Lead>("/api/profile"),
-    enabled: !sessGate && (tab === "profile" || tab === "meet"),
+    enabled: !sessGate && (tab === "profile" || tab === "meet" || tab === "wizard"),
     retry: false,
   });
   const [leadForm, setLeadForm] = useState({
@@ -2735,7 +2727,6 @@ export default function App() {
         name: w.name,
         mission: w.mission,
         stage: w.stage,
-        lead: w.lead,
         advisors: w.seats,
       });
       wizLastSentRef.current = { step: stepToSave, presetKey: presetToSave, fields: fieldsJson };
@@ -2783,8 +2774,6 @@ export default function App() {
   const guideInput = () => {
     if (wizard.step === 2)
       return `Advisors so far: ${wizard.seats.map((s) => s.role).join(", ") || "none"}. Mission: ${wizard.mission}`;
-    if (wizard.step === 3)
-      return `Lead so far: ${wizard.lead.name} ${wizard.lead.roleLabel} ${wizard.lead.background}`;
     return `${wizard.name} ${wizard.mission} ${wizard.stage}`;
   };
   const suggest = useMutation({
@@ -2857,7 +2846,6 @@ export default function App() {
           name: w.name,
           mission: w.mission,
           stage: w.stage,
-          lead: w.lead,
           advisors: w.seats,
         });
         if (currentFields !== sent.fields || presetKeyRef.current !== sent.presetKey) return;
@@ -2867,7 +2855,6 @@ export default function App() {
       // Snapshot pre-apply state: the baseline below must describe exactly
       // what this accepted hydration writes (same fallbacks as the setters).
       const wPrev = wizardRef.current;
-      const mergedLead = { ...wPrev.lead, ...(f.lead ?? {}) };
       const mergedSeats: WizardSeat[] = Array.isArray(f.advisors)
         ? f.advisors.map((s: WizardSeat) => ({ role: s.role ?? "", name: s.name ?? "", rosterEntryId: s.rosterEntryId }))
         : wPrev.seats;
@@ -2877,14 +2864,13 @@ export default function App() {
         mission: f.mission ?? w.mission,
         stage: f.stage ?? w.stage,
         seats: Array.isArray(f.advisors) ? f.advisors.map((s: WizardSeat) => ({ role: s.role ?? "", name: s.name ?? "", rosterEntryId: s.rosterEntryId })) : w.seats,
-        lead: { ...w.lead, ...(f.lead ?? {}) },
       }));
       if (d.presetKey) setPresetKey(d.presetKey);
       // A background arrival never yanks explicit local navigation: when the
       // user moved (Back) since the last clean sync, fields still apply but
       // the local step stands until the next save makes it the baseline.
       if (!keepLocalStep && typeof d.step === "number" && d.step >= 1 && d.step <= 4)
-        setWizard((w) => ({ ...w, step: d.step }));
+        setWizard((w) => ({ ...w, step: d.step === 3 ? 4 : d.step }));
       // The server state was accepted above: advance the last-clean baseline
       // to what was just applied, so a later hydration (e.g. the second of
       // two interview GETs) is not rejected as newer local edits. Dirty local
@@ -2892,13 +2878,12 @@ export default function App() {
       // When the local step was kept, the baseline still records the server
       // step so later arrivals keep respecting the explicit navigation.
       wizLastSentRef.current = {
-        step: (typeof d.step === "number" && d.step >= 1 && d.step <= 4) ? d.step : wPrev.step,
+        step: (typeof d.step === "number" && d.step >= 1 && d.step <= 4) ? (d.step === 3 ? 4 : d.step) : wPrev.step,
         presetKey: d.presetKey || presetKeyRef.current,
         fields: JSON.stringify({
           name: f.name ?? wPrev.name,
           mission: f.mission ?? wPrev.mission,
           stage: f.stage ?? wPrev.stage,
-          lead: mergedLead,
           advisors: mergedSeats,
         }),
       };
@@ -2963,10 +2948,6 @@ export default function App() {
       try {
         (wizardRef as any).current = {
           name: "", mission: "", stage: "", step: 1, seats: [],
-          lead: {
-            name: "", roleLabel: "Board Lead", background: "",
-            familiarTopics: "", simplerTopics: "", commPrefs: "",
-          },
         };
       } catch {}
       // Seed the new board into the list + detail caches before the
@@ -3002,14 +2983,6 @@ export default function App() {
         stage: "",
         step: 1,
         seats: [],
-        lead: {
-          name: "",
-          roleLabel: "Board Lead",
-          background: "",
-          familiarTopics: "",
-          simplerTopics: "",
-          commPrefs: "",
-        },
       });
       setPresetKey("strategy");
       setGuide(null);
@@ -6948,20 +6921,20 @@ const testModel = useMutation({
               <h2>Create a board</h2>{" "}
               <ol className="steps" aria-label="Progress">
                 {" "}
-                {["About", "Advisors", "Lead", "Review"].map((s, i) => (
+                {[{ label: "About", step: 1 }, { label: "Advisors", step: 2 }, { label: "Review", step: 4 }].map((item, i) => (
                   <li
-                    key={s}
-                    aria-current={wizard.step === i + 1 ? "step" : undefined}
+                    key={item.label}
+                    aria-current={wizard.step === item.step ? "step" : undefined}
                     className={
-                      wizard.step === i + 1
+                      wizard.step === item.step
                         ? "now"
-                        : wizard.step > i + 1
+                        : wizard.step > item.step
                           ? "done"
                           : ""
                     }
                   >
                     {" "}
-                    {i + 1}. {s}{" "}
+                    {i + 1}. {item.label}{" "}
                   </li>
                 ))}{" "}
               </ol>{" "}
@@ -7086,153 +7059,6 @@ const testModel = useMutation({
                       className="primary"
                       disabled={!wizardSelectionsValid || wizSave.isPending || (!!wizId && wizVersion == null)}
                       onClick={() => {
-                        wizSave.mutate(3);
-                        setWizard({ ...wizard, step: 3 });
-                      }}
-                    >
-                      {" "}
-                      Continue{" "}
-                    </button>{" "}
-                  </div>{" "}
-                </div>
-              )}{" "}
-              {wizard.step === 3 && (
-                <div className="card">
-                  {" "}
-                  <h3>Who leads this board?</h3>{" "}
-                  <label>
-                    {" "}
-                    Name{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.name}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: { ...wizard.lead, name: e.target.value },
-                        })
-                      }
-                    />{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Role label{" "}
-                    <select
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.roleLabel}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: { ...wizard.lead, roleLabel: e.target.value },
-                        })
-                      }
-                    >
-                      {" "}
-                      {[
-                        "Board Lead",
-                        "CEO",
-                        "Founder",
-                        "Project Lead",
-                        "Care Lead",
-                        "Organizer",
-                      ].map((r) => (
-                        <option key={r} value={r}>
-                          {" "}
-                          {r}{" "}
-                        </option>
-                      ))}{" "}
-                    </select>{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Background{" "}
-                    <textarea
-                      rows={4}
-                      className="profile-area"
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.background}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: { ...wizard.lead, background: e.target.value },
-                        })
-                      }
-                      placeholder="What should advisors know about you?"
-                    ></textarea>{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Subjects already familiar{" "}
-                    <textarea
-                      rows={4}
-                      className="profile-area"
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.familiarTopics}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: {
-                            ...wizard.lead,
-                            familiarTopics: e.target.value,
-                          },
-                        })
-                      }
-                    ></textarea>{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Subjects needing simpler explanation{" "}
-                    <textarea
-                      rows={4}
-                      className="profile-area"
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.simplerTopics}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: {
-                            ...wizard.lead,
-                            simplerTopics: e.target.value,
-                          },
-                        })
-                      }
-                    ></textarea>{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Communication preferences{" "}
-                    <textarea
-                      rows={5}
-                      className="profile-area"
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.lead.commPrefs}
-                      onChange={(e) =>
-                        setWizard({
-                          ...wizard,
-                          lead: { ...wizard.lead, commPrefs: e.target.value },
-                        })
-                      }
-                      placeholder="e.g. Blunt and brief"
-                    ></textarea>{" "}
-                  </label>{" "}
-                  <div className="meetctl">
-                    {" "}
-                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
-                      {" "}
-                      Save draft{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      onClick={() => setWizard({ ...wizard, step: 2 })}
-                    >
-                      {" "}
-                      Back{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={!wizard.lead.name.trim() || wizSave.isPending || (!!wizId && wizVersion == null)}
-                      onClick={() => {
                         wizSave.mutate(4);
                         setWizard({ ...wizard, step: 4 });
                       }}
@@ -7356,44 +7182,6 @@ const testModel = useMutation({
                           </button>{" "}
                         </div>
                       )}{" "}
-                      {guide.fields?.lead && (
-                        <div className="meetctl">
-                          {" "}
-                          <span className="muted">
-                            {" "}
-                            Suggested lead details received.{" "}
-                          </span>{" "}
-                          <button
-                            type="button"
-                            disabled={!!wizId && wizVersion == null}
-                            onClick={() => {
-                              const l = guide.fields?.lead ?? {};
-                              setWizard({
-                                ...wizard,
-                                lead: {
-                                  name: l.name || wizard.lead.name,
-                                  roleLabel:
-                                    l.roleLabel || wizard.lead.roleLabel,
-                                  background:
-                                    l.background || wizard.lead.background,
-                                  familiarTopics:
-                                    l.familiarTopics ||
-                                    wizard.lead.familiarTopics,
-                                  simplerTopics:
-                                    l.simplerTopics ||
-                                    wizard.lead.simplerTopics,
-                                  commPrefs:
-                                    l.commPrefs || wizard.lead.commPrefs,
-                                },
-                              });
-                              setGuide(null);
-                            }}
-                          >
-                            {" "}
-                            Apply lead details{" "}
-                          </button>{" "}
-                        </div>
-                      )}{" "}
                     </>
                   )}{" "}
                 </div>
@@ -7415,8 +7203,8 @@ const testModel = useMutation({
                   </p>{" "}
                   <p>
                     {" "}
-                    Lead: {wizard.lead.name || "not set"} ({" "}
-                    {wizard.lead.roleLabel}){" "}
+                    {profile.isSuccess ? `Your saved profile (${profile.data.name}) will be used automatically.` : profile.isLoading ? "Loading your saved profile…" : "Save your profile before creating this board."}
+                    {!profile.isLoading && !profile.isSuccess && <button type="button" className="btn ghost" onClick={() => setTab("profile")}>Open Your Profile</button>}
                   </p>{" "}
                   <p role="status">
                     {" "}
@@ -7447,7 +7235,7 @@ const testModel = useMutation({
                     {" "}
                     <button
                       type="button"
-                      onClick={() => setWizard({ ...wizard, step: 3 })}
+                      onClick={() => setWizard({ ...wizard, step: 2 })}
                     >
                       {" "}
                       Back{" "}
@@ -7458,6 +7246,7 @@ const testModel = useMutation({
                       disabled={
                         !wizId ||
                         !wizardSelectionsValid ||
+                        !profile.isSuccess ||
                         createBoardFromWizard.isPending ||
                         (wizReview.data?.blockers ?? []).length > 0
                       }

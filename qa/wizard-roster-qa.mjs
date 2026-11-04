@@ -10,7 +10,9 @@ async function ok(method,path,body) {const r=await call(method,path,body);assert
 assert.equal((await ok('GET','/health')).instance,'qa-author-15396');
 assert.equal((await ok('GET','/ready')).store,'inmemory');
 assert.equal((await ok('GET','/api/auth/status')).hasAccounts,false);
-await ok('POST','/api/profile',{name:'Roster picker CEO',background:'Saved background',commPrefs:'Explain the tradeoffs briefly.'});
+const noProfile=await ok('POST','/api/wizard',{step:4,fieldsJson:JSON.stringify({name:'No saved profile',mission:'First run'})});
+assert.ok((await ok('GET',`/api/wizard/${noProfile.id}/review`)).blockers.some(b=>b.field==='profile'));
+const defaultProfile=await ok('POST','/api/profile',{name:'Roster picker CEO',background:'Saved background',commPrefs:'Explain the tradeoffs briefly.'});
 const entries=[];
 for(let i=0;i<11;i++) {
   const entry=await ok('POST','/api/roster',{name:`Advisor ${String(i).padStart(2,'0')}`,description:'An existing fictional specialist.',profileJson:JSON.stringify({background:'An experienced fictional specialist with documented practices.',contributionCriteria:'Contribute when operations expertise is relevant.',reasoningApproach:'Explain practical options using the CEO context.',responseStyle:'Concise conversational explanations.'})});
@@ -50,11 +52,13 @@ try {
   await page.reload();await group.waitFor();await page.waitForFunction(()=>document.querySelectorAll('.wizard-roster-option input:checked').length===10);
   await page.screenshot({path:'.tmp/wizard-roster-picker.png',fullPage:true,animations:'disabled'});
   await page.getByRole('button',{name:'Continue',exact:true}).click();
-  await page.getByLabel('Name',{exact:true}).fill('Roster picker CEO');
-  await page.getByRole('button',{name:'Continue',exact:true}).click();
+  assert.equal(await page.getByRole('heading',{name:'Who leads this board?',exact:true}).count(),0);
+  assert.equal(await page.getByRole('list',{name:'Progress'}).locator('li').count(),3);
+  await page.getByText('Your saved profile (Roster picker CEO) will be used automatically.',{exact:true}).waitFor();
   const create=page.getByRole('button',{name:'Create board',exact:true});await create.waitFor();
   const response=page.waitForResponse(r=>/\/api\/wizard\/[^/]+\/create$/.test(r.url())&&r.request().method()==='POST');
   await create.click();const r=await response;assert.equal(r.status(),201);const data=await r.json();createdId=data.board.id;
+  const lead=await ok('GET',`/api/boards/${createdId}/lead`);assert.equal(lead.source,'default');assert.equal(lead.id,defaultProfile.id);
   const replay=await ok('POST',new URL(r.url()).pathname,{});assert.equal(replay.board.id,createdId);
   const members=await ok('GET',`/api/boards/${createdId}/advisors`);assert.equal(members.length,10);
   assert.deepEqual(members.map(a=>a.rosterEntryId).sort(),entries.slice(1).map(e=>e.id).sort());
@@ -69,8 +73,25 @@ async function rejected(advisors,status=409) {
   assert.equal((await call('POST',`/api/wizard/${d.id}/create`,{})).status,status);
   assert.equal((await ok('GET','/api/boards')).length,before,'Rejected creation leaves no board');
 }
+const legacy=await ok('POST','/api/wizard',{step:3,fieldsJson:JSON.stringify({name:'Legacy leader draft',mission:'Inherit the saved CEO',lead:{name:'Outdated leader',background:'Outdated context',override:true},advisors:[{rosterEntryId:entries[0].id}]})});
+const resumeBrowser=await chromium.launch({executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',headless:true});
+try {
+ const ctx=await resumeBrowser.newContext();await ctx.grantPermissions(['local-network-access'],{origin:base});
+ await ctx.addInitScript(id=>{localStorage.setItem('simceo-wizard:anon',id);localStorage.setItem('simceo-wizard',id);},legacy.id);
+ const page=await ctx.newPage();await page.goto(base+'/#/wizard');
+ await page.getByRole('heading',{name:'Review and create',exact:true}).waitFor();
+ assert.equal(await page.getByRole('heading',{name:'Who leads this board?',exact:true}).count(),0);
+ await page.getByText('Your saved profile (Roster picker CEO) will be used automatically.',{exact:true}).waitFor();
+ await ctx.close();
+} finally {await resumeBrowser.close();}
+const oldBoard=await ok('POST',`/api/wizard/${legacy.id}/create`,{});
+assert.equal((await ok('GET',`/api/boards/${oldBoard.board.id}/lead`)).id,defaultProfile.id);
+const updated=await ok('POST','/api/profile',{...defaultProfile,name:'Updated CEO',background:'New CEO background'});
+for(const id of [createdId,oldBoard.board.id]) {
+ const lead=await ok('GET',`/api/boards/${id}/lead`);assert.equal(lead.source,'default');assert.equal(lead.name,updated.name);assert.equal(lead.background,updated.background);
+}
 const seats=entries.map(e=>({rosterEntryId:e.id,role:e.name,name:e.name}));
 await rejected([]);await rejected(seats);await rejected([seats[0],seats[0]]);await rejected([{name:'Invented',role:'Invented'}]);await rejected([{rosterEntryId:crypto.randomUUID()}]);
 await ok('POST',`/api/roster/${entries[0].id}/archive`,{archived:true});await rejected([seats[0]]);
 const unfinished=(await ok('GET',`/api/roster?accountId=${accountId}`)).find(r=>!r.complete);await rejected([{rosterEntryId:unfinished.entry.id}]);
-console.log(JSON.stringify({passed:true,checks:['211-member paginated roster','search','ten-member cap','uncheck at cap','incomplete disabled','saved selection reload','guided helper hidden on Advisors','existing roster identities and profiles retained','idempotent creation','empty, duplicate, over-limit, legacy, missing, archived and incomplete rejected'],createdBoard:createdId}));
+console.log(JSON.stringify({passed:true,checks:['211-member paginated roster','search','ten-member cap','uncheck at cap','incomplete disabled','saved selection reload','guided helper hidden on Advisors','existing roster identities and profiles retained','idempotent creation','three-step wizard without leader form','saved profile inherited and updates propagate','legacy leader fields ignored','legacy leader step resumes at review','missing saved profile directs user to Profile','empty, duplicate, over-limit, legacy, missing, archived and incomplete rejected'],createdBoard:createdId}));
