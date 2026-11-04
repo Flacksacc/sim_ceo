@@ -465,8 +465,15 @@ async function runResearch(token, id) {
   }
   // Full returned research claims retained (bounded) for dedicated semantic review.
   // Retention is not grounding: excerpts/quotes alone do not prove claim truth.
-  const rawClaims = Array.isArray(pick(cur, "claims")) ? pick(cur, "claims") : [];
+  let researchSummary = cur;
+  const serializedResearch = pick(cur, "researchJson");
+  if (typeof serializedResearch === "string" && serializedResearch) {
+    try { researchSummary = JSON.parse(serializedResearch); } catch {}
+  }
+  const rawClaims = Array.isArray(pick(researchSummary, "claims")) ? pick(researchSummary, "claims") : [];
+  check("research-claims-retained", rawClaims.length > 0, "claims=" + rawClaims.length);
   const retainedClaims = rawClaims.slice(0, 30).map((c) => ({
+    kind: String((c && c.kind) || ""), verified: typeof c?.verified === "boolean" ? c.verified : null,
     angle: String((c && c.angle) || ""),
     text: String((c && c.text) || "").slice(0, 4000),
     sources: Array.isArray(c && c.sources) ? c.sources.slice(0, 5).map((x) => ({
