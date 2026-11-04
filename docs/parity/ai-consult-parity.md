@@ -549,6 +549,29 @@ Backup `.tmp/update-20261104-165237-UTC-760ec3f0`; rollback
 Original database/volumes retained; no background agents or test servers
 launched, owned browsers closed. Full parity remains paused.
 
+### 2026-11-04 — One grouped board sidebar list
+
+`b5dcb18` moves board page navigation into the same scrolling list as meetings.
+Section order is Meetings, Resources (Sources, Records), then Board (overview,
+advisors, activity; People remains hidden by the demo switch). The separate
+main-area Board settings menu is removed. Meeting search/state filters remain
+with Meetings. Page selection retains meeting context and highlights the active
+page; the board name/back arrow stay at the top.
+
+TypeScript/Vite build and live light/dark desktop/mobile browser checks passed:
+all grouped page buttons, meeting selection, back arrow, browser history,
+refresh, filtering and chat width. Zero domain writes/page errors and unchanged
+board/meeting/roster/advisor data. Evidence:
+`.tmp/grouped-board-sidebar-live-check.log` and
+`output/grouped-board-sidebar-review/2026-11-04`.
+
+Live healthy on 5173, image
+`sha256:093bff5f14aa6970371f6e5b92c34a6cab5e2eb399580ea6e21844b6ec407ace`.
+Backup `.tmp/update-20261104-165635-UTC-f777dced`; rollback
+`simceo-essentials-app:rollback-20261104-165635-f777dced`.
+Database/volumes preserved, owned browsers closed, no coding agents or test
+servers used. Full parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
