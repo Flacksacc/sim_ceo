@@ -178,6 +178,13 @@ async function main() {
       }
     }
 
+    // Records navigation and help must work on the actual deployed build.
+    await rail("Records").click();
+    await section("Records").waitFor({ timeout: 10000 });
+    ok("records-destination", (await hashOf(page)).includes("/records"));
+    ok("records-plain-language-help", await section("Records").getByText(/Approval always checks that you are reviewing the latest meeting input/).count() === 1);
+    ok("records-no-technical-help", !(await section("Records").innerText()).includes("hash + watermark"));
+
     // ---------- Overflow: 1440 + 390, read-only ----------
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.waitForTimeout(500);

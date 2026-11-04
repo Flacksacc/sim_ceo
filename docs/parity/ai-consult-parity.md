@@ -137,7 +137,7 @@ Historical lane interface/review references remain `.tmp/secretary-fourth-interf
 - [ ] Clarifying question on ambiguous requests. (Delivered and exercised in the selected API/browser checks, including reload/retry/answer recovery; full-phase acceptance remains open.)
 
 ## Phase 5 -- Records review UX
-- [ ] One-document review: working notes, items, excerpts, recent input; per-item approve/revise/discard + approve-all. (Basic review, selected/all approval, and whole-draft revision/discard are delivered. Granular item revision/discard controls remain pending: `itemRevise`/`itemDiscard` handlers exist, but the current rendered editor uses whole-draft JSON and draft discard. Do not count helper definitions as completed UI.)
+- [ ] One-document review: working notes, items, excerpts, recent input; per-item approve/revise/discard + approve-all. (The combined Records candidate now renders and exercises granular approve/revise/set-aside controls, selected/all approval, working notes, supporting excerpts, recent input, version history and a structured whole-document editor. Primary fresh-build verification: 226 API / 300 browser checks, zero failures, plus the 362-check advisor/meeting/navigation regression. Full-phase acceptance and the broader persistence/audit gates remain open; see the November 4 Records continuation below.)
 - [ ] Empty-draft guard: no approval control at all. (Delivered and covered by the final browser checks; full-phase acceptance remains open.)
 - [ ] Hash/version/watermark + supersession shown; 409 on drift. (Delivered in basic review; the selected browser checks exercise conflict display and an explicit refresh POST. Full-phase acceptance remains open.)
 
@@ -375,3 +375,56 @@ their patches remain preserved. Only the live app and database are running;
 QA stacks are stopped. Human testing should now cover profile save/defaults,
 advisor research/editing and tone, board responses/progress, Secretary, and
 physical voice dictation.
+
+## Records continuation: deployed November 4, 2026
+
+Primary integrated the preserved Records branch and final browser follow-up
+with the current advisor/meeting build. Combined candidate `d856b67` passed
+fresh frontend/API builds, 48 human-format groups, 226 API checks and 300
+browser checks with zero failures. The separate fresh combined application
+also passed all 362 advisor/profile/meeting/Secretary/chat/navigation checks
+in 102,532 ms. Actual final logs:
+`.tmp/primary-records-main-direct-verified-runtime.log`,
+`.tmp/primary-records-main-formatter.log`,
+`.tmp/primary-records-release-integrated.log`.
+
+Primary directly repaired QA hydration timing, granted local-network
+permission only to owned browser contexts at the exact isolated API origin,
+and correlated the unrelated-account fixture's expected private-board 403s
+with exact method/path/query/status/context responses. No blanket console
+suppression was added. The earlier failing runs remain preserved. Primary
+also replaced the Records hash/watermark help text with a plain-language
+description. No new background agent or Muse authoring was used. These
+changes had primary source/runtime review, not a new dedicated-agent review.
+
+MAIN `d18518b` contains the exact tested application source. Deployment used
+the existing sealed-environment update helper, fresh backup and app-only
+recreation. Live image:
+`sha256:1b40899afb9c06281d6f8d36b54f2f91e0c5efb43b1d8251fedf9e2738f2bed6`.
+App container `e33c52afd1532318df94d50f39b0db57a738373a83569c47568b8639ca1a37d1`
+is healthy, and `/ready` returns PostgreSQL ready. The database container and
+both existing volume mount records match before/after exactly. Seven table
+counts match: boards 3, meetings 2, messages 8, roster 13, profiles 1,
+advisors 17, accounts 0. Full backup is retained at
+`.tmp/update-20261104-135636-UTC-6bcecb4b`; rollback image:
+`simceo-essentials-app:rollback-20261104-135636-6bcecb4b`.
+
+Post-deployment read-only profile/meeting/Records/layout smoke passed 28/0
+with one explicit absent-custom-profile skip, zero API mutations and zero
+unexpected page errors (`.tmp/primary-records-live-smoke-final.log`). Primary
+inspected desktop and narrow-screen Records renderings. The screenshot's
+historical dark-mode filename alone is not evidence that dark mode activated.
+All owned Records API/fake/browser processes exited; the advisor regression
+stack was explicitly stopped with ports closed
+(`.tmp/primary-records-release-stop.log`). The initial signed-script launch
+was refused before deployment; the standard helper then ran successfully in
+a process-scoped PowerShell invocation. No machine execution policy changed.
+
+Delivered Records controls include per-decision approve/revise/set-aside,
+selected/all approvals, structured whole-document revision, working notes,
+supporting excerpts, recent input, and authoritative current/historical
+approval views. Tests cover retained typing after failed review fetches,
+explicit reload reset, stale guards, hidden empty/invalid approval controls,
+guest/stranger restrictions, inherited approvals and long version chains.
+Full parity acceptance remains open, including final phase-specific
+persistence/audit gates and source governance, Wiki, guests, usage and jobs.
