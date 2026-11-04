@@ -1264,27 +1264,13 @@ public static class SimCEOEndpoints
           return s.Messages.TryGetValue(id, out var cl) && cl is not null
             ? cl.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor) : 0;
       }
-      // P3: deferred activity publication. Intent is captured INSIDE the critical section/unit;
-      // async network publish runs ONLY after all outer ROOT aliases (SetupLock/MessageLock +
-      // commit) exit. Never Task.Run/delay/yield inside ROOT, never Hub->Root inversion,
-      // never rollback-event publish. SyncRoundCommit state is captured immutably inside and
-      // applied after locks release; failure/rollback paths publish nothing.
+      // P3: deferred network publication only. SyncRoundCommit (synchronous activity state) runs
+      // INSIDE SetupLock/MessageLock + Atomic unit immediately after the successful commit, while
+      // still holding the outer ROOT aliases; ONLY async network PublishDiscussionAsync is deferred
+      // until after all ROOT exit. Never Task.Run/delay/yield inside ROOT, never Hub->Root inversion
+      // (recipient path releases HubGate before acquiring ROOT for per-recipient auth), never rollback-event
+      // publish (throw skips flag set; finalizer interruption after rollback is retained).
       bool __deferredActivityPublish = false;
-      List<(Guid id, string role)> __pendingRound = new();
-      HashSet<Guid> __pendingPub = new();
-      List<(string advisor, string reason)> __pendingYields = new();
-      bool __pendingSync = false;
-      void RequestActivityPublish(bool needSync, List<(Guid id, string role)>? roundList, HashSet<Guid>? pubSet, List<(string advisor, string reason)>? yields)
-      {
-        if (needSync && roundList is not null)
-        {
-          __pendingRound = new List<(Guid id, string role)>(roundList);
-          __pendingPub = pubSet is not null ? new HashSet<Guid>(pubSet) : new HashSet<Guid>();
-          __pendingYields = yields is not null ? new List<(string advisor, string reason)>(yields) : new List<(string advisor, string reason)>();
-          __pendingSync = true;
-        }
-        __deferredActivityPublish = true;
-      }
       // Lane B: declared before bidding so every interruption path reports accurate yields/counts.
       var published = new List<Message>();
       var manifests = new List<object>();
@@ -1593,10 +1579,9 @@ public static class SimCEOEndpoints
             });
             if (laneBGate is null) completedGroups++;
             }); // end Atomic gate: authoritative fetch/authorize/validate/mutate in one backend transaction
-            // Capture immutable publication intent INSIDE the unit/critical section;
-            // async publish runs AFTER SetupLock/MessageLock + commit exit below.
+            // Success path: apply SyncRoundCommit synchronously HERE, still holding the
+            // outer ROOT aliases, immediately after the successful Atomic commit above.
             __roundGateOuter = laneBGate;
-            IResult? __roundGateCopy = laneBGate;
             try
             {
               var __actNewPub = new HashSet<Guid>(published.Skip(__actPub0).Select(p => p.AdvisorId));
@@ -1612,32 +1597,27 @@ public static class SimCEOEndpoints
                 }
                 catch { }
               }
-              if (__roundGateCopy is null)
+              if (laneBGate is null)
               {
                 var __capRound = round.Select(a => (a.Id, a.BoardRole)).ToList();
-                RequestActivityPublish(true, __capRound, __actNewPub, __actNewY);
+                try { MeetingActivity.SyncRoundCommit(id, activityOpId, __capRound, __actNewPub, __actNewY); } catch { }
+                __deferredActivityPublish = true;
               }
-              // Failure path (laneBGate set): LaneBFail already finished discussion state
-              // inside and requested deferred publish via __deferredActivityPublish; no
-              // rollback-event publish here. Publish happens after locks exit only if the
-              // unit committed (we reached here without throwing).
+              // Failure path (laneBGate set): LaneBFail already applied FinishDiscussion synchronously
+              // inside and set deferred publish; nothing to sync here. Only the async network
+              // publish is deferred below. Rollback (throw) never reaches here, so no rollback-event
+              // publish exists.
             }
             catch { }
           }
         }
-        // AFTER all outer ROOT aliases (SetupLock/MessageLock) + commit exit: apply
-        // captured activity state then publish once. Never under ROOT, never Task.Run
-        // inside ROOT, no Hub->Root inversion (BoardHub acquires HubGate then ROOT
-        // briefly for auth, never ROOT-held here). Rollback (throw) skips this block.
+        // AFTER all outer ROOT aliases (SetupLock/MessageLock) + commit exit: network
+        // publish only. SyncRoundCommit already ran inside ROOT above. Never under ROOT,
+        // never Task.Run inside ROOT, no Hub->Root inversion (recipient path releases
+        // HubGate before acquiring ROOT for per-recipient auth). Rollback (throw) skips this block because the flag is set only after a committed unit.
         if (__deferredActivityPublish)
         {
-          var __dRound = __pendingRound.ToList();
-          var __dPub = new HashSet<Guid>(__pendingPub);
-          var __dY = __pendingYields.ToList();
-          var __dSync = __pendingSync;
-          __deferredActivityPublish = false; __pendingSync = false;
-          __pendingRound = new(); __pendingPub = new(); __pendingYields = new();
-          try { if (__dSync) MeetingActivity.SyncRoundCommit(id, activityOpId, __dRound, __dPub, __dY); } catch { }
+          __deferredActivityPublish = false;
           try { _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         }
         if (__roundGateOuter is not null) return __roundGateOuter;
