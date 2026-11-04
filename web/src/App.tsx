@@ -1283,6 +1283,7 @@ export default function App() {
   const purgePrivate = (why: string) => {
     try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
     try { profileOpRef.current++; } catch {}
+    try { setProfileReloading(false); } catch {}
     try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort?.abort(); } catch {}
     try { for (const u of ((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs ?? [])) { try { URL.revokeObjectURL(u); } catch {} } } catch {}
     try { (window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs = []; } catch {}
@@ -2031,7 +2032,7 @@ export default function App() {
     const remote = profile.data;
     const key = remote ? remote.id + ":" + String(remote.version) : "";
     if (!remote) {
-      if ((profile.isSuccess || isNotFound(profile.error)) && profileLoaded !== "" && !profileDirty) {
+      if ((profile.isSuccess || isNotFound(profile.error)) && profileLoaded !== "" && !profileDirty && profileConflict === null) {
         const fresh = { name: "", roleLabel: "Board Lead", background: "", familiarTopics: "", simplerTopics: "", commPrefs: DEFAULT_COMM_PREFS };
         setLeadForm(fresh);
         profileSnap.current = JSON.stringify(fresh);
@@ -2042,7 +2043,7 @@ export default function App() {
       return;
     }
     if (key !== profileLoaded) {
-      if (!profileDirty) {
+      if (!profileDirty && profileConflict === null) {
         const adopted = {
           name: remote.name ?? "",
           roleLabel: remote.roleLabel || "Board Lead",
@@ -2086,10 +2087,7 @@ export default function App() {
     },
     onSuccess: (response, attempt) => {
       if (attempt.op !== profileOpRef.current) return;
-      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) {
-        setSaveErr("Account changed during save; the response was discarded. Review and save again.");
-        return;
-      }
+      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) return;
       const rr = response;
       if (!rr || !rr.id) return;
       const nkey = rr.id + ":" + String(rr.version);
@@ -2116,17 +2114,14 @@ export default function App() {
     },
     onError: (error, attempt) => {
       if (attempt.op !== profileOpRef.current) return;
+      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) return;
       setSaveMsg("");
-      if (profileGatedNow() || epochNow() !== attempt.epoch || currentToken() !== attempt.token || canonicalUser() !== attempt.user) {
-        setSaveErr("Account changed; the save was discarded. Review and save again.");
-        return;
-      }
       if (error instanceof Error && error.message.startsWith("409")) {
         setProfileConflict({ id: attempt.baseId, version: attempt.baseVersion });
         setSaveErr("Another save landed first. Your edits are kept and nothing was overwritten. Saving is paused until you reload the saved profile, review it, and reapply your changes.");
         return;
       } else if (error instanceof Error && (error as { stale?: boolean }).stale) {
-        setSaveErr("Account changed; the save was discarded. Review and save again.");
+        return;
       } else {
         setSaveErr("Save was rejected. Your text is kept. Try again.");
       }
@@ -2143,11 +2138,7 @@ export default function App() {
     } catch {
       latest = undefined;
     }
-    if (origin.op !== profileOpRef.current || profileGatedNow() || epochNow() !== origin.epoch || currentToken() !== origin.token || canonicalUser() !== origin.user) {
-      setProfileReloading(false);
-      setSaveErr("Account changed; the reload was discarded. Your edits are kept.");
-      return;
-    }
+    if (origin.op !== profileOpRef.current || profileGatedNow() || epochNow() !== origin.epoch || currentToken() !== origin.token || canonicalUser() !== origin.user) return;
     if (profileEditRev.current !== origin.rev) {
       setProfileReloading(false);
       setSaveErr("Newer edits were typed during reload. They are kept — confirm reload again to discard them, or keep editing.");
@@ -8748,6 +8739,14 @@ const testModel = useMutation({
                       onClick={() => {
                         actAs = actAsState.trim();
                         setAppliedActAs(actAs);
+                        // Profile origin transition: retire the previous
+                        // operation guard and reset this origin's busy latch
+                        // synchronously. Held save/reload completions capture
+                        // op/epoch/token/user and return fully silent on any
+                        // mismatch, so they can neither clear the new busy
+                        // state nor write into the reset UI.
+                        try { profileOpRef.current++; } catch {}
+                        try { setProfileReloading(false); } catch {}
                         try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
                         try { secEpoch.current++; } catch {}
                         try { qc.clear(); } catch {}
