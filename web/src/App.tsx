@@ -1023,11 +1023,15 @@ function AuthPanel() {
   type MineRow = { id: string; boardId: string; meetingId: string; userKey: string; active?: boolean; canRejoin?: boolean; meetingTitle?: string; boardName?: string; inviteId?: string };
   const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
   const [rejoinBusy, setRejoinBusy] = useState("");
+  const rejoinOpRef = useRef(0);
   const rejoin = async (m: MineRow) => {
+    // Per-rejoin operation claim: a newer rejoin retires this callback.
     // Origin identity for THIS rejoin: the selected row plus the requesting
     // account. A changed account retires this callback: it must never
     // announce success for another identity.
+    const __reOp = (rejoinOpRef.current += 1);
     const __reEpoch = epochNow(); const __reToken = currentToken(); const __reUser = currentUser();
+    const __reAlive = (): boolean => rejoinOpRef.current === __reOp && epochNow() === __reEpoch && currentToken() === __reToken && currentUser() === __reUser;
     const __selBoard = String(m.boardId); const __selMeet = String(m.meetingId); const __selUser = String(m.userKey);
     setMsg("");
     setRejoinBusy(m.meetingId);
@@ -1039,10 +1043,12 @@ function AuthPanel() {
           if (!s.includes("not pending") && !s.includes("already") && !s.includes("accepted")) throw e;
         }
       }
+      if (!__reAlive()) return;
       // Typed /join capture: the returned Membership DTO (Id/BoardId/MeetingId/
       // UserKey/Active per Domain.Entities Membership) binds THIS result. Accept
       // either casing; Active must be an explicit boolean true below.
       const __joined = await post<Record<string, unknown>>(`/api/meetings/${m.meetingId}/join`, {});
+      if (!__reAlive()) return;
       const __jId = String((__joined as Record<string, unknown>)["id"] ?? (__joined as Record<string, unknown>)["Id"] ?? "");
       const __jBoard = String((__joined as Record<string, unknown>)["boardId"] ?? (__joined as Record<string, unknown>)["BoardId"] ?? "");
       const __jMeet = String((__joined as Record<string, unknown>)["meetingId"] ?? (__joined as Record<string, unknown>)["MeetingId"] ?? "");
@@ -1064,17 +1070,19 @@ function AuthPanel() {
       } catch (e) {
         throw new Error("Rejoin verification failed: membership readback failed.");
       }
+      if (!__reAlive()) return;
       const __ok = (__fresh ?? []).some((r) => String((r as MineRow).id ?? (r as unknown as Record<string, unknown>)["Id"] ?? "") === __jId && String((r as MineRow).boardId) === __selBoard && String((r as MineRow).meetingId) === __selMeet && String((r as MineRow).userKey ?? "").toLowerCase() === __selUser.toLowerCase() && (r as MineRow).active === true);
       if (!__ok) throw new Error("Rejoin verification failed: no active membership for this board/meeting/user.");
-      // Identity origin guard: a changed account since THIS rejoin started
-      // retires the callback instead of announcing a stale success.
-      if (epochNow() !== __reEpoch || currentToken() !== __reToken || currentUser() !== __reUser) return;
+      // Identity + operation guard: a changed account or a newer rejoin
+      // retires this callback instead of announcing a stale success.
+      if (!__reAlive()) return;
       try { await qcPanel.refetchQueries({ queryKey: ["my-memberships"] }); } catch {}
+      if (!__reAlive()) return;
       try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
       try { qcPanel.invalidateQueries({ queryKey: ["messages", m.meetingId] }); } catch {}
       setMsg("Rejoined meeting.");
-    } catch (e) { if (epochNow() !== __reEpoch || currentToken() !== __reToken || currentUser() !== __reUser) return; setMsg(String(e)); }
-    finally { setRejoinBusy(""); }
+    } catch (e) { if (!__reAlive()) return; setMsg(String(e)); }
+    finally { if (rejoinOpRef.current === __reOp) setRejoinBusy(""); }
   };
   const doRegister = async () => {
     setMsg("");
