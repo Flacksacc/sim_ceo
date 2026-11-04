@@ -2502,6 +2502,13 @@ export default function App() {
   // callbacks after an account switch are ignored; per-user draft keys.
   const wizSaveIdentityRef = useRef<{ epoch: number; token: string; user: string } | null>(null);
   const wizOwnerRef = useRef<string>("");
+  // Synchronously retired completed wizard ids. setWizId/setWizard enqueue a
+  // render, so render-synced refs still hold the old id until the next render.
+  // A wizSave success or hydrate GET resolving in that window must not
+  // resurrect the consumed draft; this set retires them synchronously at
+  // confirmed create success. Only success retires, so unknown-commit retry
+  // with the same id still replays idempotently and unfinished drafts survive.
+  const wizCompletedRef = useRef<Set<string>>(new Set());
   // Version-only refresh after a rejected save: adopts the fresh strict
   // version guard without touching local fields/step, so the next save
   // retries with the current inputs instead of silently discarding them.
@@ -2509,6 +2516,7 @@ export default function App() {
     const target = id ?? wizIdRef.current;
     if (!target) return;
     get<{ version: number }>(`/api/wizard/${target}`).then((d) => {
+      if (wizCompletedRef.current.has(target)) return;
       if (wizIdRef.current !== target) return;
       // Synchronous identity-aware monotonic update: a delayed older response
       // is ignored entirely and can never downgrade the strict guard.
@@ -2558,6 +2566,7 @@ export default function App() {
       // Identity-carried callback: ignore late success after an account switch.
       const cap = wizSaveIdentityRef.current;
       if (!cap || epochNow() !== cap.epoch || currentToken() !== cap.token || currentUser() !== cap.user) return;
+      if (wizCompletedRef.current.has(r.id)) return;
       setWizId(r.id);
       if (typeof r.version === "number") acceptWizVersion(r.id, r.version);
       { try { const u = cap.user || "anon"; localStorage.setItem("simceo-wizard:"+u, r.id); localStorage.removeItem("simceo-wizard"); } catch {} }
@@ -2625,6 +2634,7 @@ export default function App() {
       const d = await get<{ presetKey: string; step: number; version: number; fieldsJson: string; interviewJson: string }>(`/api/wizard/${id}`);
       // Discard late arrivals whose draft changed or was retired in flight
       // (a new draft started, or create-board consumed the id and cleared it).
+      if (wizCompletedRef.current.has(id)) return;
       if (wizIdRef.current !== id) return;
       // Monotonic version within the same draft: a delayed older GET (fresh
       // save v3 then stale GET v2) must neither downgrade the strict guard
@@ -2759,6 +2769,28 @@ export default function App() {
       // switch boards, or retire another account's draft pointer.
       if (!o?.origin || originStale(o.origin)) return;
       if (wizIdRef.current !== o.originWizId) return;
+      // Synchronous retirement of the completed wizard BEFORE seeded caches or
+      // React state flush: render-synced refs still hold the old id until the
+      // next render, so a wizSave success or hydrate GET resolving in that
+      // window would otherwise resurrect Step 4 and replay the same wizard id
+      // (idempotent fixture returns the SAME board). Mark the origin id
+      // completed and clear the live refs now; late arrivals for the old id
+      // are discarded by the completed-set checks. Only success retires, so
+      // unknown-commit retry keeps the id and unfinished drafts survive.
+      try { if (o.originWizId) wizCompletedRef.current.add(o.originWizId); } catch {}
+      wizIdRef.current = "";
+      wizVersionRef.current = null;
+      wizKnownRef.current = { id: "", version: null };
+      wizLastSentRef.current = null;
+      try {
+        (wizardRef as any).current = {
+          name: "", mission: "", stage: "", step: 1, seats: [],
+          lead: {
+            name: "", roleLabel: "Board Lead", background: "",
+            familiarTopics: "", simplerTopics: "", commPrefs: "",
+          },
+        };
+      } catch {}
       // Seed the new board into the list + detail caches before the
       // invalidated list returns, so a delayed refresh never discards the
       // just-created selection as "absent".
@@ -2776,7 +2808,7 @@ export default function App() {
       // id, storage, fields and interview state so the next New board is a
       // fresh Step 1 that creates a DISTINCT board. Unfinished drafts survive
       // logo/ordinary navigation because this runs solely on success.
-      try { const ou = (o?.originOwner || o?.origin?.user || "anon"); if (ou === o?.origin?.user || ou === currentUser()) { localStorage.removeItem("simceo-wizard:"+ou); wizOwnerRef.current = ""; } localStorage.removeItem("simceo-wizard"); } catch { /* private-mode */ }
+      try { const key = "simceo-wizard:" + (currentUser() || "anon"); try { if (localStorage.getItem(key) === o?.originWizId) { localStorage.removeItem(key); } } catch {} try { if (localStorage.getItem("simceo-wizard") === o?.originWizId) { localStorage.removeItem("simceo-wizard"); } } catch {} wizOwnerRef.current = ""; } catch { /* private-mode */ }
       setWizId("");
       setWizVersion(null);
       // Retire the save baseline with the completed draft: a late hydration
@@ -7513,7 +7545,7 @@ const testModel = useMutation({
                         const d = selResearchData as any;
                         const err = selResearchDataError;
                         if (selResearchLoading) return (<p role="status">{" "}Checking research\u2026{" "}</p>);
-                        if (err) return (<p className="muted">{" "}Research state unavailable \u2014 use Check again in the editor below.{" "}</p>);
+                        if (err) return (<p className="muted">Research state unavailable. <button type="button" onClick={() => void selResearch.refetch()} disabled={selResearch.isFetching}>Check research status</button></p>);
                         const running = isRosterResearchRunning(d);
                         if (running) {
                           const ev = typeof d?.evidenceCount === "number" ? d.evidenceCount : selRow.entry.evidenceCount;
