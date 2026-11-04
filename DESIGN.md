@@ -2,6 +2,11 @@
 
 ## Current meeting layout (2026-11-04)
 
+The Boards navigation badge matches the board rows in the current Active,
+Archived or All view. Board and roster creation actions sit below their
+scrollable lists in a fixed footer, remaining visible when the lists overflow.
+The separate New board button in the main board view is removed.
+
 The 280px meeting team and attachment panel stays pinned on the right on desktop.
 Advisors use ten fixed slots arranged in two rows of five, with 44px portraits;
 unused slots show open seats. The Orchestrator and Secretary appear separately
