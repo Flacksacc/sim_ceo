@@ -2,7 +2,7 @@
 
 Companion to `qa/advisor-integrated-qa.mjs`. Read this before executing.
 No App/server changes were made for this QA; only this QA file + this doc exist.
-Closure revision addressing all 21 findings of the ce5b492 review (frontend 0e7230b+7b3986f in .tmp/advisor-final-frontend, server dbb698c; both read-only, no production edits; fake http import cb5fad4 preserved). Small function-local repairs only; primary runs actual runtime.
+Closure revision addressing all 21 dispositions of the fb43bbc final review (frontend ec2a4ca / server dbb; immutable actual source in .tmp/advisor-release read-only; no App/server edits; fake http import cb5fad4 preserved). Monolith SIMPLIFIED (duplicative backend negative scenarios removed with mapping, no separate 500-line patch framework). Primary runs actual runtime (20 PASS / 2 FAIL baseline: research-progress-live-visible stops at setup; this revision holds research running via QA-SLEEP-R:6000 and strict visible correlation).
 This author never executed the script (node --check only); primary executes it
 against the actual compiled combined app. No runtime claims are made here. Exit 0=PASS, 1=FAIL (assertion), 2=FATAL/setup (no raw JSON or tokens in logs; redacted summaries only).
 
@@ -13,7 +13,7 @@ against the actual compiled combined app. No runtime claims are made here. Exit 
   published API wwwroot, fake-backed) or `:15180` (owned compiled Docker, real
   provider, needs `ALLOW_LIVE_PROVIDER=1`).
 - Fake prompt log at `QA_FAKE=http://127.0.0.1:15302` (dedicated
-  `qa/advisor-integrated-fake.mjs`: deterministic `COMPILE-CHARACTER-PARAGRAPHS` echoing the researched name, `YOUR TURN`/bid pacing, structured secretary JSON echoing the owned run marker, `QA-SLEEP-*` pacing; reuses research/chat schema from `qa/fake-provider.mjs` and secretary schema from `qa/secretary-fake.mjs`). Required in native 15300 mode; live 15180 mode has no prompt log (explicit UNPROVED path, fails closed). The script NEVER issues a global prompt-log DELETE: it captures a baseline timestamp at setup and filters all prompt assertions to `t >= baseline` plus owned run markers. Mode is selected explicitly by `ALLOW_LIVE_PROVIDER` (`native` vs `live`), never by log availability. Native request bodies are exact: PATCH brief is QUESTION.slice(0,800) + CAS fields without advisor ID; run body is {policy,prompt,evidenceSupported,leadVersion}; lead POST content is exactly QUESTION. Secretary completion requires completed + noteId under one deadline with correlated provisional note; direction rows are validated before the no-decision proof. Debug scanner uses independent GUID/string/object/array/primitive fixtures plus a clean negative and hidden-attribute exclusion; creation is scanned while open with visible form values.
+  `qa/advisor-integrated-fake.mjs`: deterministic `COMPILE-CHARACTER-PARAGRAPHS` echoing the researched name, `YOUR TURN`/bid pacing, structured secretary JSON echoing the owned run marker, `QA-SLEEP-*`/`QA-SLEEP-R:*` pacing (existing marker reused; research description/background carry `[QA-SLEEP-R:6000]` so the fake /responses hold running while the UI samples visible progress; no fake logic change needed); reuses research/chat schema from `qa/fake-provider.mjs` and secretary schema from `qa/secretary-fake.mjs`). Required in native 15300 mode; live 15180 mode has no prompt log (explicit UNPROVED path, fails closed). The script NEVER issues a global prompt-log DELETE: it captures a baseline timestamp at setup and filters all prompt assertions to `t >= baseline` plus owned run markers. Mode is selected explicitly by `ALLOW_LIVE_PROVIDER` (`native` vs `live`), never by log availability. Native request bodies are exact: PATCH brief is QUESTION.slice(0,800) + CAS fields without advisor ID; run body is {policy,prompt,evidenceSupported,leadVersion}; lead POST content is exactly QUESTION. Secretary completion requires completed + noteId under one deadline with correlated provisional note; direction rows are validated before the no-decision proof. Debug scanner uses independent GUID/string/object/array/primitive fixtures plus a clean negative and hidden-attribute exclusion; creation is scanned while open with visible form values.
 
 ## Assumed UI contracts (verified in source, not invented)
 
@@ -22,7 +22,7 @@ against the actual compiled combined app. No runtime claims are made here. Exit 
   roster seeds and fresh-collection readbacks.
 - Rail navigation: `nav.rail` buttons by exact name — Boards, Roster,
   Board Advisors, Meetings, Sources, Records, People, Activity, Settings,
-  Profile, Help. Board-scoped destinations (`advisors,meet,sources,records,people,activity`) require `?board=<ownedBoardA>` (App filters them board-free, `App.tsx:641-648,5731`); board-free tabs use `#/seg`. Hash arrival + board context + visible heading/section + owned entity are asserted per destination; back/forward assert the same. All eleven are visited; board context is restored via an owned board route before the rail loop; direct URLs use WEB + "/" + boardHash(seg).
+  Profile, Help, plus wizard (12 total; dedicated Nav 247/2 source 941 second-wizard-fix rerun pending covers deep/back-forward/mobile). Board-scoped destinations (`advisors,meet,sources,records,people,activity`) require `?board=<ownedBoardA>` (App filters them board-free, `App.tsx:641-648,5731`); board-free tabs use `#/seg`. Each destination asserts SCOPED section+heading+owned entity (never brand-first/global body length): Boards/`Boards`, My Advisor Roster, This Board\'s Advisors, Meetings and conversation, Resources and Inbox/`Resources and Inbox`, Records/`Records`, People/`People`, Activity and Usage/`Activity and Usage`, Settings/`Settings`, Profile/`Profile`, Help, New-board wizard/`Create a board`; honest empty states accepted where scoped. Direct routes and history use the SAME predicates via assertDest; board context restored via owned board route before rail loop; direct URLs use WEB + "/" + boardHash(seg). No Nav-matrix re-implementation here.
 - Creation: rail button `+ Create new Advisor` opens
   `div.modal[role=dialog][aria-label="Create advisor"]` containing
   `section[aria-label="Create advisor"]` with `#cc-name`, `#cc-description`,
@@ -101,6 +101,30 @@ against the actual compiled combined app. No runtime claims are made here. Exit 
   `GET .../notes?kind=direction` (no-decision proof).
 - Roster chat: `POST /api/roster/{id}/chat` via panel UI; stateless (never
   meeting messages); panel contract is board-free by construction.
+
+
+## Coverage manifest (exact requirement -> actual suite/evidence; remaining UNPROVEN)
+
+Core integration (this monolith proves; primary must rerun to PASS):
+- profile inherit/edit (default->board inherit, explicit override, second save, version pins) -> stepProfile HTTP+UI; evidence: `boards-inherit-default`, `explicit-override-ok`, `override-version-stable` (strict positive-integer versions).
+- real UI new advisor research/live progress/3 paras/final tweaks -> stepCreateAdvisor dialog-scoped; evidence: `research-progress-live-visible` (strict raw bool + known stage + visible + bounded resample + QA-SLEEP-R:6000), `research-evidence-owned-fetched`, `research-dossier-prompt-owned`, `research-compiled-exact`, `research-compiled-3paras`, `owner-markers-roundtrip` (full JSON raw strings).
+- accepted portraits + canonical attach/excluded seat -> stepPortraitAttach/SecondMember; evidence: `portrait-upload-201`, `portrait-accept-200`, `attach-first-201`, `duplicate-attach-409`, `approve-first-200`, structured `{ok}` portrait bytes distinct, `board-advisors-resolve-roster`.
+- send once/reply+progress + Secretary exact provisional -> stepMeeting; evidence: `send-lead-once`/`autoinit-patch-once`/`run-once` (paired identity + response/order boundary + actual CAS values), `meeting-progress-visible`/`terminal-complete`, `activity-paired-working` (serial paced OWN-advisor raw+visible class AND human label), Secretary `secretary-post-captured`/`request-correlated` (EXACT POST requestId/nonce/StripPrefix InputText) + `completedGET same ID` + provisional exact body + FULL-note tray with expand + direction snapshot UNCHANGED.
+- canonical re-edit -> meeting prompt current full paras -> stepReeditRerun; evidence: `canonical-reopen-eq-canonical` (NOT draftProfile; backend preserves draft), `canonical-markers-roundtrip` (full raw JSON + no old markers), rerun lead POSTs unique `RERUN-` marker BEFORE run + `promptlog-current-markers-owned` (exact owned YOURTURN + current full paras, no stale).
+- roster direct chat stateless -> stepRosterChatUI; evidence: EXACT `message` key + 200 `answer/rosterId/version/stored` + UI==answer + full Sequence/ParentSequence/Status/Stance/Content snapshots unchanged (never Id).
+- real API-backed destination routing/no JSON visible -> stepNavigation + scanDebug; evidence: 12 scoped `nav-dest-*` + direct + back/forward via same `assertDest`, `debug-clean-*` (same detector/collector, visible controls, hidden ignored, FATAL on collector failure, body nonempty).
+
+Mapped OUT of this monolith (NOT claimed passed here; primary runs focused suites):
+- abstain (`yielded.length===0` rejects valid role/reason yields) -> qa/meeting-send-pipeline-qa.mjs + backend 119 HTTP + 29 PG activity paths.
+- bid-decline (expects `reply` reason; backend records `provider-error` per MeetingActivity.cs:192,221-222) -> same focused Send/activity suites.
+- reply-error short-publication / badge / unconditional-pass / no-responder lead POST gaps -> meeting-send-pipeline-qa.mjs Send 142 (no-responder) + lifecycle mounted QA (primary-advisor-7b3986f-mounted-lifecycle) + backend 119 HTTP/29 PG/activity.
+- Nav deep/back-forward/mobile full matrix -> dedicated Nav 247/2 (source 941 latest second wizard fix rerun pending) covers all 12 tabs/deep/back-forward/mobile.
+
+Remaining UNPROVEN (explicit; no weakened core integration, no dropped failures to get green):
+- Native research run timing/wording beyond the fake (real provider) and physical-mic paths (no audio assertions).
+- Live `:15180` prompt-log paths (`promptlog-live-unproved` fails closed).
+- Focused-suite reruns themselves (backend 119/29 PG/activity, Send 142, lifecycle, Nav 247/2) must still PASS under primary.
+- This author executed ONLY `node --check` (no services/browser/HTTP/QA execution per scope); primary must establish exact compiled frontend/backend/QA/fake manifest and rerun this file through final assertions including delayed/error paths and deadline cleanup, plus dedicated review.
 
 ## Budgets / honesty rules
 
