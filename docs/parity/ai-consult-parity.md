@@ -858,3 +858,26 @@ Healthy localhost:5173 image:
 Backup `.tmp/update-20261104-190545-UTC-6aa83615`; original database and volumes
 preserved. Browser contexts closed, no coding agents used, `tmp.txt` untouched.
 Broader parity goal remains paused.
+
+### 2026-11-04 — Single-page board creation
+
+Implemented `6b69960`: one About form contains Board name, an expanding multiline
+Mission, Stage and Starting shape, followed by the searchable roster checklist
+and Create board at the bottom. Step tabs, navigation buttons, review screen,
+guided interview and setup guide are removed from this UI. Saved profile
+inheritance and the ten-advisor cap remain. Accept saves the latest form first;
+a rejected save cannot create from stale fields. Saved older drafts render the
+same single form. Successful creation retires the old draft and clears the form.
+
+Frontend/release builds passed. Updated `qa/wizard-roster-qa.mjs` passed with
+211 roster entries, paragraph mission sizing, failed save/create and retry,
+reload, latest-field creation, default inheritance, old drafts, no duplicate
+roster entries and reset after success (`.tmp/single-board-form-qa.log`).
+Live desktop light/dark and 390px mobile checks passed with zero page errors or
+domain writes (`.tmp/single-board-form-live-check.log` and screenshots).
+
+Healthy localhost:5173 image:
+`sha256:268eeeee6a6089dc7790bb10d7f0ff9d9e54b04b30096f4aa2f3c329b3ee51e5`.
+Backup `.tmp/update-20261104-191827-UTC-f6e14ac9`; original database and volumes
+preserved. Owned QA services and browser contexts closed; no coding agents used.
+`tmp.txt` untouched. Broader parity goal remains paused.
