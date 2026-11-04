@@ -1620,8 +1620,8 @@ async function stepMeeting() {
   try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadRespUrl = new URL(_mr.url()).pathname; } catch { savedLeadRespUrl = ""; } try { savedLeadResp = await respJson(_mr, "lead-post"); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
   if (savedLeadStatus !== 201) {
     pollStop = true;
-    const sendDiag = await ev(() => ({ text: document.body.innerText.slice(-2200), draft: document.querySelector('.composer-bar textarea')?.value, hash: location.hash })).catch(() => ({}));
-    console.log("SEND-DIAGNOSTIC " + redact(JSON.stringify({ status: savedLeadStatus, response: savedLeadResp, view: sendDiag, errors: pageErrors.slice(-3), posts: netPosts.messages.length })));
+    const sendDiag = await ev(() => ({ status: document.querySelector('.status-line[role="status"]')?.textContent || "none", draftLength: document.querySelector('.composer-bar textarea')?.value.length, hash: location.hash })).catch(() => ({}));
+    console.log("SEND-DIAGNOSTIC " + redact(JSON.stringify({ status: savedLeadStatus, posts: netPosts.messages.length, view: sendDiag, errors: pageErrors.slice(-3) })));
     failExit("Send did not save a question; refusing activity sampling without a successful message POST.");
   }
   // pairedOk lives at function scope (ReferenceError fix); serial paced sampling below reuses it.
