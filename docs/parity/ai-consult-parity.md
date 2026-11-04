@@ -1132,3 +1132,66 @@ Backup `.tmp/update-20261104-210924-UTC-f40b2b84`; original database container a
 volumes retained. `/health` and `/ready` pass with PostgreSQL. Source published to
 Flacksacc/sim_ceo. Owned QA services and browsers stopped; tmp.txt untouched;
 broader parity goal remains paused.
+
+
+### Grounded independent advisor judgment - 2026-11-04
+
+Delivered `b9c0be4`. Existing advisors now use a separate bounded assessment
+before writing meeting responses, optional peer follow-ups, roster chat answers,
+and auditions. The assessment chooses expertise-based standards, a target,
+supported strengths and concerns, a justified position, missing information and
+a concrete next step. Support, challenge and mixed judgments require supporting
+findings. Quotes must exist in the supplied context; peer targets and their quote
+must match a real other first reply. Malformed/unjustified/invented evidence
+blocks the writer rather than falling back to an unassessed answer.
+
+Writing follows the validated judgment, stays conversational and scoped, and
+keeps useful next steps without compulsory praise or manufactured disagreement.
+Missing material prompts a focused question. AI authorship alone is not grounds
+for criticism. Ordinary explanation/creative requests remain supported. Stance
+and peer-thread labels come from the validated assessment, with human-readable
+Mixed assessment and Needs context labels. The assessment JSON is not shown.
+Progress moves from Considering to Responding; parallel publication and one
+optional peer follow-up remain intact. New research compilation includes
+character-specific evaluation criteria within the existing editable paragraphs;
+no existing profiles are rewritten or require recreation.
+
+Both calls use the same selected model/privacy policy and normal usage metering.
+Prompt builders explicitly reserve the assessment envelope while preserving
+essential profile/question text. Existing atomic post-generation publication
+checks remain, with additional freshness checks before writing. Direct chat
+shares snapshot checks before/between/after calls. Session revocation between
+assessment and writing returns 401, performs no writer call/publication, and
+releases the run lock.
+
+Frontend/release builds pass. The new AdvisorAssessmentProbe passes 23 contract
+checks; EssentialBudgetProbe passes tail preservation, bounded delivery and
+oversize rejection. Native `qa/advisor-assessment-qa.mjs` passes stage ordering,
+support/challenge/mixed/missing context, direct chat and auditions, real peer
+threading, bounded replies, server-owned stances, invalid/fabricated evidence
+blocking and the visible mixed badge. Parallel-dialogue, attachment and all-eight
+meeting-menu regression checks pass. `qa/advisor-assessment-auth-qa.mjs` passes
+logout between assessment and writing, 401/no writer/no publication/unlock.
+Evidence: `.tmp/advisor-assessment-qa/{build,assessment-probe,budget-probe,
+assessment-integration,assessment-auth,dialogue,attachments,menu,live-validation}.log`.
+
+Five REAL Muse Spark examples were also run and inspected: weak material/mixed,
+clear motivation/support, strong setting with weak motivation/mixed, absent
+story/insufficient, and peer advice/challenge. Their actual assessments pass the
+same C# quote/target/shape validation. Evidence:
+`.tmp/advisor-assessment-live-results.json` and `.tmp/live-advisor-assessment-check.log`.
+These are sample quality observations, not a guarantee for every future answer.
+A separate read-only Muse code review, supplied the complete existing publication
+boundary, returned no remaining findings; primary independently inspected the
+changes and added the authenticated revocation test. Review evidence:
+`.tmp/advisor-assessment-independent-review.txt`.
+
+Live read-only desktop/dark/light/390px checks pass with no errors or domain
+mutations (`.tmp/advisor-assessment-live-ui.log`). Healthy localhost:5173 image:
+`sha256:abb2df5b0419c4ceae333257fa7594925f48e717cecd1f274dcb60483df91b6a`.
+Backup `.tmp/update-20261104-214243-UTC-dbfe28b3`; original DB container and volumes
+retained. `/health` and `/ready` pass with PostgreSQL. Source published to
+Flacksacc/sim_ceo. Owned QA services and browsers stopped; implementation performed
+directly, with Muse used for real-model evaluations and read-only review.
+No live user meetings were modified during QA. tmp.txt untouched; broader parity
+goal remains paused.
