@@ -112,6 +112,15 @@ if (app.Environment.IsDevelopment()) { }
 
 
 
+// Inherited shipping-test isolation: --selftest must never touch a configured
+// PostgreSQL backend. Fail closed BEFORE any PG wiring/recovery when
+// USE_POSTGRES=1 so fixture boards cannot write through static Pg.Backend.
+// Memory selftest (no USE_POSTGRES) is preserved below.
+if (args.Contains("--selftest") && string.Equals(Environment.GetEnvironmentVariable("USE_POSTGRES"), "1", StringComparison.Ordinal))
+{
+  Console.Error.WriteLine("SELFTEST FATAL: --selftest refuses to run with USE_POSTGRES=1 (would write fixtures to configured PostgreSQL). Unset USE_POSTGRES to run the memory selftest.");
+  Environment.Exit(2);
+}
 var pgStore = app.Services.GetRequiredService<InMemoryStore>();
 string? pgCs = null;
 if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
@@ -1605,12 +1614,17 @@ app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequ
         }
       }
       catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      // Post-staging failures MUST throw out of the unit to ROLLBACK the staged
+      // membership. Returning a 503 from inside the callback would commit.
+      // Markers are mapped outside to fixed safe errors (no exception/SQL/path leak).
       try
       {
-        if (s.RestoreEpochId != restoreBefore) return Results.Conflict("Domain was restored during join");
-        if (!s.Meetings.TryGetValue(meetingId, out var cur2) || cur2 == null || cur2.BoardId != bid) return Results.NotFound("meeting");
+        if (s.RestoreEpochId != restoreBefore) throw new InvalidOperationException("restored");
+        if (!s.Meetings.TryGetValue(meetingId, out var cur2) || cur2 == null || cur2.BoardId != bid) throw new KeyNotFoundException("meeting");
       }
-      catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      catch (KeyNotFoundException) { throw; }
+      catch (InvalidOperationException) { throw; }
+      catch { throw new InvalidOperationException("storage"); }
       List<Message> copy;
       try
       {
@@ -1620,12 +1634,16 @@ app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequ
         else q = q.OrderByDescending(m => m.Sequence).Take(take).OrderBy(m => m.Sequence);
         copy = q.OrderBy(m => m.Sequence).Take(take).Select(m => new Message { BoardId = m.BoardId, MeetingId = m.MeetingId, Sequence = m.Sequence, AdvisorId = m.AdvisorId, Sender = m.Sender, AdvisorName = m.AdvisorName, Content = m.Content, ParentSequence = m.ParentSequence, Stance = m.Stance, Status = m.Status, CreatedAt = m.CreatedAt }).ToList();
       }
-      catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      catch (InvalidOperationException) { throw; }
+      catch (KeyNotFoundException) { throw; }
+      catch { throw new InvalidOperationException("storage"); }
       return Results.Ok(copy);
     });
   }
-  catch (InvalidOperationException ex) { return Results.Json(new { error = "Storage unavailable: " + ex.Message }, statusCode: 503); }
-  catch (Exception ex) { return Results.Json(new { error = "Message read failed: " + ex.Message }, statusCode: 500); }
+  catch (KeyNotFoundException) { return Results.NotFound("meeting"); }
+  catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during join"); }
+  catch (InvalidOperationException) { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+  catch { return Results.Json(new { error = "Message read failed." }, statusCode: 500); }
 });
 
 

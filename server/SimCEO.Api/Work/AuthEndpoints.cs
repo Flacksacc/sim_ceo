@@ -149,9 +149,12 @@ public static class AuthEndpoints
             ExpiresAt = DateTime.UtcNow + AuthOps.SessionLifetime,
           };
           s.Sessions[session.Token] = session;
-          try { if (s.Accounts.Values.Count == 1) SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { }
+          bool __firstAcct = false;
+          try { __firstAcct = s.Accounts.Values.Count == 1; } catch { __firstAcct = false; }
           Atomic.Audit(s, new AuditEvent { Action = "auth.register", Detail = JsonSerializer.Serialize(new { email }) });
-          return Results.Created("/api/auth/me", new { email, token = session.Token, expiresAt = session.ExpiresAt });
+          var __created = Results.Created("/api/auth/me", new { email, token = session.Token, expiresAt = session.ExpiresAt });
+          if (__firstAcct) { try { SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { } }
+          return __created;
           }
         }
       }
@@ -175,33 +178,40 @@ public static class AuthEndpoints
       // either observes the live session (and commits first) or observes the
       // removal (and refuses). Logout can no longer complete between another
       // request's authority check and its commit.
-      // Session revocation shares the full publication serialization boundary
-      // (SetupLock -> MessageLock -> backend unit), so an in-flight message/record
-      // gate either observes the live session and commits first, or observes the
-      // removal inside the same unit and refuses. Hub revocation stays a post-commit
-      // live effect below.
+      // Lock order: hub revocation (HubGate) runs OUTSIDE the outermost ROOT
+      // gate. Atomic.Defer would still execute while holding ROOT, so the
+      // revocation is captured here and executed after the unit+locks release.
+      string? __cur = null;
+      try
+      {
+        if (req.Headers.TryGetValue("Authorization", out var __auth)
+          && __auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+          __cur = __auth.ToString()["Bearer ".Length..].Trim();
+      }
+      catch { __cur = null; }
       lock (s.SetupLock)
       {
         lock (s.MessageLock)
         {
-          // Store-bound unit: session removal rolls back if the unit fails, and
-          // hub revocation runs only after the outermost commit (never for a
-          // rolled-back logout).
+          // Store-bound unit: session removal rolls back if the unit fails.
+          // No hub work is deferred inside the unit (Defer would hold ROOT).
           Atomic.Run(s, () =>
           {
-            string? cur = null;
-            if (req.Headers.TryGetValue("Authorization", out var auth)
-              && auth.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-              cur = auth.ToString()["Bearer ".Length..].Trim();
+            var cur = __cur;
             if (!string.IsNullOrEmpty(cur) && s.Sessions.TryRemove(cur, out var prior))
             {
               tok = cur;
               if (prior is not null)
                 Atomic.Compensate(s, () => { s.Sessions[cur] = prior; });
-              Atomic.Defer(s, () => { try { SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(cur); } catch { } });
             }
           });
         }
+      }
+      // Outside BOTH locks and outside the unit: token bookkeeping + live removal.
+      if (!string.IsNullOrEmpty(tok))
+      {
+        try { SimCEO.Api.Hubs.BoardHub.RevokeToken(tok); } catch { }
+        try { SimCEO.Api.Hubs.BoardHub.RevokeTokenAndConnections(tok); } catch { }
       }
       return Results.Ok(new { loggedOut = true });
     });

@@ -388,25 +388,112 @@ try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllo
 
     app.MapGet("/api/sources/{id:guid}/download", (InMemoryStore s, HttpRequest req, Guid id) =>
     {
-      if (!s.Sources.TryGetValue(id, out var doc)) return Results.NotFound();
-      if (PeopleOps.Check(s, req, doc.BoardId, doc.MeetingId, "read") is { } deniedSrc9) return deniedSrc9;
-      if (!IsBoardReader(s, req, doc.BoardId) && !IsSourceManager(s, req, doc.BoardId, doc.MeetingId)
-        && (!IsApprovedVisible(doc) || !InGuestScope(s, req, doc))) return PeopleOps.Denied();
-      if (!IsBoardReader(s, req, doc.BoardId))
-{
-if (!IsSourceManager(s, req, doc.BoardId, doc.MeetingId))
-{
-try
-{
-if (!s.Boards.TryGetValue(doc.BoardId, out var polBoard)) return Results.NotFound();
-if (polBoard == null) return Results.NotFound();
-if (!SourceGovernance.PolicyAllows(polBoard, doc)) return PeopleOps.Denied();
-}
-catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
-}
-}
-if (doc.Original is null) return Results.NotFound("original not retained");
-      return Results.Bytes(doc.Original, "application/octet-stream", doc.FileName);
+      // ONE ROOT atomic read: current entity + grant/approval/meeting-scope +
+      // policy + DETACHED byte copy commit together. No shared row/policy
+      // reference escapes the unit; a failed commit never opens a byte window.
+      // Reader/editor independent authority is preserved (no widening).
+      string fName = "file";
+      byte[]? bytes = null;
+      try
+      {
+        var snap = Atomic.Run(s, () =>
+        {
+          if (PeopleOps.HasInvalidToken(s, req)) throw new UnauthorizedAccessException("revoked-token");
+          bool sec = false;
+          try { sec = PeopleOps.IsSecure(s); } catch { throw new InvalidOperationException("storage"); }
+          if (sec && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked");
+          if (!s.Sources.TryGetValue(id, out var doc) || doc is null) throw new KeyNotFoundException("gone");
+          // Detach current row scalars inside the unit (never leak the tracked row).
+          var bid = doc.BoardId; var dmid = doc.MeetingId;
+          var scope = doc.Scope ?? "board"; var origin = doc.Origin ?? "upload";
+          var fname = doc.FileName ?? "file"; var appr = doc.Approved;
+          var excl = doc.Excluded; var rs = doc.ReviewState ?? "";
+          // Current authorization (grant-aware) inside the unit.
+          if (PeopleOps.Check(s, req, bid, dmid, "read") is not null)
+          {
+            if (PeopleOps.HasInvalidToken(s, req)) throw new UnauthorizedAccessException("revoked-token");
+            bool s2 = false;
+            try { s2 = PeopleOps.IsSecure(s); } catch { throw new InvalidOperationException("storage"); }
+            if (s2)
+            {
+              string em2 = "";
+              try { AuthOps.TrySession(s, req, out em2); } catch { }
+              if (string.IsNullOrWhiteSpace(em2)) throw new UnauthorizedAccessException("revoked");
+            }
+            throw new UnauthorizedAccessException("denied");
+          }
+          bool reader = false; bool mgr = false;
+          try { reader = IsBoardReader(s, req, bid); } catch { throw new InvalidOperationException("storage"); }
+          try { mgr = IsSourceManager(s, req, bid, dmid); } catch { throw new InvalidOperationException("storage"); }
+          // Guest scope gate (approval + own-scope) inside the unit.
+          if (!reader && !mgr)
+          {
+            bool vis = string.Equals(rs, "approved", StringComparison.OrdinalIgnoreCase) && !excl;
+            bool inScope = false;
+            try
+            {
+              if (scope != "meeting") inScope = true;
+              else if (dmid.HasValue)
+              {
+                string cu = "";
+                try { cu = PeopleOps.UserOf(s, req); } catch { cu = ""; }
+                var allowed = PeopleOps.GuestMeetingIds(s, cu, bid);
+                inScope = allowed.Contains(dmid.Value);
+              }
+              else inScope = true;
+            }
+            catch { throw new InvalidOperationException("storage"); }
+            if (!vis || !inScope) throw new UnauthorizedAccessException("denied");
+            // Policy on DETACHED copies: copy board policy scalars + doc policy
+            // inputs inside the unit, then evaluate without holding the shared row.
+            string blocked = ""; string mode = "allowAll";
+            try
+            {
+              if (!s.Boards.TryGetValue(bid, out var pb) || pb is null) throw new KeyNotFoundException("gone");
+              blocked = pb.BlockedTypes ?? ""; mode = pb.SourcePolicyMode ?? "allowAll";
+            }
+            catch (KeyNotFoundException) { throw; }
+            catch { throw new InvalidOperationException("storage"); }
+            var polBoardDet = new Board { BlockedTypes = blocked, SourcePolicyMode = mode };
+            var docDet = new SourceDoc { BoardId = bid, FileName = fname, Origin = origin };
+            bool allows = false;
+            try { allows = SourceGovernance.PolicyAllows(polBoardDet, docDet); }
+            catch { throw new InvalidOperationException("storage"); }
+            if (!allows) throw new UnauthorizedAccessException("denied");
+          }
+          byte[]? orig = doc.Original;
+          if (orig is null) throw new KeyNotFoundException("no-original");
+          var copy = (byte[])orig.Clone();
+          return (bid, fname, copy);
+        });
+        fName = snap.Item2;
+        bytes = snap.Item3;
+      }
+      catch (UnauthorizedAccessException uae) when (uae.Message == "revoked-token")
+      {
+        return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
+      }
+      catch (UnauthorizedAccessException uae) when (uae.Message == "revoked")
+      {
+        return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+      }
+      catch (UnauthorizedAccessException)
+      {
+        return PeopleOps.Denied();
+      }
+      catch (KeyNotFoundException knf) when (knf.Message == "no-original")
+      {
+        return Results.NotFound("original not retained");
+      }
+      catch (KeyNotFoundException)
+      {
+        return Results.NotFound();
+      }
+      catch
+      {
+        return Results.Json(new { error = "Storage unavailable." }, statusCode: 503);
+      }
+      return Results.Bytes(bytes!, "application/octet-stream", fName);
     });
 
     app.MapPost("/api/sources/{id:guid}/restore", (InMemoryStore s, HttpRequest req, Guid id) =>

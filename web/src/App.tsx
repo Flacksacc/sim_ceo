@@ -1000,7 +1000,28 @@ function AuthPanel() {
   const [msg, setMsg] = useState("");
   const status = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
   const meQ = useQuery({ queryKey: ["me"], queryFn: () => get<{ user: string; authenticated: boolean }>("/api/auth/me") });
-  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<{ id: string; boardId: string; meetingId: string; userKey: string }[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  type MineRow = { id: string; boardId: string; meetingId: string; userKey: string; active?: boolean; canRejoin?: boolean; meetingTitle?: string; boardName?: string; inviteId?: string };
+  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  const [rejoinBusy, setRejoinBusy] = useState("");
+  const rejoin = async (m: MineRow) => {
+    setMsg("");
+    setRejoinBusy(m.meetingId);
+    try {
+      // Scoped invite hint: accept first so /join sees the fresh grant.
+      if ((m as MineRow).inviteId) {
+        try { await post<unknown>(`/api/invites/${(m as MineRow).inviteId}/accept`, {}); } catch (e) {
+          const s = String(e);
+          if (!s.includes("not pending") && !s.includes("already") && !s.includes("accepted")) throw e;
+        }
+      }
+      await post<unknown>(`/api/meetings/${m.meetingId}/join`, {});
+      try { await qcPanel.refetchQueries({ queryKey: ["my-memberships"] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["messages", m.meetingId] }); } catch {}
+      setMsg("Rejoined meeting.");
+    } catch (e) { setMsg(String(e)); }
+    finally { setRejoinBusy(""); }
+  };
   const doRegister = async () => {
     setMsg("");
     try {
@@ -1061,9 +1082,16 @@ function AuthPanel() {
       {(mine.data ?? []).length > 0 && (
         <div>
           <h4>My meetings</h4>
-          {(mine.data ?? []).map((m) => (
-            <div key={m.id} className="row"><span>An assigned meeting</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button><button type="button" onClick={() => { try { post<unknown>("/api/meetings/" + m.meetingId + "/join", {}); } catch {} }}>Rejoin</button></div>
-          ))}
+          {(mine.data ?? []).map((m) => {
+            const mm = m as MineRow;
+            const nm = (mm.meetingTitle && mm.meetingTitle.trim()) ? mm.meetingTitle : "An assigned meeting";
+            const sub = (mm.boardName && mm.boardName.trim()) ? ` (${mm.boardName})` : "";
+            const isActive = mm.active !== false;
+            const canRejoin = !!mm.canRejoin && !isActive;
+            return (
+              <div key={mm.id} className="row"><span>{nm}{sub}{isActive ? "" : " (left)"}</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: mm.boardId, meeting: mm.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button>{isActive ? (<button type="button" onClick={() => leave(mm.meetingId)}>Leave</button>) : null}{canRejoin ? (<button type="button" disabled={rejoinBusy === mm.meetingId} onClick={() => rejoin(mm)}>{rejoinBusy === mm.meetingId ? "Joining..." : "Join again"}</button>) : null}</div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1434,6 +1462,10 @@ export default function App() {
   // purge (expiry, revocation, leave) BEFORE any held save/reload callback can
   // resolve, so stale completions can never repopulate cleared state.
   const profileOpRef = useRef(0);
+  // Dedupe key for CURRENT-expiry purges driven by /auth/me polls (200 +
+  // authenticated:false with a held token). One purge per expired identity;
+  // anonymous (no token) and fresh-login (authenticated) never purge.
+  const lastExpiredPurgeRef = useRef("");
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
@@ -1479,12 +1511,32 @@ export default function App() {
     try { window.location.hash = "#/boards"; } catch {}
     try { setLive(false); } catch {}
   };
+  // CURRENT-expiry poll transition: /auth/me returns 200 + authenticated:false
+  // while a token is still held (natural expiry, no 401). Invoke the SAME
+  // synchronous purge boundary once per expired identity, BEFORE any held
+  // body/click can resolve. Anonymous (no token) and fresh-login
+  // (authenticated:true) never purge. Stale-identity aware via current token.
+  useEffect(() => {
+    try {
+      const tok = currentToken();
+      if (!tok) return;
+      const d = sessQ.data as { user?: string; authenticated?: boolean } | undefined;
+      if (!d) return;
+      if (d.authenticated) { lastExpiredPurgeRef.current = ""; return; }
+      const key = tok + "|" + (d.user || "");
+      if (lastExpiredPurgeRef.current === key) return;
+      lastExpiredPurgeRef.current = key;
+      setSessExpiredFlag(true);
+      purgePrivate("expired");
+    } catch {}
+  }, [sessQ.data]);
   useEffect(() => {
     const onAuthFailed = (e: Event) => {
       try {
         const d = (e as CustomEvent<{ epoch: number; token: string; user: string }>).detail;
         if (!d) return;
         if (epochNow() !== d.epoch || currentToken() !== d.token) return; // stale failure; ignore
+        try { lastExpiredPurgeRef.current = d.token + "|" + (d.user || ""); } catch {}
         setSessExpiredFlag(true);
         purgePrivate("expired");
       } catch {}

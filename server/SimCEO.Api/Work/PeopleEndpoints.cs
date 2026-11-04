@@ -894,9 +894,11 @@ public static class PeopleEndpoints
         catch (InvalidOperationException iox) { return Results.Conflict(iox.Message); }
         catch (Exception ex) { return Results.Json(new { error = "Revocation could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (inv.MeetingId.HasValue) PeopleOps.BumpMeeting(s, inv.MeetingId.Value); else if (boardWide) foreach (var __mm in s.Meetings.Values.Where(mm => mm.BoardId == inv.BoardId).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
-        foreach (var u in removedUsers) PeopleOps.RevokeLive(u, inv.BoardId, boardWide ? null : inv.MeetingId);
         Atomic.Audit(s, new AuditEvent { BoardId = inv.BoardId, Action = "invite.revoke", Detail = JsonSerializer.Serialize(new { target, scope = boardWide ? "board" : "meeting", meeting = inv.MeetingId }) });
-        return Results.Ok(inv);
+        var __revokeUsers = removedUsers.ToList(); var __rb = inv.BoardId; Guid? __rm = boardWide ? null : inv.MeetingId;
+        var __ret = Results.Ok(inv);
+        foreach (var u in __revokeUsers) { try { PeopleOps.RevokeLive(u, __rb, __rm); } catch { } }
+        return __ret;
       }
     });
 
@@ -980,9 +982,11 @@ public static class PeopleEndpoints
         catch (InvalidOperationException iox) when (iox.Message == "Grant is gone.") { return Results.NotFound(); }
         catch (Exception ex) { return Results.Json(new { error = "Grant revocation could not be stored: " + ex.Message }, statusCode: 500); }
         try { if (mid.HasValue) PeopleOps.BumpMeeting(s, mid.Value); else foreach (var __mm in s.Meetings.Values.Where(m => m.BoardId == bid).ToList()) PeopleOps.BumpMeeting(s, __mm.Id); } catch { }
-        PeopleOps.RevokeLive(user, bid, mid);
         Atomic.Audit(s, new AuditEvent { BoardId = bid, Action = "grant.revoke", Detail = JsonSerializer.Serialize(new { user, meeting = mid }) });
-        return Results.NoContent();
+        var __ru = user; var __rb2 = bid; var __rm2 = mid;
+        var __nc = Results.NoContent();
+        try { PeopleOps.RevokeLive(__ru, __rb2, __rm2); } catch { }
+        return __nc;
       }
     });
 
@@ -995,8 +999,69 @@ public static class PeopleEndpoints
       if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out var em))
         return Results.Json(new { error = "Authentication required." }, statusCode: 401);
       var user = AuthOps.TrySession(s, req, out var e2) ? e2 : PeopleOps.UserOf(s, req);
-      try { return Results.Ok(s.Memberships.Values.Where(m => string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase) && m.Active).ToList()); }
-      catch { return Results.Ok(Array.Empty<Membership>()); }
+      try
+      {
+        return Atomic.Run(s, () =>
+        {
+          var mine = s.Memberships.Values.Where(m => string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase)).ToList();
+          var active = mine.Where(m => m.Active).ToList();
+          // Rejoinable inactive: same user, inactive row, meeting still exists on the
+          // same board, AND a CURRENT fresh meeting grant (or board-wide grant) still
+          // authorizes this user. No resurrection here; explicit /join reactivates.
+          // Pending invites bound to this identity are surfaced as join hints without
+          // leaking other users or invalid grants.
+          var outList = new System.Collections.Generic.List<object>();
+          foreach (var m in active.OrderByDescending(m => m.JoinedAt))
+          {
+            string mt = "";
+            string bt = "";
+            try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm) && mm is not null) mt = mm.Title ?? ""; } catch { }
+            try { if (s.Boards.TryGetValue(m.BoardId, out var bb) && bb is not null) bt = bb.Name ?? ""; } catch { }
+            outList.Add(new { id = m.Id, boardId = m.BoardId, meetingId = m.MeetingId, userKey = m.UserKey, active = true, canRejoin = false, meetingTitle = mt, boardName = bt, joinedAt = m.JoinedAt, leftAt = (DateTime?)null });
+          }
+          foreach (var m in mine.Where(m => !m.Active).OrderByDescending(m => m.JoinedAt))
+          {
+            bool hasGrant = false;
+            try
+            {
+              hasGrant = s.Grants.Values.Any(g => g.BoardId == m.BoardId
+                && (g.MeetingId == null || g.MeetingId == m.MeetingId)
+                && string.Equals(g.UserKey, user, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { hasGrant = false; }
+            bool sameMeeting = false;
+            try { sameMeeting = s.Meetings.TryGetValue(m.MeetingId, out var cm) && cm is not null && cm.BoardId == m.BoardId; } catch { sameMeeting = false; }
+            if (!hasGrant || !sameMeeting) continue;
+            string mt = "";
+            string bt = "";
+            try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm2) && mm2 is not null) mt = mm2.Title ?? ""; } catch { }
+            try { if (s.Boards.TryGetValue(m.BoardId, out var bb2) && bb2 is not null) bt = bb2.Name ?? ""; } catch { }
+            outList.Add(new { id = m.Id, boardId = m.BoardId, meetingId = m.MeetingId, userKey = m.UserKey, active = false, canRejoin = true, meetingTitle = mt, boardName = bt, joinedAt = m.JoinedAt, leftAt = m.LeftAt });
+          }
+          // Scoped invite hints: pending invites bound to this identity (UserKey or
+          // session email) for a meeting with no membership row at all.
+          try
+          {
+            var myMids = new System.Collections.Generic.HashSet<Guid>(mine.Select(m => m.MeetingId));
+            foreach (var inv in s.Invites.Values.Where(i => i.State == "pending" && i.MeetingId.HasValue).ToList())
+            {
+              bool mine2 = string.Equals(inv.UserKey ?? "", user, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrWhiteSpace(inv.Email) && string.Equals(inv.Email ?? "", user, StringComparison.OrdinalIgnoreCase));
+              if (!mine2) continue;
+              var mid = inv.MeetingId!.Value;
+              if (myMids.Contains(mid)) continue;
+              if (!s.Meetings.TryGetValue(mid, out var im) || im is null || im.BoardId != inv.BoardId) continue;
+              string mt = ""; string bt = "";
+              try { mt = im.Title ?? ""; } catch { }
+              try { if (s.Boards.TryGetValue(inv.BoardId, out var ib) && ib is not null) bt = ib.Name ?? ""; } catch { }
+              outList.Add(new { id = inv.Id, boardId = inv.BoardId, meetingId = mid, userKey = user, active = false, canRejoin = true, meetingTitle = mt, boardName = bt, joinedAt = (DateTime?)null, leftAt = (DateTime?)null, inviteId = inv.Id });
+            }
+          }
+          catch { }
+          return Results.Ok(outList);
+        });
+      }
+      catch { return Results.Json(new { error = "Membership read failed." }, statusCode: 500); }
     });
 
     app.MapPost("/api/meetings/{meetingId:guid}/join", (InMemoryStore s, HttpRequest req, Guid meetingId) =>
@@ -1040,9 +1105,11 @@ public static class PeopleEndpoints
         }
         catch (Exception ex) { return Results.Json(new { error = "Leave could not be stored: " + ex.Message }, statusCode: 500); }
         try { PeopleOps.BumpMeeting(s, meetingId); } catch { }
-        PeopleOps.RevokeLive(lu, mtg.BoardId, meetingId);
         Atomic.Audit(s, new AuditEvent { BoardId = mtg.BoardId, Action = "membership.leave", Detail = JsonSerializer.Serialize(new { user = lu, meeting = meetingId }) });
-        return Results.Ok(new { left = true, meetingId });
+        var __lu = lu; var __lb = mtg.BoardId; var __lm = meetingId;
+        var __ok = Results.Ok(new { left = true, meetingId });
+        try { PeopleOps.RevokeLive(__lu, __lb, __lm); } catch { }
+        return __ok;
       }
     });
 
