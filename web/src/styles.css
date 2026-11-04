@@ -288,7 +288,8 @@ ul.members li:hover { background: var(--panel); }
 .composer-bar {
   margin-top: 10px;
   position: sticky; bottom: 0; z-index: 10;
-  background: linear-gradient(to top, var(--content) 82%, transparent);
+  background: var(--content);
+  border-top: 1px solid var(--line);
   padding-block: 10px 4px;
 }
 .composer-bar .topline { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; margin-bottom: 6px; flex-wrap: wrap; }
