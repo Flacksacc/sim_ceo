@@ -874,9 +874,10 @@ public static class RosterEndpoints
         if (!dup) aiDraftUrls.Add(cu);
         if (aiDraftUrls.Count >= 10) break;
       }
+      // Inventory prefers the fetched passage per strict URL (P2); pool keeps every passage and claims keep matched origin.
       var draftRefs = aiDraftUrls.Select(u =>
       {
-        var hit = dossier.Citations.FirstOrDefault(c => SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(c.Url ?? "", u));
+        var hit = SimCEO.Api.Work.ClaimEvidenceMapper.SelectPreferredCitation(dossier.Citations, u);
         bool hf = hit?.Fetched ?? false;
         string ho = (hit?.Origin ?? "").Trim();
         if (hf && string.IsNullOrWhiteSpace(ho)) ho = "application-fetch";

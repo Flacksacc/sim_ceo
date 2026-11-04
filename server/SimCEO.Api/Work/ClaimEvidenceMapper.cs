@@ -435,4 +435,34 @@ public static class ClaimEvidenceMapper
     }
     return needed;
   }
+  // Production inventory projection (P2): URL-level inventory prefers the
+  // actual fetched passage for that strict URL instead of the first citation.
+  // Pure projection, no HTTP or env or clock. Returns preferred index or -1.
+  // Prefers first Fetched citation with nonempty excerpt, else first match.
+  // Claim-matched origin stays with MapOne; inventory keeps every pool entry.
+  public static int SelectPreferredCitationIndex<T>(System.Collections.Generic.IReadOnlyList<T> citations, string inventoryUrl, System.Func<T, string> urlOf, System.Func<T, bool> fetchedOf, System.Func<T, string> excerptOf)
+  {
+    var u = (inventoryUrl ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(u) || citations is null) return -1;
+    int first = -1;
+    int firstFetched = -1;
+    for (var i = 0; i < citations.Count; i++)
+    {
+      var c = citations[i];
+      if (c is null) continue;
+      var cu = (urlOf(c) ?? "").Trim();
+      if (cu.Length == 0) continue;
+      if (!UrlsMatch(cu, u)) continue;
+      if (first < 0) first = i;
+      if (firstFetched < 0 && fetchedOf(c) && !string.IsNullOrWhiteSpace(excerptOf(c))) firstFetched = i;
+    }
+    if (firstFetched >= 0) return firstFetched;
+    return first;
+  }
+  public static ModelGateway.Citation? SelectPreferredCitation(System.Collections.Generic.IReadOnlyList<ModelGateway.Citation> citations, string inventoryUrl)
+  {
+    var idx = SelectPreferredCitationIndex(citations, inventoryUrl, c => c.Url, c => c.Fetched, c => c.Excerpt);
+    if (idx >= 0) return citations[idx];
+    return null;
+  }
 }
