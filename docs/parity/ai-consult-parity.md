@@ -692,6 +692,31 @@ Backup `.tmp/update-20261104-181611-UTC-6b338997`; rollback
 Original database/volumes retained. Owned QA services and browser processes
 exited; no coding agents used, `tmp.txt` untouched. Full parity remains paused.
 
+### 2026-11-04 — Explicit expert role and CEO knowledge adaptation
+
+`8688764` strengthens the shared developer-priority advisor prompt: every advisor
+is the subject-matter expert for its configured role/background, responsible
+for concise, accurate explanation that improves the CEO's understanding and
+decision. FamiliarTopics means skip redundant basics; SimplerTopics means
+define unfamiliar terms, unpack the reasoning and use a short practical
+example. Background/CommPrefs set depth and language. Missing topics do not
+imply ignorance; advisors must not patronize the CEO or invent certainty,
+facts or credentials. Future research compiles the same expert-teacher role
+into the existing editable paragraphs.
+
+Fresh isolated integration passed all parallel-dialogue checks plus assertions
+that the actual outgoing initial replies, peer reviews and roster chat contain
+the expert/adaptive instructions and saved CEO knowledge context
+(`.tmp/expert-advisors-qa.log`). Frontend/backend/release builds passed; grounded
+research regression 49/0 (`.tmp/expert-advisors-grounding.log`). No new calls were
+made in user meetings for this verification. Owned test stack/browser exited.
+
+Live health/readiness passed with PostgreSQL on 5173; image
+`sha256:1ac4be841d1e8796a4b8edda348a3acf3f01efea12c976521e7542af6fbb0014`.
+Backup `.tmp/update-20261104-182213-UTC-2884eb0c`; rollback
+`simceo-essentials-app:rollback-20261104-182213-2884eb0c`.
+Database/volumes preserved, `tmp.txt` untouched. Full parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
