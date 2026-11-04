@@ -116,3 +116,6 @@ The allowlist additionally accepts exactly simceo-advisor-real-15190-v4 with an 
 
 V5 additionally permits exactly simceo-advisor-real-15190-v5, with the same full-source proof and one-fresh-attempt limits. V4 completed both model calls but honestly returned unsupported: paragraph extraction had clipped narrative quotes behind an infobox. The candidate now retains visible block boundaries; 108 security checks, 33 provenance checks, and a direct two-page public fetch passed before this new attempt. Earlier results and volumes remain retained.
 
+
+V6 additionally permits exactly simceo-advisor-real-15190-v6 under the same gates. V5 retained only one short but relevant passage, while the model cited other introductory facts; it stopped unsupported. Research now uses a request-local, at-most-1600-character contiguous opening passage, with exact inline whitespace and the original URL/byte/redirect/time/security limits. Default non-research excerpts remain capped at 320. The 111-check security suite and 33-check provenance suite pass, as does the 92-check endpoint suite.
+
