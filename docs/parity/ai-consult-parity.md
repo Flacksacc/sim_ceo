@@ -1195,3 +1195,41 @@ Flacksacc/sim_ceo. Owned QA services and browsers stopped; implementation perfor
 directly, with Muse used for real-model evaluations and read-only review.
 No live user meetings were modified during QA. tmp.txt untouched; broader parity
 goal remains paused.
+
+### 2026-11-04 — Live advisor replies and readable formatting
+
+Implementation `9fb4fdb` adds provider SSE streaming to meeting writers and
+optional direct roster chat. Separate per-advisor previews grow during parallel
+generation, then reconcile with saved messages. Failed, stale and cancelled
+previews do not become completed history. Existing final publication guards and
+non-streaming clients remain supported. Assessment/reasoning stays private.
+
+Shared sanitized rendering supports bold, italics, underlining, bullet and
+numbered lists, links and paragraphs. Existing messages use it too. Scripts,
+embedded images and unsafe URLs are blocked. Model guidance requests the
+supported syntax, while partial delimiters are hidden during streaming.
+
+Verification: release/frontend builds; 29 streaming contract checks;
+parallel-dialogue regression; browser tests for simultaneous incremental replies,
+final replacement without duplicates, formatting/Unicode, unsafe-markup blocking,
+pause/interruption rollback and direct-chat streaming. Authentication tests cover
+revocation between assessment/writer and after direct-chat SSE headers. Logs:
+`.tmp/advisor-stream-qa/{build,stream-probe,dialogue-final,streaming-final,
+streaming-auth}.log`. An additional legacy UsageProbe passed its text/image
+checks but stopped on its old invalid three-byte audio fixture; its unchanged
+audio validation rejects that fixture before dispatch. It is not a full pass.
+
+A real Muse Spark stream produced 19 content deltas, normal completion and
+usage, including bold, italic, underline and bullets. Evidence:
+`.tmp/real-muse-stream-check.log`. Separate read-only Muse review returned no
+findings (`.tmp/advisor-streaming-independent-review.txt`); primary independently
+inspected integration, authorization, bounded parsing, accounting and rendering.
+Owned QA processes stopped. No live user meetings changed by QA.
+
+Live deployment verified: image
+`sha256:4e75320f565a766a9e98293b245a67de6ef989db40a57a860b52d8b23bc0ee40`;
+backup `.tmp/update-20261104-221903-UTC-b5b21afd`. Original PostgreSQL container
+and volumes retained; `/health` and PostgreSQL `/ready` pass. Read-only live
+light/dark desktop and 390px checks pass with no browser errors or domain writes
+(`.tmp/advisor-streaming-live-ui.log`). EssentialBudgetProbe also passes with
+the expanded formatting instructions. Broader parity goal remains paused.
