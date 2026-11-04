@@ -1264,6 +1264,13 @@ public static class SimCEOEndpoints
           return s.Messages.TryGetValue(id, out var cl) && cl is not null
             ? cl.Count(x => x.AdvisorId != Guid.Empty && x.Sequence > leadFloor) : 0;
       }
+      // P3: deferred network publication only. SyncRoundCommit (synchronous activity state) runs
+      // INSIDE SetupLock/MessageLock + Atomic unit immediately after the successful commit, while
+      // still holding the outer ROOT aliases; ONLY async network PublishDiscussionAsync is deferred
+      // until after all ROOT exit. Never Task.Run/delay/yield inside ROOT, never Hub->Root inversion
+      // (recipient path releases HubGate before acquiring ROOT for per-recipient auth), never rollback-event
+      // publish (throw skips flag set; finalizer interruption after rollback is retained).
+      bool __deferredActivityPublish = false;
       // Lane B: declared before bidding so every interruption path reports accurate yields/counts.
       var published = new List<Message>();
       var manifests = new List<object>();
@@ -1306,7 +1313,7 @@ public static class SimCEOEndpoints
         // it is authoritative for the write below.
         try { PublicationGuard.Check(s, publishPin, req, m.BoardId, id, "discuss"); }
         catch (Exception laneBPreEx) { var laneBPreMapped = PublicationGuard.MapGuardFailure(laneBPreEx); if (laneBPreMapped is not null) return laneBPreMapped; throw; }
-        try { MeetingActivity.FinishDiscussion(s, id, activityOpId, "interrupted", laneBReason); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
+        try { MeetingActivity.FinishDiscussion(s, id, activityOpId, "interrupted", laneBReason); if (System.Threading.Monitor.IsEntered(s.RootGate)) { __deferredActivityPublish = true; } else { _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } } catch { }
         var laneBRev = LaneBRevision();
         var laneBTitle = "Run interrupted: " + laneBReason;
         var laneBBody = JsonSerializer.Serialize(new { policy, leadVersion, generation = gen, revision = laneBRev, rounds = laneBPlannedRounds, completedGroups, published = published.Count, yielded, abstained, bidErrorCount = bidErrors.Count, overflow, status = "interrupted", reason = laneBReason, remaining = laneBRemaining });
@@ -1461,6 +1468,7 @@ public static class SimCEOEndpoints
         // allowed state and reviewed-input fingerprints are compared immediately before commit.
         int __actPub0 = published.Count;
         int __actY0 = yielded.Count;
+        IResult? __roundGateOuter = null;
         lock (s.SetupLock)
         {
           lock (s.MessageLock)
@@ -1571,7 +1579,9 @@ public static class SimCEOEndpoints
             });
             if (laneBGate is null) completedGroups++;
             }); // end Atomic gate: authoritative fetch/authorize/validate/mutate in one backend transaction
-            if (laneBGate is not null) return laneBGate;
+            // Success path: apply SyncRoundCommit synchronously HERE, still holding the
+            // outer ROOT aliases, immediately after the successful Atomic commit above.
+            __roundGateOuter = laneBGate;
             try
             {
               var __actNewPub = new HashSet<Guid>(published.Skip(__actPub0).Select(p => p.AdvisorId));
@@ -1587,12 +1597,30 @@ public static class SimCEOEndpoints
                 }
                 catch { }
               }
-              MeetingActivity.SyncRoundCommit(id, activityOpId, round.Select(a => (a.Id, a.BoardRole)).ToList(), __actNewPub, __actNewY);
-              _ = MeetingActivity.PublishDiscussionAsync(hub, s, id);
+              if (laneBGate is null)
+              {
+                var __capRound = round.Select(a => (a.Id, a.BoardRole)).ToList();
+                try { MeetingActivity.SyncRoundCommit(id, activityOpId, __capRound, __actNewPub, __actNewY); } catch { }
+                __deferredActivityPublish = true;
+              }
+              // Failure path (laneBGate set): LaneBFail already applied FinishDiscussion synchronously
+              // inside and set deferred publish; nothing to sync here. Only the async network
+              // publish is deferred below. Rollback (throw) never reaches here, so no rollback-event
+              // publish exists.
             }
             catch { }
           }
         }
+        // AFTER all outer ROOT aliases (SetupLock/MessageLock) + commit exit: network
+        // publish only. SyncRoundCommit already ran inside ROOT above. Never under ROOT,
+        // never Task.Run inside ROOT, no Hub->Root inversion (recipient path releases
+        // HubGate before acquiring ROOT for per-recipient auth). Rollback (throw) skips this block because the flag is set only after a committed unit.
+        if (__deferredActivityPublish)
+        {
+          __deferredActivityPublish = false;
+          try { _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
+        }
+        if (__roundGateOuter is not null) return __roundGateOuter;
       }
       { Guid auditBoard = m.BoardId; try { if (s.Meetings.TryGetValue(id, out var auditMtg) && auditMtg is not null) auditBoard = auditMtg.BoardId; } catch { }
       Atomic.Audit(s, new AuditEvent { BoardId = auditBoard, Action = "discussion.run", Detail = JsonSerializer.Serialize(new { policy, rounds = rounds.Count, published = published.Count, leadVersion, generation = gen, bids = bidResults.Length, abstained, bidErrors = bidErrors.Count, manifests }) }); }

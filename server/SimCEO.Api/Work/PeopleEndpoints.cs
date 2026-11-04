@@ -1043,15 +1043,19 @@ public static class PeopleEndpoints
             bool sameParent = false;
             try { sameParent = s.Meetings.TryGetValue(m.MeetingId, out var __cm) && __cm is not null && __cm.BoardId == m.BoardId; } catch { sameParent = false; }
             if (!sameParent) continue;
-            bool hasGrantNow = false;
+            // Authoritative CURRENT authority: explicit grant OR owner/admin independent
+            // authority (board owner, installation admin, board-wide grant) OR any other
+            // granted scope via AccessFor. Owner/admin legitimate access does not need an
+            // explicit grant row; a revoked guest (AccessFor none) stays hidden.
+            // Parent validation above is retained; inactive/active meanings preserved.
+            bool hasAuthorityNow = false;
             try
             {
-              hasGrantNow = s.Grants.Values.Any(g => g.BoardId == m.BoardId
-                && (g.MeetingId == null || g.MeetingId == m.MeetingId)
-                && string.Equals(g.UserKey, inUser, StringComparison.OrdinalIgnoreCase));
+              var __acc = PeopleOps.AccessFor(s, m.BoardId, m.MeetingId, inUser);
+              hasAuthorityNow = !string.Equals(__acc, "none", StringComparison.OrdinalIgnoreCase);
             }
-            catch { hasGrantNow = false; }
-            if (!hasGrantNow) continue;
+            catch { hasAuthorityNow = false; }
+            if (!hasAuthorityNow) continue;
             string mt = "";
             string bt = "";
             try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm) && mm is not null && mm.BoardId == m.BoardId) mt = mm.Title ?? ""; else continue; } catch { continue; }
@@ -1060,17 +1064,20 @@ public static class PeopleEndpoints
           }
           foreach (var m in mine.Where(m => !m.Active).OrderByDescending(m => m.JoinedAt))
           {
-            bool hasGrant = false;
+            // Inactive rejoin hint: same parent meeting AND CURRENT authority
+            // (AccessFor, including owner/admin independent authority). A revoked guest
+            // (AccessFor none) stays hidden: no implicit rejoin bypass. Explicit /join
+            // still reactivates only with live authority (see EnsureMeetingMembership).
+            bool hasAuthority = false;
             try
             {
-              hasGrant = s.Grants.Values.Any(g => g.BoardId == m.BoardId
-                && (g.MeetingId == null || g.MeetingId == m.MeetingId)
-                && string.Equals(g.UserKey, inUser, StringComparison.OrdinalIgnoreCase));
+              var __acc2 = PeopleOps.AccessFor(s, m.BoardId, m.MeetingId, inUser);
+              hasAuthority = !string.Equals(__acc2, "none", StringComparison.OrdinalIgnoreCase);
             }
-            catch { hasGrant = false; }
+            catch { hasAuthority = false; }
             bool sameMeeting = false;
             try { sameMeeting = s.Meetings.TryGetValue(m.MeetingId, out var cm) && cm is not null && cm.BoardId == m.BoardId; } catch { sameMeeting = false; }
-            if (!hasGrant || !sameMeeting) continue;
+            if (!hasAuthority || !sameMeeting) continue;
             string mt = "";
             string bt = "";
             try { if (s.Meetings.TryGetValue(m.MeetingId, out var mm2) && mm2 is not null) mt = mm2.Title ?? ""; } catch { }
