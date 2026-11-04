@@ -990,6 +990,45 @@ Backup `.tmp/update-20261104-195210-UTC-ba3f0dbc`; original DB/volumes retained.
 Source pushed to Flacksacc/sim_ceo. Owned QA services and browser contexts closed;
 no agents used; tmp.txt untouched; broader parity goal remains paused.
 
+### Meeting attachments and Muse team portraits — 2026-11-04
+
+Delivered in `3ae37c7`. Muse (`muse-image-1.0`) generated distinct fictional
+Orchestrator and Secretary portraits, installed in the meeting team and system
+message avatars. Assets and prompts are in `web/public/portraits/`.
+
+The composer now includes a drop zone and multiple-file picker. Files upload,
+extract, index and enter the selected meeting's context automatically, with
+per-file progress and readable failures. Exact duplicate drops reuse the existing
+source. Ordinary Sources uploads retain their existing workflow. Attachment
+activation bumps only its meeting's generation without pausing it; older
+in-flight responses remain guarded, and other meetings are unaffected.
+
+Text/Markdown/CSV/JSON, selectable-text PDF and modern Office documents are read
+locally. Files are limited to 10 MB, PDF to 500 pages, extracted text to two million
+characters, and Office expansion/XML parsing is bounded. Scans/images require
+OCR outside this build. Existing indexing retains the first 12,000 characters;
+long files explicitly display that limit. There is no active vector database:
+PostgreSQL persists sections and local retrieval uses keyword scoring. The
+optional remote-search adapter is not configured in the essentials stack.
+
+Frontend/release builds, parallel dialogue regressions and all eight meeting-menu
+command checks passed. `qa/meeting-attachments-qa.mjs` verifies actual advisor
+prompt evidence, TXT/PDF/DOCX/PPTX/XLSX extraction, duplicate reuse, failure/size
+handling, scope isolation, no meeting pause, no unrelated generation changes,
+long-document disclosure, picker/drop/progress, reload persistence, draft
+preservation and narrow layout. Evidence: `.tmp/attachments-qa/attachments-final.log`,
+`dialogue.log`, `menu.log`, `build.log`. Live desktop/390px checks passed with
+portraits decoded, drop zone present, no page errors and no domain mutations
+(`.tmp/meeting-attachments-live-check.log`).
+
+Deployed to localhost:5173 using image
+`sha256:e0f35d4c470f3224aea858a804f0ae46598db7cc8b98dff2e802a6458630af20`.
+Backup `.tmp/update-20261104-204156-UTC-14070ca0`; original database container and
+volumes retained, `/health` and `/ready` pass with PostgreSQL. Owned QA services
+and browsers stopped. Muse was used for images only; implementation/review were
+performed directly. Source published to Flacksacc/sim_ceo; tmp.txt untouched;
+broader parity goal remains paused.
+
 ### 2026-11-04 — Meeting command menu and General settings
 
 Implemented `2729ab5` and shortcut guard `c4468b4`. Meeting settings now opens a
