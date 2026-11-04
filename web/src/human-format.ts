@@ -244,3 +244,87 @@ export function humanizeOmission(omitted: string[]): string {
   }
   return parts.join("; ");
 }
+
+// Human projections for Phase 5 review.
+// Wire and snapshot bytes stay server side. These helpers only change what people see.
+const GUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+const HEX32_RE = /[0-9a-fA-F]{32}/g;
+export function stripOmittedManifest(body: string): string {
+  const s = body ?? "";
+  const cut = s.replace(/\[Omitted from packet[^\]]*\]/g, "");
+  return cut.trim();
+}
+export function humanNoteBody(body: string): string {
+  const base = stripOmittedManifest(body ?? "");
+  if (base === "") return "";
+  return base.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+}
+export function humanEvidenceTitle(title: string, kind: string, version: number | null): string {
+  const t = (title ?? "").trim();
+  if (t === "") return "Supporting excerpt";
+  const m = t.match(/^record v(\d+)(?:\s*\[.*\])?\s*$/i);
+  if (m || kind === "record") {
+    const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
+    return v !== "" ? "Approved record, version " + v : "Approved record";
+  }
+  return t.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+}
+export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
+  const x = (excerpt ?? "").trim();
+  if (x === "") return "";
+  const parts = x.split(/\r?\n/).map((ln) => ln.replace(/^\s*-\s*\[[^\]]*\]\s*/, "").trim()).filter((ln) => ln !== "");
+  const candidate = parts.length > 0 ? parts.join("\n") : x;
+  const c = candidate.trim();
+  if (c.startsWith("{") || c.startsWith("[")) {
+    try { const parsed = JSON.parse(c); void parsed; } catch { /* fall through to text */ }
+    if (c.startsWith("{")) {
+      return kind === "dossier" ? "Advisor profile detail is available on the roster. This excerpt stays hidden in review." : "Supporting detail is available in context. This excerpt stays hidden in review.";
+    }
+  }
+  return candidate.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+}
+export function looksLikeItemsJson(text: string): boolean {
+  const t = (text ?? "").trim();
+  if (!t.startsWith("[")) return false;
+  try { const v: unknown = JSON.parse(t); return Array.isArray(v); } catch { return false; }
+}
+export function summarizeItemsJson(jsonText: string, maxChars: number): string {
+  const parsed = parseRecordItems(jsonText ?? "[]");
+  if (parsed.problem !== null || parsed.items.length === 0) return "";
+  const texts = parsed.items.map((it) => it.text).filter((s) => s !== "");
+  if (texts.length === 0) return parsed.items.length + " decisions";
+  const joined = texts.join(" / ");
+  const cap = maxChars > 0 ? maxChars : 220;
+  if (joined.length <= cap) return joined;
+  const slice = joined.slice(0, cap);
+  const sp = slice.lastIndexOf(" ");
+  return (sp > 40 ? slice.slice(0, sp) : slice) + " ...";
+}
+export type HumanHistoryView = { headline: string; detail: string };
+export function describeHistoryEntry(action: string, oldText: string, newText: string): HumanHistoryView {
+  const a = (action ?? "").trim().toLowerCase();
+  const nt = newText ?? "";
+  const ot = oldText ?? "";
+  const wholeNew = looksLikeItemsJson(nt);
+  const wholeOld = looksLikeItemsJson(ot);
+  if (a === "create") return { headline: "Created", detail: summarizeItemsJson(wholeNew ? nt : "[]", 220) };
+  if (a === "refresh") return { headline: "Refreshed to current meeting input", detail: "" };
+  if (a === "discard-remaining") return { headline: "Remaining set aside", detail: "" };
+  if (a === "approve") { const s = wholeNew ? summarizeItemsJson(nt, 220) : nt; return { headline: "Approved", detail: s.length > 220 ? s.slice(0, 220) + " ..." : s }; }
+  if (a === "discard") { const s = wholeNew ? summarizeItemsJson(nt !== "" ? nt : ot, 220) : (nt !== "" ? nt : ot); return { headline: "Set aside", detail: s.length > 220 ? s.slice(0, 220) + " ..." : s }; }
+  if (a === "revise") { const s = wholeNew ? summarizeItemsJson(nt, 220) : nt; const o = wholeOld ? summarizeItemsJson(ot, 120) : ot; const d = o !== "" && o !== s ? "Was: " + o + " Now: " + s : s; return { headline: "Revised", detail: d.length > 240 ? d.slice(0, 240) + " ..." : d }; }
+  if (a === "revise-branch" || a === "revise-child" || a === "amend-branch" || a === "amend-child") {
+    if (wholeNew || wholeOld) {
+      const changes = describeItemChanges(wholeOld ? ot : "[]", wholeNew ? nt : "[]");
+      const label = a.indexOf("amend") >= 0 ? "Amended" : "Branched a new version";
+      if (changes.length === 0) return { headline: label, detail: "" };
+      const bits = changes.map((c) => c.headline + ": " + c.detail);
+      const joined = bits.join(" / ");
+      return { headline: label, detail: joined.length > 240 ? joined.slice(0, 240) + " ..." : joined };
+    }
+    return { headline: a.indexOf("amend") >= 0 ? "Amended" : "Branched a new version", detail: "" };
+  }
+  const fb = wholeNew ? summarizeItemsJson(nt, 220) : (nt !== "" ? nt : ot);
+  const lb = a === "" ? "Updated" : a.charAt(0).toUpperCase() + a.slice(1);
+  return { headline: lb, detail: fb.length > 220 ? fb.slice(0, 220) + " ..." : fb };
+}

@@ -20,8 +20,8 @@ import "./meeting-participants.css";
 import { buildPresence, provenanceParts, resolveProvenanceImage } from "./meeting-presence";
 import "./roster-integrity.css";
 import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
-import { RecordComparison, RecordItemEditor, RecordItemList, RecordVersionRow } from "./human-record-items";
-import { friendlyError, friendlyRecordStatus, humanizeOmission, parseRecordItems } from "./human-format";
+import { RecordComparison, RecordItemEditor, RecordVersionRow } from "./human-record-items";
+import { describeHistoryEntry, friendlyError, friendlyRecordStatus, humanEvidenceExcerpt, humanEvidenceTitle, humanizeOmission, humanNoteBody, parseRecordItems } from "./human-format";
 import "./human-feedback.css";
 import { convertRecordedBlobToWav } from "./voiceCodec";
 import WikiResources from "./wiki-resources";
@@ -3234,7 +3234,7 @@ const tabCount = (k: Tab): number | null => {
       setRecId(r.id);
       setTab("records");
       refresh("records", "record");
-      notify("Direction staged for review as draft " + r.id + ".");
+      notify("Direction staged for review.");
     },
     onError: (e, _v, ctx) => {
       const origin = ctx as { originBoardId?: string; originMeetingId?: string; originRecId?: string; recVisit?: number; origin?: { epoch: number; token: string; user: string } } | undefined;
@@ -3475,9 +3475,60 @@ const tabCount = (k: Tab): number | null => {
   // flag, a failed/empty review, or a non-manage grant hides EVERY approval
   // control, including the selection checkboxes. An empty draft (no pending
   // items) likewise shows no approval controls.
-  const reviewPendingCount = (recReview.data?.pending ?? []).length;
+  const reviewDraft = (recReview.data?.draft as RecordDraft | undefined) ?? undefined;
+  const authDraft = reviewDraft ?? recDetail.data;
+  const reviewPending = ((recReview.data?.pending ?? []) as string[]);
+  const reviewPendingCount = reviewPending.length;
+  const reviewStatus = ((reviewDraft as unknown as { status?: unknown } | undefined)?.status as string | undefined) ?? recDetail.data?.status ?? "";
+  const reviewDecided = !!((reviewDraft as unknown as { decided?: unknown } | undefined)?.decided ?? recDetail.data?.decided);
+  const reviewSuperseded = reviewStatus.toLowerCase() === "superseded";
   const stateValid = recOk && !!recReview.data && !recReview.isError && !showReviewError && reviewPendingCount > 0 && recReview.data.stateValid === true;
-  const canApproveRecord = canManageMeeting && stateValid === true;
+  const isActionableReview = recOk && !!recReview.data && !recReview.isError && !showReviewError && recReview.data.stateValid === true && reviewPendingCount > 0 && !reviewDecided && !reviewSuperseded;
+  const canApproveRecord = canManageMeeting && isActionableReview === true;
+  const canContributeReview = canActMeeting && isActionableReview === true;
+  const ordinalOf = (itemId: string): number => reviewPending.indexOf(itemId) + 1;
+  const ordinalLabel = (itemId: string): string => { const n = ordinalOf(itemId); return n > 0 ? "decision " + String(n) : "decision"; };
+  useEffect(() => {
+    const pend = new Set(reviewPending);
+    setSelItems((old) => {
+      const kept = old.filter((x) => pend.has(x));
+      if (kept.length === 0 && pend.size > 0 && old.length === 0) return [...pend];
+      return kept;
+    });
+  }, [reviewPending.join(",")]);
+  const reviewPredIds = ((recReview.data?.predecessors ?? []) as string[]);
+  const reviewSuccIds = ((recReview.data?.successors ?? []) as string[]);
+  const [linkedVersions, setLinkedVersions] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const want = [...reviewPredIds, ...reviewSuccIds].filter((x) => linkedVersions[x] === undefined);
+    if (want.length === 0) return;
+    let live = true;
+    (async () => {
+      for (const rid of want) {
+        try {
+          const dd = await get<RecordDraft>("/api/records/" + rid);
+          if (!live) return;
+          if (dd && dd.boardId === boardId && dd.meetingId === meetingId) {
+            setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: dd.version } : old));
+          } else {
+            setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: -1 } : old));
+          }
+        } catch {
+          if (!live) return;
+          setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: -1 } : old));
+        }
+      }
+    })();
+    return () => { live = false; };
+  }, [reviewPredIds.join(","), reviewSuccIds.join(","), boardId, meetingId]);
+  useEffect(() => {
+    const ad = authDraft as RecordDraft | undefined;
+    if (!ad) return;
+    if (revTextRev.current !== 0) return;
+    if (revTextOwner.current !== "" && revTextOwner.current !== ad.id) return;
+    const fresh = ad.itemsJson ?? "";
+    setRevText((cur) => (cur === fresh ? cur : fresh));
+  }, [authDraft && (authDraft as RecordDraft).itemsJson]);
   const [itemTexts, setItemTexts] = useState<Record<string, string>>({});
   const itemTextRev = useRef<Record<string, number>>({});
   const editKey = (draftId: string, itemId: string) => `${draftId}:${itemId}`;
@@ -3589,8 +3640,8 @@ const tabCount = (k: Tab): number | null => {
     setReviewError({ key: `${origin.boardId}:${origin.meetingId}:${origin.recId}:${origin.user}:${origin.token !== undefined ? origin.token : fullIdentityToken()}`, message });
   };
   const itemApprove = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3600,7 +3651,7 @@ const tabCount = (k: Tab): number | null => {
         if (!recOriginLive(origin)) return;
         applyDraft(r);
         const st = (r as unknown as RecordDraft)?.status;
-        notify(st === "approved" ? `Approved ${itemId}; review complete.` : `Approved ${itemId}.`);
+        notify(st === "approved" ? "Approved " + ordinalLabel(itemId) + "; review complete." : "Approved " + ordinalLabel(itemId) + ".");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3609,8 +3660,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemRevise = (itemId: string) => {
-    if (!recOk || !canActMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const reviseKey = editKey(d.id, itemId);
@@ -3637,7 +3688,7 @@ const tabCount = (k: Tab): number | null => {
           return next;
         });
         delete itemTextRev.current[reviseKey];
-        notify(`Revised ${itemId}; approved text untouched.`);
+        notify("Revised " + ordinalLabel(itemId) + "; approved text untouched.");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3646,8 +3697,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemDiscard = (itemId: string) => {
-    if (!recOk || !canActMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3656,7 +3707,7 @@ const tabCount = (k: Tab): number | null => {
         const live = liveSelRef.current;
         if (!recOriginLive(origin)) return;
         applyDraft(r);
-        notify(`Discarded ${itemId}; approved items preserved.`);
+        notify("Discarded " + ordinalLabel(itemId) + "; approved items preserved.");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3665,8 +3716,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const approveAllFresh = () => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3684,20 +3735,14 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const approveRec = (all: boolean) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
-    let ids = selItems;
-    if (all) {
-      try {
-        ids = (JSON.parse(d.itemsJson) as { id?: string }[])
-          .map((i) => i.id ?? "")
-          .filter(Boolean);
-      } catch {
-        ids = selItems;
-      }
-    }
+    const pendingSet = new Set(reviewPending);
+    let ids = selItems.filter((x) => pendingSet.has(x));
+    if (all) { ids = [...reviewPending]; }
+    if (ids.length === 0) return;
     const origin = captureRecOrigin();
     const originDraftId = d.id;
     post<unknown>(`/api/meetings/${origin.meetingId}/record/approve`, {
@@ -3717,7 +3762,7 @@ const tabCount = (k: Tab): number | null => {
         void keyId;
         refresh("records", "record");
         void recReview.refetch();
-        notify(`Approved ${ids.length} item(s).`);
+        notify("Approved " + String(ids.length) + " decision" + (ids.length === 1 ? "." : "s."));
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3726,8 +3771,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const reviseRec = (amend: boolean) => {
-    if (!recOk || !canActMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     let items: unknown = [];
@@ -3777,8 +3822,9 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const discardRec = () => {
-    if (!recOk || !canActMeeting || !recDetail.data) return Promise.resolve();
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return Promise.resolve();
+    const d = reviewDraft;
+    if (!d) return Promise.resolve();
     if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
     const origin = captureRecOrigin();
     return post<unknown>(`/api/records/${d.id}/discard`, guardOf(d))
@@ -8693,7 +8739,7 @@ const testModel = useMutation({
                       {!!recReview.data && !recReview.isError && !showReviewError && (
                         <p role="status">
                           {" "}
-                          Review v{recDetail.data.version} of meeting input {recReview.data.meetingWatermark}:{" "}
+                          Review version {(authDraft as RecordDraft).version} · reviewed input {(authDraft as RecordDraft).watermark} · current input {recReview.data.meetingWatermark}{(authDraft as RecordDraft).watermark !== recReview.data.meetingWatermark ? " — new input arrived" : ""}:{" "}
                           {(recReview.data.approved ?? []).length} approved · {(recReview.data.discarded ?? []).length} set aside ·{" "}
                           {(recReview.data.pending ?? []).length} waiting.{" "}
                         </p>
@@ -8704,55 +8750,50 @@ const testModel = useMutation({
                           <h4>Decisions waiting for review</h4>{" "}
                           <p>Approve, revise, or set aside each decision below. Approved decisions are kept as the record; set-aside decisions are preserved but stay out of the record.</p>{" "}
                           <ol className="human-item-list">
-                            {(recReview.data.pending ?? []).map((pid) => {
-                              const found = parseRecordItems(recDetail.data.itemsJson).items.find((it) => it.key === pid);
-                              const ptext = found ? found.text : "";
-                              const tkey = editKey(recDetail.data.id, pid);
-                              return (
-                                <li key={pid} className="human-item">
-                                  <div className="human-item-body">
-                                    <span className="human-item-text">{ptext === "" ? "(decision text unavailable — request a fresh revision)" : ptext}</span>{" "}
-                                    {canApproveRecord && (
-                                      <button type="button" onClick={() => itemApprove(pid)}>
-                                        {" "}
-                                        Approve {pid}{" "}
-                                      </button>
-                                    )}{" "}
-                                    {canActMeeting && recReview.data.stateValid === true && (
-                                      <button type="button" onClick={() => itemDiscard(pid)}>
-                                        {" "}
-                                        Discard {pid}{" "}
-                                      </button>
-                                    )}{" "}
-                                    {canActMeeting && recReview.data.stateValid === true && (
-                                      <>
-                                        <label>
-                                          {" "}
-                                          Revised text for {pid}{" "}
-                                          <textarea
-                                            aria-label={"Revised text for " + pid}
-                                            className="human-editor-text"
-                                            value={itemTexts[tkey] ?? ""}
-                                            rows={2}
-                                            onChange={(e) => {
-                                              const v = e.target.value;
-                                              itemTextRev.current[tkey] = (itemTextRev.current[tkey] ?? 0) + 1;
-                                              setItemTexts((old) => ({ ...old, [tkey]: v }));
-                                            }}
-                                            placeholder="Write the revised decision"
-                                          />{" "}
-                                        </label>{" "}
-                                        <button type="button" onClick={() => itemRevise(pid)}>
-                                          {" "}
-                                          Revise {pid}{" "}
-                                        </button>{" "}
-                                      </>
-                                    )}
-                                  </div>
-                                </li>
-                              );
-                            })}
-                          </ol>{" "}
+  {(recReview.data.pending ?? []).map((pid, idx) => {
+    const authItems = parseRecordItems(((authDraft as RecordDraft | undefined)?.itemsJson ?? ""));
+    const found = authItems.items.find((it) => it.key === pid);
+    const ptext = found ? found.text : "";
+    const tkey = editKey((authDraft as RecordDraft).id, pid);
+    const n = idx + 1;
+    const checked = selItems.indexOf(pid) >= 0;
+    return (
+      <li key={pid} className="human-item">
+        <div className="human-item-body">
+          <label className="human-item-check">
+            <input type="checkbox" aria-label={"Select decision " + String(n)} checked={checked}
+              onChange={(e) => setSelItems(checked ? selItems.filter((x) => x !== pid) : [...selItems, pid])} />
+          </label>
+          <span className="human-item-text">{ptext === "" ? "(decision text unavailable)" : ptext}</span>{" "}
+          {canApproveRecord && (
+            <button type="button" onClick={() => itemApprove(pid)} aria-label={"Approve decision " + String(n)}>
+              {" "}Approve decision {n}{" "}
+            </button>
+          )}{" "}
+          {canContributeReview && (
+            <button type="button" onClick={() => itemDiscard(pid)} aria-label={"Set aside decision " + String(n)}>
+              {" "}Set aside decision {n}{" "}
+            </button>
+          )}{" "}
+          {canContributeReview && (
+            <>
+              <label>
+                {" "}Revised text for decision {n}{" "}
+                <textarea aria-label={"Revised text for decision " + String(n)} className="human-editor-text"
+                  value={itemTexts[tkey] ?? ""} rows={2}
+                  onChange={(e) => { const v = e.target.value; itemTextRev.current[tkey] = (itemTextRev.current[tkey] ?? 0) + 1; setItemTexts((old) => ({ ...old, [tkey]: v })); }}
+                  placeholder="Write the revised decision" />{" "}
+              </label>{" "}
+              <button type="button" onClick={() => itemRevise(pid)} aria-label={"Revise decision " + String(n)}>
+                {" "}Revise decision {n}{" "}
+              </button>{" "}
+            </>
+          )}
+        </div>
+      </li>
+    );
+  })}
+</ol>{" "}
                         </div>
                       )}{" "}
                       {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.notes ?? []).length > 0 && (
@@ -8765,7 +8806,7 @@ const testModel = useMutation({
                               <div className="human-item-body">
                                 <span className="human-item-text">{n.title === "" ? "(untitled note)" : n.title}</span>{" "}
                                 <StatusChip label={n.kind === "secretary-note" ? "Secretary provisional note" : n.kind === "secretary-briefing" ? "Secretary briefing" : n.kind === "note" ? "Working note" : n.kind === "briefing" ? "Briefing" : n.kind} tone={n.kind === "secretary-note" || n.kind === "secretary-briefing" ? "progress" : "open"} />{" "}
-                                <p>{n.body === "" ? "(no text)" : n.body}</p>{" "}
+                                <p>{humanNoteBody(n.body) === "" ? "(no text)" : humanNoteBody(n.body)}</p>{" "}
                               </div>
                             </div>
                           ))}{" "}
@@ -8779,9 +8820,9 @@ const testModel = useMutation({
                           {(recReview.data.evidence ?? []).map((c, i) => (
                             <div key={c.itemId + ":" + c.kind + ":" + String(i)} className="human-item">
                               <div className="human-item-body">
-                                <span className="human-item-text">{c.title === "" ? (c.missing ? "Withheld excerpt" : "Supporting excerpt") : c.title}</span>{" "}
+                                <span className="human-item-text">{c.missing ? "Withheld excerpt" : humanEvidenceTitle(c.title, c.kind, c.version ?? null)}</span>{" "}
                                 <StatusChip label={c.kind === "source" ? "Source excerpt" : c.kind === "direction" ? "Adopted direction" : c.kind === "note" ? "Note" : c.kind === "record" ? "Approved record" : c.kind === "message" ? "Meeting message" : c.kind === "dossier" ? "Advisor profile" : "Reference"} tone={c.missing ? "muted" : c.currentEligible ? "done" : "progress"} />{" "}
-                                {c.missing ? (<p className="muted">No longer readable in this review.</p>) : (<p>{c.excerpt}</p>)}{" "}
+                                {c.missing ? (<p className="muted">No longer readable in this review.</p>) : (<p>{humanEvidenceExcerpt(c.excerpt, c.kind)}</p>)}{" "}
                               </div>
                             </div>
                           ))}{" "}
@@ -8807,7 +8848,7 @@ const testModel = useMutation({
                           <h4>Version history</h4>{" "}
                           <p>
                             {" "}
-                            Version {recDetail.data.version} of this review · meeting input {recReview.data.meetingWatermark} ·{" "}
+                            Version {(authDraft as RecordDraft).version} · reviewed input {(authDraft as RecordDraft).watermark} · current input {recReview.data.meetingWatermark} ·{" "}
                             {recReview.data.historyCount} recorded decisions.{" "}
                           </p>{" "}
                           {(recReview.data.predecessors ?? []).length > 0 && (
@@ -8815,9 +8856,9 @@ const testModel = useMutation({
                               {" "}
                               Earlier version{(recReview.data.predecessors ?? []).length === 1 ? "" : "s"}:{" "}
                               {(recReview.data.predecessors ?? []).map((pp) => {
-                                const pv = (recs.data ?? []).find((r) => r.id === pp)?.version;
-                                return pv === undefined ? (
-                                  <span key={pp} className="muted">an earlier version (not in the recent list)</span>
+                                const pv = linkedVersions[pp] ?? (recs.data ?? []).find((r) => r.id === pp)?.version;
+                                return pv === undefined || pv === -1 ? (
+                                  <span key={pp} className="muted">an earlier version (loading or unavailable)</span>
                                 ) : (
                                   <button key={pp} type="button" onClick={() => setRecId(pp)}>
                                     {" "}
@@ -8830,11 +8871,11 @@ const testModel = useMutation({
                           {(recReview.data.successors ?? []).length > 0 && (
                             <p role="status">
                               {" "}
-                              A newer version replaced this review. Continue here:{" "}
+                              A newer version exists for this review. Continue here:{" "}
                               {(recReview.data.successors ?? []).map((sp) => {
-                                const sv = (recs.data ?? []).find((r) => r.id === sp)?.version;
-                                return sv === undefined ? (
-                                  <span key={sp} className="muted">a newer version (not in the recent list)</span>
+                                const sv = linkedVersions[sp] ?? (recs.data ?? []).find((r) => r.id === sp)?.version;
+                                return sv === undefined || sv === -1 ? (
+                                  <span key={sp} className="muted">a newer version (loading or unavailable)</span>
                                 ) : (
                                   <button key={sp} type="button" onClick={() => setRecId(sp)}>
                                     {" "}
@@ -8867,11 +8908,10 @@ const testModel = useMutation({
                       {(() => {
                         let hist: { seq?: unknown; actor?: unknown; action?: unknown; itemId?: unknown; oldText?: unknown; newText?: unknown }[] = [];
                         try {
-                          const raw: unknown = JSON.parse(recDetail.data.historyJson ?? "[]");
+                          const raw: unknown = JSON.parse((authDraft as RecordDraft)?.historyJson ?? "[]");
                           if (Array.isArray(raw)) hist = raw.filter((e) => e !== null && typeof e === "object");
                         } catch { hist = []; }
                         if (hist.length === 0) return null;
-                        const actionLabel = (a: string) => a === "approve" ? "Approved" : a === "revise" ? "Revised" : a === "discard" ? "Set aside" : a === "refresh" ? "Refreshed to current meeting input" : a === "discard-remaining" ? "Remaining set aside" : a === "revise-branch" || a === "revise-child" ? "Branched a new version" : a === "amend-branch" || a === "amend-child" ? "Amended" : a;
                         const shown = hist.slice(-30);
                         return (
                           <div className="card">
@@ -8882,14 +8922,13 @@ const testModel = useMutation({
                               {shown.map((h, i) => {
                                 const nt = typeof h.newText === "string" ? h.newText : "";
                                 const ot = typeof h.oldText === "string" ? h.oldText : "";
-                                const txt = nt !== "" ? nt : ot;
-                                const act = typeof h.action === "string" ? h.action : "";
+                                const hv = describeHistoryEntry(typeof h.action === "string" ? h.action : "", ot, nt);
                                 const who = typeof h.actor === "string" ? h.actor : "";
                                 const sq = typeof h.seq === "number" ? String(h.seq) : String(i);
                                 return (
                                   <li key={sq + "-" + String(i)} className="human-item">
                                     <div className="human-item-body">
-                                      <span className="human-item-text">{actionLabel(act)}{txt !== "" ? ": " + (txt.length > 220 ? txt.slice(0, 220) + "…" : txt) : ""}</span>{" "}
+                                      <span className="human-item-text">{hv.headline}{hv.detail !== "" ? ": " + (hv.detail.length > 220 ? hv.detail.slice(0, 220) + "…" : hv.detail) : ""}</span>{" "}
                                       {who !== "" && (<span className="muted">by {who}</span>)}{" "}
                                     </div>
                                   </li>
@@ -8899,17 +8938,50 @@ const testModel = useMutation({
                           </div>
                         );
                       })()}{" "}
-                      <RecordItemList
-                        itemsJson={recDetail.data.itemsJson}
-                        selectable={canApproveRecord}
-                        selected={selItems}
-                        onToggle={(key, checked) =>
-                          setSelItems(
-                            checked ? [...selItems, key] : selItems.filter((x) => x !== key),
-                          )
+                      {" "}
+                                            {(() => {
+                        if (isActionableReview) return null;
+                        const ad = authDraft as RecordDraft;
+                        let texts: string[] = [];
+                        try {
+                          const parsed = parseRecordItems(ad.itemsJson ?? "[]");
+                          const ap = new Set(((recReview.data?.approved ?? []) as string[]));
+                          texts = parsed.items.filter((it) => ap.has(it.key)).map((it) => it.text);
+                        } catch { texts = []; }
+                        if (texts.length === 0) {
+                          try {
+                            const gd = ad as unknown as { approvedItems?: { text?: unknown }[] };
+                            const src = gd.approvedItems ?? [];
+                            texts = src.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
+                          } catch { texts = []; }
                         }
-                      />{" "}
-                      <div className="card">
+                        if (texts.length === 0) {
+                          try {
+                            const gd2 = ad as unknown as { effective?: { approvedItems?: { text?: unknown }[] } };
+                            const src2 = gd2.effective?.approvedItems ?? [];
+                            texts = src2.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
+                          } catch { texts = []; }
+                        }
+                        if (texts.length === 0) return null;
+                        return (
+                          <div className="card">
+                            {" "}
+                            <h4>Approved decisions</h4>{" "}
+                            <p>No pending decisions remain. Approved text below is the current record.</p>{" "}
+                            <ol className="human-item-list">
+                              {texts.map((tx, i) => (
+                                <li key={"ap-" + String(i)} className="human-item">
+                                  <div className="human-item-body">
+                                    <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
+                                  </div>
+                                </li>
+                              ))}
+                            </ol>{" "}
+                          </div>
+                        );
+                      })()}{" "}
+
+<div className="card">
                         {" "}
                         <h3>Compare with another version</h3>{" "}
                         <label>
@@ -8922,7 +8994,7 @@ const testModel = useMutation({
                             {" "}
                             <option value="">— pick —</option>{" "}
                             {(recs.data ?? [])
-                              .filter((r) => r.id !== recDetail.data.id)
+                              .filter((r) => r.id !== (authDraft as RecordDraft).id)
                               .map((r) => (
                                 <option key={r.id} value={r.id}>
                                   {" "}
@@ -8935,11 +9007,11 @@ const testModel = useMutation({
                           (() => {
                             const other = (recs.data ?? []).find((r) => r.id === cmpVer);
                           if (!other) return null;
-                            const olderFirst = recDetail.data.version >= other.version;
+                            const olderFirst = (authDraft as RecordDraft).version >= other.version;
                             return (
                               <RecordComparison
-                                prevJson={olderFirst ? other.itemsJson : recDetail.data.itemsJson}
-                                curJson={olderFirst ? recDetail.data.itemsJson : other.itemsJson}
+                                prevJson={olderFirst ? other.itemsJson : (authDraft as RecordDraft).itemsJson}
+                                curJson={olderFirst ? (authDraft as RecordDraft).itemsJson : other.itemsJson}
                               />
                             );
                           })()
@@ -8949,11 +9021,11 @@ const testModel = useMutation({
                         {" "}
                         {canApproveRecord && (<button onClick={() => approveRec(false)}>
                           {" "}
-                          Approve selected{" "}
+                          Approve selected ({selItems.length}){" "}
                         </button>)}{" "}
                         {canApproveRecord && (<button onClick={() => approveAllFresh()}>
                           {" "}
-                          Approve all{" "}
+                          Approve all ({reviewPendingCount}){" "}
                         </button>)}{" "}
                         {!canApproveRecord && (<span className="muted">Approval requires a manage grant and a current valid review.</span>)}{" "}
                         {canActMeeting && (<button type="button" onClick={() => exportRecord("concise")}>
@@ -8967,11 +9039,11 @@ const testModel = useMutation({
                         </button>)}{" "}
                       </div>{" "}
                       <RecordItemEditor
-                        draftKey={recDetail.data.id + "-v" + recDetail.data.version}
+                        draftKey={(authDraft as RecordDraft).id + "-v" + (authDraft as RecordDraft).version}
                         initialJson={revText}
                         onChange={(json) => { try { revTextRev.current++; } catch { /* noop */ } setRevText(json); }}
                       />{" "}
-                      {canActMeeting && (<button onClick={() => reviseRec(false)}>
+                      {canContributeReview && (<button onClick={() => reviseRec(false)}>
                         {" "}
                         Request revision (new version){" "}
                       </button>)}{" "}
@@ -8979,7 +9051,7 @@ const testModel = useMutation({
                         {" "}
                         Amend approved record{" "}
                       </button>)}{" "}
-                      {canActMeeting && (<button onClick={discardRec}>Discard draft</button>)}{" "}
+                      {canContributeReview && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
                   )}{" "}
                 </>

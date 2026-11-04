@@ -1893,7 +1893,7 @@ public static partial class RecordsOps
     var discarded = ParseIdList(d.DiscardedJson);
     var pending = PendingIds(d);
     var notes = s.Notes.Values
-      .Where(n => n.MeetingId == d.MeetingId && n.Provisional && (n.Kind == "note" || n.Kind == "briefing" || n.Kind == "secretary-note" || n.Kind == "secretary-briefing"))
+      .Where(n => n.MeetingId == d.MeetingId && n.Provisional && (n.Kind == "note" || n.Kind == "briefing" || n.Kind == "secretary-note" || n.Kind == "secretary-briefing") && n.NoteStatus == "current")
       .OrderByDescending(n => n.CreatedAt).Take(20)
       .Select(n => new { n.Id, n.Kind, n.Title, n.Body, n.CreatedAt }).ToList();
     List<object> recent = new();
