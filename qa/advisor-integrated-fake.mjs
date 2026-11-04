@@ -1,4 +1,8 @@
-// qa/advisor-integrated-fake.mjs - integrated fake for advisor-integrated QA ONLY (never shipped). Combines deterministic research compile (COMPILE-CHARACTER-PARAGRAPHS echoing name), YOUR TURN/bid pacing, and structured secretary JSON echoing the owned run marker. Reuses research 3-paragraph outputs + chat logs + QA-SLEEP pacing from qa/fake-provider and structured secretary schema from qa/secretary-fake. Primary starts it on 15302; this file never runs services itself.
+// qa/advisor-integrated-fake.mjs - integrated fake for advisor-integrated QA ONLY (never shipped).
+// F10 holds contract (851-final, CODE ONLY doc): __hold/__release/__holds retain overlap-A/B through
+// observations; /chat completions awaits the held overlap marker up to 120s so backend rows stay
+// live deterministically (both-live ONE snapshot, A-terminal/B-live ONE snapshot while B HELD until
+// App consumption of its delivered /activity payload). No auto-expire inside the test window. Combines deterministic research compile (COMPILE-CHARACTER-PARAGRAPHS echoing name), YOUR TURN/bid pacing, and structured secretary JSON echoing the owned run marker. Reuses research 3-paragraph outputs + chat logs + QA-SLEEP pacing from qa/fake-provider and structured secretary schema from qa/secretary-fake. Primary starts it on 15302; this file never runs services itself.
 import http from "node:http";
 import { findDelimiters } from "./voice-multipart.mjs";
 import fs from "node:fs";
