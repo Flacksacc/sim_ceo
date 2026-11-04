@@ -373,7 +373,7 @@ public sealed class Session
 
 public sealed class SpendCap
 {
-  public string Mode { get; set; } = "";
+  public string Mode { get; set; } = "warn";
   public decimal? MonthlyCapUsd { get; set; }
 }
 
