@@ -265,7 +265,7 @@ async function openMeet() {
 }
 async function openRoster() {
   await openHash("#/roster?board=b-alpha");
-  await page.getByRole("heading", { name: /My Advisor Roster/ }).first().waitFor({ timeout: 20000 });
+  await page.locator('section[aria-label="My Advisor Roster"]').first().waitFor({ timeout: 20000 });
   await page.locator("aside.listpanel button.lprow", { hasText: "QA Sage" }).first().waitFor({ timeout: 20000 });
 }
 async function selectRosterEntry() {
