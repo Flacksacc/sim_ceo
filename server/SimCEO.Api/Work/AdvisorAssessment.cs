@@ -59,7 +59,8 @@ public static class AdvisorAssessment
 
   public static async Task<string> CompleteAsync(ModelGateway gateway, string model, string replyPurpose, string packet,
     int tokens, CancellationToken ct = default, bool ownerOverride = false, Guid? boardId = null, Guid? meetingId = null,
-    IReadOnlyList<Message>? peers = null, Guid self = default, Action? ensureFresh = null, Action? onAssessed = null)
+    IReadOnlyList<Message>? peers = null, Guid self = default, Action? ensureFresh = null, Action? onAssessed = null,
+    Func<string, Task>? onText = null)
   {
     peers ??= Array.Empty<Message>();
     ensureFresh?.Invoke();
@@ -77,16 +78,38 @@ public static class AdvisorAssessment
     onAssessed?.Invoke();
     var writerPacket = packet + WritingInstructions + JsonSerializer.Serialize(assessment, JsonOptions) + WriterContract;
     if (replyPurpose == "advisor-reply") writerPacket += ContextCurator.AdvisorReplySuffix;
+    var partial = new System.Text.StringBuilder();
+    var lastDelta = System.Diagnostics.Stopwatch.StartNew();
+    var emitted = false;
     var reply = await gateway.CompleteAsync(model, replyPurpose, writerPacket, tokens, 2048, ct,
-      ownerOverride: ownerOverride, boardId: boardId, meetingId: meetingId, truncatePrompt: false);
+      ownerOverride: ownerOverride, boardId: boardId, meetingId: meetingId, truncatePrompt: false,
+      onDelta: onText is null ? null : async piece => {
+        partial.Append(piece); ct.ThrowIfCancellationRequested();
+        if (emitted && lastDelta.ElapsedMilliseconds < 60) return;
+        ensureFresh?.Invoke();
+        await onText(PreviewText(partial.ToString()));
+        emitted = true; lastDelta.Restart();
+      });
     // The validated assessment owns the stance and thread target, rather than
     // trusting a second model-generated label or a made-up message sequence.
     var clean = MessageTags.SplitStance(Regex.Replace(reply, @"^\s*\[reply-to:\s*\d+\]\s*", "", RegexOptions.IgnoreCase)).clean;
     if (string.IsNullOrWhiteSpace(clean) || clean.Trim().Equals("ABSTAIN", StringComparison.OrdinalIgnoreCase))
       throw new ProviderException(502, "The advisor did not finish its assessed response. Retry the response.");
+    if (onText is not null) { ensureFresh?.Invoke(); await onText(clean); }
     if (replyPurpose != "advisor-reply") return clean;
     var stance = assessment.Position switch { "support" => "Agrees", "challenge" => "Disagrees", "mixed" => "Mixed assessment", "insufficient" => "Needs context", _ => null };
     return (assessment.PeerSequence.HasValue ? $"[reply-to: {assessment.PeerSequence.Value}] " : "") + clean
       + (stance is null ? "" : $" [stance: {stance}]");
+  }
+
+  public static string PreviewText(string text)
+  {
+    var clean = Regex.Replace(text, @"\[(?:stance|tag|reply-to|source|record):[^\]]*(?:\]|$)", "", RegexOptions.IgnoreCase);
+    var last = clean.LastIndexOf('[');
+    if (last >= 0 && !clean[last..].Contains(']')) {
+      var tail = clean[(last + 1)..].ToLowerInvariant();
+      if (new[] { "stance:", "tag:", "reply-to:", "source:", "record:" }.Any(key => key.StartsWith(tail) || tail.StartsWith(key))) clean = clean[..last];
+    }
+    return clean;
   }
 }

@@ -61,6 +61,21 @@ Completion requires independent AI review, primary inspection and meaningful ver
 
 Deploy coherent verified slices as ready. Notify the user when all advisor-related work is tested and live; do not label a component or undeployed branch as completed advisor functionality.
 
+## Live replies and formatting
+
+Meeting advisor replies and direct roster chat stream visible text while the
+writer generates it. Assessment remains private. Parallel advisors have separate
+previews; successful saved messages replace those previews without duplicates.
+Interrupted, stale or rejected output is removed rather than saved as complete.
+Final publication retains the existing authorization and context checks.
+
+Advisors may use bold, italics, underlining, bullets and numbered lists. Both
+surfaces render the same sanitized formatting, including existing replies.
+Scripts, embedded images, unsafe links and arbitrary HTML are not permitted.
+Model instructions request concise readable formatting; partial delimiters are
+suppressed while streaming. Scrolling follows live replies only while the user
+is already at the bottom.
+
 ## Latest meeting feedback
 
 During a meeting, show every board member with their selected portrait and include the secretary in the same visible participant area. Show actual responding activity for each participant; an approved seat is not evidence that the advisor is responding. Use a clear fallback avatar if no portrait is available. Keep the participant area visible on desktop and usable on narrow screens. Decisions and Evidence belong inside the existing Meeting settings menu, retaining their review controls, permissions and source navigation.

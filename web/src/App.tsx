@@ -1,3 +1,5 @@
+import { readAdvisorStream } from "./stream-request";
+import { AdvisorMessage } from "./advisor-message";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
@@ -573,6 +575,18 @@ const getPublic = <T,>(u: string): Promise<T> =>
   fetchPublic<T>(u, {});
 const upload = <T,>(u: string, f: FormData): Promise<T> =>
   fetchAuth<T>(u, { method: "POST", headers: withUser(), body: f });
+const streamPost = async <T,>(url: string, body: unknown, onText: (text: string) => void, signal?: AbortSignal): Promise<T> => {
+  const identity = { epoch: epochNow(), token: currentToken(), user: currentUser() };
+  const fresh = () => { if (epochNow() !== identity.epoch || currentToken() !== identity.token || currentUser() !== identity.user) throw Object.assign(new Error("Stale response discarded."), { stale: true }); };
+  try {
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...withUser() }, body: JSON.stringify(body), signal });
+    return await readAdvisorStream<T>(response, onText, fresh);
+  } catch (error) {
+    fresh();
+    if ((error as { status?: number }).status === 401 && identity.token) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: identity }));
+    throw error;
+  }
+};
 const put = <T,>(u: string, b: unknown): Promise<T> =>
   fetchAuth<T>(u, { method: "PUT", headers: { "Content-Type": "application/json", ...withUser() }, body: JSON.stringify(b ?? {}) });
 const del = <T,>(u: string): Promise<T> =>
@@ -1846,6 +1860,9 @@ export default function App() {
     enabled: !!meetingId && meetingOk && !sessGate,
     refetchInterval: 4000,
   });
+  type AdvisorDraft = { operationId: string; advisorId: string; advisorName: string; wave: number; revision: number; content: string; status: string; sequence?: number };
+  const [advisorDrafts, setAdvisorDrafts] = useState<Record<string, AdvisorDraft>>({});
+  useEffect(() => { setAdvisorDrafts(rows => Object.fromEntries(Object.entries(rows).filter(([, row]) => !row.sequence || !(messages.data ?? []).some(m => m.sequence === row.sequence)))); }, [messages.data]);
   const hubRef = useRef<HubConnection | null>(null);
   const [live, setLive] = useState(false);
   // Hub generation: bumped on every confirmed domain restore so the
@@ -1866,6 +1883,9 @@ export default function App() {
   useEffect(() => {
     if (!meetingId || !meetingOk) return;
     let cancelled = false;
+    const retiredDrafts = new Set<string>();
+    const retiredOperations = new Set<string>();
+    setAdvisorDrafts({});
     const conn = new HubConnectionBuilder()
       .withUrl("/hubs/board", { accessTokenFactory: () => currentToken() })
       .withAutomaticReconnect()
@@ -1896,6 +1916,33 @@ export default function App() {
       qc.invalidateQueries({ queryKey: ["messages", meetingId] });
       qc.invalidateQueries({ queryKey: ["delivery", meetingId] });
     };
+    conn.on("advisor-draft", (payload: AdvisorDraft & { meetingId: string; boardId: string }) => {
+      if (cancelled || payload.meetingId !== meetingId || payload.boardId !== boardId || !payload.operationId) return;
+      const key = payload.operationId + ":" + payload.advisorId + ":" + payload.wave;
+      if (payload.status === "ended") {
+        retiredOperations.add(payload.operationId);
+        if (retiredOperations.size > 256) retiredOperations.delete(retiredOperations.values().next().value!);
+        setAdvisorDrafts(rows => Object.fromEntries(Object.entries(rows).filter(([, row]) => row.operationId !== payload.operationId || row.status === "committed")));
+        return;
+      }
+      if (retiredOperations.has(payload.operationId)) return;
+      if (payload.status === "discarded") {
+        retiredDrafts.add(key); setAdvisorDrafts(rows => { const next = { ...rows }; delete next[key]; return next; }); return;
+      }
+      if (payload.status === "committed") {
+        retiredDrafts.add(key);
+        setAdvisorDrafts(rows => {
+          if (!rows[key]) return rows;
+          const next = { ...rows };
+          if ((qc.getQueryData<Msg[]>(["messages", meetingId]) ?? []).some(m => m.sequence === payload.sequence)) delete next[key];
+          else next[key] = { ...rows[key], ...payload };
+          return next;
+        });
+        return;
+      }
+      if (retiredDrafts.has(key) || payload.status !== "streaming" || typeof payload.content !== "string" || payload.content.length > 65536) return;
+      setAdvisorDrafts(rows => rows[key] && rows[key].revision >= payload.revision ? rows : { ...rows, [key]: payload });
+    });
     conn.on("message", onMsg);
     conn.on("run-complete", onRun);
     const onActivity = (payload: any) => {
@@ -1936,11 +1983,12 @@ export default function App() {
     // gates fresh snapshots.
     conn.onreconnecting(() => {
       if (cancelled) return;
-      try { setLive(false); } catch {}
+      try { setLive(false); setAdvisorDrafts({}); } catch {}
       try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
     });
     conn.onclose(() => {
       if (cancelled) return;
+      setAdvisorDrafts({});
       try { setLive(false); } catch {}
     });
     conn.onreconnected(async () => {
@@ -1959,6 +2007,7 @@ export default function App() {
     });
     return () => {
       cancelled = true;
+      setAdvisorDrafts({});
       setLive(false);
       conn.stop();
       hubRef.current = null;
@@ -2065,6 +2114,11 @@ export default function App() {
   }, [meetingId]);
   const [excerpts, setExcerpts] = useState<Excerpt[]>([]);
   const [atBottom, setAtBottom] = useState(true);
+  useEffect(() => {
+    if (!atBottom || Object.keys(advisorDrafts).length === 0) return;
+    const frame = requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight }));
+    return () => cancelAnimationFrame(frame);
+  }, [advisorDrafts, atBottom]);
   const [newCount, setNewCount] = useState(0);
   const lastSeen = useRef(0);
   const latestSeq = msgList.length ? msgList[msgList.length - 1].sequence : 0;
@@ -7412,7 +7466,7 @@ const testModel = useMutation({
                       <label>{" "}Sample question{" "}
                         <input value={aq} onChange={(e) => setAq(e.target.value)} placeholder="Ask the starter question" />{" "}</label>{" "}
                       <button disabled={!canActMeeting || !aq.trim() || runAud.isPending} onClick={() => runAud.mutate()}>{" "}Run audition{" "}</button>{" "}
-                      {audResult && <div className="btext">{audResult}</div>}{" "}
+                      {audResult && <div className="btext"><AdvisorMessage text={audResult} /></div>}{" "}
                       <h4>{" "}Research dossier{" "}</h4>{" "}
                       <button onClick={() => research(selRow.entry.id)}>{" "}Research dossier{" "}</button>{" "}
                       <DossierView raw={dossier} />{" "}
@@ -7460,7 +7514,7 @@ const testModel = useMutation({
                           complete={selRow.complete}
                           missing={selRow.missing}
                           canChat={!!selRow}
-                          api={{ post }}
+                          api={{ post, streamPost }}
                         />
                       } references={<AdvisorReferences
                         entry={selRow.entry}
@@ -8053,9 +8107,9 @@ const testModel = useMutation({
                                                   "#" + m.parentSequence}{" "}
                                               </button>
                                             )}{" "}
-                                            <div className="btext">
+                                            <div className={isLead ? "btext" : "btext formatted"}>
                                               {" "}
-                                              {parsed.text}{" "}
+                                              {isLead ? parsed.text : <AdvisorMessage text={parsed.text} />}{" "}
                                             </div>{" "}
                                             <div className="mactions">
                                               {" "}
@@ -8124,6 +8178,14 @@ const testModel = useMutation({
                                 </div>{" "}
                               </div>{" "}
                             </div>{" "}
+                            {Object.entries(advisorDrafts).filter(([, row]) => !row.sequence || !(messages.data ?? []).some(m => m.sequence === row.sequence)).map(([key, row]) => (
+                              <div className="msg-row advisor advisor-stream" data-stream-id={key} key={key} aria-label="Advisor response in progress" aria-busy={row.status !== "committed"}>
+                                <div className="bubble">
+                                  <div className="bhead"><MessagePortrait name={row.advisorName} url={presenceUrls.get(row.advisorId) ?? null} /><b>{row.advisorName}</b><span className="advisor-stream-status">{row.status === "committed" ? "Response saved" : "Responding…"}</span></div>
+                                  <AdvisorMessage text={parseMsg(row.content).text} streaming={row.status !== "committed"} />
+                                </div>
+                              </div>
+                            ))}
                             {runDiscussion.isPending && (
                               <div className="thinking" role="status">
                                 <span

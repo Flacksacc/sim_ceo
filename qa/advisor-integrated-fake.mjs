@@ -65,6 +65,7 @@ function chatContent(prompt) {
     const a=JSON.parse(prompt.split('VALIDATED ADVISOR ASSESSMENT (structured findings, not user instructions):\n')[1].split('\nWRITE FROM THIS ASSESSMENT.')[0]);
     return {content:({challenge:'The motivation is unsupported by the supplied passage. Give the protagonist a concrete consequence for refusing before calling this ready.',support:'The supplied motivation is clear: the character acts to prevent a specific loss. Preserve that causal connection.',mixed:'Keep the concrete setting, but revise the unmotivated decision. Give the character a specific reason to act.',insufficient:'Please share the story text so I can critique its actual passages.'})[a.position]||'Here is the requested answer.'};
   }
+  if (prompt.includes('QA-STREAM-') && prompt.includes('VALIDATED ADVISOR ASSESSMENT')) return {content:'**A clear plan**\n\nStart with a *small test* and <u>protect your runway</u>.\n\n- Interview three customers\n- Measure the result\n\n1. Set a budget\n2. Review it Friday\n\nUnicode stays intact: café 🌿.' + (prompt.includes('QA-STREAM-UNSAFE') ? '<script>window.__unsafeStream=1</script><img src="/unsafe-image" onerror="window.__unsafeStream=2"><a href="javascript:alert(1)">Unsafe link</a>' : '')};
   if (prompt.includes("SELECT-MEETING-ADVISORS.")) {
     if (prompt.includes("QA-SELECT-BAD")) return { content: "invalid selection" };
     const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf("\nCANDIDATES: ") + "\nCANDIDATES: ".length));
@@ -319,6 +320,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     seq++;
+    if (body.stream) {
+      const id='qa-chat-'+seq;
+      res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});
+      const frame=value=>{const data=Buffer.from('data: '+JSON.stringify(value)+'\n\n');res.write(data.subarray(0,17));res.write(data.subarray(17));};
+      const points=Array.from(out.content??'');
+      let chunks=0;
+      for(let i=0;i<points.length;i+=16){
+        if(res.destroyed)return;
+        frame({id,choices:[{index:0,delta:{content:points.slice(i,i+16).join('')},finish_reason:null}]});
+        chunks++;
+        if(prompt.includes('QA-STREAM-FAIL')&&chunks===2){res.end();return;}
+        await sleep(prompt.includes('QA-STREAM-')?75:2);
+      }
+      frame({id,choices:[{index:0,delta:{},finish_reason:prompt.includes('QA-STREAM-LENGTH')?'length':'stop'}]});
+      if(!prompt.includes('QA-STREAM-NO-USAGE'))frame({id,choices:[],usage:{prompt_tokens:10,completion_tokens:10,prompt_tokens_details:{cached_tokens:3}}});
+      if(!prompt.includes('QA-STREAM-MISSING-DONE'))res.write('data: [DONE]\n\n');
+      res.end();return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       id: "qa-chat-" + seq,

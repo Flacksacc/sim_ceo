@@ -77,24 +77,28 @@ public static class RosterChatEndpoints
       var chatPacket = CharacterBehavior.FitEssentialFirst(essentialChat, historyLines.TakeLast(10).ToList(), AdvisorAssessment.PacketBudget("roster-chat", CharacterBehavior.ChatInputTokens));
       if (chatPacket is null)
         return Results.Json(new { error = "Chat prompt over budget." }, statusCode: 413);
+      var stream = new AdvisorStreamResponse(req);
       try
       {
         answer = await AdvisorAssessment.CompleteAsync(gw, ModelPolicy.SparkStandard, "roster-chat",
           chatPacket, CharacterBehavior.ChatInputTokens, req.HttpContext.RequestAborted, ownerOverride: PeopleOps.IsOwner(req),
-          ensureFresh: () => { if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) throw new ChatChangedException(failure); });
+          ensureFresh: () => { if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) throw new ChatChangedException(failure); },
+          onText: stream.Enabled ? stream.Push : null);
       }
-      catch (ChatChangedException changed) { return changed.Result; }
-      catch (OperationCanceledException) { return Results.StatusCode(499); }
-      catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
+      catch (ChatChangedException changed) { return await stream.Finish(changed.Result); }
+      catch (OperationCanceledException) { return await stream.Finish(Results.StatusCode(499)); }
+      catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return await stream.Finish(PeopleOps.ModelError(ex)); }
       // Post-await recheck under ONE RootGate THROUGH the immutable final
       // response: authority, restore epoch, archive state, roster access and
       // canonical version are read at one boundary, so a restore/edit between
       // two reads cannot mix an old profile with a new epoch check.
+      IResult result;
       lock (s.RootGate)
       {
-        if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) return failure;
+        if (CheckSnapshot(s, req, id, snapVersion, userContext, restorePin) is { } failure) result = failure;
+        else {
         var fresh = s.Roster[id];
-        return Results.Ok(new
+        result = Results.Ok(new
         {
           answer,
           rosterId = fresh.Id,
@@ -109,7 +113,9 @@ public static class RosterChatEndpoints
           stored = false,
           note = "Roster advisor chat is isolated; never creates meeting messages, records, or agent memory.",
         });
+        }
       }
+      return await stream.Finish(result);
     });
   }
   private sealed class ChatChangedException(IResult result) : Exception

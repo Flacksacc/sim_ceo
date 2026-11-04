@@ -1,0 +1,15 @@
+.btext.formatted { white-space:normal; }
+.advisor-message { white-space:normal; overflow-wrap:anywhere; line-height:1.6; }
+.advisor-message > :first-child { margin-top:0; }
+.advisor-message > :last-child { margin-bottom:0; }
+.advisor-message p { margin:0 0 .65em; white-space:pre-line; }
+.advisor-message ul,.advisor-message ol { margin:.4em 0 .8em; padding-left:1.5em; }
+.advisor-message li { margin:.2em 0; }
+.advisor-message h1,.advisor-message h2,.advisor-message h3,.advisor-message h4 { font-size:1.05em; margin:.8em 0 .4em; }
+.advisor-message blockquote { margin:.6em 0; padding-left:12px; border-left:3px solid var(--line); color:var(--muted); }
+.advisor-message pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+.advisor-message table { display:block; overflow-x:auto; max-width:100%; border-collapse:collapse; }
+.advisor-message th,.advisor-message td { padding:5px 8px; border:1px solid var(--line); }
+.advisor-stream { margin:10px 0; }
+.advisor-stream .bubble { width:min(760px,100%); }
+.advisor-stream-status { font-size:.75rem; color:var(--muted); }

@@ -731,9 +731,123 @@ public sealed class ModelGateway
     catch (JsonException) { throw new ProviderException(502, RedactedError(502), bounded); }
   }
 
+  private void RecordStreamFailure(Guid callId, string model, string purpose, long elapsed, Exception error,
+    Guid? boardId, Guid? meetingId, string reason)
+  {
+    var known = error.Data["streamUsage"] is string billing && TryParseErrorBillingFull(billing, out _, out _, out _, out _, out _);
+    int input = 0, cached = 0, output = 0; string? id = null;
+    if (known) TryParseErrorBillingFull((string)error.Data["streamUsage"]!, out input, out cached, out output, out id, out _);
+    RecordFull(callId, model, purpose, input, cached, output, elapsed, false, 0, "failed", id,
+      known ? UsagePricing.ChatCost(model, input, cached, output) : null, UsageAccounting.BasisTokens,
+      reason + (known ? "; billed usage preserved" : "; cost unknown"), boardId, meetingId);
+  }
+
+  private sealed class BoundedProviderStream(Stream inner) : Stream
+  {
+    private long consumed;
+    private int Count(int read) { consumed += read; if (consumed > TextBoundBytes) throw new OversizedBodyException("", consumed); return read; }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => consumed; set => throw new NotSupportedException(); }
+    public override int Read(byte[] buffer, int offset, int count) => Count(inner.Read(buffer, offset, count));
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken token = default) => Count(await inner.ReadAsync(buffer, token));
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token) => ReadAsync(buffer.AsMemory(offset, count), token).AsTask();
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+  }
+
+  private async Task<JsonDocument> PostChatStream(string model, string developer, string prompt, int outputTokens,
+    string effort, Func<string, Task> onDelta, CancellationToken ct, string? boundKey)
+  {
+    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    timeout.CancelAfter(WholeOperationTimeoutOverride ?? WholeOperationTimeout);
+    var token = timeout.Token;
+    using var request = new HttpRequestMessage(HttpMethod.Post, $"{Base}/chat/completions");
+    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", boundKey ?? EffectiveKey);
+    request.Content = new StringContent(JsonSerializer.Serialize(new { model, messages = BuildDeliveredMessages(developer, prompt),
+      max_completion_tokens = Math.Clamp(outputTokens, 16, 16000), reasoning_effort = effort, stream = true,
+      stream_options = new { include_usage = true } }), Encoding.UTF8, "application/json");
+    using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+    if (!response.IsSuccessStatusCode || response.Content.Headers.ContentType?.MediaType != "text/event-stream")
+    {
+      var (body, oversized, consumed) = await ReadBoundedBodyAsync(response, BoundFor("/chat/completions", (int)response.StatusCode), token);
+      if (oversized) throw new OversizedBodyException(body, consumed);
+      if (!response.IsSuccessStatusCode) throw new ProviderException((int)response.StatusCode, RedactedError((int)response.StatusCode), body);
+      var fallback = JsonDocument.Parse(body);
+      // Some compatible providers return a completed JSON envelope despite the
+      // stream request. Keep that envelope's accounting/finish validation intact.
+      return fallback;
+    }
+    using var input = await response.Content.ReadAsStreamAsync(token);
+    using var boundedInput = new BoundedProviderStream(input);
+    using var reader = new StreamReader(boundedInput, Encoding.UTF8, true, 4096, leaveOpen: true);
+    var line = new StringBuilder(); var data = new StringBuilder(); var content = new StringBuilder();
+    string? id = null; string? finish = null; JsonElement? usage = null;
+    bool done = false; int consumedChars = 0;
+    async Task Frame()
+    {
+      if (data.Length == 0) return;
+      var value = data.ToString().Trim(); data.Clear();
+      if (value == "[DONE]") { done = true; return; }
+      using var chunk = JsonDocument.Parse(value);
+      var root = chunk.RootElement;
+      if (root.ValueKind != JsonValueKind.Object) throw new JsonException("Invalid provider stream event.");
+      if (root.TryGetProperty("error", out _)) throw new ProviderException(502, "Provider stream failed.", value);
+      if (root.TryGetProperty("id", out var identifier) && identifier.ValueKind == JsonValueKind.String) id ??= identifier.GetString();
+      if (root.TryGetProperty("usage", out var bill) && bill.ValueKind == JsonValueKind.Object && TryReadUsageCached(root, out _, out _, out _)) usage = bill.Clone();
+      if (!root.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array) return;
+      foreach (var choice in choices.EnumerateArray())
+      {
+        if (choice.ValueKind != JsonValueKind.Object) throw new JsonException("Invalid provider stream choice.");
+        if (choice.TryGetProperty("index", out var index)) {
+          if (index.ValueKind != JsonValueKind.Number || !index.TryGetInt32(out var number)) throw new JsonException("Invalid provider stream choice index.");
+          if (number != 0) continue;
+        }
+        if (choice.TryGetProperty("finish_reason", out var reason) && reason.ValueKind == JsonValueKind.String) finish = reason.GetString();
+        if (choice.TryGetProperty("delta", out var delta) && delta.ValueKind == JsonValueKind.Object && delta.TryGetProperty("content", out var text) && text.ValueKind == JsonValueKind.String)
+        {
+          var added = text.GetString() ?? "";
+          if (content.Length + added.Length > TextBoundBytes) throw new OversizedBodyException("", consumedChars);
+          content.Append(added);
+          if (added.Length > 0) await onDelta(added).WaitAsync(token);
+        }
+      }
+    }
+    async Task Line()
+    {
+      var value = line.ToString().TrimEnd('\r'); line.Clear();
+      if (value.Length == 0) await Frame();
+      else if (value.StartsWith("data:", StringComparison.Ordinal)) { if (data.Length > 0) data.Append('\n'); data.Append(value[5..].TrimStart(' ')); }
+      if (data.Length > ErrorBoundBytes) throw new OversizedBodyException("", consumedChars);
+    }
+    var buffer = new char[4096]; int read;
+    try
+    {
+    while (!done && (read = await reader.ReadAsync(buffer.AsMemory(), token)) > 0)
+    {
+      consumedChars += read;
+      if (consumedChars > TextBoundBytes) throw new OversizedBodyException("", consumedChars);
+      for (var i = 0; i < read && !done; i++)
+      {
+        if (buffer[i] == '\n') await Line(); else line.Append(buffer[i]);
+        if (line.Length > ErrorBoundBytes) throw new OversizedBodyException("", consumedChars);
+      }
+    }
+    if (!done) throw new IOException("Provider stream ended before completion.");
+    }
+    catch (Exception ex) { if (usage.HasValue) ex.Data["streamUsage"] = JsonSerializer.Serialize(new { id, usage }); throw; }
+    return JsonDocument.Parse(JsonSerializer.Serialize(new { id, usage, choices = new[] { new { index = 0,
+      finish_reason = finish ?? "incomplete", message = new { role = "assistant", content = content.ToString() } } } }));
+  }
+
   public async Task<string> CompleteAsync(string model, string purpose, string prompt,
     int inputBudget, int outputBudget, CancellationToken ct = default, bool ownerOverride = false,
-    Guid? boardId = null, Guid? meetingId = null, bool truncatePrompt = true, string? boundKey = null)
+    Guid? boardId = null, Guid? meetingId = null, bool truncatePrompt = true, string? boundKey = null,
+    Func<string, Task>? onDelta = null)
   {
     ThrowIfCapped(ownerOverride);
     if (boundKey is not null)
@@ -750,7 +864,9 @@ public sealed class ModelGateway
     JsonDocument doc;
     try
     {
-      doc = await PostJson("/chat/completions", new
+      if (onDelta is not null)
+        doc = await PostChatStream(model, dev, userContent, ensured, effort, onDelta, ct, boundKey);
+      else doc = await PostJson("/chat/completions", new
       {
         model,
         messages = BuildDeliveredMessages(dev, userContent),
@@ -762,6 +878,7 @@ public sealed class ModelGateway
     catch (OversizedBodyException obex)
     {
       sw.Stop();
+      if (obex.Data["streamUsage"] is string) { RecordStreamFailure(callId, model, purpose, sw.ElapsedMilliseconds, obex, boardId, meetingId, "failed: oversized stream"); throw new ProviderException(502, RedactedError(502)); }
       var basisOver = UsagePricing.PriceForOrNull(model) is not null ? UsageAccounting.BasisTokens : UsageAccounting.BasisTokens + "; unknown model";
       var prePid = TryExtractProviderId(obex.Prefix);
       int preIn = 0, preCached = 0, preOut = 0;
@@ -776,7 +893,7 @@ public sealed class ModelGateway
       sw.Stop();
       var knownErr = UsagePricing.PriceForOrNull(model) is not null;
       var basisErr = knownErr ? UsageAccounting.BasisTokens : UsageAccounting.BasisTokens + "; unknown model";
-      var fullErr = pex.FullBody ?? pex.Body;
+      var fullErr = pex.Data["streamUsage"] as string ?? pex.FullBody ?? pex.Body;
       if (TryParseErrorBillingFull(fullErr, out var eIn, out var eCached, out var eOut, out var ePid, out _))
       {
         var eCost = UsagePricing.ChatCost(model, eIn, eCached, eOut);
@@ -795,21 +912,21 @@ public sealed class ModelGateway
     }
     catch (OperationCanceledException ocex)
     {
-      // Cancellation classification is preserved, never wrapped as a 502:
-      // callers distinguish bounded-deadline expiry from client abort.
       sw.Stop();
-      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
-        "failed", null, null, UsageAccounting.BasisTokens,
-        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      RecordStreamFailure(callId, model, purpose, sw.ElapsedMilliseconds, ocex, boardId, meetingId, "cancelled: provider call cancelled after dispatch");
       throw;
     }
     catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
-      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
-        "failed", null, null, UsageAccounting.BasisTokens,
-        "failed: provider transport failure after dispatch: " + ex.GetType().Name + "; cost unknown", boardId, meetingId);
+      RecordStreamFailure(callId, model, purpose, sw.ElapsedMilliseconds, ex, boardId, meetingId, "failed: provider transport failure");
       throw new ProviderException(502, "provider transport failure: " + ex.GetType().Name);
+    }
+    catch (Exception ex)
+    {
+      sw.Stop();
+      RecordStreamFailure(callId, model, purpose, sw.ElapsedMilliseconds, ex, boardId, meetingId, "failed: response delivery interrupted");
+      throw;
     }
     using (doc)
     {

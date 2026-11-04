@@ -1460,6 +1460,9 @@ public static class SimCEOEndpoints
         inFlightDrafts.Clear();
         inFlightDrafts.AddRange(waveAdvisors.Select(async adv =>
         {
+          var lastStreamPush = System.Diagnostics.Stopwatch.StartNew();
+          var sentStream = false;
+          long streamRevision = 0;
           await draftSem.WaitAsync(runCancel.Token);
           try { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "considering", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
           try
@@ -1473,7 +1476,15 @@ public static class SimCEOEndpoints
               ownerOverride: ownerOverride, boardId: m.BoardId, meetingId: id,
               peers: followup ? firstReplies : null, self: adv.Id,
               ensureFresh: () => { lock (s.RootGate) { CheckPacketFreshnessLocked(s, req, dx, m, adv); } },
-              onAssessed: () => { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); });
+              onAssessed: () => { MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "responding", null); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); },
+              onText: async content => {
+                if (content.Length > 65536) throw new ProviderException(502, "Advisor response exceeded the streaming limit.");
+                if (sentStream && lastStreamPush.ElapsedMilliseconds < 60) return;
+                await BoardHub.PublishMeeting(hub, s, id, "advisor-draft", new { boardId = m.BoardId, meetingId = id,
+                  operationId = activityOpId, advisorId = adv.Id, advisorName = adv.BoardRole, wave,
+                  revision = ++streamRevision, status = "streaming", content }, "read");
+                sentStream = true; lastStreamPush.Restart();
+              });
             try
             {
               if (string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith("ABSTAIN", StringComparison.OrdinalIgnoreCase)) MeetingActivity.SetAdvisor(id, activityOpId, adv.Id, adv.BoardRole, "abstained", "abstained");
@@ -1671,7 +1682,15 @@ public static class SimCEOEndpoints
         if (__roundGateOuter is not null) return __roundGateOuter;
         waveFinished.Add(draft.adv.Id);
         foreach (var message in published.Skip(__actPub0))
+        {
           await BoardHub.PublishMeeting(hub, s, id, "message", new { meetingId = id, sequence = message.Sequence }, "read");
+          await BoardHub.PublishMeeting(hub, s, id, "advisor-draft", new { boardId = m.BoardId, meetingId = id,
+            operationId = activityOpId, advisorId = message.AdvisorId, wave, status = "committed",
+            sequence = message.Sequence, content = message.Content }, "read");
+        }
+        if (!published.Skip(__actPub0).Any())
+          await BoardHub.PublishMeeting(hub, s, id, "advisor-draft", new { boardId = m.BoardId, meetingId = id,
+            operationId = activityOpId, advisorId = draft.adv.Id, wave, status = "discarded" }, "read");
         }
       }
       { Guid auditBoard = m.BoardId; try { if (s.Meetings.TryGetValue(id, out var auditMtg) && auditMtg is not null) auditBoard = auditMtg.BoardId; } catch { }
@@ -1703,6 +1722,8 @@ public static class SimCEOEndpoints
       {
         runCancel.Cancel();
         try { await Task.WhenAll(inFlightDrafts); } catch { }
+        try { await BoardHub.PublishMeeting(hub, s, id, "advisor-draft", new { boardId = m.BoardId, meetingId = id,
+          operationId = activityOpId, status = "ended" }, "read").WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
         try { MeetingActivity.FinishIfRunning(s, id, activityOpId, "interrupted", "run ended"); _ = MeetingActivity.PublishDiscussionAsync(hub, s, id); } catch { }
         lock (s.MessageLock) { s.RunningRuns.Remove(id); }
       }

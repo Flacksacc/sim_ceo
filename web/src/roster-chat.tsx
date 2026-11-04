@@ -1,10 +1,11 @@
+import { AdvisorMessage } from "./advisor-message";
 import { useEffect, useRef, useState } from "react";
 import { FriendlyError } from "./human-disclosure";
 import { friendlyError } from "./human-format";
 import "./roster-chat.css";
 
 export type RosterChatTurn = { role: string; content: string };
-export type RosterChatApi = { post: <T>(u: string, b: unknown) => Promise<T> };
+export type RosterChatApi = { post: <T>(u: string, b: unknown) => Promise<T>; streamPost?: <T>(u: string, b: unknown, onText: (text: string) => void, signal?: AbortSignal) => Promise<T> };
 export type RosterChatProps = {
   rosterId: string;
   // Effective authenticated identity label (canonical user / applied demo
@@ -53,6 +54,9 @@ export function RosterChatPanel(p: RosterChatProps) {
   const [msg, setMsg] = useState(() => loadDraft(p.identity, p.rosterId));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [partial, setPartial] = useState("");
+  const requestRef = useRef<AbortController | null>(null);
+  const followRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const epochRef = useRef(0);
   const versionRef = useRef(p.rosterVersion);
@@ -60,13 +64,14 @@ export function RosterChatPanel(p: RosterChatProps) {
 
   useEffect(() => {
     epochRef.current += 1;
-    return () => { epochRef.current += 1; };
+    return () => { epochRef.current += 1; requestRef.current?.abort(); };
   }, []);
 
   useEffect(() => {
     if (versionRef.current === p.rosterVersion) return;
     versionRef.current = p.rosterVersion;
     epochRef.current += 1;
+    requestRef.current?.abort(); setPartial("");
     setBusy(false);
     setPendingAttempt(null);
     setErr("");
@@ -79,6 +84,7 @@ export function RosterChatPanel(p: RosterChatProps) {
     if (identityRef.current === p.identity) return;
     identityRef.current = p.identity;
     epochRef.current += 1;
+    requestRef.current?.abort(); setPartial("");
     setBusy(false);
     setPendingAttempt(null);
     setErr("");
@@ -92,8 +98,8 @@ export function RosterChatPanel(p: RosterChatProps) {
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [turns, busy]);
+    if (el && followRef.current) el.scrollTop = el.scrollHeight;
+  }, [turns, busy, partial]);
 
   const blocked = p.complete === false;
   const send = async (retryText?: string) => {
@@ -101,6 +107,7 @@ export function RosterChatPanel(p: RosterChatProps) {
     if (!p.rosterId || !text || busy || blocked || p.canChat === false) return;
     const myEpoch = epochRef.current;
     const myIdentity = p.identity;
+    const controller = new AbortController(); requestRef.current = controller; setPartial(""); followRef.current = true;
     setBusy(true);
     setErr("");
     setPendingAttempt(text);
@@ -109,16 +116,17 @@ export function RosterChatPanel(p: RosterChatProps) {
       try { window.localStorage.removeItem(rosterDraftKey(myIdentity, p.rosterId)); } catch {}
     }
     try {
-      const r = await p.api.post<ChatResponse>(
-        "/api/roster/" + p.rosterId + "/chat",
-        { message: text, history: turns.slice(-10) },
-      );
+      const url = "/api/roster/" + p.rosterId + "/chat";
+      const body = { message: text, history: turns.slice(-10) };
+      const r = p.api.streamPost
+        ? await p.api.streamPost<ChatResponse>(url, body, value => { if (epochRef.current === myEpoch && identityRef.current === myIdentity) setPartial(value); }, controller.signal)
+        : await p.api.post<ChatResponse>(url, body);
       if (epochRef.current !== myEpoch || p.identity !== myIdentity) return;
       setTurns([...turns, { role: "lead", content: text }, { role: "advisor", content: r.answer }]);
-      setPendingAttempt(null);
+      setPendingAttempt(null); setPartial("");
     } catch (e) {
       if (epochRef.current !== myEpoch || p.identity !== myIdentity) return;
-      setErr(String(e));
+      setPartial(""); setErr(String(e));
     } finally {
       if (epochRef.current === myEpoch && p.identity === myIdentity) setBusy(false);
     }
@@ -137,7 +145,7 @@ export function RosterChatPanel(p: RosterChatProps) {
         </p>
       ) : (
         <div className="chatwrap">
-          <div className="roster-chat-log" ref={scrollRef} role="log" aria-label={"Chat with " + (p.advisorName || "advisor")}>
+          <div className="roster-chat-log" ref={scrollRef} onScroll={event => { const el = event.currentTarget; followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60; }} role="log" aria-label={"Chat with " + (p.advisorName || "advisor")}>
             {turns.length === 0 && pendingAttempt === null && (
               <p className="muted">No messages yet. Ask the first question below.</p>
             )}
@@ -147,7 +155,7 @@ export function RosterChatPanel(p: RosterChatProps) {
                 <div key={idx} className={"msg-row " + (adv ? "advisor" : "lead")}>
                   <div className="bubble">
                     <div className="bhead"><b>{adv ? (p.advisorName || "Advisor") : "You"}</b></div>
-                    <div className="btext">{t.content}</div>
+                    <div className="btext">{adv ? <AdvisorMessage text={t.content} /> : t.content}</div>
                   </div>
                 </div>
               );
@@ -162,7 +170,7 @@ export function RosterChatPanel(p: RosterChatProps) {
             )}
             {busy && (
               <div className="msg-row advisor">
-                <div className="bubble"><div className="btext muted">Responding…</div></div>
+                <div className="bubble" aria-label="Advisor response in progress"><div className="advisor-stream-status">Responding…</div>{partial && <AdvisorMessage text={partial} streaming />}</div>
               </div>
             )}
           </div>
