@@ -1545,12 +1545,12 @@ async function scanDebug(tag) {
   const guidRe = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
   const jsonRe = /"[^"]+"\s*:\s*(\{|\[|")/g;
   const primRe = /"[^"]+"\s*:\s*(\d+|true|false|null)/g;
+  // SAME actual detector on every positive/clean fixture (no independent has* regexes).
+  const det = (t) => ({ g: (String(t).match(new RegExp(guidRe.source, "i")) || []).length >= 1, j: (String(t).match(new RegExp(jsonRe.source, "g")) || []).length >= 1, p: (String(t).match(new RegExp(primRe.source, "g")) || []).length >= 1 });
   const detCollected = det(collected);
   const guidHits = detCollected.g ? (collected.match(guidRe) || []).length : 0;
   const jsonHits = detCollected.j ? (collected.match(jsonRe) || []).length : 0;
   const primHits = detCollected.p ? (collected.match(primRe) || []).length : 0;
-  // SAME actual detector on every positive/clean fixture (no independent has* regexes).
-  const det = (t) => ({ g: (String(t).match(new RegExp(guidRe.source, "i")) || []).length >= 1, j: (String(t).match(new RegExp(jsonRe.source, "g")) || []).length >= 1, p: (String(t).match(new RegExp(primRe.source, "g")) || []).length >= 1 });
   const hasGuid = (t) => det(t).g;
   const hasStrJson = (t) => det(t).j;
   const hasObjJson = (t) => det(t).j;
