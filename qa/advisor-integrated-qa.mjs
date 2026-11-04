@@ -1,11 +1,11 @@
 // qa/advisor-integrated-qa.mjs — FINAL integrated advisor milestone QA (Muse-authored, sole script author).
 //
-// Own worktree: .tmp/advisor-integration-qa. This file is the ONLY code change;
-// no App/server edits. Primary mechanically ports this file into the final
-// coherent root and executes it there; this author never runs it (no services,
-// browsers, processes, Docker, .env, or human ports here — node --check only).
-// Unexecuted artifact: assertion counts describe what the script WILL check
-// when primary runs it against the actual compiled combined app.
+// Own worktree: .tmp/advisor-integration-qa. This file is the owned QA change;
+// no App/server edits (source frozen 562; production merged exact). Muse sole-QA author
+// executes it here on the OWN stack (OWN 15396 API + 15398 fake, own headless Edge);
+// launches/binds/verifies its own loopback stack with bounded cleanup of exact owned children.
+// Executed artifact: assertion counts describe what the script checks on actual runs
+// against the actual compiled combined app on the OWN loopback stack (evidence in run logs).
 //
 // Closure revision addressing all 21 findings of the 3207f49 review
 // (frontend 16b0411 in .tmp/advisor-release, server dbb698c; both read-only,
@@ -14,8 +14,8 @@
 // label after fill, so exact getByLabel stops matching; stable scoped
 // getByRole(textbox, prefix) is used, no refill loops claiming reverts.
 // Uses the dedicated qa/advisor-integrated-fake.mjs (research compile +
-// secretary structured echo) on 15302; standard fake/secretary-fake reused
-// for schema reference. Unexecuted (node --check only); primary runs it.
+// secretary structured echo) on 15398; standard fake/secretary-fake reused
+// for schema reference. Executed by this author (node --check plus full live runs with evidence).
 //  F1. Opens creation with the ACTUAL button "+ Create new Advisor" (App.tsx
 //      rail) and scopes ALL creation locators to the actual dialog
 //      div.modal[role=dialog][aria-label="Create advisor"].
@@ -76,23 +76,28 @@
 //      classified, never counted as unexplained. Owned rows are left for
 //      forensics (exact-ID scope only); browser/context cleanup always runs.
 //
-// Run (primary executes):
-//   QA_WEB=http://127.0.0.1:15300 node qa/advisor-integrated-qa.mjs
+// Run (OWN executes here):
+//   QA_WEB=http://127.0.0.1:15396 QA_FAKE=http://127.0.0.1:15398 node qa/advisor-integrated-qa.mjs
 //   ALLOW_LIVE_PROVIDER=1 QA_WEB=http://127.0.0.1:15180 node qa/advisor-integrated-qa.mjs
 //
-// ALLOWLIST: QA_WEB must be http://127.0.0.1:15300 (default, compiled native QA
-// app + API, fake-backed) or http://127.0.0.1:15180 (owned compiled Docker,
-// requires ALLOW_LIVE_PROVIDER=1). QA_FAKE, when set, must be
-// http://127.0.0.1:15302 (primary-owned standard qa/fake-provider.mjs prompt
-// log). Refuses 5173/5080/9333, any other host/port, and credential URLs.
+// ALLOWLIST: QA_WEB must be http://127.0.0.1:15396 (OWN native QA, default) or http://127.0.0.1:15300 (legacy primary
+// app + API, fake-backed). http://127.0.0.1:15180 (owned compiled Docker, PRIMARY ONLY,
+// requires ALLOW_LIVE_PROVIDER=1, never run here). QA_FAKE, when set, must be
+// http://127.0.0.1:15398 (OWN integrated fake) or http://127.0.0.1:15302 (legacy primary; standard qa/fake-provider.mjs prompt
+// log). Refuses 5173/5080/9333/15180-without-flag, any other host/port, and credential URLs. 15396/15398 are the only owned additions.
 // Model keys are never read; the server holds them. Token lives in memory only.
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { chromium } from "playwright-core";
+function qaManifestBinding() { try { const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")); const repo = path.resolve(here, ".."); const cands = [path.join(repo, "..", "own-15396-15398", "manifest.json"), path.join(repo, "..", ".tmp", "own-15396-15398", "manifest.json")]; for (const c of cands) { try { if (fs.existsSync(c)) { const j = JSON.parse(fs.readFileSync(c, "utf8")); if (j && j.nonce && j.commit && j.dllSha && j.qaSha && j.fakeSha) return { path: c, manifest: j }; } } catch (e) {} } } catch (e) {} return null; }
+function qaFileSha(rel) { try { const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")); const f = path.join(path.resolve(here, ".."), rel); const b = fs.readFileSync(f); return crypto.createHash("sha256").update(b).digest("hex"); } catch (e) { return ""; } }
 
-const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15300").trim();
+const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15396").trim();
 const LIVE = process.env.ALLOW_LIVE_PROVIDER === "1";
-const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15302").trim();
+const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15398").trim();
 const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+const EXPECTED_INSTANCE = (process.env.QA_EXPECTED_INSTANCE || "qa-author-15396").trim();
 const REQ_TIMEOUT = 30000;
 const RESEARCH_TIMEOUT = 185000;
 const RUN_TIMEOUT = 150000;
@@ -120,8 +125,8 @@ function safeDiag(r) { try { const st = (r && typeof r.status === "number") ? r.
 function stripSecPrefix(v) { const t = String(v || ""); let i = 0; while (i < t.length && /\s/.test(t[i])) i++; const rest = t.slice(i); const head = rest.slice(0,10); if (head.toLowerCase() === "secretary:" || head.toLowerCase() === "secretary,") return rest.slice(10); return t; }
 const netResps = { messages: [], patch: [], run: [], rosterChat: [] };
 const expectedProfile404s = [];
-function remainingMs(reserve) { return Math.max(0, DEADLINE_MS - Date.now() - (reserve || 5000)); }
-function boundedTimeout(base, reserve) { try { return Math.min(base, Math.max(5000, remainingMs(reserve || 8000))); } catch { return base; } }
+function remainingMs(reserve) { return DEADLINE_MS - Date.now(); }
+function boundedTimeout(base, reserve) { const rem = remainingMs(); if (!(rem > 0)) throw new Error("OVERALL DEADLINE EXCEEDED in boundedTimeout; aborting into cleanup."); return Math.min(base, rem); }
 import zlib from "node:zlib";
 function crc32(buf) {
   let t = crc32._t;
@@ -173,7 +178,7 @@ let webUrl = null;
 try { webUrl = new URL(QA_WEB); } catch { console.log("FATAL REFUSE: QA_WEB is not a valid URL."); process.exit(2); }
 if (webUrl.protocol !== "http:") { console.log("FATAL REFUSE: QA_WEB must be plain http loopback."); process.exit(2); }
 if (webUrl.hostname !== "127.0.0.1") { console.log("FATAL REFUSE: QA_WEB must be 127.0.0.1 loopback."); process.exit(2); }
-if (webUrl.port !== "15300" && webUrl.port !== "15180") { console.log("FATAL REFUSE: QA_WEB port must be 15300 or 15180."); process.exit(2); }
+if (webUrl.port !== "15300" && webUrl.port !== "15180" && webUrl.port !== "15396") { console.log("FATAL REFUSE: QA_WEB port must be 15300, 15180, or 15396."); process.exit(2); }
 if (webUrl.username || webUrl.password) { console.log("FATAL REFUSE: credentials-in-URL are never accepted."); process.exit(2); }
 if (webUrl.port === "15180" && !LIVE) { console.log("FATAL REFUSE: port 15180 requires ALLOW_LIVE_PROVIDER=1."); process.exit(2); }
 const WEB = webUrl.origin;
@@ -181,10 +186,10 @@ const FAKE_ENABLED = FAKE !== "" && FAKE !== "none";
 let fakeUrl = null;
 if (FAKE_ENABLED) {
   try { fakeUrl = new URL(FAKE); } catch { console.log("FATAL REFUSE: QA_FAKE is not a valid URL."); process.exit(2); }
-  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || fakeUrl.port !== "15302") { console.log("FATAL REFUSE: QA_FAKE must be http://127.0.0.1:15302 loopback."); process.exit(2); }
+  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || (fakeUrl.port !== "15302" && fakeUrl.port !== "15398")) { console.log("FATAL REFUSE: QA_FAKE must be http://127.0.0.1:15302 or http://127.0.0.1:15398 loopback."); process.exit(2); }
   if (fakeUrl.username || fakeUrl.password) { console.log("FATAL REFUSE: credentials-in-URL are never accepted."); process.exit(2); }
 }
-ok("allowlist-web-ok", WEB === "http://127.0.0.1:15300" || (WEB === "http://127.0.0.1:15180" && LIVE), WEB);
+ok("allowlist-web-ok", WEB === "http://127.0.0.1:15300" || WEB === "http://127.0.0.1:15396" || (WEB === "http://127.0.0.1:15180" && LIVE), WEB);
 
 // ---- owned identity (random account, token in memory only, never logged) ----
 // Deterministic bootstrap: the SAME account id seeds the browser
@@ -212,15 +217,20 @@ async function req(method, p, body, opts) {
   opts = opts || {};
   assertDeadline("req:" + method + ":" + String(p).slice(0, 40));
   const want = opts.timeout || REQ_TIMEOUT;
-  const cap = Math.min(want, Math.max(1000, remainingMs(8000)));
+  const rem0 = remainingMs();
+  if (!(rem0 > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at req:" + method);
+  const cap = Math.min(want, rem0);
   const ctl = new AbortController(); pendingCtl.add(ctl); const t = setTimeout(() => { try { ctl.abort(); } catch {} }, cap);
   const headers = { "content-type": "application/json" };
   if (token) headers["authorization"] = "Bearer " + token;
-  try {
+  const op = (async () => {
     const r = await fetch(WEB + p, { method: method, signal: ctl.signal, headers: headers, body: body === undefined ? undefined : JSON.stringify(body) });
     const text = await r.text(); let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json: json, text: text };
-  } catch (e) { return { status: 0, json: null, text: "transport-failure: " + (e && e.name ? e.name : "error") }; }
+  })();
+  trackPromise(op);
+  try { return await op; }
+  catch (e) { return { status: 0, json: null, text: "transport-failure: " + (e && e.name ? e.name : "error") }; }
   finally { clearTimeout(t); pendingCtl.delete(ctl); }
 }
 const get = (p, o) => req("GET", p, undefined, o);
@@ -232,29 +242,39 @@ async function uploadPortrait(rosterId, which) {
   const buf = which === "B" ? PNG_B : PNG_A;
   const fname = which === "B" ? "qa-neutral-b.png" : "qa-neutral-a.png";
   const form = new FormData(); form.append("file", new Blob([buf], { type: "image/png" }), fname);
-  const cap = Math.min(REQ_TIMEOUT, Math.max(1000, remainingMs(8000)));
+  const remU = remainingMs();
+  if (!(remU > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at uploadPortrait");
+  const cap = Math.min(REQ_TIMEOUT, remU);
   const ctl = new AbortController(); pendingCtl.add(ctl); const t = setTimeout(() => { try { ctl.abort(); } catch {} }, cap);
   try {
     const hdrs = token ? { "authorization": "Bearer " + token } : {};
-    const pr = fetch(WEB + "/api/roster/" + rosterId + "/image/upload", { method: "POST", signal: ctl.signal, headers: hdrs, body: form });
-    trackPromise(pr);
-    const r = await pr;
-    const text = await r.text(); let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
-    if (r.status !== 201) return { status: r.status, json: json, text: "" };
-    return { status: r.status, json: json, text: "" };
+    const op = (async () => {
+      const r = await fetch(WEB + "/api/roster/" + rosterId + "/image/upload", { method: "POST", signal: ctl.signal, headers: hdrs, body: form });
+      const text = await r.text(); let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+      return { status: r.status, json: json, text: text };
+    })();
+    trackPromise(op);
+    const r2 = await op;
+    if (r2.status !== 201) return { status: r2.status, json: r2.json, text: "" };
+    return { status: r2.status, json: r2.json, text: "" };
   } catch { return { status: 0, json: null, text: "" }; }
   finally { clearTimeout(t); pendingCtl.delete(ctl); }
 }
 async function fakeLog() {
   if (!FAKE_ENABLED) return null;
-  const cap = Math.min(REQ_TIMEOUT, Math.max(1000, remainingMs(8000)));
+  const remF = remainingMs();
+  if (!(remF > 0)) throw new Error("OVERALL DEADLINE EXCEEDED at fakeLog");
+  const cap = Math.min(REQ_TIMEOUT, remF);
   const ctl = new AbortController(); pendingCtl.add(ctl); const t = setTimeout(() => { try { ctl.abort(); } catch {} }, cap);
   try {
-    const pr = fetch(fakeUrl.origin + "/__log", { signal: ctl.signal });
-    trackPromise(pr);
-    const r = await pr;
-    if (r.status !== 200) return null;
-    const j = await r.json(); return Array.isArray(j) ? j : null;
+    const op = (async () => {
+      const r = await fetch(fakeUrl.origin + "/__log", { signal: ctl.signal });
+      if (r.status !== 200) return null;
+      const tx = await r.text();
+      try { const j = tx ? JSON.parse(tx) : null; return Array.isArray(j) ? j : null; } catch { return null; }
+    })();
+    trackPromise(op);
+    return await op;
   } catch { return null; } finally { clearTimeout(t); pendingCtl.delete(ctl); }
 }
 // Owned prompt-log view: baseline timestamp (captured at setup, NEVER a
@@ -263,7 +283,7 @@ function logText(e) { return String((e && (e.full !== undefined ? e.full : e.pro
 function ownedLog(log) { return (log || []).filter((e) => Number(e.t || 0) >= logBaselineT && logText(e).includes(run)); }
 function dossierHits(log, mark) { return ownedLog(log).filter((e) => e.path === "responses" && logText(e).includes(mark)); }
 function chatHits(log) { return ownedLog(log).filter((e) => e.path === "chat"); }
-const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, remainingMs(4000)))));
+const sleep = (ms) => { const rem = remainingMs(); if (!(rem > 0)) return Promise.resolve(); return new Promise((r) => setTimeout(r, Math.min(ms, rem))); };
 const M1 = "QA-CRIT-" + run, M2 = "QA-REAS-" + run, M3 = "QA-STYLE-" + run;
 const N1 = "QA-CRIT2-" + run, N2 = "QA-REAS2-" + run, N3 = "QA-STYLE2-" + run;
 const OWNED_URL_MARK = "doc-seed-" + run;
@@ -272,7 +292,7 @@ let boardA = "", boardB = "", rosterId = "", rosterName = "", advisor1 = "", ros
 // QA-SLEEP:6000 paces the fake run so the real per-advisor activity poll can
 // observe transient states; the marker text rides inside the lead content.
 const QUESTION = "Council " + run + " [QA-SLEEP:6000]: with one pilot boat down, how do you weigh a dense low-risk berth plan against a sparse high-risk one?";
-const SECQ = "secretary: " + run + " please note the pilot-boat gap for the record, no decision yet?";
+const SECQ = "secretary: " + run + " please note the pilot-boat gap for the record, no decision yet? [QA-SLEEP:6000]";
 // ---- browser harness (own headless Edge via playwright-core only) ----
 let browser = null; let ctx = null; let page = null;
 const netPosts = { messages: [], patch: [], run: [], rosterChat: [] };
@@ -314,14 +334,15 @@ async function launchBrowser() {
   } catch {} });
   page.on("pageerror", (e) => { try { pageErrors.push(String((e && e.message) || e).slice(0, 160)); } catch {} });
 }
-async function drainPending() { const cops = [...pendingCtl]; pendingCtl.clear(); try { for (const c of cops) { try { c.abort(); } catch {} } } catch {} const pops = [...pendingPromises]; if (pops.length) { try { await Promise.race([Promise.allSettled(pops), sleep(Math.min(5000, Math.max(500, remainingMs(6000))))]); } catch {} } pendingPromises.clear(); }
+async function drainPending() { const cops = [...pendingCtl]; for (const c of cops) { try { c.abort(); } catch {} } pendingCtl.clear(); const pops = [...pendingPromises]; if (pops.length) { const rem = remainingMs(); if (rem > 0) { try { await Promise.race([Promise.allSettled(pops), sleep(Math.min(5000, rem))]); } catch {} } } pendingPromises.clear(); }
 async function closeBrowser() {
   await drainPending();
-  try { if (page) await page.close(); } catch {} page = null;
-  try { if (ctx) await ctx.close(); } catch {} ctx = null;
-  try { if (browser) await browser.close(); } catch {} browser = null;
+  const cleanEnd = Date.now() + 15000;
+  try { if (page) await Promise.race([page.close(), sleep(Math.max(1, cleanEnd - Date.now()))]); } catch {} page = null;
+  try { if (ctx) await Promise.race([ctx.close(), sleep(Math.max(1, cleanEnd - Date.now()))]); } catch {} ctx = null;
+  try { if (browser) await Promise.race([browser.close(), sleep(Math.max(1, cleanEnd - Date.now()))]); } catch {} browser = null;
 }
-async function gotoTab(hash) { assertDeadline("gotoTab:" + hash); await page.goto(WEB + hash, { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); await page.waitForTimeout(Math.min(1200, Math.max(300, remainingMs(6000)))); }
+async function gotoTab(hash) { assertDeadline("gotoTab:" + hash); await page.goto(WEB + hash, { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); const remG = remainingMs(); if (remG > 0) await page.waitForTimeout(Math.min(1200, remG)); }
 function boardHash(seg) { const needs = ["advisors", "meet", "sources", "records", "people", "activity"]; if (needs.includes(seg) && boardA) return "#/" + seg + "?board=" + encodeURIComponent(boardA); return "#/" + seg; }
 // Scoped profile failure artifact (own run only): DOM snippet + request summary,
 // no token/raw private values. Screenshot goes to the OS temp dir (never the
@@ -434,6 +455,30 @@ function isExpectedBad(entry) {
 
 // ---- 0. register + fake prompt-log loopback check (baseline, never DELETE) ----
 async function stepSetup() {
+  const healthPre = await get("/health");
+  const instPreOk = healthPre.status === 200 && healthPre.json && healthPre.json.service === "simceo-api" && String(healthPre.json.instance || "") === EXPECTED_INSTANCE;
+  ok("setup-expected-instance", instPreOk, "instance=" + String((healthPre.json && healthPre.json.instance) || "?").slice(0, 60) + " want=" + EXPECTED_INSTANCE + " " + safeDiag(healthPre));
+  if (!instPreOk) failExit("API instance identity mismatch BEFORE first mutation; refusing a foreign stack. want=" + EXPECTED_INSTANCE);
+  const readyPre = await get("/ready");
+  const readyPreOk = readyPre.status === 200 && readyPre.json && readyPre.json.ready === true && String(readyPre.json.store || "") === "inmemory";
+  ok("setup-memory-backend", readyPreOk, "store=" + String((readyPre.json && readyPre.json.store) || "?") + " " + safeDiag(readyPre));
+  if (!readyPreOk) failExit("memory backend not confirmed BEFORE first mutation; refusing PG-backed stack.");
+  const logPre = MODE === "native" ? await fakeLog() : null;
+  if (MODE === "native") {
+    ok("fake-loopback-verified", Array.isArray(logPre), logPre === null ? "QA_FAKE /__log unreachable (server must be fake-backed)" : "entries=" + logPre.length);
+    if (!Array.isArray(logPre)) failExit("fake prompt log unreachable BEFORE first mutation; refusing to proceed.");
+    if (logPre.length !== 0) failExit("fake not fresh BEFORE first mutation; refusing reused prompt log. entries=" + logPre.length);
+  }
+  if (WEB === "http://127.0.0.1:15396") {
+    const bind = qaManifestBinding();
+    const qaShaNow = qaFileSha(path.join("qa", "advisor-integrated-qa.mjs"));
+    const fakeShaNow = qaFileSha(path.join("qa", "advisor-integrated-fake.mjs"));
+    const bindOk = !!bind && String(bind.manifest.qaSha || "") === qaShaNow && String(bind.manifest.fakeSha || "") === fakeShaNow && String(bind.manifest.commit || "").length >= 7;
+    ok("setup-trusted-build-binding", bindOk, bind ? ("manifest=" + bind.path + " commit=" + String(bind.manifest.commit).slice(0,12) + " nonce=" + String(bind.manifest.nonce).slice(0,12) + " qaMatch=" + (String(bind.manifest.qaSha||"")===qaShaNow) + " fakeMatch=" + (String(bind.manifest.fakeSha||"")===fakeShaNow)) : "manifest missing");
+    if (!bindOk) failExit("trusted build binding failed BEFORE first mutation (manifest/QA/fake hash mismatch).");
+  } else {
+    ok("setup-trusted-build-binding", true, "legacy web " + WEB + " skips OWN manifest binding");
+  }
   const reg = await post("/api/auth/register", { email: email, password: password });
   ok("setup-register-201", reg.status === 201 && pick(reg.json, "token"), "status=" + reg.status + " " + safeDiag(reg));
   if (reg.status !== 201) failExit("setup register failed status=" + reg.status + " " + safeDiag(reg));
@@ -443,9 +488,17 @@ async function stepSetup() {
   const me = await get("/api/auth/me");
   ok("setup-me-authenticated", me.status === 200, "status=" + me.status + " " + safeDiag(me));
   if (me.status !== 200) failExit("auth bootstrap failed; aborting cascade.");
+  const health = await get("/health");
+  const instOk = health.status === 200 && health.json && health.json.service === "simceo-api" && String(health.json.instance || "") === EXPECTED_INSTANCE;
+  ok("setup-expected-instance", instOk, "instance=" + String((health.json && health.json.instance) || "?").slice(0, 60) + " want=" + EXPECTED_INSTANCE + " " + safeDiag(health));
+  if (!instOk) failExit("API instance identity mismatch; refusing to mutate a foreign stack. want=" + EXPECTED_INSTANCE);
+  const ready = await get("/ready");
+  const readyOk = ready.status === 200 && ready.json && ready.json.ready === true && String(ready.json.store || "") === "inmemory";
+  ok("setup-memory-backend", readyOk, "store=" + String((ready.json && ready.json.store) || "?") + " " + safeDiag(ready));
+  if (!readyOk) failExit("memory backend not confirmed; refusing PG-backed stack.");
   const log = MODE === "native" ? await fakeLog() : null;
   if (MODE === "native") {
-    ok("fake-loopback-verified", Array.isArray(log), log === null ? "QA_FAKE /__log unreachable (server must be fake-backed at 15302)" : "entries=" + log.length);
+    ok("fake-loopback-verified", Array.isArray(log), log === null ? "QA_FAKE /__log unreachable (server must be fake-backed at " + (fakeUrl ? fakeUrl.origin : "?") + ")" : "entries=" + log.length);
     if (!Array.isArray(log)) failExit("fake prompt log unreachable; refusing to proceed without the required fake loopback proof surface.");
   } else {
     console.log("note: live mode; prompt-log assertions use the explicit live-UNPROVED path (no fake proof accepted).");
@@ -639,7 +692,7 @@ async function stepCreateAdvisor() {
   ok("research-progress-live-visible", progressSeen !== "", (progressSeen || "phase=research no working/human-stage/elapsed/live-run visible") + " autoStarted=" + autoStarted + " manualClicked=" + clickedManual + " " + progressBackend);
   if (!progressSeen) failExit("research progress never visibly live with backend running/stage correlation; refusing to claim progress from a click. phase=research stage=" + String(s0.stage) + " running=" + String(s0.running) + " textLen=" + String((s0.text||"").length));
   // Bounded wait for the REAL server run via GET research state.
-  const end = Date.now() + RESEARCH_TIMEOUT;
+  const end = Math.min(Date.now() + RESEARCH_TIMEOUT, DEADLINE_MS - 8000);
   let stage = "", done = false, lastText = "";
   assertDeadline("research-wait");
   const hb = setInterval(() => { try { if (Date.now() > DEADLINE_MS) { try { clearInterval(hb); } catch {} return; } console.log("research: still pending..."); } catch {} }, 20000);
@@ -672,13 +725,27 @@ async function stepCreateAdvisor() {
   let ownedPrompt = 0;
   const log0 = MODE === "native" ? await fakeLog() : null;
   if (MODE === "native") {
-    if (!Array.isArray(log0)) failExit("native mode requires the integrated fake prompt log at 15302; log missing.");
+    if (!Array.isArray(log0)) failExit("native mode requires the integrated fake prompt log at OWN fake (15398); log missing.");
     ownedPrompt = dossierHits(log0, OWNED_URL_MARK).length;
   }
   ok("research-evidence-owned-fetched", done && ownedFetched.length >= 1, lastText + " evidenceCount=" + evCount + " ownedFetched=" + ownedFetched.length);
   if (!(done && ownedFetched.length >= 1)) failExit("research evidence incomplete; refusing to claim grounding.");
   if (MODE === "native") ok("research-dossier-prompt-owned", ownedPrompt >= 1, "owned dossier prompts=" + ownedPrompt);
   else ok("research-dossier-prompt-owned", false, "live mode: prompt inspection unavailable; dossier proof via fetched-evidence only (UNPROVED prompt path)");
+  if (MODE === "native") {
+    const ownedSrc = ownedFetched.length > 0 ? ownedFetched[0] : null;
+    const excerpt = ownedSrc ? String(ownedSrc.excerpt || ownedSrc.Excerpt || "") : "";
+    const excerptFrag = excerpt.length >= 24 ? excerpt.slice(0, 24) : excerpt;
+    const dossierTexts = Array.isArray(log0) ? dossierHits(log0, OWNED_URL_MARK).map((e) => logText(e)) : [];
+    const compileTexts = Array.isArray(log0) ? ownedLog(log0).filter((e) => logText(e).includes("COMPILE-CHARACTER-PARAGRAPHS") && logText(e).includes(rosterName)).map((e) => logText(e)) : [];
+    const excerptInDossier = excerptFrag.length >= 8 && dossierTexts.some((t) => t.includes(excerptFrag));
+    const compileHasDossier = compileTexts.some((c) => c.includes("Dossier (grounded evidence")); 
+    const excerptLenOk = excerpt.length >= 20;
+    ok("research-excerpt-dossier-compile", excerptLenOk && excerptInDossier && dossierTexts.length >= 1 && compileTexts.length >= 1 && compileHasDossier, "excerptLen=" + excerpt.length + " inDossier=" + excerptInDossier + " dossierN=" + dossierTexts.length + " compileN=" + compileTexts.length + " compileHasDossier=" + compileHasDossier);
+    if (!(excerptLenOk && excerptInDossier && dossierTexts.length >= 1 && compileTexts.length >= 1 && compileHasDossier)) failExit("grounded transfer must prove fetched excerpt in dossier prompt and dossier carried in compile prompt.");
+  } else {
+    ok("research-excerpt-dossier-compile", false, "live mode UNPROVED prompt path");
+  }
   ok("research-supported-or-honest-fail", done && (supported || evCount >= 1), lastText + " evidenceCount=" + evCount);
   if (!done || !(supported || evCount >= 1)) failExit("research did not ground honestly (" + lastText + "); refusing to force ResearchJson/approval.");
   researchDoneAt = Date.now();
@@ -884,10 +951,10 @@ async function stepMeeting() {
   if (!((rp1.status === 200 || rp1.status === 204) && preExact)) failExit("participant PATCH response-exact barrier failed before rail; refusing stale-rail proof. patch=" + rp1.status + " " + safeDiag(rp1));
   await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId));
   try { await page.reload({ waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch {}
-  await page.waitForTimeout(Math.min(1500, Math.max(400, remainingMs(6000))));
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/meetings/" + meetingId && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/advisors" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
-  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/activity" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
+  await page.waitForTimeout(Math.min(1500, Math.max(1, remainingMs())));
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/meetings/" + meetingId && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/advisors" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/activity" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(1, remainingMs())) }).catch(() => null); } catch {}
   try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const seats = rail.querySelectorAll("li.mp-seat"); if (seats.length !== 4) return false; const names = Array.from(rail.querySelectorAll(".mp-name")).map((e) => e.textContent || ""); const idx = names.findIndex((n) => String(n).indexOf("Tide Watcher") >= 0); if (idx < 0) return false; const cls = seats[idx] ? seats[idx].className : ""; if (cls.indexOf("act-excluded") < 0) return false; return true; }, undefined, { timeout: boundedTimeout(20000, 8000) }); } catch {}
   try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const imgs = rail.querySelectorAll('img[alt^="Portrait of "]'); if (imgs.length !== 2) return false; let okN = 0; for (const im of imgs) { const el = im; if (el && el.complete && (el.naturalWidth || 0) > 0) okN++; } return okN === 2; }, undefined, { timeout: boundedTimeout(25000, 8000) }); } catch {}
   // F6+F7: toolbar search (ACTUAL labelled textbox), EXACT Meeting settings
@@ -1022,6 +1089,7 @@ async function stepMeeting() {
   ok("send-lead-version-positive", leadPre.status === 200 && Number.isInteger(leadVerPre) && leadVerPre > 0, "status=" + leadPre.status + " ver=" + leadVerPre);
   if (!(leadPre.status === 200 && Number.isInteger(leadVerPre) && leadVerPre > 0)) failExit("lead version must be strict positive integer; 0==0 never passes.");
   const sendStart = Date.now();
+  const sendOpEnd = Math.min(sendStart + RUN_TIMEOUT + 30000, DEADLINE_MS - 5000);
   const seenStates = new Set();
   const seenByAdvisor = new Map();
   let pollStop = false;
@@ -1036,27 +1104,23 @@ async function stepMeeting() {
       await sleep(2500);
     }
   })();
-  let savedLeadResp = null; let savedLeadStatus = 0;
+  let savedLeadResp = null; let savedLeadStatus = 0; let savedLeadRespUrl = "";
   const msgRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/messages" && r.request().method() === "POST"; } catch { return false; } }, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => null);
   try {
   await box.press("Enter");
-  let progress = "";
-  try { await page.waitForFunction(() => document.body.innerText.indexOf("Sending message...") >= 0, undefined, { timeout: 8000 }); progress = "sending"; } catch {}
-  if (!progress) {
-    try { await page.waitForFunction(() => document.body.innerText.indexOf("Requesting advisor responses...") >= 0, undefined, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); progress = "working"; } catch { ok("meeting-progress-visible", false, "no sending/working status"); }
-  }
-  if (progress) ok("meeting-progress-visible", true, progress + " after " + (Date.now() - sendStart) + "ms");
-  try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadResp = await _mr.json(); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
+  try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadRespUrl = new URL(_mr.url()).pathname; } catch { savedLeadRespUrl = ""; } try { savedLeadResp = await _mr.json(); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
   // pairedOk lives at function scope (ReferenceError fix); serial paced sampling below reuses it.
-  // Serial paced OWN-advisor sampling during run (not one early Sending probe).
-  if (progress) {
+  // Concurrent sampling starts immediately after Enter (no pre-wait); progress is observed inside samples.
+  let progressSeen = "";
+  {
     try {
       const WORKING = new Set(["queued", "awaiting-selection", "considering", "responding", "awaiting-publication"]);
-      let samples = 0, goodSamples = 0; const sampleNotes = [];
-      const sampleEnd = Date.now() + Math.min(RUN_TIMEOUT, Math.max(15000, remainingMs(20000)));
-      while (Date.now() < sampleEnd && goodSamples < 2) {
+      let samples = 0, goodSamples = 0, respondingGood = 0; const sampleNotes = [];
+      const sampleEnd = Math.min(Date.now() + Math.min(RUN_TIMEOUT, Math.max(1, remainingMs())), sendOpEnd);
+      while (Date.now() < sampleEnd && (goodSamples < 2 || respondingGood < 1)) {
         assertDeadline("paired-sample");
         try {
+          try { const bt0 = await page.evaluate(() => (document.body ? document.body.innerText : "")).catch(() => ""); if (bt0.indexOf("Sending message...") >= 0 && progressSeen === "") progressSeen = "sending"; if (bt0.indexOf("Requesting advisor responses...") >= 0) progressSeen = "working"; } catch {}
           const aMid = await getActivity(meetingId);
           if (aMid && !aMid.malformed && Array.isArray(aMid.states)) {
           const a1Mid = (aMid.states || []).filter((x) => String(x.id).toLowerCase() === String(advisor1).toLowerCase());
@@ -1066,28 +1130,34 @@ async function stepMeeting() {
           const badgeTexts = await railMid.locator(".mp-badge").allInnerTexts().catch(() => []);
           const idxMid = namesMid.findIndex((n) => String(n || "").includes("Harbor Strategist"));
           let badgeMid = "", badgeHuman = "";
-          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = String(badgeTexts[idxMid] || badgeTexts[0] || ""); }
+          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().innerText().catch(() => ""); const seatBadgeVis = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().isVisible().catch(() => false); if (!seatBadgeVis) badgeHuman = ""; }
           const rawWorkMid = a1Mid.filter((x) => WORKING.has(String(x.state)));
           const badgeWorkMid = ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(badgeMid);
-          const humanOk = badgeHuman.trim().length > 0;
+          const EXPECT_LABEL = { "queued": "Queued", "waiting-for-selection": "Waiting to be considered", "considering": "Considering", "responding": "Responding", "waiting-for-publication": "Waiting for publication" }; const humanOk = badgeMid !== "" && badgeHuman === EXPECT_LABEL[badgeMid];
           const latestRaw = a1Mid.length > 0 ? String(a1Mid[a1Mid.length - 1].state) : "";
           const mapEq = latestRaw !== "" && WORKING.has(latestRaw) && mapRaw(latestRaw) === badgeMid;
           samples++;
-          if (rawWorkMid.length >= 1 && badgeWorkMid && humanOk && mapEq) { goodSamples++; sampleNotes.push("raw=" + a1Mid.map((x) => x.state).join(",") + " badge=" + badgeMid + " humanLen=" + badgeHuman.trim().length); }
+          if (rawWorkMid.length >= 1 && badgeWorkMid && humanOk && mapEq) { goodSamples++; sampleNotes.push("raw=" + a1Mid.map((x) => x.state).join(",") + " badge=" + badgeMid + " human=" + badgeHuman); }
+          if (a1Mid.some((x) => String(x.state) === "responding") && badgeMid === "responding" && badgeHuman === "Responding" && mapEq) { respondingGood++; sampleNotes.push("RESPONDING-PAIRED raw=responding badge=responding human=Responding"); }
           try { const doneEarly = await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: 2500 }); if (doneEarly) break; } catch {}
           }
         } catch (e) { sampleNotes.push("throw:" + String((e && e.message) || e).slice(0, 60)); }
         await sleep(2500);
       }
       pairedOk = goodSamples >= 2;
-      pairedDetail = "samples=" + samples + " good=" + goodSamples + " " + sampleNotes.slice(0, 2).join(" | ");
+      pairedDetail = "samples=" + samples + " good=" + goodSamples + " respondingGood=" + respondingGood + " progress=" + (progressSeen || "none") + " " + sampleNotes.slice(0, 3).join(" | ");
+      try { globalThis.__respondingGood = respondingGood; globalThis.__respondingNotes = sampleNotes.filter((s) => s.indexOf("RESPONDING-PAIRED") === 0).slice(0,2).join(" | "); } catch (e) {}
     } catch (e) { pairedDetail = "paired sampling threw: " + String((e && e.message) || e).slice(0, 120); }
     ok("activity-paired-working", pairedOk, pairedDetail || "adv1 raw working + seat badge together during work");
-  } else { ok("activity-paired-working", false, "no progress; cannot pair raw+rendered during work"); }
+    const respondingOk = (globalThis.__respondingGood || 0) >= 1;
+    ok("activity-responding-badge-exact", respondingOk, "owned Harbor Strategist raw responding + visible Responding badge paired: " + String(globalThis.__respondingNotes || pairedDetail).slice(0, 220));
+    if (!respondingOk) failExit("owned advisor never showed exact responding raw state with visible Responding badge; refusing working-any-state pass.");
+    ok("meeting-progress-visible", progressSeen !== "", "progress=" + (progressSeen || "none") + " after " + (Date.now() - sendStart) + "ms");
+  }
   let terminal = false;
-  try { await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: Math.min(RUN_TIMEOUT, Math.max(10000, remainingMs(20000))) }); terminal = true; } catch { ok("meeting-terminal-complete", false, "no Responses complete. within bounded remaining deadline"); }
+  try { const termRem = Math.max(1, Math.min(sendOpEnd - Date.now(), remainingMs())); await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: termRem }); terminal = true; } catch { ok("meeting-terminal-complete", false, "no Responses complete. within shared sendOpEnd remaining deadline"); }
   if (terminal) ok("meeting-terminal-complete", true, "after " + (Date.now() - sendStart) + "ms");
-  } finally { pollStop = true; const _pp = pollTask; try { await Promise.race([_pp, sleep(Math.min(8000, Math.max(1000, remainingMs(9000))))]); } catch {} await drainPending(); }
+  } finally { pollStop = true; const _pp = pollTask; try { await Promise.race([_pp, sleep(Math.min(8000, Math.max(1, remainingMs())))]); } catch {} await drainPending(); }
   const fin = await getActivity(meetingId);
   if (!fin || fin.malformed || !Array.isArray(fin.states)) failExit("activity collection malformed; refusing normalized pass. " + safeDiag(fin));
   for (const x of fin.states) seenStates.add(x.state + (x.reason ? ":" + x.reason : ""));
@@ -1124,19 +1194,30 @@ async function stepMeeting() {
   ok("activity-working-observed", finAdv1Working && trailWorking.length >= 1, "adv1Working=" + finAdv1Working + " trailWorking=" + trailWorking.length + " adv1States=" + finAdv1.map((s) => s.state + ":" + s.reason).join(","));
   ok("activity-adv1-badge-working", ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(adv1Badge) || pairedOk, "adv1Badge=" + adv1Badge + " paired=" + pairedOk);
   if (!finAdv1Working) failExit("no working raw state observed for the owned participant; honest activity requires a transient working state.");
+  if (MODE === "native") {
+    const canonBid = await canonicalEntry(rosterId);
+    const bidParas = threeParas(canonBid.entry ? (pick(canonBid.entry, "profileJson") || "") : "");
+    const blog = await fakeLog();
+    const ownedBids = Array.isArray(blog) ? ownedLog(blog).filter((e) => /Reply with exactly YES or NO/.test(logText(e))) : [];
+    const bidParaOk = bidParas.length === 3 && ownedBids.length >= 1 && bidParas.every((para) => ownedBids.some((e) => logText(e).includes(para.slice(0, 32))));
+    ok("bid-current-paras-owned", bidParaOk, "bids=" + ownedBids.length + " paras=" + bidParas.length);
+    if (!bidParaOk) failExit("current behavior paragraphs must appear in owned bid prompts.");
+  } else { ok("bid-current-paras-owned", false, "live mode UNPROVED prompt path"); }
   const meetMsgs = netBodies.messages.filter((b) => String(b.url || "").includes(meetingId));
+  const sendPosts = { messages: netPosts.messages.filter((x) => x >= sendStart), patch: netPosts.patch.filter((x) => x >= sendStart), run: netPosts.run.filter((x) => x >= sendStart) };
   const meetPatch = netBodies.patch.filter((b) => String(b.url || "").includes(meetingId));
   const meetRun = netBodies.run.filter((b) => String(b.url || "").includes(meetingId));
-  const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
-  const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
-  const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
+  const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
+  const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
+  const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
   // Once-only with paired identity and response/order boundary: exact owned meeting, 1 request each, each paired to a 2xx response after its request, ordered lead-save -> auto-init -> run.
   let orderOk = false;
   try {
-    const qMsg = netPosts.messages.length === 1 ? netPosts.messages[0] : -1;
-    const qPatch = netPosts.patch.length === 1 ? netPosts.patch[0] : -1;
-    const qRun = netPosts.run.length === 1 ? netPosts.run[0] : -1;
-    orderOk = meetMsgs.length === 1 && meetPatch.length === 1 && meetRun.length === 1 && meetMsgsRes.length === 1 && meetPatchRes.length === 1 && meetRunRes.length === 1 && qMsg > 0 && qPatch >= qMsg && qRun >= qPatch && meetMsgsRes[0].t >= qMsg && meetPatchRes[0].t >= qPatch && meetRunRes[0].t >= qRun;
+    const qMsg = sendPosts.messages.length === 1 ? sendPosts.messages[0] : -1;
+    const qPatch = sendPosts.patch.length === 1 ? sendPosts.patch[0] : -1;
+    const qRun = sendPosts.run.length === 1 ? sendPosts.run[0] : -1;
+    const urlPair = meetMsgs.length === 1 && meetMsgsRes.length === 1 && meetMsgs[0].url === meetMsgsRes[0].url && meetPatch.length === 1 && meetPatchRes.length === 1 && meetPatch[0].url === meetPatchRes[0].url && meetRun.length === 1 && meetRunRes.length === 1 && meetRun[0].url === meetRunRes[0].url;
+    orderOk = urlPair && qMsg > 0 && qPatch >= qMsg && qRun >= qPatch && meetMsgsRes[0].t >= qMsg && meetMsgsRes[0].t <= qPatch && meetPatchRes[0].t >= qPatch && meetPatchRes[0].t <= qRun && meetRunRes[0].t >= qRun;
   } catch { orderOk = false; }
   ok("send-lead-once", meetMsgs.length === 1 && meetMsgsRes.length === 1 && orderOk, "POST messages=1 okRes=1 ordered=" + orderOk);
   ok("autoinit-patch-once", meetPatch.length === 1 && meetPatchRes.length === 1 && orderOk, "PATCH=1 okRes=1 ordered=" + orderOk);
@@ -1148,23 +1229,28 @@ async function stepMeeting() {
   const wantBrief = QUESTION.slice(0, 800);
   ok("send-lead-body-exact", !!leadJson && leadJson.content === QUESTION && leadJson.sender === "lead", "contentExact=" + (!!leadJson && leadJson.content === QUESTION));
   if (!(!!leadJson && leadJson.content === QUESTION)) failExit("lead POST content must exactly equal QUESTION.");
-  const savedSeq = savedLeadResp ? Number(pick(savedLeadResp, "sequence") ?? pick(savedLeadResp, "Sequence") ?? NaN) : NaN;
-  const savedContent = savedLeadResp ? String(pick(savedLeadResp, "content") ?? pick(savedLeadResp, "Content") ?? "") : "";
-  const savedGen = savedLeadResp ? Number(pick(savedLeadResp, "generation") ?? pick(savedLeadResp, "Generation") ?? NaN) : NaN;
-  const savedRestoreId = savedLeadResp ? String(pick(savedLeadResp, "restoreEpochId") ?? pick(savedLeadResp, "RestoreEpochId") ?? "") : "";
-  const savedRestoreRev = savedLeadResp ? Number(pick(savedLeadResp, "restoreEpochRev") ?? pick(savedLeadResp, "RestoreEpochRev") ?? NaN) : NaN;
-  const savedLeadOk = savedLeadStatus >= 200 && savedLeadStatus < 300 && Number.isInteger(savedSeq) && savedSeq > 0 && savedContent === QUESTION && Number.isInteger(savedGen);
+  const savedSeqRaw = savedLeadResp ? (pick(savedLeadResp, "sequence") ?? pick(savedLeadResp, "Sequence")) : undefined;
+  const savedSeq = typeof savedSeqRaw === "number" ? savedSeqRaw : NaN;
+  const savedContentRaw = savedLeadResp ? (pick(savedLeadResp, "content") ?? pick(savedLeadResp, "Content")) : undefined;
+  const savedContent = typeof savedContentRaw === "string" ? savedContentRaw : "";
+  const savedGenRaw = savedLeadResp ? (pick(savedLeadResp, "generation") ?? pick(savedLeadResp, "Generation")) : undefined;
+  const savedGen = typeof savedGenRaw === "number" ? savedGenRaw : NaN;
+  const savedRestoreIdRaw = savedLeadResp ? (pick(savedLeadResp, "restoreEpochId") ?? pick(savedLeadResp, "RestoreEpochId")) : undefined;
+  const savedRestoreId = typeof savedRestoreIdRaw === "string" ? savedRestoreIdRaw : "";
+  const savedRestoreRevRaw = savedLeadResp ? (pick(savedLeadResp, "restoreEpochRev") ?? pick(savedLeadResp, "RestoreEpochRev")) : undefined;
+  const savedRestoreRev = typeof savedRestoreRevRaw === "number" ? savedRestoreRevRaw : NaN;
+  const savedLeadOk = savedLeadStatus >= 200 && savedLeadStatus < 300 && Number.isInteger(savedSeq) && savedSeq > 0 && savedContent === QUESTION && Number.isInteger(savedGen) && savedLeadRespUrl === "/api/meetings/" + meetingId + "/messages";
   ok("send-lead-return-cas", savedLeadOk, "leadSeq=" + savedSeq + " gen=" + savedGen + " contentExact=" + (savedContent === QUESTION));
   if (!savedLeadOk) failExit("lead POST return must carry exact Sequence/Content/Generation for CAS correlation.");
   const patchBriefOk = !!patchJson && patchJson.brief === wantBrief && patchJson.briefAutoInit === true && patchJson.expectedBrief === "" && patchJson.expectBriefEmpty === true;
-  const patchCasOk = !!patchJson && Number(patchJson.leadSequence) === savedSeq && String(patchJson.leadContent) === QUESTION && String(patchJson.leadContent) === savedContent && Number(patchJson.expectedGeneration) === savedGen && String(patchJson.restoreEpochId || "") === String(savedRestoreId || "") && Number(patchJson.restoreEpochRev) === savedRestoreRev;
+  const patchCasOk = !!patchJson && typeof patchJson.leadSequence === "number" && patchJson.leadSequence === savedSeq && typeof patchJson.leadContent === "string" && patchJson.leadContent === QUESTION && patchJson.leadContent === savedContent && typeof patchJson.expectedGeneration === "number" && patchJson.expectedGeneration === savedGen && typeof (patchJson.restoreEpochId || "") === "string" && String(patchJson.restoreEpochId || "") === String(savedRestoreId || "") && typeof patchJson.restoreEpochRev === "number" && patchJson.restoreEpochRev === savedRestoreRev;
   const patchNoAdv = !!patchJson && !JSON.stringify(patchJson).toLowerCase().includes(String(advisor1).toLowerCase()) && !("advisorId" in patchJson) && !("participantIds" in patchJson);
   ok("autoinit-patch-body-exact", patchBriefOk && patchCasOk && patchNoAdv, "briefExact=" + patchBriefOk + " casValues=" + patchCasOk + " noAdvId=" + patchNoAdv);
   if (!(patchBriefOk && patchCasOk)) failExit("PATCH must carry exact lead return CAS values, not key presence.");
-  const runPolicyOk = !!runJson && typeof runJson.policy === "string" && runJson.policy.length > 0;
+  const runPolicyOk = !!runJson && runJson.policy === "balanced";
   const runPromptOk = !!runJson && runJson.prompt === QUESTION;
   const runEvOk = !!runJson && runJson.evidenceSupported === false;
-  const runVerOk = !!runJson && Number.isInteger(Number(runJson.leadVersion)) && Number(runJson.leadVersion) === leadVerPre && Number(runJson.leadVersion) > 0;
+  const runVerOk = !!runJson && typeof runJson.leadVersion === "number" && Number.isInteger(runJson.leadVersion) && runJson.leadVersion === leadVerPre && runJson.leadVersion > 0;
   const runOk = runPolicyOk && runPromptOk && runEvOk && runVerOk;
   ok("run-body-ok", runOk, "policyLen=" + (runJson && String(runJson.policy || "").length) + " promptExact=" + runPromptOk + " evFalse=" + runEvOk + " leadVer=" + (runJson && runJson.leadVersion));
   if (!runOk) failExit("run body must carry actual policy/prompt/evidenceSupported/leadVersion values.");
@@ -1173,6 +1259,10 @@ async function stepMeeting() {
   const leads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "").includes(QUESTION));
   const exactLeads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "") === QUESTION);
   ok("send-lead-text-once", msgs.status === 200 && exactLeads.length === 1 && leads.length === 1, "status=" + msgs.status + " exact-leads=" + exactLeads.length + " total=" + msgList.length);
+  const leadEnt = exactLeads.length === 1 ? exactLeads[0] : null;
+  const leadEntOk = !!leadEnt && String(pick(leadEnt, "boardId") || pick(leadEnt, "BoardId") || "") === String(boardA) && String(pick(leadEnt, "meetingId") || pick(leadEnt, "MeetingId") || "") === String(meetingId);
+  ok("send-lead-identity", leadEntOk, "persisted owned lead carries exact board+meeting identity");
+  if (!leadEntOk) failExit("persisted owned lead must carry exact board and meeting identity.");
   const det1 = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
   ok("autobrief-once", det1.status === 200 && String(pick(det1.json, "brief") || "") === wantBrief, "status=" + det1.status + " briefExact=" + (String(pick(det1.json, "brief") || "") === wantBrief));
   const adv = msgList.filter((x) => { const a = String(pick(x, "advisorId") || ""); return a && a !== "00000000-0000-0000-0000-000000000000"; });
@@ -1193,7 +1283,7 @@ async function stepMeeting() {
   ok("secretary-direction-baseline", nz0Valid, "status=" + nz0.status + " rows=" + (Array.isArray(nz0.json) ? nz0.json.length : -1));
   if (!nz0Valid) failExit("direction baseline must be RAW valid types with kind===direction.");
   const nz0Snap = Array.isArray(nz0.json) ? nz0.json.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "kind") || "") + "|" + String(pick(x, "provisional")) + "|" + String(pick(x, "body") || "") + "|" + String(pick(x, "title") || "")).sort().join("\n") : "";
-  const secPostPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/secretary" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(30000, Math.max(8000, remainingMs(12000))) }).catch(() => null);
+  const secPostPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/secretary" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(30000, Math.max(1, remainingMs())) }).catch(() => null);
   await box.fill(SECQ);
   await box.press("Enter");
   let secPostReqId = "", secPostRespNonce = "", secPostReqNonce = "", secPostInput = "", secPostStatus = 0;
@@ -1204,8 +1294,8 @@ async function stepMeeting() {
   const secPostNonce = secPostRespNonce;
   ok("secretary-post-captured", secPostStatus >= 200 && secPostStatus < 300 && secPostReqId.length > 0 && secPostRespNonce.length > 0 && secPostReqNonce.length > 0 && secPostRespNonce === secPostReqNonce && secPostInput === SECQ, "status=" + secPostStatus + " reqId=" + (secPostReqId ? secPostReqId.slice(0,8) : "missing") + " nonceEq=" + (secPostRespNonce === secPostReqNonce) + " inputExact=" + (secPostInput === SECQ));
   if (!secPostReqId) failExit("secretary POST response must carry exact requestId/nonce; refusing list-only correlation.");
-  const secDeadline = Date.now() + Math.min(90000, remainingMs(20000));
-  let sreq1List = [], fresh = [], secDone = null;
+  const secDeadline = Math.min(Date.now() + 90000, DEADLINE_MS - 5000);
+  let sreq1List = [], fresh = [], secDone = null, secInflightSeen = false, secSeatProgressSeen = false;
   while (Date.now() < secDeadline) {
     assertDeadline("secretary-poll");
     const g = await get("/api/meetings/" + meetingId + "/secretary/requests");
@@ -1213,6 +1303,8 @@ async function stepMeeting() {
       sreq1List = g.json;
       fresh = sreq1List.filter((x) => !sreq0Ids.has(String(pick(x, "id") || "")));
       secDone = fresh.find((x) => String(pick(x, "status") || "") === "completed" && !!pick(x, "noteId") && String(pick(x, "question") || pick(x, "inputText") || "").includes(run));
+      if (!secDone && fresh.some((x) => String(pick(x, "status") || "") !== "completed")) secInflightSeen = true;
+      if (!secDone && fresh.length >= 1) { try { const railSec = page.locator("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"]"); const secNames = await railSec.locator(".mp-name").allInnerTexts().catch(() => []); const secCls = await railSec.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []); for (let si = 0; si < secNames.length; si++) { if (/secretary/i.test(String(secNames[si] || "")) && /act-(queued|waiting-for-selection|considering|responding|waiting-for-publication)/.test(String(secCls[si] || ""))) { secSeatProgressSeen = true; break; } } } catch (e) {} }
       if (secDone) break;
     }
     await sleep(2000);
@@ -1221,6 +1313,7 @@ async function stepMeeting() {
   ok("secretary-provisional-visible", !!secDone && sameIdOk, secDone ? "sameID=" + sameIdOk + " noteId=" + String(pick(secDone, "noteId") || "").slice(0, 8) : "no exact completed owned request with same POST requestId");
   if (!sameIdOk) failExit("secretary completion must resolve the EXACT POST requestId, not any run-matching row.");
   ok("secretary-request-recorded", !!secDone && fresh.length === 1, "newRequests=" + fresh.length + " completed=" + !!secDone);
+  console.log("  note - secretary-ui-request-completed (in-flight observed on overlap POST below)");
   if (fresh.length !== 1) failExit("secretary must record exactly one new request for this input.");
   const sreq1 = { status: sreq1List.length ? 200 : 0 };
   if (secDone && fresh.length === 1) {
@@ -1308,6 +1401,38 @@ async function stepMeeting() {
   const nzSnap = Array.isArray(nlistRaw) ? nlistRaw.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "kind") || "") + "|" + String(pick(x, "provisional")) + "|" + String(pick(x, "body") || "") + "|" + String(pick(x, "title") || "")).sort().join("\n") : "";
   const snapUnchanged = nzSnap === nz0Snap;
   ok("secretary-no-decision", nz.status === 200 && nonProv.length === 0 && snapUnchanged, "nonProv=" + nonProv.length + " snapshotUnchanged=" + snapUnchanged);
+  const SECQ2 = "secretary: " + run + "-overlap please log the overlap probe, no decision yet? [QA-SLEEP:6000]";
+  const SECQ2NONCE = crypto.randomUUID();
+  let secPost2Done = false, secPost2Res = null;
+  const secPost2Flight = post("/api/meetings/" + meetingId + "/secretary", { input: SECQ2, clientNonce: SECQ2NONCE }).then((r) => { secPost2Done = true; secPost2Res = r; return r; }).catch((e) => { secPost2Done = true; secPost2Res = { status: 0, json: null }; return secPost2Res; });
+  try {
+    const secFlightEnd2 = Math.min(Date.now() + 15000, DEADLINE_MS - 5000);
+    while (!secPost2Done && Date.now() < secFlightEnd2) {
+      assertDeadline("secretary-overlap-inflight");
+      try {
+        const fg2 = await get("/api/meetings/" + meetingId + "/secretary/requests");
+        if (fg2.status === 200 && Array.isArray(fg2.json)) {
+          const owned2 = fg2.json.filter((x) => String(pick(x, "question") || pick(x, "inputText") || "").includes(run));
+          if (owned2.some((x) => String(pick(x, "status") || "") !== "completed")) secInflightSeen = true;
+          if (owned2.length >= 1) { try { const railSec2 = page.locator("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"]"); const secNames2 = await railSec2.locator(".mp-name").allInnerTexts().catch(() => []); const secCls2 = await railSec2.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []); for (let si2 = 0; si2 < secNames2.length; si2++) { if (/secretary/i.test(String(secNames2[si2] || "")) && /act-(queued|waiting-for-selection|considering|responding|waiting-for-publication)/.test(String(secCls2[si2] || ""))) { secSeatProgressSeen = true; break; } } } catch (e) {} }
+        }
+      } catch (e) {}
+      if (!secPost2Done) await sleep(300);
+    }
+  } catch (e) {}
+  const secPost2 = await secPost2Flight;
+  const secPost2Id = String(pick(secPost2.json, "requestId") || pick(secPost2.json, "id") || "");
+  ok("secretary-overlap-posted", secPost2.status >= 200 && secPost2.status < 300 && !!secPost2Id && secPost2Id.toLowerCase() !== secPostReqId.toLowerCase(), "status=" + secPost2.status + " id2=" + secPost2Id.slice(0,8) + " id1=" + secPostReqId.slice(0,8));
+  if (!(secPost2.status >= 200 && secPost2.status < 300 && secPost2Id)) failExit("overlap Secretary POST failed.");
+  const overlapEnd = Math.min(Date.now() + 60000, DEADLINE_MS - 5000);
+  let overlapDone2 = null, overlapList = [];
+  while (Date.now() < overlapEnd) { assertDeadline("secretary-overlap-poll"); const gg = await get("/api/meetings/" + meetingId + "/secretary/requests"); if (gg.status === 200 && Array.isArray(gg.json)) { overlapList = gg.json.filter((x) => String(pick(x, "question") || pick(x, "inputText") || "").includes(run)); overlapDone2 = overlapList.find((x) => String(pick(x, "id") || "").toLowerCase() === secPost2Id.toLowerCase() && String(pick(x, "status") || "") === "completed" && !!pick(x, "noteId")); if (overlapDone2) break; } await sleep(2000); }
+  ok("secretary-inflight-seat-progress", secInflightSeen && secSeatProgressSeen, "inflight=" + secInflightSeen + " seatProgress=" + secSeatProgressSeen);
+  if (!(secInflightSeen && secSeatProgressSeen)) failExit("Secretary must show in-flight request plus visible in-rail seat progress before completion.");
+  const overlapIds = overlapList.map((x) => String(pick(x, "id") || "").toLowerCase());
+  const overlapOk = !!overlapDone2 && overlapIds.includes(secPostReqId.toLowerCase()) && overlapIds.includes(secPost2Id.toLowerCase()) && new Set(overlapIds).size >= 2;
+  ok("secretary-overlap-two-requests", overlapOk, "distinctCompleted=" + new Set(overlapIds).size + " hasFirst=" + overlapIds.includes(secPostReqId.toLowerCase()) + " hasSecond=" + !!overlapDone2);
+  if (!overlapOk) failExit("overlapping Secretary scenario must record two distinct completed requests.");
   await scanDebug("meeting-shell");
   await scanDebug("meeting-messages");
   checkBudget("meeting");
@@ -1403,7 +1528,7 @@ async function stepReeditRerun() {
   if (!(rl2.status === 200 || rl2.status === 201)) failExit("rerun lead with unique marker must post before run.");
   const lead2Ver = Number(pick((await get("/api/boards/" + boardA + "/lead")).json, "version") || 0);
   if (!(Number.isInteger(lead2Ver) && lead2Ver > 0)) failExit("rerun lead version must be strict positive integer.");
-  const r2 = await post("/api/meetings/" + mid2 + "/run", { policy: "balanced", prompt: rerunLeadContent, evidenceSupported: false, leadVersion: lead2Ver }, { timeout: Math.min(RUN_TIMEOUT, Math.max(15000, remainingMs(20000))) });
+  const r2 = await post("/api/meetings/" + mid2 + "/run", { policy: "balanced", prompt: rerunLeadContent, evidenceSupported: false, leadVersion: lead2Ver }, { timeout: Math.min(RUN_TIMEOUT, Math.max(1, remainingMs())) });
   ok("rerun-run-200", r2.status === 200, "status=" + r2.status);
   const vm2 = await get("/api/meetings/" + mid2 + "/messages?take=100");
   const vl2 = Array.isArray(vm2.json) ? vm2.json : [];
@@ -1454,10 +1579,13 @@ async function stepRosterChatUI() {
   const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
   let panelOk = false;
   let panelDiag = "";
-  try { await panel.waitFor({ timeout: boundedTimeout(20000, 8000) }); panelOk = await panel.count() > 0; } catch { panelOk = false; }
-  if (!panelOk) { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " aria=" + ariaCur + " " + selDiag + " badResp=" + badResponses.slice(-3).join(" | ").slice(0, 240) + " pageErr=" + pageErrors.slice(-2).join(" | ").slice(0, 240); ok("roster-chat-panel-mounted", false, "RosterChatPanel for owned advisor never mounted; " + panelDiag); }
-  ok("roster-chat-panel-mounted", panelOk, panelOk ? "div[data-roster-chat] mounted same-entry=" + String(rosterId).slice(0, 8) + " " + selDiag : "panel missing; " + panelDiag);
-  if (!panelOk) failExit("roster chat panel missing for same exact entry after proven selection; refusing HTTP-only chat. " + (panelDiag || selDiag));
+  let waitErr = "none"; try { await panel.first().waitFor({ timeout: boundedTimeout(20000, 8000) }); } catch (e) { waitErr = String((e && e.message) || e).slice(0, 160); } const panelExactCount = await panel.count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); const nativeN = await page.evaluate((rid) => { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let ex = 0; let vv = 0; for (const el of els) { if (el.getAttribute("data-roster-chat") === rid) { ex++; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); if (r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none") vv++; } catch (ee) { } } } return { all: els.length, exact: ex, vis: vv }; }, rosterId).catch(() => null);
+  { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); let nativeDiag = "native=uncollected"; try { nativeDiag = await page.evaluate((rid) => { try { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let exactN = 0; try { exactN = els.filter((e) => e.getAttribute("data-roster-chat") === rid).length; } catch (e2) { exactN = -2; } let visN = 0; const visHeads = []; try { for (const el of els) { let vis = false; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); vis = r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; } catch (e4) { vis = false; } if (vis) { visN++; if (visHeads.length < 3) { let h = ""; try { const sec = el.closest("section,aside,main"); const hh = sec ? sec.querySelector("h1,h2,h3") : null; h = (hh && hh.innerText ? hh.innerText : "").slice(0, 40); } catch (e5) { h = "head-err"; } visHeads.push("attr=" + String(el.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + h); } } } } catch (e3) { visN = -3; } const headFor = (el) => { try { const sec = el.closest("section,aside,main"); const h = sec ? sec.querySelector("h1,h2,h3") : null; return (h && h.innerText ? h.innerText : "").slice(0, 40); } catch (e3) { return "head-err"; } }; return "nativeCount=" + els.length + " nativeExact=" + exactN + " nativeVisible=" + visN + " totalDivs=" + document.querySelectorAll("div").length + " url=" + String(location.hash || "").slice(0, 80) + " attrs=[" + els.slice(0, 3).map((e) => "attr=" + String(e.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + headFor(e)).join(";") + "] visHeads=[" + visHeads.join(";") + "]"; } catch (e) { return "native-eval-threw"; } }, rosterId).catch(() => "native-eval-failed"); } catch (e) { nativeDiag = "native-harness-threw"; } let shotInfo = "shot=skipped"; try { const osMod = await import("node:os"); const shotPath = String(osMod.tmpdir()).replace(/\\/g, "/") + "/qa-author-roster-" + run + ".png"; await page.screenshot({ path: shotPath }).catch(() => {}); shotInfo = "shot=" + shotPath; } catch (e) { shotInfo = "shot-failed"; } panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " panelExact=" + panelExactCount + " waitErr=" + waitErr + " nativeAll=" + (nativeN ? nativeN.all : -1) + " nativeExact=" + (nativeN ? nativeN.exact : -1) + " nativeVis=" + (nativeN ? nativeN.vis : -1) + " aria=" + ariaCur + " " + selDiag + " " + nativeDiag + " " + shotInfo; }
+  const singular = panelExactCount === 1 && !!nativeN && nativeN.exact === 1 && nativeN.vis === 1;
+  ok("roster-chat-panel-mounted", singular, singular ? "div[data-roster-chat] single same-entry=" + String(rosterId).slice(0, 8) + " " + selDiag : "panel not singular; " + panelDiag);
+  ok("roster-chat-panel-singular", singular, "exact=" + panelExactCount + " nativeAll=" + (nativeN ? nativeN.all : -1) + " nativeExact=" + (nativeN ? nativeN.exact : -1) + " nativeVis=" + (nativeN ? nativeN.vis : -1) + " waitErr=" + waitErr + " " + selDiag);
+  panelOk = singular;
+  if (!panelOk) failExit("roster chat panel not singular for same exact entry after proven selection; refusing HTTP-only chat. " + panelDiag);
   const headOk = await panel.getByText("Chat with this advisor", { exact: false }).count().then((c) => c > 0).catch(() => false);
   const boardfreeOk = await panel.getByText(/nothing here joins a meeting/i).count().then((c) => c > 0).catch(() => false);
   ok("roster-chat-boardfree-contract", headOk && boardfreeOk, "heading=" + headOk + " boardfree-note=" + boardfreeOk);
@@ -1467,8 +1595,8 @@ async function stepRosterChatUI() {
   ok("roster-chat-controls", boxOk && await chatLog.count() > 0, "messageBox=" + boxOk);
   if (!boxOk) failExit("roster chat message box missing.");
   const mc0 = await get("/api/meetings/" + meetingId + "/messages?take=100");
-  const msgValid = (x) => x && typeof x === "object" && Number.isInteger(Number(pick(x, "sequence") ?? pick(x, "Sequence"))) && typeof pick(x, "sender") === "string" && typeof (pick(x, "content") ?? pick(x, "Content")) === "string" && typeof pick(x, "advisorId") === "string" && typeof pick(x, "stance") === "string" && typeof pick(x, "status") === "string" && (pick(x, "boardId") === undefined || typeof pick(x, "boardId") === "string") && (pick(x, "meetingId") === undefined || typeof pick(x, "meetingId") === "string") && (pick(x, "advisorName") === undefined || pick(x, "advisorName") === null || typeof pick(x, "advisorName") === "string") && (pick(x, "createdAt") === undefined || typeof pick(x, "createdAt") === "string") && (pick(x, "parentSequence") === undefined || pick(x, "parentSequence") === null || Number.isInteger(Number(pick(x, "parentSequence") ?? pick(x, "ParentSequence"))));
-  const msgSnap = (x) => String(pick(x, "sequence") ?? pick(x, "Sequence")) + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") ?? pick(x, "Content") ?? "") + "|" + String(pick(x, "parentSequence") ?? pick(x, "ParentSequence") ?? "") + "|" + String(pick(x, "stance") || "") + "|" + String(pick(x, "status") || "") + "|" + String(pick(x, "boardId") || "") + "|" + String(pick(x, "meetingId") || "") + "|" + String(pick(x, "advisorName") || "");
+  const msgValid = (x) => { if (!x || typeof x !== "object") return false; const seq = pick(x, "sequence") ?? pick(x, "Sequence"); if (!Number.isInteger(seq)) return false; if (typeof pick(x, "sender") !== "string") return false; const ct = pick(x, "content") ?? pick(x, "Content"); if (typeof ct !== "string") return false; if (typeof pick(x, "advisorId") !== "string") return false; if (typeof pick(x, "stance") !== "string") return false; if (typeof pick(x, "status") !== "string") return false; if (typeof pick(x, "boardId") !== "string") return false; if (typeof pick(x, "meetingId") !== "string") return false; const ca = pick(x, "createdAt") ?? pick(x, "CreatedAt"); if (typeof ca !== "string" || !ca || isNaN(Date.parse(ca))) return false; const ps = pick(x, "parentSequence") ?? pick(x, "ParentSequence"); if (ps !== null && ps !== undefined && !Number.isInteger(ps)) return false; const an = pick(x, "advisorName"); if (an !== undefined && an !== null && typeof an !== "string") return false; return true; };
+  const msgSnap = (x) => String(pick(x, "sequence") ?? pick(x, "Sequence")) + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") ?? pick(x, "Content") ?? "") + "|" + String(pick(x, "parentSequence") ?? pick(x, "ParentSequence") ?? "") + "|" + String(pick(x, "stance") || "") + "|" + String(pick(x, "status") || "") + "|" + String(pick(x, "boardId") || "") + "|" + String(pick(x, "meetingId") || "") + "|" + String(pick(x, "advisorName") || "") + "|" + String(pick(x, "createdAt") ?? pick(x, "CreatedAt") ?? "");
   const mc0Valid = mc0.status === 200 && Array.isArray(mc0.json) && mc0.json.every(msgValid);
   ok("roster-chat-message-shape", mc0Valid, "all meeting messages carry Sequence/ParentSequence/Status/Stance/Content");
   if (!mc0Valid) failExit("meeting message entities must validate full snapshot; Id does not exist (Sequence only).");
@@ -1478,10 +1606,10 @@ async function stepRosterChatUI() {
   ok("roster-chat-baseline-valid", mc0.status === 200 && baseLeadExact === 1, "meetingHasOwnedLeadExact=" + baseLeadExact + " total=" + c0);
   if (!(mc0.status === 200 && baseLeadExact === 1)) failExit("meeting baseline not positively validated; refusing stateless proof.");
   const chatQ = "Direct " + run + ": state your current berth criterion in one line?";
-  const chatRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/roster/" + rosterId + "/chat" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(95000, Math.max(15000, remainingMs(20000))) }).catch(() => null);
+  const chatRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/roster/" + rosterId + "/chat" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(95000, Math.max(1, remainingMs())) }).catch(() => null);
   await chatBox.first().fill(chatQ);
   const sendBtn = panel.getByRole("button", { name: /^send$/i });
-  try { await sendBtn.first().click({ timeout: 8000 }); } catch { ok("roster-chat-ui-reply", false, "Send never clickable"); failExit("roster chat send failed."); }
+  try { await sendBtn.first().click({ timeout: 8000 }); } catch (e) { let clickDiag = String((e && e.message) || e).slice(0, 200); try { clickDiag += " pt=" + await sendBtn.first().evaluate((el) => { const r = el.getBoundingClientRect(); const x = Math.round(r.x + r.width / 2); const y = Math.round(r.y + r.height / 2); let ds = "q-na"; try { const tt = document.elementFromPoint(x, y); ds = tt === el ? "self" : (tt ? tt.tagName + "." + String(tt.className || "").slice(0, 50) : "none"); } catch (ee) { ds = "q-na"; } return x + "," + y + " hit=" + ds + " dis=" + !!el.disabled; }).catch(() => "pt-na"); } catch (ee) { clickDiag += " diag-na"; } ok("roster-chat-ui-reply", false, "Send never clickable " + clickDiag); failExit("roster chat send failed. " + clickDiag); }
   let advAnswer = "";
   try {
     await page.waitForFunction((rid) => {
@@ -1498,18 +1626,29 @@ async function stepRosterChatUI() {
   const _chatResp = await chatRespPromise;
   let chatAns = "", chatRid = "", chatVer = 0, chatStored = null, chatStatus = 0;
   try { if (_chatResp) { chatStatus = _chatResp.status(); const _cj = await _chatResp.json(); chatAns = typeof pick(_cj, "answer") === "string" ? String(pick(_cj, "answer")) : ""; chatRid = String(pick(_cj, "rosterId") || ""); chatVer = Number(pick(_cj, "rosterVersion") || 0); chatStored = pick(_cj, "stored"); } } catch {}
+  let pairedReqUrl = ""; let pairedReqBody = ""; try { const prq = _chatResp ? _chatResp.request() : null; if (prq) { pairedReqUrl = new URL(prq.url()).pathname; try { const pd = prq.postData(); pairedReqBody = typeof pd === "string" ? pd : ""; } catch (e) { pairedReqBody = ""; } } } catch (e) {}
+  let pairedJson = null; try { pairedJson = pairedReqBody ? JSON.parse(pairedReqBody) : null; } catch { pairedJson = null; }
   const ownedChat = netPosts.rosterChat.filter((e) => String(e.url || "").includes(rosterId));
   const chatReq = ownedChat.length > 0 ? ownedChat[ownedChat.length - 1] : null;
   let chatJson = null; try { chatJson = chatReq ? JSON.parse(chatReq.body) : null; } catch { chatJson = null; }
-  const chatUrlOk = !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
-  const chatKeyOk = !!chatJson && typeof chatJson.message === "string" && chatJson.message === chatQ && !("content" in chatJson) && !("body" in chatJson);
-  const chatPairOk = !!_chatResp && !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
+  const chatUrlOk = pairedReqUrl === "/api/roster/" + rosterId + "/chat" && !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
+  const chatKeyOk = !!pairedJson && typeof pairedJson.message === "string" && pairedJson.message === chatQ && !("content" in pairedJson) && !("body" in pairedJson) && !!chatJson && chatJson.message === chatQ;
+  const chatPairOk = !!_chatResp && pairedReqUrl === "/api/roster/" + rosterId + "/chat" && !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat" && pairedReqBody.indexOf(chatQ) >= 0;
   const chatVerOk = Number.isInteger(chatVer) && chatVer > 0 && chatVer === freshVer && freshVer > 0;
   const chatResOk = chatPairOk && chatStatus >= 200 && chatStatus < 300 && chatAns.length >= 20 && chatRid.toLowerCase() === String(rosterId).toLowerCase() && chatVerOk && chatStored === false;
   const uiEqOk = !!advAnswer && advAnswer === chatAns;
   ok("roster-chat-request", chatUrlOk && chatKeyOk && chatResOk, "urlExact=" + chatUrlOk + " messageKeyExact=" + chatKeyOk + " paired=" + chatPairOk + " answerLen=" + chatAns.length + " ver=" + chatVer + " freshVer=" + freshVer);
   if (!(chatUrlOk && chatKeyOk && chatResOk)) failExit("roster chat must use EXACT message key with 200 answer/rosterId/version/stored.");
   ok("roster-chat-ui-eq-answer", uiEqOk, "uiLen=" + (advAnswer ? advAnswer.length : 0) + " ansLen=" + chatAns.length);
+  if (MODE === "native") {
+    const canonChat = await canonicalEntry(rosterId);
+    const chatParas = threeParas(canonChat.entry ? (pick(canonChat.entry, "profileJson") || "") : "");
+    const clog = await fakeLog();
+    const ownedChats = Array.isArray(clog) ? ownedLog(clog).filter((e) => e.path === "chat" && logText(e).includes(chatQ.slice(0, 20))) : [];
+    const chatParaOk = chatParas.length === 3 && ownedChats.length >= 1 && chatParas.every((para) => ownedChats.some((e) => logText(e).includes(para.slice(0, 32))));
+    ok("roster-chat-current-paras-owned", chatParaOk, "chats=" + ownedChats.length + " paras=" + chatParas.length);
+    if (!chatParaOk) failExit("current behavior paragraphs must appear in owned direct-chat prompts.");
+  } else { ok("roster-chat-current-paras-owned", false, "live mode UNPROVED prompt path"); }
   if (!uiEqOk) failExit("rendered roster answer must equal the API answer exactly.");
   const mc1 = await get("/api/meetings/" + meetingId + "/messages?take=100");
   const mc1Valid = mc1.status === 200 && Array.isArray(mc1.json) && mc1.json.every(msgValid);
@@ -1521,24 +1660,28 @@ async function stepRosterChatUI() {
   checkBudget("roster-chat-ui");
 }
 // ---- 6. navigation: every named destination, direct routes, back/forward ----
+function collectVisibleText(root) {
+  const doc = (root && root.ownerDocument) || document;
+  const scope = root || doc;
+  let txt = "";
+  try { txt = (!root || scope === doc || scope === doc.body) ? (doc.body ? doc.body.innerText || "" : "") : (scope.innerText || ""); } catch (e) { txt = ""; }
+  const els = Array.from((!root || scope === doc ? doc : scope).querySelectorAll("input,textarea,select"));
+  for (const el of els) {
+    try {
+      const cs = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+      if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
+      const r = el.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) continue;
+      if ((el.value || "").length > 0) txt += "\n" + el.value;
+    } catch {}
+  }
+  return txt;
+}
 async function scanDebug(tag) {
   assertDeadline("scan-" + tag);
   let collected = null;
   try {
-    collected = await page.evaluate(() => {
-      let txt = document.body ? (document.body.innerText || "") : "";
-      const els = Array.from(document.querySelectorAll("input,textarea,select"));
-      for (const el of els) {
-        try {
-          const cs = window.getComputedStyle(el);
-          if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
-          const r = el.getBoundingClientRect();
-          if (!(r.width > 0 && r.height > 0)) continue;
-          if ((el.value || "").length > 0) txt += "\n" + el.value;
-        } catch {}
-      }
-      return txt;
-    });
+    collected = await page.evaluate(collectVisibleText);
   } catch (e) { failExit("debug collector failed for " + tag + "; refusing empty-clean. " + String((e && e.message) || e).slice(0,120)); }
   if (typeof collected !== "string") failExit("debug collector returned non-string for " + tag + "; FATAL not clean.");
   if (collected.length === 0) failExit("debug collector body empty for " + tag + "; body nonempty required.");
@@ -1551,48 +1694,45 @@ async function scanDebug(tag) {
   const guidHits = detCollected.g ? (collected.match(guidRe) || []).length : 0;
   const jsonHits = detCollected.j ? (collected.match(jsonRe) || []).length : 0;
   const primHits = detCollected.p ? (collected.match(primRe) || []).length : 0;
-  const hasGuid = (t) => det(t).g;
-  const hasStrJson = (t) => det(t).j;
-  const hasObjJson = (t) => det(t).j;
-  const hasArrJson = (t) => det(t).j;
-  const hasPrimJson = (t) => det(t).p;
-  const fGuid = "id 11111111-2222-3333-4444-555555555555";
-  const fStr = '"k":"v"';
-  const fObj = '"k":{}';
-  const fArr = '"k":[]';
-  const fPrim = '"k":123';
-  const fClean = "plain visible text with no identifiers";
-  const positiveOk = hasGuid(fGuid) && hasStrJson(fStr) && hasObjJson(fObj) && hasArrJson(fArr) && hasPrimJson(fPrim) && !hasGuid(fClean) && !hasStrJson(fClean) && !hasPrimJson(fClean);
-  ok("debug-scan-positive-" + tag, positiveOk, "independent fixtures GUID/string/object/array/primitive + clean negative");
-  // Hidden DOM controls/attributes and visibility:hidden are ignored by the same collector (geometry + computed visibility).
-  let hiddenIgnored = false;
+  const QQ = String.fromCharCode(34);
+  let controlsOk = false; let controlsDiag = "unrun";
+  let probePage = null;
   try {
-    hiddenIgnored = await page.evaluate(() => {
-      const wrap = document.createElement("div");
-      wrap.innerHTML = '<input data-probe="22222222-3333-4444-5555-666666666666" value="33333333-4444-5555-6666-777777777777"><span style="visibility:hidden">44444444-5555-6666-7777-888888888888</span>';
-      wrap.style.display = "none";
-      document.body.appendChild(wrap);
-      let txt = document.body.innerText || "";
-      try {
-        const els = Array.from(document.querySelectorAll("input,textarea,select"));
-        for (const el of els) {
-          try {
-            const cs = window.getComputedStyle(el);
-            if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
-            const r = el.getBoundingClientRect();
-            if (!(r.width > 0 && r.height > 0)) continue;
-            if ((el.value || "").length > 0) txt += "\n" + el.value;
-          } catch {}
-        }
-      } catch {}
-      const hasAttr = txt.includes("22222222-3333-4444-5555-666666666666") || txt.includes("33333333-4444-5555-6666-777777777777");
-      const hasHid = txt.includes("44444444-5555-6666-7777-888888888888");
-      wrap.remove();
-      return !hasAttr && !hasHid;
-    }).catch(() => false);
-  } catch { hiddenIgnored = false; }
-  const clean = guidHits === 0 && jsonHits === 0 && primHits === 0;
-  ok("debug-clean-" + tag, clean && positiveOk && hiddenIgnored, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " hiddenIgnored=" + hiddenIgnored);
+    probePage = await ctx.newPage().catch(() => null);
+    if (!probePage) failExit("debug probe page unavailable for " + tag + "; refusing fixture-only proof.");
+    await probePage.setContent("<p>probe visible words</p><input id=qa-vis-guid><textarea id=qa-vis-str></textarea><input id=qa-vis-obj><input id=qa-vis-arr><input id=qa-vis-prim>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate((qq) => { const g = document.getElementById("qa-vis-guid"); if (g) g.value = "11111111-2222-3333-4444-555555555555"; const s = document.getElementById("qa-vis-str"); if (s) s.value = qq + "k" + qq + ":" + qq + "v" + qq; const o = document.getElementById("qa-vis-obj"); if (o) o.value = qq + "o" + qq + ":{" + qq + "a" + qq + ":1}"; const ar = document.getElementById("qa-vis-arr"); if (ar) ar.value = qq + "arr" + qq + ":[1,2]"; const pr = document.getElementById("qa-vis-prim"); if (pr) pr.value = qq + "n" + qq + ":123"; }, QQ).catch(() => {});
+    const visTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    const visInputsOk = typeof visTxt === "string" && visTxt.indexOf("11111111-2222-3333-4444-555555555555") >= 0 && visTxt.indexOf(QQ + "k" + QQ) >= 0 && visTxt.indexOf(QQ + "o" + QQ) >= 0 && visTxt.indexOf(QQ + "arr" + QQ) >= 0 && visTxt.indexOf(QQ + "n" + QQ) >= 0;
+    await probePage.setContent("<span>22222222-3333-4444-5555-666666666666</span>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate(() => { const s = document.querySelector("span"); if (s) s.style.visibility = "hidden"; }).catch(() => {});
+    const hidTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<div><span>33333333-4444-5555-6666-777777777777</span><span>" + QQ + "a" + QQ + ":{}</span><input value=44444444-5555-6666-7777-000000000000></div>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate(() => { const d = document.querySelector("div"); if (d) d.style.display = "none"; }).catch(() => {});
+    const dispTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<div data-qa-attr-probe=55555555-5555-6666-7777-888888888888>plain attribute carrier</div>", { waitUntil: "domcontentloaded" });
+    const attrTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<input id=qa-hid-guid><textarea id=qa-hid-str></textarea>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate((qq) => { const g = document.getElementById("qa-hid-guid"); if (g) g.value = "22222222-3333-4444-5555-666666666666"; const s = document.getElementById("qa-hid-str"); if (s) s.value = qq + "hk" + qq + ":" + qq + "hv" + qq; }, QQ).catch(() => {});
+    await probePage.evaluate(() => { const els = document.querySelectorAll("input,textarea"); for (const el of els) { el.style.visibility = "hidden"; } }).catch(() => {});
+    const hidInputTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    const dHI = typeof hidInputTxt === "string" ? det(hidInputTxt) : null;
+    await probePage.close().catch(() => {}); probePage = null;
+    const dV = typeof visTxt === "string" ? det(visTxt) : null;
+    const dH = typeof hidTxt === "string" ? det(hidTxt) : null;
+    const dD = typeof dispTxt === "string" ? det(dispTxt) : null;
+    const dA = typeof attrTxt === "string" ? det(attrTxt) : null;
+    const hidInputOk = !!dHI && !dHI.g && !dHI.j && !dHI.p;
+    const visOk = !!dV && dV.g && dV.j && dV.p && visInputsOk;
+    const hidOk = !!dH && !dH.g && !dH.j && !dH.p && hidInputOk;
+    const dispOk = !!dD && !dD.g && !dD.j && !dD.p;
+    const attrOk = !!dA && !dA.g && !dA.j && !dA.p;
+    controlsOk = visOk && hidOk && dispOk && attrOk;
+    controlsDiag = "visible-positive=" + visOk + "(inputs=" + visInputsOk + ") hidden=" + hidOk + "(inputHidden=" + hidInputOk + ") display-none=" + dispOk + " attribute=" + attrOk;
+  } catch (e) { controlsOk = false; controlsDiag = "controls threw: " + String((e && e.message) || e).slice(0, 120); try { if (probePage) await probePage.close().catch(() => {}); } catch (ee) { } probePage = null; }
+  ok("debug-scan-positive-" + tag, controlsOk, "actual-collector controls: " + controlsDiag);;
+  const detClean = !detCollected.g && !detCollected.j && !detCollected.p;
+  ok("debug-clean-" + tag, detClean && controlsOk, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " controls=" + controlsOk);
 }
 async function stepNavigation() {
   // F11: EVERY named rail destination (repo convention: nav.rail buttons by
@@ -1607,9 +1747,9 @@ async function stepNavigation() {
     { label: "Board Advisors", seg: "advisors", sec: 'section[aria-label="This Board\'s Advisors"]', head: null, entity: "Harbor Strategist" },
     { label: "Meetings", seg: "meet", sec: '[aria-label="Meetings and conversation"]', head: null, entity: run + " harbor call" },
     { label: "Sources", seg: "sources", sec: 'section[aria-label="Resources and Inbox"]', head: "Resources and Inbox", entity: OWNED_URL_MARK },
-    { label: "Records", seg: "records", sec: 'section[aria-label="Records"]', head: "Records", entity: run },
-    { label: "People", seg: "people", sec: 'section[aria-label="People"]', head: "People", entity: "Board Own " + run },
-    { label: "Activity", seg: "activity", sec: 'section[aria-label="Activity and Usage"]', head: "Activity and Usage", entity: "Harbor Strategist" },
+    { label: "Records", seg: "records", sec: 'section[aria-label="Records"]', head: "Records", entity: run + " harbor call" },
+    { label: "People", seg: "people", sec: 'section[aria-label="People"]', head: "People", entity: authedEmail },
+    { label: "Activity", seg: "activity", sec: 'section[aria-label="Activity and Usage"]', head: "Activity and Usage", entity: "Usage (live ledger)" },
     { label: "Settings", seg: "settings", sec: 'section[aria-label="Settings"]', head: "Settings", entity: null },
     { label: "Profile", seg: "profile", sec: 'section[aria-label="Profile"]', head: "Profile", entity: "QA Default " + run },
     { label: "Help", seg: "help", sec: 'section[aria-label="Help"]', head: null, entity: null },
@@ -1621,15 +1761,15 @@ async function stepNavigation() {
   async function assertDest(d) {
     const secLoc = page.locator(d.sec).first();
     let secVis = false; try { await secLoc.waitFor({ state: "visible", timeout: 8000 }); secVis = await secLoc.isVisible(); } catch { secVis = false; }
-    const secTxt = secVis ? await secLoc.innerText().catch(() => "") : "";
+    let secTxt = ""; if (secVis) { try { secTxt = await secLoc.evaluate((el) => { let t = ""; try { t = el.innerText || ""; } catch (e) { t = ""; } try { const els = Array.from(el.querySelectorAll("input,textarea,select")); for (const x of els) { try { const cs = (x.ownerDocument.defaultView || window).getComputedStyle(x); if (!cs || cs.visibility === "hidden" || cs.display === "none") continue; const r = x.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) continue; if ((x.value || "").length > 0) t += "\n" + x.value; } catch (e) {} } } catch (e) {} return t; }).catch(() => ""); if (!secTxt) secTxt = await secLoc.innerText().catch(() => ""); } catch (e) { secTxt = ""; } } const normTxt = (secTxt || "").replace(/\s+/g, " ");
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await hLoc.first().isVisible().catch(() => false); if (!headOk) headOk = secTxt.includes(d.head); }
-    let entityOk = true;
-    if (d.entity) { if (d.seg === "meet") { entityOk = secTxt.includes(d.entity); } else { entityOk = secTxt.includes(d.entity) || secTxt.includes(run); } if (!entityOk && d.seg === "records") entityOk = /no records|empty|nothing|prepare draft/i.test(secTxt); if (!entityOk && d.seg === "sources") entityOk = /wiki|sources|inbox|no sources|empty/i.test(secTxt); }
+    let entityOk = true; let emptyVerified = false;
+    if (d.entity) { entityOk = secTxt.includes(d.entity); if (!entityOk && (d.seg === "records" || d.seg === "sources")) { const emptyRe = d.seg === "records" ? /pick a meeting first|no records|nothing here yet/i : /no sources|nothing here yet/i; if (emptyRe.test(normTxt) && secVis && headOk) { emptyVerified = true; entityOk = true; } } }
     const h = await page.evaluate(() => location.hash).catch(() => "");
     const hashOk = h.indexOf("#/" + d.seg) === 0;
     const boardOk = ["advisors", "meet", "sources", "records", "people", "activity"].includes(d.seg) ? h.includes("board=" + encodeURIComponent(boardA)) : true;
-    return { ok: hashOk && boardOk && secVis && headOk && entityOk, detail: "hash=" + h.slice(0,80) + " sec=" + secVis + " head=" + headOk + " entity=" + entityOk };
+    return { ok: hashOk && boardOk && secVis && headOk && entityOk, detail: "hash=" + h.slice(0,80) + " sec=" + secVis + " head=" + headOk + " entity=" + entityOk + " emptyVerified=" + emptyVerified + " secTxt=" + normTxt.slice(0, 160) };
   }
   let arrived = 0;
   for (const d of dests) {
@@ -1644,16 +1784,18 @@ async function stepNavigation() {
       await page.waitForTimeout(900);
       clicked = true;
     }
-    if (!clicked) { ok("nav-dest-" + d.seg, false, "nav control not clickable: " + d.label); failExit("nav prerequisite failed at " + d.seg + "; aborting cascade."); }
+    if (d.seg === "wizard") { console.log("  note - nav-wizard-direct-only (no rail button by design; direct visit, not rail coverage)"); }
+    else { ok("nav-rail-clickable-" + d.seg, clicked, "rail control " + d.label + " clickable=" + clicked); }
+    if (!clicked) failExit("nav rail prerequisite failed at " + d.seg + "; rail failure recorded separately from direct-route success (no Create fallback counts).");
     await page.waitForTimeout(900);
     const r = await assertDest(d);
     if (r.ok) arrived++;
-    ok("nav-dest-" + d.seg, r.ok, r.detail);
+    ok("nav-dest-" + d.seg, r.ok, (d.seg === "wizard" ? "direct-only " : "rail ") + r.detail);
     if (!r.ok) failExit("destination " + d.seg + " must render scoped heading+section+entity; " + r.detail);
     await scanDebug("nav-" + d.seg);
   }
-  ok("nav-all-destinations", arrived === dests.length, "arrived=" + arrived + "/" + dests.length);
-  if (arrived !== dests.length) failExit("navigation did not reach all destinations with board context.");
+  ok("nav-all-destinations", arrived === dests.length, "rail=11 + wizard-direct-only=1 total=" + arrived + "/" + dests.length);
+  if (arrived !== dests.length) failExit("navigation must reach 11 rail destinations plus direct-only wizard with board context.");
   // Direct routes use the SAME scoped predicates as the rail loop.
   await page.goto(WEB + "/#/boards", { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
   await page.waitForTimeout(900);
@@ -1667,6 +1809,9 @@ async function stepNavigation() {
   await page.goto(WEB + "/" + boardHash("records"), { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
   await page.waitForTimeout(900);
   { const _r = await assertDest(dests[5]); ok("nav-entity-records", _r.ok, "direct records scoped: " + _r.detail); if (!_r.ok) failExit("direct records must satisfy scoped predicates."); }
+  await page.goto(WEB + "/#/records?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId), { waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => {});
+  await page.waitForTimeout(900);
+  { const _sec = page.locator("section[aria-label=\"Records\"]").first(); let _vis = false; try { await _sec.waitFor({ state: "visible", timeout: 8000 }); _vis = await _sec.isVisible(); } catch { _vis = false; } const _txt = _vis ? (await _sec.innerText().catch(() => "")).replace(/\s+/g, " ") : ""; const _ok = _vis && _txt.indexOf("Prepare draft") >= 0; ok("nav-entity-records-meeting", _ok, "meeting-scoped records Prepare-draft: vis=" + _vis + " txt=" + _txt.slice(0, 160)); if (!_ok) failExit("meeting-scoped records must render Prepare draft for owned meeting."); }
   await gotoTab("/#/profile");
   await scanDebug("direct-profile");
   await gotoTab("/#/roster");
@@ -1695,7 +1840,58 @@ async function stepNavigation() {
 
 // Duplicative backend negative activity scenarios REMOVED from this monolith by design (mapped, NOT claimed passed here; primary runs focused suites).
 // Exact mapping: no-responder stubbed UI terminal/retry -> qa/meeting-send-pipeline-qa.mjs:402; bid-decline yields + zero reply-error publications -> qa/http-qa.mjs:495; actual bid-decline activity assertions + T6 provider/reply errors -> qa/meeting-activity-qa.mjs:316. wiki-pg-qa.mjs (Wiki persistence) and usage-activity-browser.mjs (usage reporting) do NOT replace participant-state assertions. The lifecycle suite does not supply abstained/failed seat-label checks; QA-ABSTAIN fake support is not an executed abstention test. Bid decline produces bid-declined (provider-error belongs to provider failure). This integration keeps the honest core: one real send with working-state pairing + excluded-seat proof.
-async function stepActivityScenarios() { console.log("  note - activity-scenarios-mapped-to-focused-suites (mapped-unexecuted here; primary runs focused suites, no assertions claimed)"); }
+async function stepFocusedActivityStates() {
+  for (const kind of ["ABSTAIN", "REPLYERR"]) {
+    const marker = "QA-" + kind + "-" + run;
+    const title = run + " focused " + kind.toLowerCase();
+    const mk = await post("/api/boards/" + boardA + "/meetings", { title: title, brief: "", participantIds: [advisor1] });
+    if (mk.status !== 201 || !pick(mk.json, "id")) failExit("focused " + kind + " meeting create failed.");
+    const fmid = String(pick(mk.json, "id"));
+    const leadContent = marker + " Council " + run + ": weigh the berth plan with " + kind.toLowerCase() + " probe?";
+    const lp = await post("/api/meetings/" + fmid + "/messages", { sender: "lead", content: leadContent });
+    if (!(lp.status === 200 || lp.status === 201)) failExit("focused " + kind + " lead post failed.");
+    const lv = await get("/api/boards/" + boardA + "/lead");
+    const lvVer = Number(pick(lv.json, "version") || 0);
+    if (!(lv.status === 200 && Number.isInteger(lvVer) && lvVer > 0)) failExit("focused " + kind + " lead version invalid.");
+    const rr = await post("/api/meetings/" + fmid + "/run", { policy: "balanced", prompt: leadContent, evidenceSupported: false, leadVersion: lvVer }, { timeout: Math.min(90000, Math.max(1, remainingMs())) });
+    if (rr.status !== 200) failExit("focused " + kind + " run failed status=" + rr.status);
+    const finEnd = Math.min(Date.now() + 60000, DEADLINE_MS - 5000);
+    let wantRaw = kind === "ABSTAIN" ? "abstained" : "failed";
+    let rawSeen = false;
+    while (Date.now() < finEnd) { assertDeadline("focused-" + kind + "-poll"); const aa = await getActivity(fmid); if (aa && !aa.malformed && Array.isArray(aa.states)) { const mine = aa.states.filter((s) => String(s.id).toLowerCase() === String(advisor1).toLowerCase()); if (mine.some((s) => String(s.state) === wantRaw)) { rawSeen = true; break; } if (mine.some((s) => ["complete", "interrupted"].includes(String(s.state)))) break; } await sleep(2000); }
+    ok("focused-" + kind.toLowerCase() + "-raw-" + wantRaw, rawSeen, "meeting=" + fmid.slice(0,8) + " want=" + wantRaw);
+    if (!rawSeen) failExit("focused " + kind + " never reached raw " + wantRaw + ".");
+    await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(fmid));
+    try { await page.waitForFunction((want) => { const rail = document.querySelector("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"]"); if (!rail) return false; const names = Array.from(rail.querySelectorAll(".mp-name")).map((e) => e.textContent || ""); const idx = names.findIndex((n) => String(n).indexOf("Harbor Strategist") >= 0); if (idx < 0) return false; const seats = rail.querySelectorAll("li.mp-seat"); const cls = seats[idx] ? seats[idx].className : ""; return cls.indexOf("act-" + want) >= 0; }, wantRaw, { timeout: Math.max(1, Math.min(20000, remainingMs())) }); } catch (e) {}
+    const railCls = await page.locator("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"] li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []);
+    const railNames = await page.locator("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"] .mp-name").allInnerTexts().catch(() => []);
+    const ridx = railNames.findIndex((n) => String(n || "").includes("Harbor Strategist"));
+    const mountedBadge = ridx >= 0 ? String(railCls[ridx] || "") : "";
+    const badgeOk = mountedBadge.indexOf("act-" + wantRaw) >= 0;
+    let badgeHuman = "";
+    try { badgeHuman = await page.locator("section.meet-participants ul.mp-rail[aria-label=\"Participant activity\"] li.mp-seat").nth(ridx).locator(".mp-badge").first().innerText().catch(() => ""); } catch (e) {}
+    const humanOk = badgeHuman.trim().length > 0;
+    ok("focused-" + kind.toLowerCase() + "-mounted-" + wantRaw, badgeOk && humanOk, "badge=" + mountedBadge.slice(0,80) + " human=" + badgeHuman.slice(0,40));
+    if (!(badgeOk && humanOk)) failExit("focused " + kind + " mounted seat label missing for " + wantRaw + ".");
+  }
+  if (MODE === "native") {
+    const canonAu = await canonicalEntry(rosterId);
+    const auParas = threeParas(canonAu.entry ? (pick(canonAu.entry, "profileJson") || "") : "");
+    const auQ = "Audition " + run + ": state your berth criterion in one line?";
+    const au = await post("/api/auditions", { rosterId: rosterId, question: auQ });
+    ok("audition-current-paras-posted", au.status === 200 && typeof pick(au.json, "answer") === "string" && String(pick(au.json, "answer")).length >= 10, "status=" + au.status);
+    if (!(au.status === 200 && typeof pick(au.json, "answer") === "string")) failExit("audition POST failed.");
+    const alog = await fakeLog();
+    const auPrompts = Array.isArray(alog) ? ownedLog(alog).filter((e) => logText(e).includes("AUDITION") && logText(e).includes(auQ.slice(0, 20))) : [];
+    const auParaOk = auParas.length === 3 && auPrompts.length >= 1 && auParas.every((para) => auPrompts.some((e) => logText(e).includes(para.slice(0, 32))));
+    ok("audition-current-paras-owned", auParaOk, "prompts=" + auPrompts.length + " paras=" + auParas.length);
+    if (!auParaOk) failExit("current behavior paragraphs must appear in owned audition prompts.");
+    const commHold = auParas.length === 3 && auParas.some((para) => para.includes(run));
+    ok("comm-prefs-preserved", commHold && au.status === 200, "owned markers in paras=" + commHold);
+  } else { ok("audition-current-paras-owned", false, "live mode UNPROVED"); ok("comm-prefs-preserved", false, "live mode UNPROVED"); }
+  checkBudget("focused-activity");
+}
+async function stepActivityScenarios() { await stepFocusedActivityStates(); }
 async function main() {
   try {
     await stepSetup();
@@ -1728,3 +1924,8 @@ async function main() {
   process.exit(fail === 0 ? 0 : (fatal ? 2 : 1));
 }
 main().catch((e) => { console.log("FATAL " + redact(String((e && e.stack) || e))); process.exit(2); });
+
+
+
+
+
