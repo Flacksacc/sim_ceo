@@ -163,6 +163,23 @@ function fixtureHandler(reqLog, unhandled) {
       if (!boardById(m[1])) return V("unknown board");
       return J([]);
     }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/guest-settings$/))) {
+      const b = boardById(m[1]);
+      if (!b) return V("unknown board");
+      return J({ id: b.id, name: b.name, mission: b.mission, stage: "Seed", discussionPolicy: "balanced", dataUse: "standard", lead: null, meetingIds: [] });
+    }
+    if (p === "/api/profile" && req.method() === "GET") {
+      if (store.globalLead) return J(store.globalLead);
+      return V("no global lead");
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/wiki-resources$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/sources\/review$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J([]);
+    }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/activity$/))) {
       const found = meetingById(m[1]);
       if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
@@ -213,6 +230,24 @@ function fixtureHandler(reqLog, unhandled) {
       if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
       return J([]);
     }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/notes\/history$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J([]);
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/source-policy$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J({ blockedTypes: "", mode: "allowAll" });
+    }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/context$/))) {
+      if (!boardById(m[1])) return V("unknown board");
+      return J(null);
+    }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/secretary\/requests$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J([]);
+    }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/records$/))) {
       const found = meetingById(m[1]);
       if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
@@ -252,7 +287,7 @@ function fixtureHandler(reqLog, unhandled) {
       store.byRecordId[rec.id] = rec;
       return J(rec);
     }
-    if ((m = p.match(/^\/api\/records\/([^/]+)\/review$/))) { const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const g = rGuarded(d); const succ = Object.values(store.byRecordId).filter((x) => x.id !== d.id && rIds(x.supersedesJson).includes(d.id)).map((x) => x.id); return J({ draft: g, approved: rIds(d.approvedJson), discarded: rIds(d.discardedJson), pending: rPending(d), notes: [], recentMessages: [], predecessors: rIds(d.supersedesJson), successors: succ, evidence: [], historyCount: 0, meetingWatermark: d.watermark }); }
+    if ((m = p.match(/^\/api\/records\/([^/]+)\/review$/))) { const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const g = rGuarded(d); const succ = Object.values(store.byRecordId).filter((x) => x.id !== d.id && rIds(x.supersedesJson).includes(d.id)).map((x) => x.id); return J({ draft: g, approved: rIds(d.approvedJson), discarded: rIds(d.discardedJson), pending: rPending(d), notes: [], recentMessages: [], predecessors: rIds(d.supersedesJson), successors: succ, evidence: [], historyCount: 0, meetingWatermark: d.watermark, stateValid: rPending(d).length > 0, stateError: rPending(d).length > 0 ? null : "No pending items." }); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/evidence$/))) { if (!store.byRecordId[m[1]]) return V("unknown record"); return J([]); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/items\/approve$/)) && req.method() === "POST") { let b = {}; try { b = req.postDataJSON() || {}; } catch {} const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const ggA = rGuard(d, b); if (ggA) return ggA; const id = b.itemId; const ids = rItems(d).map((x) => x && x.id); if (typeof id !== "string" || !id || !ids.includes(id)) return J({ error: "Unknown item id." }, 422); const ap = new Set(rIds(d.approvedJson)); const dc = new Set(rIds(d.discardedJson)); if (ap.has(id) || dc.has(id) || d.decided) return J({ error: "already decided" }, 409); ap.add(id); d.approvedJson = JSON.stringify([...ap]); d.reviewRevision = (d.reviewRevision ?? 1) + 1; d.reviewToken = "h-tok-" + d.id + "-" + d.reviewRevision; rRefresh(d); return J(rGuarded(d)); }
     if ((m = p.match(/^\/api\/records\/([^/]+)\/approve-all$/)) && req.method() === "POST") { let bA = {}; try { bA = req.postDataJSON() || {}; } catch {} const d = store.byRecordId[m[1]]; if (!d) return V("unknown record"); const ggB = rGuard(d, bA); if (ggB) return ggB; const pe = rPending(d); if (!pe.length) return J({ error: "No pending items." }, 409); const ap = new Set(rIds(d.approvedJson)); pe.forEach((x) => ap.add(x)); d.approvedJson = JSON.stringify([...ap]); d.reviewRevision = (d.reviewRevision ?? 1) + 1; d.reviewToken = "h-tok-" + d.id + "-" + d.reviewRevision; rRefresh(d); return J(rGuarded(d)); }
