@@ -43,3 +43,9 @@ htmlcov/
 *.key
 *.pfx
 *.p12
+qa/.sigclient/
+qa/.pgclient/
+qa/.qarun*.json
+server/SimCEO.Api/bin-closure/
+qa/*.log
+qa/*.err

@@ -146,6 +146,12 @@ public sealed class ModelGateway
       throw new ProviderException(502, "Secretary prompt exceeds budget; essential context cannot fit.");
     return (dev, user);
   }
+  // Shared user-packet budget: packet builders size USER text against
+  // inputBudget*4 MINUS the developer instruction the gateway always sends,
+  // so an accepted packet can never trip the gateway total below. Single
+  // root formula; no per-caller margins.
+  public static int UserCharBudget(string purpose, int inputBudget)
+    => inputBudget * 4 - DeveloperInstructionFor(purpose).Length;
   // Canonical ORDERED role/content array used by the ACTUAL sender. Hash is of this array, not a delimiter string.
   public static object[] BuildDeliveredMessages(string developer, string userContent) =>
     new object[] { new { role = "developer", content = developer }, new { role = "user", content = userContent } };
@@ -176,7 +182,7 @@ public sealed class ModelGateway
   // floor so bounded effort still leaves room for the final answer.
   private static int EnsureOutputBudget(string purpose, int requested)
   {
-    var floor = ReasoningEffortFor(purpose) == "minimal" ? 512 : 2048;
+    var floor = purpose == "advisor-research" ? 4096 : ReasoningEffortFor(purpose) == "minimal" ? 512 : 2048;
     return Math.Clamp(Math.Max(requested, floor), 16, 16000);
   }
 
@@ -191,7 +197,7 @@ public sealed class ModelGateway
     "wizard-interview" => "Reply with JSON only, no other text.",
     "advisor-profile" => "Reply with a single JSON object only, no code fences or commentary.",
     "advisor-reply" => "If you add nothing, reply with exactly ABSTAIN.",
-    "advisor-research" => "Return concise factual claims only, one per line, as the final answer. Do not reply with progress commentary.",
+    "advisor-research" => "Return at most eight concise claims, one per line, in the requested evidence format, as the final answer. Use one or two supporting references per claim. Do not reply with progress commentary.",
     _ => "Return only the requested final answer. No progress commentary.",
   };
 
@@ -782,7 +788,17 @@ public sealed class ModelGateway
       }
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      // Cancellation classification is preserved, never wrapped as a 502:
+      // callers distinguish bounded-deadline expiry from client abort.
+      sw.Stop();
+      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisTokens,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
@@ -914,7 +930,10 @@ public sealed class ModelGateway
     }
   }
 
-  public sealed record Citation(string Url, string Title, string Excerpt);
+  // Optional fetch metadata (compatible): provider snippets stay Fetched=false/Origin=provider-search or unfetched;
+  // successful PublicEvidenceFetcher hydration sets Fetched=true/Origin=application-fetch and flows through
+  // gateway + CharacterResearch + ai-draft inventory + claim refs. No gateway rewrite.
+  public sealed record Citation(string Url, string Title, string Excerpt, bool Fetched = false, string Origin = "");
   public sealed record GroundedResult(string Text, bool RanSearch, string? ResponseId,
     List<Citation> Citations, int InTokens, int OutTokens, int SearchCalls, decimal? Cost);
 
@@ -1009,7 +1028,17 @@ public sealed class ModelGateway
       }
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      // Cancellation classification is preserved, never wrapped as a 502:
+      // callers distinguish bounded-deadline expiry from client abort.
+      sw.Stop();
+      RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisSearch,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, model, purpose, 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
@@ -1061,7 +1090,7 @@ public sealed class ModelGateway
                   if (string.IsNullOrEmpty(u)) u = GetStr(hit, "URL");
                   var t = GetStr(hit, "title");
                   if (string.IsNullOrEmpty(t)) t = GetStr(hit, "Title");
-                  citations.Add(new Citation(u, t, GetSearchSnippet(hit)));
+                  { var snip = GetSearchSnippet(hit); citations.Add(new Citation(u, t, snip, false, string.IsNullOrWhiteSpace(snip) ? "unfetched" : "provider-search")); }
                 }
             }
             else if (string.Equals(type, "message", StringComparison.Ordinal))
@@ -1089,7 +1118,7 @@ public sealed class ModelGateway
                   {
                     if (a.ValueKind != JsonValueKind.Object) continue;
                     if (!string.Equals(GetStr(a, "type"), "url_citation", StringComparison.Ordinal)) continue;
-                    citations.Add(new Citation(GetStr(a, "url"), GetStr(a, "title"), ""));
+                    citations.Add(new Citation(GetStr(a, "url"), GetStr(a, "title"), "", false, "unfetched"));
                   }
               }
             }
@@ -1121,7 +1150,9 @@ public sealed class ModelGateway
               "unknown", responseId0, null, basisG,
               "unknown: non-completed research; usage missing; searches " + (searchObservable ? searches.ToString() : "unobservable"), boardId, meetingId);
           }
-          throw new ProviderException(502, RedactedError(502));
+          throw new ProviderException(502, reason == "max_output_tokens"
+            ? "Research ran out of response space before finishing. Try a more focused description or try again."
+            : "The research provider did not finish its answer. Try again.");
         }
         if (!hasOutput)
         {
@@ -1168,7 +1199,7 @@ public sealed class ModelGateway
           }
           if (needsHydration)
           {
-            var hydrated = await _evidence.HydrateAsync(citations, prompt, ct).ConfigureAwait(false);
+            var hydrated = await _evidence.HydrateAsync(citations, prompt, ct, forResearch: purpose == "advisor-research").ConfigureAwait(false);
             citations.Clear();
             citations.AddRange(hydrated);
           }
@@ -1241,7 +1272,16 @@ public sealed class ModelGateway
       var asrBound = res.IsSuccessStatusCode ? TextBoundBytes : ErrorBoundBytes;
       (text, oversized, asrConsumed) = await ReadBoundedBodyAsync(res, asrBound, op).ConfigureAwait(false);
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException)
+    catch (OperationCanceledException ocex)
+    {
+      if (res is not null) try { res.Dispose(); } catch { }
+      sw.Stop();
+      RecordFull(callId, ModelPolicy.Voice, "voice-transcribe", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisVoice,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException)
     {
       if (res is not null) try { res.Dispose(); } catch { }
       sw.Stop();
@@ -1392,7 +1432,15 @@ public sealed class ModelGateway
         "failed: provider HTTP " + pex.Status + "; cost unknown; id " + (imgPid ?? "none"), boardId, meetingId);
       throw;
     }
-    catch (Exception ex) when (ex is OperationCanceledException or IOException or HttpRequestException or JsonException)
+    catch (OperationCanceledException ocex)
+    {
+      sw.Stop();
+      RecordFull(callId, ModelPolicy.Image, "image-generate", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,
+        "failed", null, null, UsageAccounting.BasisImage,
+        "cancelled: provider call cancelled after dispatch: " + ocex.GetType().Name + "; cost unknown", boardId, meetingId);
+      throw;
+    }
+    catch (Exception ex) when (ex is IOException or HttpRequestException or JsonException)
     {
       sw.Stop();
       RecordFull(callId, ModelPolicy.Image, "image-generate", 0, 0, 0, sw.ElapsedMilliseconds, false, 0,

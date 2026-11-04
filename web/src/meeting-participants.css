@@ -1,0 +1,56 @@
+/* Meeting participants rail. Tokens reuse styles.css vars. Compact desktop
+   vertical rail; narrow screens get a horizontal scroll strip. */
+.meet-participants{margin:0 0 12px}
+.mp-head{display:flex;align-items:center;gap:8px}
+.mp-head h3{margin:0}
+.mp-status{margin:4px 0 8px;font-size:.85rem}
+.mp-rail{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.mp-seat{display:flex;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-s);background:var(--panel)}
+.mp-avatar{position:relative;flex:none;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;background:var(--panel-2);border:2px solid var(--line);overflow:visible}
+.mp-avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block}
+.mp-fallback{font-weight:700;font-size:.95rem;color:var(--muted)}
+.mp-fallback.sec{background:var(--panel-2);border:1px dashed var(--muted);border-radius:50%;width:100%;height:100%;display:grid;place-items:center;color:var(--ink)}
+.mp-pulse{position:absolute;inset:-5px;border-radius:50%;border:2px solid var(--info);opacity:.7;pointer-events:none}
+.mp-meta{display:flex;flex-direction:column;gap:2px;min-width:0}
+.mp-name{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mp-role{font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mp-badge{align-self:flex-start;font-size:.72rem}
+/* Distinct state rings + badges. Only queued/considering/responding pulse. */
+.act-responding .mp-avatar{border-color:var(--info)}
+.act-considering .mp-avatar{border-color:var(--accent)}
+.act-queued .mp-avatar{border-color:var(--muted);border-style:dashed}
+.act-waiting-for-clarification .mp-avatar{border-color:var(--accent);border-style:dotted}
+.act-failed .mp-avatar{border-color:var(--danger)}
+.act-excluded{opacity:.6}
+.act-excluded .mp-avatar{border-style:dotted}
+.act-pending .mp-avatar{border-color:var(--line)}
+.st-responding{background:var(--info);color:#fff}
+.st-considering{background:var(--accent-soft);color:var(--ink);border:1px solid var(--accent)}
+.st-queued{background:var(--panel-2);color:var(--ink);border:1px solid var(--muted)}
+.st-waiting-for-clarification{background:var(--accent-soft);color:var(--ink);border:1px solid var(--accent)}
+.st-failed{background:var(--danger);color:#fff}
+.st-excluded{background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+.st-pending{background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+.st-idle{background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+.mp-avatar:focus-within{outline:2px solid var(--info);outline-offset:2px}
+@media (max-width:760px){
+.mp-rail{flex-direction:row;overflow-x:auto;padding-bottom:6px;scroll-snap-type:x mandatory}
+.mp-seat{min-width:168px;scroll-snap-align:start}
+.mp-name{white-space:normal}
+}
+@media (prefers-reduced-motion:reduce){.mp-pulse{display:none}}
+/* Extended states: complete / abstained / waiting-for-selection /
+   waiting-for-publication / interrupted / needs-approval. */
+.act-complete .mp-avatar{border-color:var(--ok)}
+.act-abstained{opacity:.72}
+.act-abstained .mp-avatar{border-style:dotted}
+.act-waiting-for-selection .mp-avatar{border-color:var(--muted);border-style:dashed}
+.act-waiting-for-publication .mp-avatar{border-color:var(--info);border-style:dashed}
+.act-interrupted .mp-avatar{border-color:var(--danger);border-style:dashed}
+.act-needs-approval .mp-avatar{border-color:var(--accent)}
+.st-complete{background:var(--ok);color:#fff}
+.st-abstained{background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+.st-waiting-for-selection{background:var(--panel-2);color:var(--muted);border:1px dashed var(--muted)}
+.st-waiting-for-publication{background:var(--panel-2);color:var(--ink);border:1px dashed var(--info)}
+.st-interrupted{background:var(--panel-2);color:var(--danger);border:1px dashed var(--danger)}
+.st-needs-approval{background:var(--accent-soft);color:var(--ink);border:1px solid var(--accent)}

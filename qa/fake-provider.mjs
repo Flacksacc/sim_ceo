@@ -8,9 +8,10 @@ const PORT = Number(argIdx >= 0 ? process.argv[argIdx + 1] : 5199);
 let seq = 0;
 const counts = { chat: 0, responses: 0, transcribe: 0, images: 0 };
 const promptLog = [];
+let nextTranscribeFailure = null;
 const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
 function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
-function gateWait(text) { const w = sleepMsOf(text); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
+function gateWait(text, kind) { const w = sleepMsOf(text, kind); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
 function logPrompt(path, text) {
   try {
     promptLog.push({ t: Date.now(), path, draft: /YOUR TURN/.test(text || ""), bid: isBidPrompt(text || ""), sleep: sleepMsOf(text || ""), len: (text || "").length, full: (text || "").slice(0, 200000) });
@@ -25,8 +26,10 @@ function readRaw(req) {
   });
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function sleepMsOf(text) {
-  const m = /QA-SLEEP:(\d+)/.exec(text || "");
+function sleepMsOf(text, kind) {
+  const t = text || "";
+  if (kind) { const km = new RegExp("QA-SLEEP-" + kind + ":([0-9]+)").exec(t); if (km) return Math.min(Number(km[1]), 15000); }
+  const m = /QA-SLEEP:([0-9]+)/.exec(t);
   return m ? Math.min(Number(m[1]), 15000) : 0;
 }
 function chatContent(prompt) {
@@ -56,6 +59,18 @@ function chatContent(prompt) {
     return {
       content: JSON.stringify({ suggestion: "QA suggestion.", nextQuestion: "QA next?", fields: {} }),
     };
+  }
+  // Character-advisor compile: deterministic 3-paragraph JSON echoing the
+  // researched name so QA can prove the draft round-trips into storage.
+  if (prompt.includes("COMPILE-CHARACTER-PARAGRAPHS")) {
+    if (prompt.includes("QA-COMPILEERR")) return { status: 500, body: "qa compile failure" };
+    const nm = /character "([^"]+)"/.exec(prompt || "") || [];
+    const who = nm[1] || "QA character";
+    return { content: JSON.stringify({
+      contributionCriteria: "QA-CRITERIA for " + who + ": contributes fleet logistics and port risk; abstains without port data.",
+      reasoningApproach: "QA-REASON for " + who + ": compares options against port evidence; agrees when supported, challenges unsupported premises; never invents credentials.",
+      responseStyle: "QA-STYLE for " + who + ": blunt about port risk, diplomatic with crew; detailed when evidence allows.",
+    }) };
   }
   if (prompt.includes("Reply with exactly: OK")) return { content: "OK" };
   return { content: "QA provisional text." };
@@ -177,6 +192,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const rawBuf = await readRaw(req);
+  if (req.method === "POST" && url.pathname === "/__fail-next-transcribe") {
+    let body = {};
+    try { body = JSON.parse(rawBuf.toString("utf8")); } catch {}
+    nextTranscribeFailure = { status: Number(body.status) === 502 ? 502 : 500, body: String(body.body || "qa controlled failure") };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ armed: true }));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/chat/completions") {
     counts.chat++;
     let body = {};
@@ -184,7 +207,7 @@ const server = http.createServer(async (req, res) => {
     const msgs = Array.isArray(body?.messages) ? body.messages : [];
     const prompt = msgs.map((m) => m.content).join("\n") || "";
     logPrompt("chat", prompt);
-    const wait = gateWait(prompt);
+    const wait = gateWait(prompt, "C");
     if (wait) await sleep(wait);
     const out = chatContent(prompt);
     if (out.envelope) {
@@ -218,11 +241,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     logPrompt("responses", input);
-    if (input.includes("QA-SLEEP")) await sleep(gateWait(input));
+    if (/QA-SLEEP(-R)?:/.test(input)) await sleep(gateWait(input, "R"));
     seq++;
     const noSearch = input.includes("QA-NOSEARCH");
     const output = [
-      { type: "message", content: [{ type: "output_text", text: "QA grounded claim line one.\nQA grounded claim line two." }] },
+      { type: "message", content: [{ type: "output_text", text: "FACT | QA grounded claim line one about port risk || EVIDENCE: https://qa.example/s1 :: \"QA excerpt one.\"\nINTERPRETATION | QA grounded interpretation line two about crew || EVIDENCE: https://qa.example/s2 :: \"QA excerpt two.\"" }] },
     ];
     if (!noSearch) {
       output.unshift({
@@ -243,6 +266,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/asr/transcribe") {
     counts.transcribe++;
+    const failure = nextTranscribeFailure;
+    nextTranscribeFailure = null;
     try {
       const ctype = String(req.headers["content-type"] || "");
       const mp = parseMultipart(rawBuf, ctype);
@@ -275,6 +300,11 @@ const server = http.createServer(async (req, res) => {
       const sha = audioBytes ? crypto.createHash("sha256").update(audioBytes).digest("hex").slice(0, 16) : "";
       lastTranscribe = { n: counts.transcribe, bytes: rawBuf.length, audioBytes: audioBytes ? audioBytes.length : 0, foundRiff: !!audioBytes && audioBytes.indexOf(Buffer.from("RIFF")) >= 0, validWav: valid, sampleRate: sr, channels: ch, bits, dataBytes, encoding: enc, rms, nz, zc, durSec: dur, freqEst: freq, audioSha256: sha, partNames, wavError };
     } catch { /* keep last */ }
+    if (failure) {
+      res.writeHead(failure.status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: failure.body }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ transcript: "qa transcript", text: "qa transcript", audioProcessedMs: 2000 }));
     return;

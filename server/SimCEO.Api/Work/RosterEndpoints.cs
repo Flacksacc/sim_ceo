@@ -21,23 +21,30 @@ public static class RosterOps
         approved = a.Approved,
       }).ToList();
 
+  // Single attach choke point: every board attach (advisor POST, roster copy)
+  // routes through RosterIntegrity.CheckAttach, so a board advisor can ONLY
+  // link an authorized, existing, non-archived roster entry. The portrait
+  // completeness rule stays here: a roster entry without an image is still
+  // not board-usable (ApprovalGate parity).
   public static (BoardAdvisor? advisor, string? error, int status) TryCopy(
-    InMemoryStore s, Guid rosterId, Guid boardId, string role)
+    InMemoryStore s, Guid rosterId, Guid boardId, string role,
+    bool callerCanReadRoster = true, bool canAttachBoard = true)
   {
+    var gate = RosterIntegrity.CheckAttach(s, rosterId, boardId, callerCanReadRoster, canAttachBoard);
+    if (!gate.Ok) return (null, gate.Error, gate.Status);
     if (!s.Roster.TryGetValue(rosterId, out var entry) || entry.Archived)
       return (null, "Roster entry not found.", 404);
-    if (!s.Boards.ContainsKey(boardId)) return (null, "Board not found.", 404);
     // Source authorization required before copy: caller must read the source template entry.
     // (Source roster entries are account templates; unrelated private research is filtered at read sites.)
     lock (s.SetupLock)
     {
       if (s.Advisors.Values.Any(a => a.BoardId == boardId && a.RosterEntryId == rosterId && !a.Removed))
         return (null, "Advisor already attached to this board.", 409);
+      if (s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed) >= 10)
+        return (null, "Board already has 10 advisors. Remove an advisor to add another.", 409);
       var (dok, dmissing) = RosterOps.Completeness(s, rosterId);
       if (!dok)
         return (null, "Roster entry is incomplete: " + string.Join(", ", dmissing) + ".", 409);
-      if (s.Advisors.Values.Count(a => a.BoardId == boardId && !a.Removed) >= 10)
-        return (null, "Board already has 10 advisors. Remove an advisor to add another.", 409);
       var copy = new BoardAdvisor
       {
         Id = Guid.NewGuid(), BoardId = boardId, RosterEntryId = rosterId,
@@ -55,16 +62,51 @@ public static class RosterOps
     }
   }
 
+  // Honest research state for review gates: live work blocks as "in progress";
+  // terminal failed/unsupported/interrupted research is named, never "running".
+  // An "unsupported" run finished but gathered zero grounded evidence: the entry
+  // may attach (stage an unapproved copy) but approval still requires grounded
+  // evidence, so review eligibility stays honest without blocking staging.
+  public static string? ResearchTerminalStatus(RosterEntry entry)
+  {
+    if (!string.IsNullOrEmpty(entry.ResearchJobId) && IsLiveResearchJob(entry.ResearchJobId)) return null;
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(entry.ResearchJson) ? "{}" : entry.ResearchJson);
+      if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+      if (!doc.RootElement.TryGetProperty("draftStatus", out var ds) || ds.ValueKind != JsonValueKind.String) return null;
+      var st = (ds.GetString() ?? "").Trim().ToLowerInvariant();
+      if (st is "failed" or "unsupported" or "superseded") return st;
+    }
+    catch (JsonException) { }
+    return null;
+  }
+
+  public static string ResearchMissingReason(InMemoryStore s, RosterEntry entry)
+  {
+    if (!string.IsNullOrEmpty(entry.ResearchJobId) && IsLiveResearchJob(entry.ResearchJobId))
+      return "research in progress";
+    return ResearchTerminalStatus(entry) switch
+    {
+      "failed" => "research failed (rerun research)",
+      "unsupported" => "research unsupported (editable draft, not grounded; rerun for grounding)",
+      "superseded" => "research interrupted (rerun research)",
+      _ => "research in progress",
+    };
+  }
+
   public static (bool complete, List<string> missing) DataCompleteness(InMemoryStore s, Guid rosterId)
   {
     var missing = new List<string>();
     if (!s.Roster.TryGetValue(rosterId, out var de) || de.Archived)
       return (false, new List<string> { "roster entry not found" });
+    if ((de.Tags ?? "").Split(",").Any(t => string.Equals(t.Trim(), "recovered", StringComparison.OrdinalIgnoreCase)))
+      missing.Add("recovered placeholder: complete the profile or run grounded research");
     if (string.IsNullOrWhiteSpace(de.Name)) missing.Add("name");
     if (string.IsNullOrWhiteSpace(de.Description)) missing.Add("description");
     var dpj = (de.ProfileJson ?? "").Trim();
     if (dpj.Length < 20) missing.Add("profile");
-    if (de.ResearchRequested && de.ResearchedAt is null) missing.Add("research in progress");
+    if (de.ResearchRequested && de.ResearchedAt is null && RosterOps.ResearchTerminalStatus(de) != "unsupported") missing.Add(RosterOps.ResearchMissingReason(s, de));
     return (missing.Count == 0, missing);
   }
 
@@ -73,11 +115,13 @@ public static class RosterOps
     var missing = new List<string>();
     if (!s.Roster.TryGetValue(rosterId, out var entry) || entry.Archived)
       return (false, new List<string> { "roster entry not found" });
+    if ((entry.Tags ?? "").Split(",").Any(t => string.Equals(t.Trim(), "recovered", StringComparison.OrdinalIgnoreCase)))
+      missing.Add("recovered placeholder: complete the profile or run grounded research");
     if (string.IsNullOrWhiteSpace(entry.Name)) missing.Add("name");
     if (string.IsNullOrWhiteSpace(entry.Description)) missing.Add("description");
     var pj = (entry.ProfileJson ?? "").Trim();
     if (pj.Length < 20) missing.Add("profile");
-    if (entry.ResearchRequested && entry.ResearchedAt is null) missing.Add("research in progress");
+    if (entry.ResearchRequested && entry.ResearchedAt is null && RosterOps.ResearchTerminalStatus(entry) != "unsupported") missing.Add(RosterOps.ResearchMissingReason(s, entry));
     if (!s.Images.Values.Any(i => i.RosterEntryId == rosterId)) missing.Add("portrait");
     return (missing.Count == 0, missing);
   }
@@ -191,7 +235,22 @@ public static class RosterOps
     if (a.Removed) return "removed";
     if (!s.Roster.TryGetValue(a.RosterEntryId, out var rent) || rent.Archived) return "archived-entry";
     if (a.RosterVersion != rent.Version) return "stale-version";
-    if (rent.ResearchRequested && rent.ResearchedAt is null) return "research-pending";
+    // BACKEND-PROFILE HOOK (cherry-pick note): recovered reconstructions stay
+    // explicitly incomplete until the owner completes the profile (removes the
+    // "recovered" tag) or grounded research completes with evidence (which
+    // strips the tag). Portrait acceptance alone never unblocks approval.
+    if ((rent.Tags ?? "").Split(",").Any(t => string.Equals(t.Trim(), "recovered", StringComparison.OrdinalIgnoreCase))) return "recovered-incomplete";
+    if (rent.ResearchRequested && rent.ResearchedAt is null)
+    {
+      // Terminal research states fail closed with honest codes: a finished-but-
+      // ungrounded run ("unsupported") may stage copies but never approve without
+      // grounded evidence; failed/interrupted runs must rerun first.
+      var terminal = RosterOps.ResearchTerminalStatus(rent);
+      if (terminal == "unsupported") return "research-unsupported";
+      if (terminal == "failed") return "research-failed";
+      if (terminal == "superseded") return "research-interrupted";
+      return "research-pending";
+    }
     if (rent.ResearchRequested && rent.EvidenceCount < 1) return "no-evidence";
     var sel = ResolveSelectedImage(s, a);
     if (sel is not null)
@@ -222,10 +281,16 @@ public static class RosterOps
     var user = PeopleOps.UserOf(s, req);
     if (!string.IsNullOrWhiteSpace(entry.OwnerKey))
       return string.Equals(entry.OwnerKey, user, StringComparison.OrdinalIgnoreCase);
-    // BACKEND-PROFILE HOOK (cherry-pick note): legacy blank-OwnerKey rows resolve to the
-    // unambiguous linked-board owner for writes. No invented ownership, no cross-account
-    // merge; ambiguous/ownerless rows still fall through to the linked-board grant rule.
-    if (RosterLegacyAccess.CallerMatchesEffectiveOwner(s, req, entry)) return true;
+    // BACKEND-PROFILE HOOK (cherry-pick note): blank legacy OwnerKey resolves ONLY via
+    // strict history-aware ownership (removed links count as evidence; unknown, missing,
+    // or conflicting owners fail closed). A conflicting or unknown owner denies the write
+    // outright: board grants never override ownership ambiguity, so a removed link can
+    // never silently transfer the entry to another account. Unanimous ownership (including
+    // unanimous removed-link history) grants the single owner; grant holders still qualify
+    // through the linked-board grant rule below.
+    var strictOwner = RosterLegacyAccess.MutationOwnerKey(s, entry.Id);
+    if (strictOwner is null) return false;
+    if (string.Equals(strictOwner, user, StringComparison.OrdinalIgnoreCase)) return true;
     var linked = s.Advisors.Values
       .Where(a => a.RosterEntryId == entry.Id && !a.Removed)
       .Select(a => a.BoardId).Distinct().ToList();
@@ -245,8 +310,9 @@ public static class RosterOps
   }
 
   // Editing profile content invalidates the old dossier: support, timestamps
-  // and counts reset and board copies unapprove until research reruns.
-  // Preserves ResearchRequested=true so failed/started research still blocks approval.
+  // Editing research IDENTITY/inputs (name, description, background) invalidates the old
+  // dossier: support, timestamps and counts reset and board copies unapprove until
+  // research reruns. Preserves ResearchRequested=true so failed/started research still blocks approval.
   public static void InvalidateDossier(InMemoryStore s, RosterEntry entry)
   {
     entry.ResearchJson = "{}";
@@ -257,6 +323,94 @@ public static class RosterOps
     UnapproveBoardCopies(s, entry.Id);
   }
 
+  // Finalizing BEHAVIOR (the 3 editable paragraphs, or other profile/metadata edits)
+  // without changing research identity/inputs preserves the pinned research proof:
+  // ResearchJson dossier, ResearchedAt and EvidenceCount survive; the canonical
+  // version still bumps and board copies still unapprove for renewed review.
+  // The save is recorded on the dossier (draftStatus "saved" + profile hash) so
+  // reload shows what was finalized against which research version.
+  public static void PreserveResearchOnBehaviorSave(RosterEntry entry, string savedProfileJson)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(entry.ResearchJson) ? "{}" : entry.ResearchJson);
+      if (doc.RootElement.ValueKind != JsonValueKind.Object) return;
+      var hasDraft = doc.RootElement.TryGetProperty("draftProfile", out _)
+        || doc.RootElement.TryGetProperty("claims", out _);
+      if (!hasDraft) return;
+      var draftStatus = doc.RootElement.TryGetProperty("draftStatus", out var ds) && ds.ValueKind == JsonValueKind.String
+        ? (ds.GetString() ?? "") : "";
+      var payload = new Dictionary<string, object?>();
+      foreach (var p in doc.RootElement.EnumerateObject())
+      {
+        if (p.NameEquals("draftStatus") || p.NameEquals("savedAt") || p.NameEquals("savedProfileHash")) continue;
+        payload[p.Name] = JsonSerializer.Deserialize<object?>(p.Value.GetRawText());
+      }
+      payload["draftStatus"] = string.Equals(draftStatus, "failed", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(draftStatus, "unsupported", StringComparison.OrdinalIgnoreCase)
+        ? draftStatus : "saved";
+      payload["savedAt"] = DateTime.UtcNow;
+      try { payload["savedProfileHash"] = Hashing.HashOf(savedProfileJson); }
+      catch { payload["savedProfileHash"] = "hash-error"; }
+      entry.ResearchJson = JsonSerializer.Serialize(payload);
+    }
+    catch (JsonException) { }
+  }
+
+  // research identity = the subject research was ABOUT. Subject changes
+  // invalidate the dossier; paragraph-only edits preserve it (see above).
+  public static bool IsSubjectChange(string? oldProfileJson, string? newProfileJson)
+  {
+    // A new profile that omits background entirely is paragraph-only w.r.t.
+    // identity: it must not invalidate the dossier or wipe persisted inputs.
+    // An explicitly present background (even empty) IS an identity statement.
+    if (!HasBackgroundProperty(newProfileJson)) return false;
+    TryProfileBackground(newProfileJson, out var newBg);
+    var oldBg = HasBackgroundProperty(oldProfileJson) && TryProfileBackground(oldProfileJson, out var ob) ? ob : "";
+    return !string.Equals(oldBg, newBg, StringComparison.Ordinal);
+  }
+
+  public static bool HasBackgroundProperty(string? profileJson)
+  {
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(profileJson) ? "{}" : profileJson);
+      return doc.RootElement.ValueKind == JsonValueKind.Object
+        && doc.RootElement.TryGetProperty("background", out var b) && b.ValueKind == JsonValueKind.String;
+    }
+    catch (JsonException) { return false; }
+  }
+
+  public static bool TryProfileBackground(string? profileJson, out string background)
+  {
+    background = "";
+    try
+    {
+      using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(profileJson) ? "{}" : profileJson);
+      if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+      if (doc.RootElement.TryGetProperty("background", out var b) && b.ValueKind == JsonValueKind.String)
+        background = (b.GetString() ?? "").Trim();
+      return true;
+    }
+    catch (JsonException) { background = ""; return false; }
+  }
+
+  public static string ProfileBackground(string? profileJson) =>
+    TryProfileBackground(profileJson, out var bg) ? bg : "\u0000unparseable";
+
+  public static bool SameSourceUrls(string? inputsJson, List<string> urls)
+  {
+    // Strict URI identity: /Case vs /case, query case, trailing slash are distinct inputs.
+    var stored = CharacterBehavior.ParseInputs(inputsJson).SourceUrls;
+    var rhs = urls ?? new List<string>();
+    var da = new List<string>();
+    foreach (var u in stored) SimCEO.Api.Work.EvidenceUri.AddDistinct(da, u);
+    var db = new List<string>();
+    foreach (var u in rhs) SimCEO.Api.Work.EvidenceUri.AddDistinct(db, u);
+    if (da.Count != db.Count) return false;
+    foreach (var u in da) if (!SimCEO.Api.Work.EvidenceUri.ContainsStrict(db, u)) return false;
+    return true;
+  }
   public static void UnapproveBoardCopies(InMemoryStore s, Guid rosterId)
   {
     foreach (var a in s.Advisors.Values.Where(a => a.RosterEntryId == rosterId && !a.Removed && a.Approved).ToList())
@@ -298,14 +452,36 @@ public static class RosterEndpoints
   {
     var me = PeopleOps.UserOf(s, req);
     if (PeopleOps.IsInstallationAdmin(s, me)) return true;
-    if (string.Equals(entry.OwnerKey ?? "", me, StringComparison.OrdinalIgnoreCase)) return true;
-    if (RosterLegacyAccess.CallerMatchesEffectiveOwner(s, req, entry)) return true;
+    if (RosterLegacyAccess.OwnerMatches(s, entry, me)) return true;
     try
     {
       return s.Advisors.Values.Any(a => a.RosterEntryId == entry.Id && !a.Removed
         && PeopleOps.Can(s, req, a.BoardId, null, "read"));
     }
     catch { return false; }
+  }
+
+  // ai-draft structured prompts (P1-F2): dossier requests the mapper-required
+  // KIND/EVIDENCE grammar; profile is built from VERIFIED claims only, never
+  // raw dossier text, so unsupported notes cannot steer the profile.
+  public static string BuildAiDraftDossierPrompt(string name, string role, string focus)
+  {
+    return "Research this fictional advisor persona for a business advisory board. Name: " + (name ?? "").Trim() + ". Role: " + (role ?? "").Trim() + ". Focus: " + (focus ?? "").Trim() + "."
+      + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage."
+      + " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <full-url> :: \"<exact supporting quote>\" [ ;; <full-url> :: \"<exact quote>\" ]"
+      + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
+      + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source retrieval excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only.";
+  }
+
+  public static string BuildAiDraftProfilePrompt(string name, string role, string focus, string groundedDossier)
+  {
+    var dossierPart = string.IsNullOrWhiteSpace(groundedDossier)
+      ? "(no verified grounded claims; draft from the owner seed and explicit limits only; do not invent grounding)"
+      : groundedDossier;
+    return "Draft a fictional advisor profile as ONLY a JSON object (no code fences, no commentary) with keys: background, strengths (array of 3), methods (array of 3), evidenceNeeded (array), limits (array of 3), collaboration (string). Persona: " + (name ?? "").Trim() + ", " + (role ?? "").Trim() + ", focus: " + (focus ?? "").Trim() + "."
+      + " Verified grounded claims (only these plus the seed may inform behavior; unverified notes excluded): " + dossierPart
+      + " Explicit limits: never invent real-world credentials, employment, degrees, licenses, or endorsements; abstain where evidence is missing or the topic is outside the seed."
+      + " State that the advisor is fictional with no real employment, degrees, licenses, or endorsements.";
   }
 
   public static void MapRoster(this WebApplication app)
@@ -337,16 +513,17 @@ public static class RosterEndpoints
       // Source authorization: caller must own the template, be installation admin,
       // or read a board the template is already attached to.
       if (!s.Roster.TryGetValue(id, out var __srcCp) || __srcCp.Archived) return Results.NotFound("Roster entry not found.");
+      bool __canSrcCp = false;
       {
         var __meCp = PeopleOps.UserOf(s, req);
-        var __canSrc = PeopleOps.IsInstallationAdmin(s, __meCp)
+        __canSrcCp = PeopleOps.IsInstallationAdmin(s, __meCp)
           || string.Equals(__srcCp.OwnerKey ?? "", __meCp, StringComparison.OrdinalIgnoreCase)
           || string.Equals(RosterLegacyAccess.EffectiveOwnerKey(s, __srcCp) ?? "", __meCp, StringComparison.OrdinalIgnoreCase)
           || s.Advisors.Values.Any(a => a.RosterEntryId == id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"));
-        if (!__canSrc) return PeopleOps.Denied();
+        if (!__canSrcCp) return PeopleOps.Denied();
       }
       var role = body.TryGetProperty("boardRole", out var r) ? (r.GetString() ?? "") : "";
-      var (copy, error, status) = RosterOps.TryCopy(s, id, boardId, role);
+      var (copy, error, status) = RosterOps.TryCopy(s, id, boardId, role, callerCanReadRoster: __canSrcCp, canAttachBoard: true);
       return copy is not null ? Results.Created($"/api/boards/{boardId}/advisors/{copy.Id}", copy)
         : Results.Json(new { error }, statusCode: status);
     });
@@ -370,15 +547,34 @@ public static class RosterEndpoints
         newDesc = d.GetString()!.Trim();
         descProvided = true;
       }
+      if (nameProvided && newName!.Trim().Length > 120) return Results.BadRequest("Name must be 120 chars or fewer.");
+      if (descProvided && newDesc!.Trim().Length > CharacterBehavior.MaxBackgroundChars) return Results.BadRequest("Description must be 4000 chars or fewer.");
       string? newProfile = null;
       var profileProvided = false;
-      if (body.TryGetProperty("profileJson", out var pp) && pp.ValueKind == JsonValueKind.String)
+      if (body.TryGetProperty("profileJson", out var pp)
+          && pp.ValueKind != JsonValueKind.Null && pp.ValueKind != JsonValueKind.Undefined)
       {
-        var pj = pp.GetString() ?? "";
+        if (pp.ValueKind != JsonValueKind.String && pp.ValueKind != JsonValueKind.Object)
+          return Results.BadRequest("profileJson must be a JSON object or a JSON-encoded object string.");
+        var pj = pp.ValueKind == JsonValueKind.String ? (pp.GetString() ?? "") : pp.GetRawText();
         if (pj.Trim().Length < 20) return Results.BadRequest("Profile must be at least 20 characters.");
+        if (pj.Length > CharacterBehavior.MaxProfileJsonChars) return Results.BadRequest("Profile must be " + CharacterBehavior.MaxProfileJsonChars + " chars or fewer (got " + pj.Length + "). Shorten paragraphs instead of embedding documents.");
+        var (pok, perr, _) = CharacterBehavior.ValidateSavedProfile(pj);
+        if (!pok) return Results.BadRequest(perr);
         newProfile = pj;
         profileProvided = true;
       }
+      List<string>? newSourceUrls = null;
+      var urlsProvided = false;
+      if (body.TryGetProperty("sourceUrls", out var psu) && psu.ValueKind == JsonValueKind.Array)
+      {
+        var (uok, uerr, urls) = CharacterBehavior.ValidateSourceUrls(body);
+        if (!uok) return Results.BadRequest(uerr);
+        newSourceUrls = urls;
+        urlsProvided = true;
+      }
+      else if (body.TryGetProperty("sourceUrls", out var psuBad) && psuBad.ValueKind != JsonValueKind.Null && psuBad.ValueKind != JsonValueKind.Undefined)
+        return Results.BadRequest("sourceUrls must be an array of up to " + CharacterBehavior.MaxSourceUrls + " http(s) URLs.");
       string? newTags = null;
       var tagsProvided = false;
       if (body.TryGetProperty("tags", out var tt) && tt.ValueKind == JsonValueKind.String)
@@ -394,6 +590,14 @@ public static class RosterEndpoints
         if (nameProvided && newName != entry.Name) profileChanged = true;
         if (descProvided && newDesc != entry.Description) profileChanged = true;
         if (profileProvided && newProfile != entry.ProfileJson) profileChanged = true;
+        // Research identity vs behavior finalization: name/description/background
+        // changes invalidate the dossier (research was ABOUT the old subject);
+        // paragraph-only edits preserve the pinned research proof while the
+        // canonical version still bumps and copies still unapprove for review.
+        var subjectChanged = (nameProvided && newName != entry.Name)
+          || (descProvided && newDesc != entry.Description)
+          || (profileProvided && RosterOps.IsSubjectChange(entry.ProfileJson, newProfile))
+          || (urlsProvided && !RosterOps.SameSourceUrls(entry.ResearchInputsJson, newSourceUrls ?? new List<string>()));
         RosterEntry? applied = null;
         try
         {
@@ -401,14 +605,28 @@ public static class RosterEndpoints
           {
             if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
             if (!RosterOps.CanWriteRoster(s, req, cur)) throw new UnauthorizedAccessException("Access revoked or not granted for this scope.");
+            var backgroundChanged = profileProvided && RosterOps.IsSubjectChange(cur.ProfileJson, newProfile);
             if (nameProvided) cur.Name = newName!;
             if (descProvided) cur.Description = newDesc!;
             if (profileProvided) cur.ProfileJson = newProfile!;
             if (tagsProvided) cur.Tags = newTags!;
             cur.Version += 1;
             cur.UpdatedAt = DateTime.UtcNow;
-            if (profileChanged) RosterOps.InvalidateDossier(s, cur);
-            else RosterOps.UnapproveBoardCopies(s, id);
+            if (backgroundChanged || urlsProvided)
+            {
+              var inp = CharacterBehavior.ParseInputs(cur.ResearchInputsJson);
+              var bg = inp.Background;
+              // Sync the persisted background ONLY on an actual canonical background change versus the fresh stored profile (never on mere property presence): paragraph-only full-profile saves keep the exact B1/URLs/focus inputs and their proof.
+              if (backgroundChanged && RosterOps.TryProfileBackground(newProfile, out var newBg)) bg = newBg;
+              var urls = urlsProvided && newSourceUrls is not null ? newSourceUrls : inp.SourceUrls;
+              cur.ResearchInputsJson = CharacterBehavior.SerializeInputs(bg, urls, inp.Focus);
+            }
+            if (subjectChanged) RosterOps.InvalidateDossier(s, cur);
+            else
+            {
+              if (profileChanged && profileProvided) RosterOps.PreserveResearchOnBehaviorSave(cur, newProfile!);
+              RosterOps.UnapproveBoardCopies(s, id);
+            }
             s.Roster[cur.Id] = cur;
             applied = cur;
           });
@@ -486,12 +704,44 @@ public static class RosterEndpoints
       var name = body.TryGetProperty("name", out var n) ? (n.GetString() ?? "Unnamed character") : "Unnamed character";
       if (string.IsNullOrWhiteSpace(role) || string.IsNullOrWhiteSpace(problem))
         return Results.BadRequest("role and problem are required; the rest is generated as a draft.");
+      if (name.Trim().Length > 120) return Results.BadRequest("Name must be 120 chars or fewer.");
+      if (role.Trim().Length > 500) return Results.BadRequest("Role must be 500 chars or fewer.");
+      if (problem.Trim().Length > 4000) return Results.BadRequest("Problem must be 4000 chars or fewer.");
+      var hasDescription = body.TryGetProperty("description", out var dd) && !string.IsNullOrWhiteSpace(dd.GetString());
+      // The full role/problem remain in CharacterJson; keep the generated
+      // summary within its own limit when both seed fields are at capacity.
+      var descText = hasDescription ? dd.GetString()! : role + " helping with: " + problem;
+      if (!hasDescription && descText.Length > 4000) descText = descText[..4000];
+      if (descText.Trim().Length > 4000) return Results.BadRequest("Description must be 4000 chars or fewer.");
+      string suppliedProfile = "";
+      if (body.TryGetProperty("profileJson", out var pj))
+      {
+        if (pj.ValueKind == JsonValueKind.Object) suppliedProfile = pj.GetRawText();
+        else if (pj.ValueKind == JsonValueKind.String) suppliedProfile = pj.GetString() ?? "";
+      }
+      if (!string.IsNullOrWhiteSpace(suppliedProfile))
+      {
+        if (suppliedProfile.Trim().Length < 20) return Results.BadRequest("Provided profile must be at least 20 characters.");
+        if (suppliedProfile.Length > CharacterBehavior.MaxProfileJsonChars) return Results.BadRequest("Profile must be " + CharacterBehavior.MaxProfileJsonChars + " chars or fewer.");
+        try
+        {
+          using var pjDoc = JsonDocument.Parse(suppliedProfile);
+          if (pjDoc.RootElement.ValueKind == JsonValueKind.Object)
+          {
+            var (cvok, cverr, _) = CharacterBehavior.ValidateSavedProfile(suppliedProfile);
+            if (!cvok) return Results.BadRequest(cverr);
+          }
+          else if (suppliedProfile.Length > CharacterBehavior.MaxProfileJsonChars)
+            return Results.BadRequest("Profile must be " + CharacterBehavior.MaxProfileJsonChars + " chars or fewer.");
+        }
+        catch (JsonException) { return Results.BadRequest("Provided profileJson must be a JSON object."); }
+      }
       var entry = new RosterEntry
       {
         Id = Guid.NewGuid(), AccountId = accountId, OwnerKey = PeopleOps.UserOf(s, req), Type = AdvisorType.FictionalCharacter,
         Name = name,
-        Description = body.TryGetProperty("description", out var dd) && !string.IsNullOrWhiteSpace(dd.GetString()) ? dd.GetString()! : role + " helping with: " + problem,
-        ProfileJson = body.TryGetProperty("profileJson", out var pj) && pj.GetRawText().Trim().Length >= 20 ? pj.GetRawText() : RosterOps.CharacterJson(name, role, problem),
+        Description = descText,
+        ProfileJson = string.IsNullOrWhiteSpace(suppliedProfile) ? RosterOps.CharacterJson(name, role, problem) : suppliedProfile,
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       if (body.TryGetProperty("tags", out var t)) entry.Tags = t.GetString() ?? "";
@@ -513,6 +763,7 @@ public static class RosterEndpoints
       return Results.Ok(new { complete = ok, missing, imageCount = s.Images.Values.Count(i => i.RosterEntryId == id) });
     });
 
+
     app.MapPost("/api/roster/quick", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
       if (PeopleOps.BadToken(s, req) is { } badQuick) return badQuick;
@@ -520,23 +771,28 @@ public static class RosterEndpoints
       var name = body.TryGetProperty("name", out var qan) ? (qan.GetString() ?? "") : "";
       var desc = body.TryGetProperty("description", out var qad) ? (qad.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(name)) return Results.BadRequest("Name is required.");
+      if (string.IsNullOrWhiteSpace(name.Trim()) || name.Trim().Length > 120) return Results.BadRequest("Name must be 1-120 chars.");
       if (string.IsNullOrWhiteSpace(desc) || desc.Trim().Length < 5) return Results.BadRequest("Description is required (a sentence or more).");
-      var profile = JsonSerializer.Serialize(new
+      if (desc.Trim().Length > 4000) return Results.BadRequest("Description must be 4000 chars or fewer.");
+      string? background = null;
+      if (body.TryGetProperty("background", out var qbg) && qbg.ValueKind == JsonValueKind.String)
       {
-        fictional = true,
-        name = name.Trim(),
-        background = desc.Trim(),
-        strengths = new[] { "practical tradeoffs", "risk surfacing", "structured comparison" },
-        methods = new[] { "assumption check", "options comparison", "next-step proposal" },
-        evidenceNeeded = new[] { "approved board sources", "board-lead brief" },
-        limits = new[] { "defers outside specialty", "abstains without evidence", "never overrides board instructions", "never claims real employment, degrees, licenses, endorsements" },
-        collaboration = "direct, concise, cites evidence",
-      });
+        background = (qbg.GetString() ?? "").Trim();
+        if (background.Length > 4000) return Results.BadRequest("Background must be 4000 chars or fewer.");
+        if (background.Length == 0) background = null;
+      }
+      var (urlsOk, urlsError, seedUrls) = CharacterBehavior.ValidateSourceUrls(body);
+      if (!urlsOk) return Results.BadRequest(urlsError);
+      // Seed only: user text verbatim, no invented persona. The 3 behavior keys are present as
+      // explicitly-marked seeds so meeting behavior is deterministic before research + explicit save.
+      var profile = CharacterBehavior.SeedProfileJson(name, desc, background);
       var entry = new RosterEntry
       {
         Id = Guid.NewGuid(), AccountId = accountId, OwnerKey = PeopleOps.UserOf(s, req), Type = AdvisorType.FictionalCharacter,
         Name = name.Trim(), Description = desc.Trim(), ProfileJson = profile,
         Version = 1, UpdatedAt = DateTime.UtcNow,
+        ResearchJson = JsonSerializer.Serialize(new { seed = true }),
+        ResearchInputsJson = CharacterBehavior.SerializeInputs(background ?? "", seedUrls),
       };
       if (body.TryGetProperty("tags", out var qtg)) entry.Tags = qtg.GetString() ?? "";
       var quickEntry = entry;
@@ -562,19 +818,47 @@ public static class RosterEndpoints
       var focus = body.TryGetProperty("focus", out var aaf) ? (aaf.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(role))
         return Results.BadRequest("name and role are required; focus steers the research.");
+      if (name.Trim().Length > 120) return Results.BadRequest("Name must be 120 chars or fewer.");
+      if (role.Trim().Length > 500) return Results.BadRequest("Role must be 500 chars or fewer.");
+      if (focus.Trim().Length > CharacterBehavior.MaxFocusChars) return Results.BadRequest("Focus must be " + CharacterBehavior.MaxFocusChars + " chars or fewer.");
       ModelGateway.GroundedResult dossier;
+      string aiDossierPrompt = BuildAiDraftDossierPrompt(name, role, focus);
       try
       {
         dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkFor(s, null), "advisor-research",
-        "Research this fictional advisor persona for a business advisory board. Name: " + name + ". Role: " + role + ". Focus: " + focus + ". Return concise factual-style guidance: what such an advisor should know, typical methods, key risks they watch, and limits. One claim per line.",
+        aiDossierPrompt,
         ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
+      // Map BEFORE compiling: only verified quote-linked claims may inform the profile.
+      var aiPoolMulti = new Dictionary<string, List<SimCEO.Api.Work.PoolPassage>>(StringComparer.Ordinal);
+      foreach (var cite in dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
+      {
+        if (string.IsNullOrWhiteSpace(cite.Excerpt)) continue;
+        string akey = cite.Url.Trim();
+        foreach (var k in new List<string>(aiPoolMulti.Keys)) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(k, akey)) { akey = k; break; } }
+        if (!aiPoolMulti.TryGetValue(akey, out var alist)) { alist = new List<SimCEO.Api.Work.PoolPassage>(); aiPoolMulti[akey] = alist; }
+        // Propagate actual gateway provenance: provider snippets stay fetched=false/provider-search;
+        // successful application fetches stay fetched=true with their origin (never downgraded).
+        bool cf = cite.Fetched;
+        string co = (cite.Origin ?? "").Trim();
+        if (cf && string.IsNullOrWhiteSpace(co)) co = "application-fetch";
+        if (!cf) co = "provider-search";
+        alist.Add(new SimCEO.Api.Work.PoolPassage(cite.Title ?? "", cite.Excerpt ?? "", cf, co));
+      }
+      // SID-keyed (S1..Sn), not URL-keyed: keys are case-insensitive identifiers; URL values compare strictly via UrlsMatch.
+      var aiSid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      var aiLines = dossier.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
+      var aiValidated = SimCEO.Api.Work.ClaimEvidenceMapper.MapAll(aiLines, aiPoolMulti, aiSid);
+      var groundedDossier = aiValidated.Any(v => v.Verified)
+        ? string.Join("\n", aiValidated.Where(v => v.Verified).Select(v => v.Kind.ToUpperInvariant() + " | " + v.Text + " || EVIDENCE: " + string.Join(" ;; ", v.Refs.Select(r => r.Url + " :: \"" + r.Quote + "\""))))
+        : "";
+      string aiProfilePrompt = BuildAiDraftProfilePrompt(name, role, focus, groundedDossier);
       string profile;
       try
       {
         profile = await gw.CompleteAsync(ModelPolicy.SparkFor(s, null), "advisor-profile",
-          "Draft a fictional advisor profile as ONLY a JSON object (no code fences, no commentary) with keys: background, strengths (array of 3), methods (array of 3), evidenceNeeded (array), limits (array of 3), collaboration (string). Persona: " + name + ", " + role + ", focus: " + focus + ". Research notes: " + dossier.Text + ". State that the advisor is fictional with no real employment, degrees, licenses, or endorsements.",
+          aiProfilePrompt,
           ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
       }
       catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
@@ -585,12 +869,48 @@ public static class RosterEndpoints
         var pend = profile.LastIndexOf("```");
         if (pnl >= 0 && pend > pnl) profile = profile.Substring(pnl + 1, pend - pnl - 1).Trim();
       }
-      var draftRefs = dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)).Take(10)
-        .Select(c => new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt }).ToList();
-      var draftClaims = dossier.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12)
-        .Select(line => new { angle = "dossier", text = line, sources = dossier.Citations.Take(3).Select(c => new { url = c.Url, title = c.Title }).ToList(), refs = draftRefs }).ToList<object>();
+      var aiDraftUrls = new List<string>();
+      foreach (var cite in dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
+      {
+        var cu = cite.Url.Trim();
+        bool dup = false;
+        foreach (var e in aiDraftUrls) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(e, cu)) { dup = true; break; } }
+        if (!dup) aiDraftUrls.Add(cu);
+        if (aiDraftUrls.Count >= 10) break;
+      }
+      // Inventory prefers the fetched passage per strict URL (P2); pool keeps every passage and claims keep matched origin.
+      var draftRefs = aiDraftUrls.Select(u =>
+      {
+        var hit = SimCEO.Api.Work.ClaimEvidenceMapper.SelectPreferredCitation(dossier.Citations, u);
+        bool hf = hit?.Fetched ?? false;
+        string ho = (hit?.Origin ?? "").Trim();
+        if (hf && string.IsNullOrWhiteSpace(ho)) ho = "application-fetch";
+        if (!hf) ho = string.IsNullOrWhiteSpace(hit?.Excerpt) ? "unfetched" : "provider-search";
+        return new { kind = "source", @ref = u, url = u, title = hit?.Title ?? "", excerpt = hit?.Excerpt ?? "", fetched = hf, origin = ho, ownerSupplied = false };
+      }).ToList();
+      var draftClaims = new List<object>();
+      foreach (var vc in aiValidated)
+      {
+        if (vc.Verified)
+        {
+          var vcAngle = string.Equals(vc.Kind, "interpretation", StringComparison.OrdinalIgnoreCase) ? "dossier [interpretation]" : "dossier";
+          draftClaims.Add(new { angle = vcAngle, text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList<object>(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote, fetched = r.Fetched, origin = r.Origin }).ToList<object>() });
+        }
+        else
+          draftClaims.Add(new { angle = "dossier [unverified]", text = vc.Text, kind = vc.Kind, verified = false, sources = new List<object>(), refs = new List<object>() });
+      }
       foreach (var c in dossier.Citations.Take(6).Where(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-        draftClaims.Add(new { angle = "dossier [citation]", text = c.Excerpt, sources = new[] { new { url = c.Url, title = c.Title } }.ToList(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList() });
+        draftClaims.Add(new { angle = "dossier [citation]", text = c.Excerpt, kind = "citation", verified = false, sources = new[] { new { url = c.Url, title = c.Title } }.ToList<object>(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList<object>() });
+      var aiSupported = aiValidated.Any(v => v.Verified);
+      var aiDistinct = new List<string>();
+      foreach (var u in aiValidated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)))
+      {
+        var tu = (u ?? "").Trim();
+        if (tu.Length == 0) continue;
+        bool dup2 = false;
+        foreach (var d in aiDistinct) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(d, tu)) { dup2 = true; break; } }
+        if (!dup2) aiDistinct.Add(tu);
+      }
       var entry = new RosterEntry
       {
         Id = Guid.NewGuid(), AccountId = accountId, OwnerKey = PeopleOps.UserOf(s, req), Type = AdvisorType.FictionalCharacter,
@@ -601,18 +921,19 @@ public static class RosterEndpoints
         {
           subject = name.Trim() + " (" + role.Trim() + ")",
           searched = dossier.SearchCalls,
-          supported = dossier.RanSearch && draftClaims.Count > 0 && dossier.Citations.Any(c => !string.IsNullOrWhiteSpace(c.Url) && !string.IsNullOrWhiteSpace(c.Excerpt)),
+          supported = aiSupported,
           claims = draftClaims,
           responseIds = dossier.ResponseId is null ? new List<string>() : new List<string> { dossier.ResponseId },
           version = 1,
           evidenceRefs = draftRefs,
-          note = (dossier.RanSearch && dossier.Citations.Any(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-            ? "Snippet-level claims need cross-checking against independent sources before approval."
-            : "No completed grounded evidence: treat every claim above as unsupported, not verified research.",
+          draftStatus = aiSupported ? "done" : "unsupported",
+          note = aiSupported
+            ? "Snippet-level claims need cross-checking against independent sources before approval. Only claims with validated per-claim quotes are marked verified; unverified notes carry no support refs. Quote linkage proves passage provenance only, not claim truth."
+            : "No grounded evidence completed (no verified quote-linked claims). The draft below is editable but UNSUPPORTED: not marked complete, not eligible for approval. Rerun research with better inputs, or proceed without research-gated approval.",
         }),
-        ResearchedAt = DateTime.UtcNow,
+        ResearchedAt = aiSupported ? DateTime.UtcNow : null,
         ResearchRequested = true,
-        EvidenceCount = dossier.Citations.Count(c => !string.IsNullOrWhiteSpace(c.Url) && !string.IsNullOrWhiteSpace(c.Excerpt)),
+        EvidenceCount = aiDistinct.Count,
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       var aiEntry = entry;
@@ -625,339 +946,142 @@ public static class RosterEndpoints
         });
       }
       catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Roster draft") ?? Results.Json(new { error = "Roster draft failed; no state changed: " + ex.Message }, statusCode: 500); }
-      return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = dossier.RanSearch, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
+      var aiCommittedSupported = aiValidated.Any(v => v.Verified);
+      return Results.Created("/api/roster/" + aiEntry.Id, new { entry = aiEntry, researched = aiCommittedSupported, draftStatus = aiCommittedSupported ? "done" : "unsupported", supported = aiCommittedSupported, evidenceCount = aiDistinct.Count, citations = dossier.Citations.Count, note = "Draft created. Add a portrait to complete this advisor." });
     });
 
-    app.MapPost("/api/boards/{bid:guid}/advisors/{aid:guid}/chat", async (InMemoryStore s, HttpRequest req, Guid bid, Guid aid, JsonElement body) =>
+    app.MapPost("/api/boards/{bid:guid}/advisors/{aid:guid}/chat", (InMemoryStore s, HttpRequest req, Guid bid, Guid aid) =>
     {
+      // RETIRED (roster-only direct chat): board-scoped direct advisor chat would let a caller
+      // with bare board-read reach an advisor without roster authorization and injects board
+      // context outside the canonical roster profile. The ONLY direct-chat path is roster-scoped:
+      // POST /api/roster/{rosterId}/chat with an authorized selected roster entry. Board group
+      // discussion (/api/meetings/{id}/run) is unaffected. Kept as 410 (not 404) so old clients
+      // learn the canonical route instead of silently failing.
       if (!s.Advisors.TryGetValue(aid, out var adv) || adv.BoardId != bid || adv.Removed) return Results.NotFound("advisor");
-      if (!s.Boards.TryGetValue(bid, out var board)) return Results.NotFound("board");
+      if (!s.Boards.ContainsKey(bid)) return Results.NotFound("board");
       if (!PeopleOps.Can(s, req, bid, null, "read")) return PeopleOps.Denied();
-      if (PeopleOps.Guard(gw, req) is { } cappedChat) return cappedChat;
-      var message = body.TryGetProperty("message", out var cm) ? (cm.GetString() ?? "") : "";
-      if (string.IsNullOrWhiteSpace(message)) return Results.BadRequest("message is required.");
-      if (message.Length > 4000) return Results.BadRequest("message exceeds 4000 chars.");
-      string profile = "{}";
-      string advisorName = adv.BoardRole;
-      if (s.Roster.TryGetValue(adv.RosterEntryId, out var rent)) { profile = rent.ProfileJson; advisorName = rent.Name; }
-      var historyText = "";
-      if (body.TryGetProperty("history", out var ch) && ch.ValueKind == JsonValueKind.Array)
-      {
-        var turns = new List<string>();
-        foreach (var te in ch.EnumerateArray())
-        {
-          if (te.ValueKind != JsonValueKind.Object) continue;
-          var rr = te.TryGetProperty("role", out var rrv) ? (rrv.GetString() ?? "") : "";
-          var cc = te.TryGetProperty("content", out var ccv) ? (ccv.GetString() ?? "") : "";
-          if (string.IsNullOrWhiteSpace(cc)) continue;
-          var ccut = cc.Length > 800 ? cc[..800] : cc;
-          turns.Add($"{rr}: {ccut}");
-          if (turns.Count >= 10) break;
-        }
-        if (turns.Count > 0) historyText = "Conversation so far:\n" + string.Join("\n", turns.TakeLast(10)) + "\n";
-      }
-      string answer;
-      try
-      {
-        var prompt = $"DIRECT ADVISOR CHAT (isolated, not a meeting message). You are {advisorName}, serving as {adv.BoardRole} (fictional advisor). Board: {board.Name} | Mission: {board.Mission} | Stage: {board.Stage}. Profile: {profile}. {historyText}Lead says: {message}\nReply in character, concise, with personality for {adv.BoardRole}; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements.";
-        answer = await gw.CompleteAsync(ModelPolicy.SparkFor(s, bid), "advisor-chat",
-          prompt, ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), boardId: bid);
-      }
-      catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ModelError(ex); }
-      return Results.Ok(new
-      {
-        answer,
-        indicators = new
-        {
-          expertiseUsed = adv.BoardRole,
-          assumptions = new[] { "advisor profile + board mission only; no meeting history" },
-          sources = new[] { "none: direct chat uses only owner-entered board info" },
-          withinLimits = true,
-        },
-        stored = false,
-        note = "Direct advisor chat is isolated; never creates meeting messages, records, or agent memory.",
-      });
+      return Results.Json(new { error = "Board-scoped direct advisor chat is retired. Chat from your roster: POST /api/roster/{rosterId}/chat.", rosterId = adv.RosterEntryId, rosterChat = "/api/roster/" + adv.RosterEntryId + "/chat" }, statusCode: 410);
     });
 
-    app.MapPost("/api/roster/{id:guid}/research", async (InMemoryStore s, HttpRequest req, Guid id, JsonElement body) =>
-    {
-      if (PeopleOps.BadToken(s, req) is { } badRes) return badRes;
-      if (!s.Roster.TryGetValue(id, out var preRes) || preRes.Archived) return Results.NotFound();
-      if (!RosterOps.CanWriteRoster(s, req, preRes)) return PeopleOps.Denied();
-      if (PeopleOps.Guard(gw, req) is { } capped) return capped;
-      if (body.ValueKind != JsonValueKind.Object)
-        return Results.BadRequest("Invalid research request body.");
-      string focus;
-      if (body.TryGetProperty("focus", out var ffe))
-      {
-        if (ffe.ValueKind == JsonValueKind.Null || ffe.ValueKind == JsonValueKind.Undefined)
-          focus = "";
-        else if (ffe.ValueKind != JsonValueKind.String)
-          return Results.BadRequest("focus must be a string.");
-        else
-          focus = ffe.GetString() ?? "";
-      }
-      else
-      {
-        focus = "";
-      }
-      string jobId = "";
-      int baseVersion;
-      string startSubject;
-      (Guid epochId, long epochRev) resPin = (Guid.Empty, 0L);
-      lock (s.SetupLock)
-      {
-        if (!s.Roster.TryGetValue(id, out var entry) || entry.Archived) return Results.NotFound();
-        if (!RosterOps.CanWriteRoster(s, req, entry)) return PeopleOps.Denied();
-        if (entry.ResearchRequested && entry.ResearchedAt is null && !string.IsNullOrEmpty(entry.ResearchJobId))
-        {
-          if (RosterOps.IsLiveResearchJob(entry.ResearchJobId))
-            return Results.Conflict("Research is already running for this advisor; wait for it to finish.");
-        }
-        jobId = Guid.NewGuid().ToString("N");
-        baseVersion = entry.Version;
-        startSubject = entry.Name + " (" + entry.Type + ")";
-        try
-        {
-          Atomic.Run(s, () =>
-          {
-            if (!s.Roster.TryGetValue(id, out var cur) || cur is null || cur.Archived) throw new InvalidOperationException("gone");
-            if (!RosterOps.CanWriteRoster(s, req, cur)) throw PeopleOps.AuthFault(s, req);
-            if (cur.ResearchRequested && cur.ResearchedAt is null && !string.IsNullOrEmpty(cur.ResearchJobId) && RosterOps.IsLiveResearchJob(cur.ResearchJobId))
-              throw new InvalidOperationException("running");
-            cur.ResearchRequested = true;
-            cur.ResearchedAt = null;
-            cur.EvidenceCount = 0;
-            cur.ResearchJson = "{}";
-            cur.ResearchJobId = jobId;
-            cur.ResearchBaseVersion = cur.Version;
-            baseVersion = cur.Version;
-            resPin = PublicationGuard.Capture(s);
-            cur.UpdatedAt = DateTime.UtcNow;
-            RosterOps.UnapproveBoardCopies(s, id);
-            s.Roster[cur.Id] = cur;
-          });
-        }
-        catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
-        catch (InvalidOperationException iox) when (iox.Message == "security-unavailable") { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
-        catch (UnauthorizedAccessException) { return PeopleOps.Denied(); }
-        catch (InvalidOperationException iox) when (iox.Message == "running") { return Results.Conflict("Research is already running for this advisor; wait for it to finish."); }
-        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { return Results.NotFound(); }
-        catch (InvalidOperationException iox) { return CommitOutcome.StorageFault("Research start", iox); }
-        catch (Exception ex) { return CommitOutcome.MapCommitFailure(ex, "Research start") ?? Results.Json(new { error = "Research start failed; no state changed: " + ex.Message }, statusCode: 500); }
-        RosterOps.MarkLiveResearchJob(jobId);
-      }
-      try
-      {
-      var subject = startSubject;
-      var focusTag = string.IsNullOrWhiteSpace(focus) ? "" : " Focus: " + focus + ".";
-      var angles = new[] { "identity of " + subject + "." + focusTag, "relevant work of " + subject + "." + focusTag, "limitations and criticism of " + subject + "." + focusTag };
-      var claims = new List<object>();
-      var responseIds = new List<string>();
-      var searched = 0;
-      var citedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-      var citedExcerpts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-      try
-      {
-        foreach (var angle in angles)
-        {
-          var g = await gw.CompleteGroundedAsync(ModelPolicy.SparkStandard, "advisor-research",
-            "Advisor dossier research. " + angle + ". Return concise factual claims only, one per line.",
-            4000, 2048, ownerOverride: PeopleOps.IsOwner(req));
-          if (g.ResponseId is not null) responseIds.Add(g.ResponseId);
-          if (g.RanSearch) searched++;
-          foreach (var cite in g.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
-          {
-            citedUrls.Add(cite.Url);
-            if (!string.IsNullOrWhiteSpace(cite.Excerpt))
-              citedExcerpts[cite.Url] = cite.Excerpt;
-          }
-          var claimRefs = g.Citations.Take(3).Select(c => new EvidenceRef("source", c.Url, null, c.Url, c.Title, c.Excerpt)).ToList()
-            .Select(r => new { kind = r.Kind, @ref = r.Ref, url = r.Url, title = r.Title, excerpt = r.Excerpt }).ToList();
-          foreach (var line in g.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12))
-            claims.Add(new { angle, text = line, sources = g.Citations.Take(3).Select(c => new { url = c.Url, title = c.Title }).ToList(), refs = claimRefs });
-          foreach (var c in g.Citations.Take(6).Where(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-            claims.Add(new { angle = angle + " [citation]", text = c.Excerpt, sources = new[] { new { url = c.Url, title = c.Title } }.ToList(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList() });
-        }
-      }
-      catch (Exception ex) when (ex is CapExceededException or ProviderException or TaskCanceledException or HttpRequestException or JsonException)
-      {
-        lock (s.SetupLock)
-        {
-          IResult? failCleanupErr = null;
-          try
-          {
-            Atomic.Run(s, () =>
-            {
-              if (!s.Roster.TryGetValue(id, out var failed) || failed is null) return;
-              if (failed.ResearchJobId != jobId) return;
-              if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
-              if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked");
-              if (!RosterOps.CanWriteRoster(s, req, failed)) throw new UnauthorizedAccessException("denied");
-              failed.ResearchJobId = "";
-              failed.ResearchRequested = true;
-              failed.ResearchedAt = null;
-              failed.EvidenceCount = 0;
-              failed.ResearchJson = "{}";
-              failed.UpdatedAt = DateTime.UtcNow;
-              RosterOps.UnapproveBoardCopies(s, id);
-              s.Roster[failed.Id] = failed;
-              s.Roster.Flush();
-            });
-          }
-          catch (InvalidOperationException iox) when (iox.Message == "res-restored") { failCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
-          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { failCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
-          catch (UnauthorizedAccessException) { failCleanupErr = PeopleOps.Denied(); }
-          catch (Exception fex) { failCleanupErr = CommitOutcome.MapCommitFailure(fex, "Research failure cleanup") ?? Results.Json(new { error = "Research failure cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
-          RosterOps.ClearLiveResearchJob(jobId);
-          if (failCleanupErr is not null) return failCleanupErr;
-        }
-        return PeopleOps.ModelError(ex);
-      }
-      object dossier;
-      lock (s.SetupLock)
-      {
-        if (!s.Roster.TryGetValue(id, out var cur) || cur.Archived)
-        {
-          RosterOps.ClearLiveResearchJob(jobId);
-          return Results.NotFound();
-        }
-        if (cur.ResearchJobId != jobId)
-        {
-          RosterOps.ClearLiveResearchJob(jobId);
-          return Results.Conflict("A newer research request superseded this run; use its result.");
-        }
-        if (cur.Version != baseVersion)
-        {
-          IResult? staleCleanupErr = null;
-          try
-          {
-            Atomic.Run(s, () =>
-            {
-              if (!s.Roster.TryGetValue(id, out var stale) || stale is null) return;
-              if (stale.ResearchJobId != jobId) return;
-              if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
-              if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) throw new UnauthorizedAccessException("revoked");
-              if (!RosterOps.CanWriteRoster(s, req, stale)) throw new UnauthorizedAccessException("denied");
-              stale.ResearchJobId = "";
-              stale.ResearchRequested = true;
-              stale.UpdatedAt = DateTime.UtcNow;
-              s.Roster[stale.Id] = stale;
-            });
-          }
-          catch (InvalidOperationException iox) when (iox.Message == "res-restored") { staleCleanupErr = Results.Conflict("Domain was restored during research; the restored entry was left untouched."); }
-          catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { staleCleanupErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); }
-          catch (UnauthorizedAccessException) { staleCleanupErr = PeopleOps.Denied(); }
-          catch (Exception fex) { staleCleanupErr = CommitOutcome.MapCommitFailure(fex, "Research cleanup") ?? Results.Json(new { error = "Research cleanup failed; no state changed: " + fex.Message }, statusCode: 500); }
-          RosterOps.ClearLiveResearchJob(jobId);
-          if (staleCleanupErr is not null) return staleCleanupErr;
-          return Results.Conflict("Advisor profile changed during research; rerun research on the new version.");
-        }
-        var built = new
-        {
-          subject,
-          searched,
-          supported = searched > 0 && claims.Count > 0 && citedExcerpts.Count > 0,
-          claims,
-          responseIds,
-          version = baseVersion,
-          evidenceRefs = citedUrls.Select(u => new { kind = "source", @ref = u, url = u, excerpt = citedExcerpts.TryGetValue(u, out var exu) ? exu : "" }).ToList(),
-          note = (searched == 0 || citedExcerpts.Count == 0)
-            ? "No completed grounded evidence: treat every claim above as unsupported, not verified research."
-            : "Snippet-level claims need cross-checking against independent sources before approval.",
-        };
-        try
-        {
-          Atomic.Run(s, () =>
-          {
-            if (!s.Roster.TryGetValue(id, out var fresh) || fresh is null || fresh.Archived) throw new InvalidOperationException("gone");
-            if (s.RestoreEpochId != resPin.epochId || s.RestoreEpochRev != resPin.epochRev) throw new InvalidOperationException("res-restored");
-            if (fresh.ResearchJobId != jobId) throw new InvalidOperationException("superseded");
-            if (PeopleOps.BadToken(s, req) is not null) throw new UnauthorizedAccessException("revoked");
-            if (!RosterOps.CanWriteRoster(s, req, fresh)) throw new UnauthorizedAccessException("denied");
-          fresh.ResearchJson = JsonSerializer.Serialize(built);
-          fresh.ResearchedAt = DateTime.UtcNow;
-          fresh.EvidenceCount = citedExcerpts.Count;
-          fresh.ResearchJobId = "";
-          fresh.ResearchRequested = true;
-          fresh.Version += 1;
-          fresh.UpdatedAt = DateTime.UtcNow;
-            RosterOps.UnapproveBoardCopies(s, id);
-            s.Roster[fresh.Id] = fresh;
-          });
-        }
-        catch (InvalidOperationException iox) when (iox.Message == "superseded")
-        {
-          RosterOps.ClearLiveResearchJob(jobId);
-          return Results.Conflict("A newer research request superseded this run; use its result.");
-        }
-        catch (InvalidOperationException iox) when (iox.Message == "res-restored")
-        {
-          RosterOps.ClearLiveResearchJob(jobId);
-          return Results.Conflict("Domain was restored during research; the restored entry was left untouched; rerun research on the current version.");
-        }
-        catch (UnauthorizedAccessException uex) when (uex.Message == "revoked") { RosterOps.ClearLiveResearchJob(jobId); return Results.Json(new { error = "Authentication required." }, statusCode: 401); }
-        catch (UnauthorizedAccessException) { RosterOps.ClearLiveResearchJob(jobId); return PeopleOps.Denied(); }
-        catch (InvalidOperationException iox) when (CommitOutcome.IsMissing(iox, "gone")) { RosterOps.ClearLiveResearchJob(jobId); return Results.NotFound(); }
-        catch (InvalidOperationException iox) { RosterOps.ClearLiveResearchJob(jobId); return CommitOutcome.StorageFault("Research completion", iox); }
-        catch (Exception ex) { RosterOps.ClearLiveResearchJob(jobId); return CommitOutcome.MapCommitFailure(ex, "Research completion") ?? Results.Json(new { error = "Research completion failed; no state changed: " + ex.Message }, statusCode: 500); }
-        dossier = built;
-      }
-      return Results.Ok(dossier);
-      }
-      finally
-      {
-        RosterOps.ClearLiveResearchJob(jobId);
-      }
-    });
 
-    app.MapGet("/api/roster/{id:guid}/research", (InMemoryStore s, HttpRequest req, Guid id) =>
-    {
-      if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-      if (!s.Roster.TryGetValue(id, out var entry)) return Results.NotFound();
-      if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, entry)) return PeopleOps.Denied();
-      return Results.Ok(new { entry.ResearchJson, entry.ResearchedAt });
-    });
+
 
     app.MapPost("/api/auditions", async (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
       if (PeopleOps.Guard(gw, req) is { } cappedAu) return cappedAu;
       var question = body.TryGetProperty("question", out var q) ? (q.GetString() ?? "") : "";
       if (string.IsNullOrWhiteSpace(question)) return Results.BadRequest("question is required.");
-      string profile = body.TryGetProperty("profileJson", out var pj) ? pj.GetRawText() : "{}";
-      if (body.TryGetProperty("rosterId", out var ri) && ri.GetGuid() is Guid rid
-          && s.Roster.TryGetValue(rid, out var entry))
+      if (question.Length > 4000) return Results.BadRequest("question must be 4000 chars or fewer.");
+      // Inline drafts must be a JSON object or a JSON-encoded object string;
+      // malformed text, arrays and other shapes are 400 before any provider call.
+      // Canonical behavior (any of the 3 keys) enforces the same save-time bounds;
+      // legacy objects without behavior keys keep the deterministic mapping.
+      string? inlineProfile = null;
+      if (body.TryGetProperty("profileJson", out var pj)
+        && pj.ValueKind != JsonValueKind.Null && pj.ValueKind != JsonValueKind.Undefined)
+      {
+        if (pj.ValueKind == JsonValueKind.Object) inlineProfile = pj.GetRawText();
+        else if (pj.ValueKind == JsonValueKind.String) inlineProfile = pj.GetString() ?? "";
+        else return Results.BadRequest("profileJson must be a JSON object or a JSON-encoded object string.");
+        var (iok, ierr) = CharacterBehavior.ValidateInlineProfile(inlineProfile);
+        if (!iok) return Results.BadRequest(ierr);
+      }
+      string profile = inlineProfile ?? "{}";
+      var auditionName = "draft character";
+      var auditionVersion = 0;
+      Guid? auditionRosterId = null;
+      string auditionProfile = profile;
+      string? auditionDesc = null;
+      (Guid epochId, long epochRev) auditionPin = default;
+      bool auditionHasPin = false;
+      Guid auditionRid = Guid.Empty;
+      var hasRid = false;
+      if (body.TryGetProperty("rosterId", out var ri))
+      {
+        if (ri.ValueKind == JsonValueKind.String && Guid.TryParse(ri.GetString(), out var g)) { auditionRid = g; hasRid = true; }
+        else return Results.BadRequest("rosterId must be a guid.");
+      }
+      if (hasRid)
       {
         // Authorize the referenced private roster source BEFORE reading its
         // profile or dispatching to the provider; strangers are denied here
-        // without consuming any metered call.
-        if (entry.Archived) return Results.NotFound();
-        if (PeopleOps.IsSecure(s) && !CanReadRoster(s, req, entry)) return PeopleOps.Denied();
-        profile = entry.ProfileJson;
+        // without consuming any metered call. Snapshot, restore pin and access
+        // are captured atomically under ONE RootGate: no old-profile /
+        // new-restore-pin window exists.
+        lock (s.RootGate)
+        {
+          if (!s.Roster.TryGetValue(auditionRid, out var rent) || rent is null || rent.Archived) return Results.NotFound();
+          if (!CanReadRoster(s, req, rent)) return PeopleOps.Denied();
+          auditionProfile = rent.ProfileJson ?? "{}";
+          auditionDesc = rent.Description;
+          auditionName = rent.Name;
+          auditionVersion = rent.Version;
+          auditionRosterId = auditionRid;
+          auditionPin = PublicationGuard.Capture(s);
+          auditionHasPin = true;
+        }
       }
+      // Same behavior contract as meetings and roster chat: all 3 researched
+      // paragraphs (or the deterministic legacy mapping) drive the answer in
+      // FULL; profile text is never truncated and never passed as raw JSON.
+      var auditionBehavior = CharacterBehavior.BehaviorSection(auditionProfile, auditionName, auditionVersion, auditionVersion, "");
+      auditionBehavior += CharacterBehavior.SeedContextSection(auditionBehavior, auditionProfile, auditionDesc);
       var boardInfo = body.TryGetProperty("boardInfo", out var bi) ? (bi.GetString() ?? "") : "";
+      if (boardInfo.Length > 2000) return Results.BadRequest("boardInfo must be 2000 chars or fewer.");
+      // Essential-first packet: behavior + current question always whole;
+      // owner board info is droppable context. truncatePrompt:false so the
+      // gateway never blindly cuts the question tail.
+      var essentialAud = "AUDITION (isolated, not a meeting message). " + auditionBehavior
+        + " Question: " + question + "\nReply in character from the criteria above: agree/disagree/challenge as the character's bluntness or diplomacy; concise; flag missing evidence, stay within specialty, never claim real employment, degrees, licenses, or endorsements. ";
+      var audPacket = CharacterBehavior.FitEssentialFirst(essentialAud,
+        string.IsNullOrWhiteSpace(boardInfo) ? new List<string>() : new List<string> { "Board info: " + boardInfo },
+        ModelGateway.UserCharBudget("audition", CharacterBehavior.ChatInputTokens));
+      if (audPacket is null)
+        return Results.Json(new { error = "Character behavior plus question exceed the audition prompt budget; shorten the saved paragraphs." }, statusCode: 413);
       string answer;
       try
       {
         answer = await gw.CompleteAsync(ModelPolicy.SparkStandard, "audition",
-          $"AUDITION (isolated, not a meeting message). Profile: {profile}. Board info: {boardInfo}. Question: {question}",
-          ContextBudget.BidTokens, 2048, ownerOverride: PeopleOps.IsOwner(req));
+          audPacket, CharacterBehavior.ChatInputTokens, 2048, ownerOverride: PeopleOps.IsOwner(req), truncatePrompt: false);
       }
+      catch (OperationCanceledException) { return Results.StatusCode(499); }
       catch (Exception ex) when (ex is ProviderException or TaskCanceledException or HttpRequestException or JsonException) { return PeopleOps.ProviderError(ex is ProviderException pex ? pex : new ProviderException(502, ex.Message)); }
-      return Results.Ok(new
+      // Post-await recheck under ONE RootGate THROUGH the immutable final
+      // response: the roster checks and the answer object are built at one
+      // boundary, so a restore/edit between two reads cannot mix states.
+      lock (s.RootGate)
       {
-        answer,
-        indicators = new
+        if (auditionRosterId.HasValue)
         {
-          expertiseUsed = "draft capability card",
-          assumptions = new[] { "draft profile only; no meeting history" },
-          sources = new[] { "none: auditions use only owner-entered board info" },
-          withinLimits = true,
-        },
-        stored = false,
-        note = "Auditions never create meeting messages, records, or agent memory.",
-      });
+          if (PeopleOps.BadToken(s, req) is { } badAu) return badAu;
+          if (auditionHasPin && (s.RestoreEpochId != auditionPin.epochId || s.RestoreEpochRev != auditionPin.epochRev))
+            return Results.Conflict("Domain was restored during generation; stale answer discarded, retry.");
+          if (!s.Roster.TryGetValue(auditionRosterId.Value, out var freshAu)) return Results.NotFound();
+          if (freshAu.Archived)
+            return Results.Conflict("Roster entry was archived during generation; stale answer discarded.");
+          if (!CanReadRoster(s, req, freshAu)) return PeopleOps.Denied();
+          if (freshAu.Version != auditionVersion)
+            return Results.Conflict("Advisor was edited during generation; stale answer discarded, retry with the current version.");
+          auditionVersion = freshAu.Version;
+        }
+        return Results.Ok(new
+        {
+          answer,
+          rosterVersion = auditionVersion,
+          indicators = new
+          {
+            expertiseUsed = auditionName,
+            assumptions = new[] { "draft profile only; no meeting history" },
+            sources = new[] { "none: auditions use only owner-entered board info" },
+            withinLimits = true,
+          },
+          stored = false,
+          note = "Auditions never create meeting messages, records, or agent memory.",
+        });
+      }
     });
+
 
     app.MapPost("/api/roster/{id:guid}/image/upload", async (InMemoryStore s, HttpRequest req, Guid id, IFormFile file) =>
     {
@@ -1325,3 +1449,4 @@ public static class RosterEndpoints
     });
   }
 }
+

@@ -1,4 +1,4 @@
-const API = process.env.QA_API || "http://127.0.0.1:5097";
+const API = process.env.QA_API || "http://127.0.0.1:15441";
 const run = process.env.QA_RUN || "p8pg-mw00f8zl";
 let pass = 0, fail = 0; const bad = [];
 function ok(n, c, e) { if (c) pass++; else { fail++; bad.push(n + (e ? " :: " + e : "")); console.log("  FAIL " + n + (e ? " :: " + e : "")); } }
@@ -29,7 +29,8 @@ async function req(method, path, body, headers) {
     ok("pg3-exact-meeting-denied", denied.status === 403, denied.status + " " + denied.text.slice(0, 160));
     const mems = await req("GET", `/api/boards/${bid}/memberships`, undefined, B(adminT));
     const mine = (Array.isArray(mems.json) ? mems.json : []).filter((x) => ((x.userKey || x.UserKey) || "").toLowerCase() === (run + "-pgguest@example.com") && ((x.meetingId || x.MeetingId) === mid));
-    ok("pg3-membership-not-active", mine.every((x) => (x.active ?? x.Active) === false), JSON.stringify(mine.map((x) => x.active ?? x.Active)));
+    ok("pg3-membership-present", mine.length > 0, "rows=" + mine.length);
+    ok("pg3-membership-not-active", mine.length > 0 && mine.every((x) => (x.active ?? x.Active) === false), JSON.stringify(mine.map((x) => x.active ?? x.Active)));
   } else { ok("pg3-exact-meeting-denied", false, "no recorded meeting id"); }
   console.log(`FINAL pass=${pass} fail=${fail}`);
   if (bad.length) { console.log("FAILURES:"); for (const x of bad) console.log(" - " + x); }

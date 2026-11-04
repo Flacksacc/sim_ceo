@@ -24,8 +24,14 @@ public static class PolicyStore
 
   public static (decimal? cap, string mode) ReadSpend(InMemoryStore s)
   {
+    // Fresh-install truth: no configured policy means warn-only, never an
+    // empty/unsupported mode. Blank is a legacy/empty-slot signal, so GET
+    // normalizes it to "warn" in memory only (no durable write, no secret
+    // or policy mutation). A configured "block" + cap passes through
+    // unchanged. Storage failures throw PolicyUnavailableException (503).
+    static string NormMode(string? m) => string.IsNullOrWhiteSpace(m) ? "warn" : m!;
     var b = Pg.Backend;
-    if (b is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, s.Spend.Mode); }
+    if (b is null) { lock (s.RootGate) return (s.Spend.MonthlyCapUsd, NormMode(s.Spend.Mode)); }
     // Root-held projection: lookup AND scalar copy happen under the root gate
     // (outer) and the single backend gate (inner), preserving ROOT -> backend
     // order. Scalars are detached: a concurrent writer that later rolls back
@@ -38,8 +44,8 @@ public static class PolicyStore
         if (SimCEO.Api.Data.PgFaults.FailPolicyLookup?.Invoke() == true) throw new System.IO.IOException("injected policy lookup fault (PgFaults.FailPolicyLookup)");
         (decimal? cap, string mode)? snap = b.Project<InstallationPolicy, (decimal? cap, string mode)?>(
           SingletonId, row => row is null ? null : (row.MonthlyCapUsd, string.IsNullOrWhiteSpace(row.Mode) ? "warn" : row.Mode));
-        if (snap is null) return (s.Spend.MonthlyCapUsd, s.Spend.Mode);
-        return snap.Value;
+        if (snap is null) return (s.Spend.MonthlyCapUsd, NormMode(s.Spend.Mode));
+        return (snap.Value.cap, NormMode(snap.Value.mode));
       }
       catch (PolicyUnavailableException) { throw; }
       catch (Exception ex) { throw new PolicyUnavailableException("Installation policy store unavailable; failing closed instead of substituting defaults.", ex); }

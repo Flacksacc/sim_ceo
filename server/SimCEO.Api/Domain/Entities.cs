@@ -63,6 +63,10 @@ public sealed class RosterEntry
   public int EvidenceCount { get; set; }
   public string ResearchJobId { get; set; } = "";
   public int ResearchBaseVersion { get; set; }
+  // Persisted research inputs (full background + URLs + focus), stored
+  // SEPARATELY from replaceable results: failure/reload/retry keeps the
+  // exact inputs without resubmission. Never cleared by result writes.
+  public string ResearchInputsJson { get; set; } = "{}";
   public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
 
@@ -369,7 +373,7 @@ public sealed class Session
 
 public sealed class SpendCap
 {
-  public string Mode { get; set; } = "";
+  public string Mode { get; set; } = "warn";
   public decimal? MonthlyCapUsd { get; set; }
 }
 

@@ -80,7 +80,7 @@ function findFreePort() {
 }
 async function startOwnEdge() {
   const port = await findFreePort();
-  const profile = path.join(ROOT, ".tmp", "voice-qa", "edge-profile");
+  const profile = path.join(ROOT, ".tmp", "voice-qa", "edge-profile-" + process.pid);
   try { fs.mkdirSync(profile, { recursive: true }); } catch {}
   const edgeBin = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
   const args = ["--headless", "--remote-debugging-port=" + port, "--no-first-run", "--no-default-browser-check", "--user-data-dir=" + profile, "about:blank"];

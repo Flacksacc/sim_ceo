@@ -145,6 +145,30 @@ static class Probe
       Ok("url-preserved", out1[0].Url == "https://example.com/article", out1[0].Url);
     }
 
+    // A long punctuation-free infobox must not push the useful paragraph
+    // beyond the excerpt cap, as happened with the real Holmes owner page.
+    {
+      const string quote = "Sherlock Holmes is a fictional detective created by British author Arthur Conan Doyle.";
+      var fake = new FakeHandler();
+      var html = "<html><body><table><tr><td>Sherlock Holmes metadata " + new string('x', 600)
+        + "</td></tr></table><p>" + quote + "</p><p>Holmes uses a \"<em>consulting detective</em>\" approach to observation and deduction. "
+        + new string('y', 1800) + "</p><p hidden>secret-private-hidden</p></body></html>";
+      fake.ResponderAsync = (_, _) => Task.FromResult(Html(html));
+      var f = new PublicEvidenceFetcher(fake, DnsFor);
+      var hydrated = await f.HydrateAsync(new List<ModelGateway.Citation> { new("https://example.com/holmes", "", "") }, "Sherlock Holmes fictional detective Arthur Conan Doyle", CancellationToken.None);
+      var passage = hydrated[0].Excerpt ?? "";
+      Ok("paragraph-after-infobox-retained", passage.Contains(quote), passage);
+      Ok("paragraph-no-infobox-prefix", !passage.Contains("metadata") && passage.Length <= 320, "len=" + passage.Length);
+      var pool = new Dictionary<string, (string Title, string Excerpt)> { ["https://example.com/holmes"] = ("Holmes", passage) };
+      var claim = ClaimEvidenceMapper.MapOne("FACT | Doyle created Holmes || EVIDENCE: S1 :: \"" + quote + "\"", pool, new Dictionary<string, string> { ["S1"] = "https://example.com/holmes" });
+      Ok("paragraph-quote-verifies-claim", claim.Verified, "verified=" + claim.Verified);
+      var research = await f.HydrateAsync(new List<ModelGateway.Citation> { new("https://example.com/holmes", "", "") }, "Sherlock Holmes fictional detective Arthur Conan Doyle", CancellationToken.None, forResearch: true);
+      var researchPassage = research[0].Excerpt ?? "";
+      Ok("research-window-keeps-intro", researchPassage.Contains(quote) && researchPassage.Length > 320 && researchPassage.Length <= PublicEvidenceFetcher.MaxResearchExcerptChars, "len=" + researchPassage.Length);
+      Ok("research-window-inline-quote-exact", researchPassage.Contains("a \"consulting detective\" approach"), "inline spacing");
+      Ok("research-window-hidden-stays-hidden", !researchPassage.Contains("secret-private-hidden"), "hidden content");
+    }
+
     // 2: empty body and 404 stay empty (2 URLs, within budget)
     {
       var fake = new FakeHandler();

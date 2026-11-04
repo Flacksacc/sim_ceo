@@ -20,17 +20,75 @@ public sealed record CuratorManifest(
 
 public static class ContextCurator
 {
+  // Delivered instruction suffixes: SINGLE shared source for builder reserve + sender append.
+  // The provider USER message is packet + suffix; the builder reserves suffix.Length inside
+  // ModelGateway.UserCharBudget so packet+suffix never exceeds the delivered budget. Sender
+  // must append these constants (never a duplicated literal) with truncatePrompt:false.
+  public const string AdvisorReplySuffix = "\nYOUR TURN. Cite [source:name] or [record:version] where used; if you add nothing, reply with exactly ABSTAIN. If your reply takes a clear position on the lead question or another advisor point, end with [stance: Agrees|Disagrees|Raises risk|Proposes alternative]; otherwise omit the tag.";
+  public const string AdvisorBidSuffix = "\nReply with exactly YES or NO, then one line why.";
+
+  // Explicit budget rejection: essentials (behavior + question + latest lead + suffix) cannot
+  // fit together. Callers surface Message (contains advisor profile and question are too long
+  // together); essentials are never silently cropped and metadata never describes trimmed text.
+  public sealed class EssentialBudgetExceededException : Exception
+  {
+    public EssentialBudgetExceededException(string message) : base(message) { }
+  }
+
+  // Latest posted lead message: when the run prompt is a bare continue, the
+  // actual question lives in the transcript. The full essential text rides
+  // with the run prompt so a decisive instruction past old truncation caps is
+  // never lost from bidding or replies.
+  public static string LatestLeadMessage(InMemoryStore s, Guid meetingId, int maxChars = 4000)
+  {
+    Message? latest = null;
+    foreach (var msg in Recent(s, meetingId, 40))
+      if (string.Equals(msg.Sender, "lead", StringComparison.OrdinalIgnoreCase)) latest = msg;
+    if (latest is null) return "";
+    return CharacterBehavior.EssentialQuestion(latest.Content ?? "", maxChars);
+  }
+  // Bid packet: selection MUST consume the full character (not BoardRole alone).
+  // ALL THREE accepted paragraphs are delivered whole: oversize input is
+  // rejected at save, never silently cut here. The run question PLUS the latest
+  // posted lead message are essential context alongside behavior; transcript
+  // history is droppable and trimmed oldest-first under the bid budget.
   public static string BidPacket(InMemoryStore s, Meeting m, BoardAdvisor adv,
     string prompt, Board? board)
   {
     var sb = new StringBuilder();
     var effName = board is null ? "?" : LeadSetup.EffectiveView(s, board).name;
     sb.AppendLine($"BOARD: {effName} | BRIEF: {Truncate(m.Brief, 500)}");
+    string rosterProfile = "{}";
+    int rosterVersion = adv.RosterVersion;
+    string advisorName = adv.BoardRole;
+    string? seedDesc = null;
+    if (s.Roster.TryGetValue(adv.RosterEntryId, out var rent) && rent is not null)
+    {
+      rosterProfile = rent.ProfileJson ?? "{}";
+      rosterVersion = rent.Version;
+      advisorName = rent.Name;
+      seedDesc = rent.Description;
+    }
+    var behavior = CharacterBehavior.Resolve(rosterProfile);
+    sb.AppendLine($"ADVISOR: {advisorName} (canonical roster v{rosterVersion}, pinned v{adv.RosterVersion}{(adv.RosterVersion != rosterVersion ? " STALE" : "")})");
     sb.AppendLine($"YOUR ROLE: {adv.BoardRole}");
-    foreach (var msg in Recent(s, m.Id, 3))
-      sb.AppendLine($"[{msg.Sequence}] {msg.Sender}: {Truncate(msg.Content, 300)}");
-    sb.AppendLine($"QUESTION: {Truncate(prompt, 800)}");
-    return sb.ToString();
+    sb.AppendLine("Contribution criteria: " + behavior.ContributionCriteria);
+    sb.AppendLine("Reasoning approach: " + behavior.ReasoningApproach);
+    sb.AppendLine("Response style: " + behavior.ResponseStyle);
+    sb.Append(CharacterBehavior.SeedContextSection(sb.ToString(), rosterProfile, seedDesc));
+    sb.AppendLine("QUESTION (essential - bid on THIS request): " + CharacterBehavior.EssentialQuestion(prompt, CharacterBehavior.MaxBidQuestionChars));
+    var leadQ = LatestLeadMessage(s, m.Id);
+    if (!string.IsNullOrWhiteSpace(leadQ))
+      sb.AppendLine("LATEST LEAD MESSAGE (essential - the posted question this run continues): " + leadQ);
+    var essential = sb.ToString();
+    var droppable = Recent(s, m.Id, 3)
+      .Select(msg => "[" + msg.Sequence + "] " + msg.Sender + ": " + Truncate(msg.Content, 300)).ToList();
+    var budget = ModelGateway.UserCharBudget("advisor-bid", CharacterBehavior.BidInputTokens);
+    var effective = budget - AdvisorBidSuffix.Length;
+    if (essential.Length > effective)
+      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essential.Length} chars essential + {AdvisorBidSuffix.Length} chars instruction exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
+    return CharacterBehavior.FitEssentialFirst(essential, droppable, effective)
+      ?? throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essential.Length} chars essential exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
   }
 
   public static (string packet, CuratorManifest manifest) BuildPacket(
@@ -45,36 +103,56 @@ public static class ContextCurator
     if (lead is not null)
       sb.AppendLine($"LEAD: {lead.Name} ({lead.RoleLabel}). Familiar: {Truncate(lead.FamiliarTopics, 300)}. Explain simply: {Truncate(lead.SimplerTopics, 300)}. Prefs: {Truncate(lead.CommPrefs, 300)}");
     sb.AppendLine($"MEETING BRIEF: {Truncate(m.Brief, 800)}");
-    sb.AppendLine($"YOUR ROLE: {adv.BoardRole} (roster v{adv.RosterVersion})");
-    sb.AppendLine($"QUESTION: {Truncate(prompt, 800)}");
-    if (s.Roster.TryGetValue(adv.RosterEntryId, out var rent) && rent is not null)
+    // Canonical roster authority: the packet embeds the CURRENT roster entry (full behavior
+    // paragraphs + dossier + version pin), never a forked board copy. Roster edits therefore
+    // change effective behavior; board-specific role stays on its own line and never leaks
+    // into the canonical behavior hash. ESSENTIAL FIRST: behavior + the actual run question
+    // are never trimmed; evidence, sources and transcript below yield to the deterministic
+    // budget instead (see enforcement at the end).
+    var behaviorSection = RosterIntegrity.CanonicalPacketSection(s, adv);
+    var questionSection = "CURRENT REQUEST (essential - answer THIS, even when it differs from transcript): "
+      + CharacterBehavior.EssentialQuestion(prompt) + "\n";
+    var leadQ = LatestLeadMessage(s, m.Id);
+    if (!string.IsNullOrWhiteSpace(leadQ))
+      questionSection += "LATEST LEAD MESSAGE (essential - the posted question this run continues): " + leadQ + "\n";
+    string? pktSeedDesc = null;
+    string pktSeedProf = "{}";
+    if (s.Roster.TryGetValue(adv.RosterEntryId, out var pktRent) && pktRent is not null)
     {
-      sb.AppendLine($"ADVISOR PROFILE (roster v{rent.Version}): {Truncate(rent.ProfileJson, 1500)}");
-      foreach (var claim in DossierClaims(rent).Take(5))
-        sb.AppendLine($"DOSSIER: {Truncate(claim, 400)}");
+      pktSeedDesc = pktRent.Description;
+      pktSeedProf = pktRent.ProfileJson ?? "{}";
     }
+    sb.Append(behaviorSection);
+    sb.Append(CharacterBehavior.SeedContextSection(behaviorSection, pktSeedProf, pktSeedDesc));
+    sb.Append(questionSection);
+    var essentialPrefix = sb.ToString();
+    // Transcript blocks (single-line, atomic): seq tracked with its rendered line.
     var recent = Recent(s, m.Id, 12);
-    foreach (var msg in recent)
-      sb.AppendLine($"[{msg.Sequence}] {msg.Sender}{(msg.AdvisorName is null ? "" : "/" + msg.AdvisorName)}: {Truncate(msg.Content, 600)}");
-    var evidence = new List<EvidenceRef>();
+    var transcriptBlocks = recent.Select(msg => (seq: msg.Sequence, line: $"[{msg.Sequence}] {msg.Sender}{(msg.AdvisorName is null ? "" : "/" + msg.AdvisorName)}: {SingleLine(Truncate(msg.Content, 600))}")).ToList();
+    // Record blocks with their evidence (atomic units).
+    var recordBlocks = new List<(string Line, List<EvidenceRef> Refs)>();
     foreach (var v in RecordsOps.EffectiveChains(s.Drafts.Values.Where(d => d.MeetingId == m.Id))
       .Where(v => v.EffectiveIds.Count > 0).OrderByDescending(v => v.Head.Version).Take(3))
     {
-      sb.AppendLine($"APPROVED RECORD v{v.Head.Version}: {Truncate(v.ConciseExport, 1500)}");
+      var line = $"APPROVED RECORD v{v.Head.Version}: {SingleLine(Truncate(v.ConciseExport, 1500))}";
+      var refs = new List<EvidenceRef>();
       foreach (var id2 in v.EffectiveIds)
       {
         if (v.EffectiveOwners.TryGetValue(id2, out var own) && v.EffectiveTexts.TryGetValue(id2, out var et))
-          evidence.Add(EvidenceRef.ForRecordItem(own.RecordId, own.Version, id2, Truncate(et, 200)));
+          refs.Add(EvidenceRef.ForRecordItem(own.RecordId, own.Version, id2, SingleLine(Truncate(et, 200))));
       }
+      recordBlocks.Add((line, refs));
     }
+    // Direction blocks with their evidence (atomic units).
+    var directionBlocks = new List<(string Line, EvidenceRef Ref)>();
     foreach (var n in s.Notes.Values
       .Where(n => n.BoardId == m.BoardId && n.Kind == "direction" && !n.Provisional
         && (n.Scope == "board" || n.MeetingId == m.Id))
       .OrderByDescending(n => n.CreatedAt).Take(5))
     {
       var nref = EvidenceRef.ForNote(n);
-      sb.AppendLine($"DIRECTION ({n.Scope} {nref.Ref}): {Truncate(n.Body, 500)}");
-      evidence.Add(nref);
+      var line = $"DIRECTION ({n.Scope} {nref.Ref}): {SingleLine(Truncate(n.Body, 500))}";
+      directionBlocks.Add((line, nref));
     }
     var words = Keywords(prompt);
     var ranked = s.Sources.Values
@@ -83,41 +161,78 @@ public static class ContextCurator
       .Where(e => !string.IsNullOrWhiteSpace(e.text))
       .OrderByDescending(e => Score(e.text, words))
       .Take(6).ToList();
-    // Permitted-use guidance for Wiki excerpts: the resource's COMPLETE
-    // AllowedUse text is emitted ONCE per resource (never truncated, never
-    // redacted as content). This is model-use guidance, not content redaction,
-    // and credentials never enter model context.
-    var wikiUseIds = ranked
-      .Where(e => e.doc.ResourceId.HasValue)
-      .Select(e => e.doc.ResourceId!.Value).Distinct().ToList();
-    foreach (var rid in wikiUseIds)
+    // Permitted-use guidance per wiki resource (model-use guidance, never content).
+    var wikiUseByRes = new Dictionary<Guid, string>();
+    foreach (var rid in ranked.Where(e => e.doc.ResourceId.HasValue).Select(e => e.doc.ResourceId!.Value).Distinct().ToList())
     {
       if (s.WikiResources.TryGetValue(rid, out var wr) && wr.BoardId == m.BoardId
         && wr.Enabled && !string.IsNullOrWhiteSpace(wr.AllowedUse))
-        sb.AppendLine($"[WIKI PERMITTED USE ({wr.Description.Trim()}): {wr.AllowedUse.Trim()}]");
+        wikiUseByRes[rid] = $"[WIKI PERMITTED USE ({SingleLine(wr.Description.Trim())}): {SingleLine(wr.AllowedUse.Trim())}]";
     }
-    var sourceIds = new List<string>();
-    var room = draftTokens * 4 - sb.Length;
+    // Source blocks: COMPLETE single-line blocks with metadata/pins/evidence.
+    // Multiline excerpts are flattened to one line per block so trimming can
+    // never leave a quoted body orphan after removing its header line.
+    var replyBudget0 = ModelGateway.UserCharBudget("advisor-reply", draftTokens);
+    var effective0 = replyBudget0 - AdvisorReplySuffix.Length;
+    var baseLen = essentialPrefix.Length
+      + transcriptBlocks.Sum(b => b.line.Length + 1)
+      + recordBlocks.Sum(b => b.Line.Length + 1)
+      + directionBlocks.Sum(b => b.Line.Length + 1)
+      + wikiUseByRes.Values.Sum(v => v.Length + 1);
+    var room = effective0 - baseLen;
+    var sourceBlocks = new List<(string Block, string SourceId, EvidenceRef Evidence, Guid? ResourceId)>();
     if (room > 0 && ranked.Count > 0)
     {
       var share = room / ranked.Count;
       foreach (var (doc, text) in ranked)
       {
-        sb.AppendLine($"[SOURCE:{doc.FileName} v{doc.Version}]: {Truncate(text, share)}");
-        sourceIds.Add($"{doc.Id}:v{doc.Version}:g{doc.IndexGeneration}:{doc.ContentHash}:s{SourceGovernance.SectionRevision(s, doc.Id)}");
-        evidence.Add(EvidenceRef.ForSource(doc, Truncate(text, 200)));
+        var clean = SingleLine(Truncate(text, share));
+        var block = $"[SOURCE:{doc.FileName} v{doc.Version}]: {clean}";
+        var sid = $"{doc.Id}:v{doc.Version}:g{doc.IndexGeneration}:{doc.ContentHash}:s{SourceGovernance.SectionRevision(s, doc.Id)}";
+        var ev = EvidenceRef.ForSource(doc, SingleLine(Truncate(text, 200)));
+        sourceBlocks.Add((block, sid, ev, doc.ResourceId));
       }
     }
-    var packet = sb.ToString();
-    // Manifest must describe the ACTUAL effective profile in the packet, not the
-    // stale board counter: inherited defaults advance while board counters stay put.
-    var manifest = new CuratorManifest(sourceIds,
-      recent.Select(x => x.Sequence).ToList(),
+    // Atomic assembly from RETAINED blocks with the corresponding manifest.
+    // Priority: sources (lowest-ranked last) then records then directions, then
+    // transcript oldest-first. Essential prefix (3 paragraphs + question) is never cut.
+    string Rebuild(out List<string> outSourceIds, out List<long> outSeqs, out List<EvidenceRef> outEvidence)
+    {
+      var b = new StringBuilder(essentialPrefix);
+      foreach (var tb in transcriptBlocks) b.AppendLine(tb.line);
+      foreach (var rb in recordBlocks) b.AppendLine(rb.Line);
+      foreach (var db in directionBlocks) b.AppendLine(db.Line);
+      var liveRes = new HashSet<Guid>(sourceBlocks.Where(x => x.ResourceId.HasValue).Select(x => x.ResourceId!.Value));
+      foreach (var kv in wikiUseByRes.Where(kv => liveRes.Contains(kv.Key))) b.AppendLine(kv.Value);
+      foreach (var src in sourceBlocks) b.AppendLine(src.Block);
+      outSourceIds = sourceBlocks.Select(x => x.SourceId).ToList();
+      outSeqs = transcriptBlocks.Select(x => (long)x.seq).ToList();
+      outEvidence = new List<EvidenceRef>();
+      foreach (var rb in recordBlocks) outEvidence.AddRange(rb.Refs);
+      foreach (var db in directionBlocks) outEvidence.Add(db.Ref);
+      foreach (var src in sourceBlocks) outEvidence.Add(src.Evidence);
+      return b.ToString();
+    }
+    var budget = ModelGateway.UserCharBudget("advisor-reply", draftTokens);
+    var effectiveBudget = budget - AdvisorReplySuffix.Length;
+    if (essentialPrefix.Length > effectiveBudget)
+      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential + {AdvisorReplySuffix.Length} chars instruction exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
+    var packet = Rebuild(out var curSourceIds, out var curSeqs, out var curEvidence);
+    while (packet.Length > effectiveBudget && sourceBlocks.Count > 0) { sourceBlocks.RemoveAt(sourceBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
+    while (packet.Length > effectiveBudget && recordBlocks.Count > 0) { recordBlocks.RemoveAt(recordBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
+    while (packet.Length > effectiveBudget && directionBlocks.Count > 0) { directionBlocks.RemoveAt(directionBlocks.Count - 1); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
+    while (packet.Length > effectiveBudget && transcriptBlocks.Count > 0) { transcriptBlocks.RemoveAt(0); packet = Rebuild(out curSourceIds, out curSeqs, out curEvidence); }
+    if (packet.Length > effectiveBudget)
+      throw new EssentialBudgetExceededException($"advisor profile and question are too long together ({essentialPrefix.Length} chars essential + {AdvisorReplySuffix.Length} chars instruction exceed {budget} chars delivered budget); shorten the saved paragraphs or the request and try again.");
+    var manifest = new CuratorManifest(curSourceIds, curSeqs,
       lead?.Version ?? 0,
       eff.policy,
-      packet.Length / 4, m.DeliveredRevision, evidence);
+      (packet.Length + AdvisorReplySuffix.Length) / 4, m.DeliveredRevision, curEvidence);
     return (packet, manifest);
   }
+
+  private static string SingleLine(string s) =>
+    string.IsNullOrEmpty(s) ? "" : s.Replace("\r", " ").Replace("\n", " ").Trim();
 
   private static List<string> DossierClaims(RosterEntry doc)
   {

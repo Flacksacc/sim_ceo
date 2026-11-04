@@ -478,10 +478,13 @@ public sealed class WikiSyncService
     }
     var now = _clock.UtcNow;
     var memberKeys = staged.Select(s => s.FamilyKey).ToList();
-    // Validate + build every new/repaired row and its sections BEFORE any
-    // insert: a single unindexable page fails the whole attempt (F3/F4).
-    var toInsert = new List<(SourceDoc doc, List<SourceSection> secs)>();
+    // Phase A - detached validation with ZERO allocation mutation: every new or
+    // repaired page is index-staged against a provisional template first. A single
+    // unindexable page fails the whole attempt (F3/F4) BEFORE any ReserveVersion
+    // water bump, so a failed staged sync leaves allocation history untouched,
+    // including multi-page index staging (all-or-nothing inside one Atomic unit).
     var repairs = new List<(SourceDoc doc, List<SourceSection> secs)>();
+    var needsInsert = new List<WikiStagedPage>();
     var scope = (cur.Scope ?? "board").Trim().ToLowerInvariant() == "meeting" ? "meeting" : "board";
     Guid? meeting = scope == "meeting" ? cur.MeetingId : null;
     foreach (var sp in staged)
@@ -496,11 +499,40 @@ public sealed class WikiSyncService
         repairs.Add((same, rsecs));
         continue;
       }
-      var maxV = _store.Sources.Values.Where(x => x.BoardId == cur.BoardId && x.FamilyKey == sp.FamilyKey).Select(x => (int?)x.Version).Max() ?? 0;
+      // New content (no identical row): validate indexability against a provisional
+      // template that carries no version yet. Reservation happens in Phase B only
+      // after EVERY staged page has validated, so a failure here returns BEFORE
+      // any allocation mutation (no water bump, no row, no section).
+      var provisional = new SourceDoc
+      {
+        BoardId = cur.BoardId, FileName = sp.NormalizedPath, ContentHash = sp.ContentHash,
+        Version = 0, Approved = false, Excluded = false,
+        ReviewState = "pending", Origin = "wiki", ResourceId = cur.Id,
+        FamilyKey = sp.FamilyKey, Scope = scope, MeetingId = meeting,
+        IndexState = "queued", IndexGeneration = 0,
+      };
+      provisional.Original = Encoding.UTF8.GetBytes(sp.Page.Content ?? "");
+      provisional.ExtractionJson = Extraction.ToJson(new Extraction.Result("ok", sp.Page.Content, null));
+      if (!SourceGovernance.TryStageIndexSections(provisional, out _, out _))
+      { failError = "Wiki page indexing failed; sync failed closed."; failStatus = 502; return CommitOutcome.Failed; }
+      needsInsert.Add(sp);
+    }
+    // Phase B - shared durable allocator (same Atomic unit, SetupLock held by
+    // CommitAsync): each new version reserves via ReserveVersion, which covers
+    // live rows AND the retained head HighWater (including pending-only stub
+    // water), so a deletion can never free a version for reuse and exports
+    // always validate. Approved heads are untouched and new rows stay pending
+    // (no auto-approval). A staging failure here is unexpected (Phase A staged
+    // identical bytes) and throws so the Atomic unit rolls back the whole batch,
+    // including water bumps already reserved above - never a partial commit.
+    var toInsert = new List<(SourceDoc doc, List<SourceSection> secs)>();
+    foreach (var sp in needsInsert)
+    {
+      var version = SourceGovernance.ReserveVersion(_store, cur.BoardId, sp.FamilyKey);
       var doc = new SourceDoc
       {
         BoardId = cur.BoardId, FileName = sp.NormalizedPath, ContentHash = sp.ContentHash,
-        Version = maxV + 1, Approved = false, Excluded = false,
+        Version = version, Approved = false, Excluded = false,
         ReviewState = "pending", Origin = "wiki", ResourceId = cur.Id,
         FamilyKey = sp.FamilyKey, Scope = scope, MeetingId = meeting,
         IndexState = "queued", IndexGeneration = 0,
@@ -508,7 +540,7 @@ public sealed class WikiSyncService
       doc.Original = Encoding.UTF8.GetBytes(sp.Page.Content ?? "");
       doc.ExtractionJson = Extraction.ToJson(new Extraction.Result("ok", sp.Page.Content, null));
       if (!SourceGovernance.TryStageIndexSections(doc, out var dsecs, out _))
-      { failError = "Wiki page indexing failed; sync failed closed."; failStatus = 502; return CommitOutcome.Failed; }
+        throw new InvalidOperationException("Wiki page indexing failed after reservation; sync failed closed.");
       toInsert.Add((doc, dsecs));
     }
     var prevMembers = new HashSet<string>(WikiRules.ParseList(cur.SuccessPagesJson), StringComparer.Ordinal);
