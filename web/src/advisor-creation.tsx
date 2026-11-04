@@ -128,13 +128,13 @@ export function characterFriendlyError(raw: string): string {
   const status = parts.status;
   const serverError = parts.serverError;
   const hay = String(serverError || input).toLowerCase();
+  if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
+  if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
+  if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
   try {
     const shared = friendlyError(input) || friendlyError(serverError);
     if (shared) return shared;
   } catch {}
-  if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
-  if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
-  if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
   if (status === 409 || hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) {
     if (hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) return "Research is already running for this draft on the server. Wait, then use Check again - do not start a second run.";
     if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer") >= 0 || hay.indexOf("changed") >= 0 || hay.indexOf("profile") >= 0 || hay.indexOf("version") >= 0 || hay.indexOf("conflict") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
