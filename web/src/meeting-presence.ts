@@ -26,6 +26,22 @@ export interface PresenceAdvisor {
   portraitUrl: string | null;
 }
 
+// New messages identify the exact board seat. Older saved messages only carry
+// its display name; resolve those only when the current board has one match.
+export function messageAdvisorKey(
+  message: { sender: string; advisorId?: string | null; advisorName?: string | null },
+  advisors: { id: string; boardRole: string; rosterName?: string | null }[],
+): string | null {
+  if (message.sender !== "advisor") return null;
+  const id = message.advisorId?.trim();
+  if (id && id !== "00000000-0000-0000-0000-000000000000")
+    return advisors.find(a => a.id.toLowerCase() === id.toLowerCase())?.id ?? null;
+  const name = message.advisorName?.trim().toLowerCase();
+  if (!name) return null;
+  const matches = advisors.filter(a => a.boardRole.trim().toLowerCase() === name || a.rosterName?.trim().toLowerCase() === name);
+  return matches.length === 1 ? matches[0].id : null;
+}
+
 export interface PresenceInput {
   leadName: string;
   leadRoleLabel: string;

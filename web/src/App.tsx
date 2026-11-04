@@ -19,7 +19,7 @@ import "./roster-chat.css";
 import { BoardAdvisorLinkPanel, RosterLinkBadge } from "./roster-integrity";
 import { MeetingParticipants } from "./meeting-participants";
 import "./meeting-participants.css";
-import { buildPresence, normalizeDisplayImageId } from "./meeting-presence";
+import { buildPresence, messageAdvisorKey, normalizeDisplayImageId } from "./meeting-presence";
 import "./roster-integrity.css";
 import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
 import { RecordComparison, RecordItemEditor, RecordVersionRow } from "./human-record-items";
@@ -32,6 +32,7 @@ type Meeting = { id: string; title: string; state: number };
 type Msg = {
   sequence: number;
   sender: string;
+  advisorId?: string | null;
   advisorName?: string;
   content: string;
   status?: string;
@@ -1163,6 +1164,13 @@ function AuthPanel() {
       )}
     </div>
   );
+}
+function MessagePortrait({ name, url }: { name: string; url: string | null }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const visible = url && url !== failedUrl;
+  return <span className="avatar sm message-portrait" style={{ backgroundColor: `hsl(${hue(name)} 30% 32%)` }} aria-hidden="true" data-portrait-state={visible ? "image" : "placeholder"}>
+    {visible ? <img src={url} alt="" onError={() => setFailedUrl(url)} /> : initials(name)}
+  </span>;
 }
 function RosterListPortrait({ id, name, identity }: { id: string; name: string; identity: string }) {
   const images = useQuery({
@@ -8607,6 +8615,8 @@ const testModel = useMutation({
                                         : m.sender);
                                     const isLead =
                                       m.sender === "lead" && !m.advisorName;
+                                    const portraitAdvisorId = messageAdvisorKey(m, (advisors.data ?? []).filter(a => !a.removed));
+                                    const messagePortraitUrl = portraitAdvisorId ? presenceUrls.get(portraitAdvisorId) ?? null : null;
                                     const when = m.createdAt
                                       ? new Date(m.createdAt).toLocaleString()
                                       : "";
@@ -8655,16 +8665,7 @@ const testModel = useMutation({
                                             <div className="bhead">
                                               {" "}
                                               {!isLead && (
-                                                <span
-                                                  className="avatar sm"
-                                                  style={{
-                                                    backgroundColor: `hsl(${hue(who)} 30% 32%)`,
-                                                  }}
-                                                  aria-hidden="true"
-                                                >
-                                                  {" "}
-                                                  {initials(who)}{" "}
-                                                </span>
+                                                <MessagePortrait name={who} url={messagePortraitUrl} />
                                               )}{" "}
                                               <b>{who}</b>{" "}
                                               <span className="bmeta">

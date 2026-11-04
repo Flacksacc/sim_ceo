@@ -242,6 +242,8 @@ ul.members li:hover { background: var(--panel); }
   background-color: var(--av, #55647c);
 }
 .avatar.sm { width: 28px; height: 28px; font-size: 0.7rem; }
+.message-portrait { overflow: hidden; }
+.message-portrait img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
 .member-n { flex: 1; min-width: 0; font-weight: 600; font-size: 0.9rem; }
 .member-r { display: block; font-weight: 400; font-size: 0.78rem; color: var(--muted); }
 .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--line); border: 2px solid var(--panel); outline: 1px solid var(--line); }
