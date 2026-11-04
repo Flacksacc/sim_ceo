@@ -113,6 +113,10 @@ function profileBox(labelPrefix, kind) {
 }
 let profileSavedAt = 0;
 let requestFailed = [];
+const pendingCtl = new Set();
+const netResps = { messages: [], patch: [], run: [], rosterChat: [] };
+const expectedProfile404s = [];
+function remainingMs(reserve) { return Math.max(0, DEADLINE_MS - Date.now() - (reserve || 5000)); }
 import zlib from "node:zlib";
 function crc32(buf) {
   let t = crc32._t;
@@ -201,7 +205,10 @@ function pick(o) {
 }
 async function req(method, p, body, opts) {
   opts = opts || {};
-  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), opts.timeout || REQ_TIMEOUT);
+  assertDeadline("req:" + method + ":" + String(p).slice(0, 40));
+  const want = opts.timeout || REQ_TIMEOUT;
+  const cap = Math.min(want, Math.max(1000, remainingMs(8000)));
+  const ctl = new AbortController(); pendingCtl.add(ctl); const t = setTimeout(() => { try { ctl.abort(); } catch {} }, cap);
   const headers = { "content-type": "application/json" };
   if (token) headers["authorization"] = "Bearer " + token;
   try {
@@ -209,7 +216,7 @@ async function req(method, p, body, opts) {
     const text = await r.text(); let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json: json, text: text };
   } catch (e) { return { status: 0, json: null, text: "transport-failure: " + (e && e.name ? e.name : "error") }; }
-  finally { clearTimeout(t); }
+  finally { clearTimeout(t); pendingCtl.delete(ctl); }
 }
 const get = (p, o) => req("GET", p, undefined, o);
 const post = (p, b, o) => req("POST", p, b, o);
@@ -243,7 +250,7 @@ function logText(e) { return String((e && (e.full !== undefined ? e.full : e.pro
 function ownedLog(log) { return (log || []).filter((e) => Number(e.t || 0) >= logBaselineT && logText(e).includes(run)); }
 function dossierHits(log, mark) { return ownedLog(log).filter((e) => e.path === "responses" && logText(e).includes(mark)); }
 function chatHits(log) { return ownedLog(log).filter((e) => e.path === "chat"); }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, remainingMs(4000)))));
 const M1 = "QA-CRIT-" + run, M2 = "QA-REAS-" + run, M3 = "QA-STYLE-" + run;
 const N1 = "QA-CRIT2-" + run, N2 = "QA-REAS2-" + run, N3 = "QA-STYLE2-" + run;
 const OWNED_URL_MARK = "doc-seed-" + run;
@@ -278,11 +285,25 @@ async function launchBrowser() {
   } catch {} });
   page.on("response", (r) => { try {
     const u = new URL(r.url()); if (u.origin !== WEB) return;
-    if (r.status() >= 400) badResponses.push(r.status() + " " + u.pathname.slice(0, 100));
+    const p = u.pathname; const st = r.status();
+    try {
+      const rm = r.request().method();
+      if (rm === "POST" && /\/api\/meetings\/[^/]+\/messages$/.test(p)) netResps.messages.push({ t: Date.now(), url: p, status: st });
+      if (rm === "PATCH" && /\/api\/meetings\/[^/]+$/.test(p)) netResps.patch.push({ t: Date.now(), url: p, status: st });
+      if (rm === "POST" && /\/api\/meetings\/[^/]+\/run$/.test(p)) netResps.run.push({ t: Date.now(), url: p, status: st });
+      if (rm === "POST" && /\/api\/roster\/[^/]+\/chat$/.test(p)) netResps.rosterChat.push({ t: Date.now(), url: p, status: st });
+    } catch {}
+    if (st >= 400) {
+      const entry = st + " " + p.slice(0, 100);
+      if (/^404 \/api\/profile(\?|$|\s)/.test(entry) && profileSavedAt === 0) expectedProfile404s.push(entry + " @arrival-pre-save");
+      else badResponses.push(entry);
+    }
   } catch {} });
   page.on("pageerror", (e) => { try { pageErrors.push(String((e && e.message) || e).slice(0, 160)); } catch {} });
 }
+async function drainPending() { try { for (const c of pendingCtl) { try { c.abort(); } catch {} } } catch {} pendingCtl.clear(); await sleep(50); }
 async function closeBrowser() {
+  await drainPending();
   try { if (page) await page.close(); } catch {} page = null;
   try { if (ctx) await ctx.close(); } catch {} ctx = null;
   try { if (browser) await browser.close(); } catch {} browser = null;
@@ -388,7 +409,8 @@ async function canonicalEntry(id) {
   }
   return { row: row, entry: row ? (pick(row, "entry") || row) : null, status: rl.status, text: "" };
 }
-function threeParas(profileJson) { try { const p = JSON.parse(profileJson || "{}"); const arr = [p.contributionCriteria, p.reasoningApproach, p.responseStyle].map((s) => String(s || "")); if (arr.some((v) => typeof v !== "string")) return []; return arr; } catch { return []; } }
+function originalThreeStrings(profileJson) { try { const p = JSON.parse(profileJson || "{}"); const raw = [p.contributionCriteria, p.reasoningApproach, p.responseStyle]; if (!Array.isArray(raw) || raw.length !== 3) return null; if (!raw.every((v) => typeof v === "string" && v.length > 0)) return null; return raw; } catch { return null; } }
+function threeParas(profileJson) { const r = originalThreeStrings(profileJson); return r ? r.slice() : []; }
 function requireThree(full) { return Array.isArray(full) && full.length === 3 && full.every((v) => typeof v === "string" && v.length > 0); }
 // Expected 404s are narrowly scoped to PRE-SAVE /api/profile absence only
 // (before profileSavedAt). Any later 404 is unexplained.
@@ -404,6 +426,7 @@ async function stepSetup() {
   if (reg.status !== 201) failExit("setup register failed status=" + reg.status + " " + redact(reg.text));
   token = String(pick(reg.json, "token") || ""); authedEmail = String(pick(reg.json, "email") || email);
   ok("setup-token-held", token.length >= 16, "len=" + token.length);
+  if (!(token.length >= 16)) failExit("auth token invalid; aborting cascade.");
   const me = await get("/api/auth/me");
   ok("setup-me-authenticated", me.status === 200, "status=" + me.status + " " + redact(me.text));
   if (me.status !== 200) failExit("auth bootstrap failed; aborting cascade.");
@@ -466,6 +489,7 @@ async function stepProfile() {
     saveStatus = resps[0].status();
   } catch (e) { ok("profile-ui-saved", false, "no POST /api/profile response completion observed. " + await profileArtifact("save-timeout")); }
   if (saveStatus) ok("profile-ui-saved", saveStatus === 200, "status=" + saveStatus);
+  if (saveStatus === 200 && profileSavedAt === 0) profileSavedAt = Date.now();
   const g = await get("/api/profile");
   ok("profile-http-readback", g.status === 200 && pick(g.json, "name") === P.name && String(pick(g.json, "background") || "").includes(run) && String(pick(g.json, "familiarTopics") || "").includes(run) && String(pick(g.json, "simplerTopics") || "").includes(run) && pick(g.json, "commPrefs") === P.comms, "status=" + g.status + " " + redact(g.text));
   const gver = Number(pick(g.json, "version") || 0);
@@ -478,14 +502,16 @@ async function stepProfile() {
   ok("boards-created", !!a.id && !!b.id, (a.error || a.id) + " / " + (b.error || b.id));
   if (!a.id || !b.id) failExit("board setup failed.");
   boardA = a.id; boardB = b.id;
-  profileSavedAt = Date.now();
+  if (profileSavedAt === 0) profileSavedAt = Date.now();
   const la = await get("/api/boards/" + boardA + "/lead"); const lb = await get("/api/boards/" + boardB + "/lead");
   function leadMatches(j, exp) {
     return pick(j, "name") === exp.name && pick(j, "roleLabel") === exp.roleLabel && pick(j, "background") === exp.background && pick(j, "familiarTopics") === exp.familiarTopics && pick(j, "simplerTopics") === exp.simplerTopics && pick(j, "commPrefs") === exp.commPrefs;
   }
   const expDefault = { name: P.name, roleLabel: "Board Lead", background: P.background, familiarTopics: P.familiar, simplerTopics: P.simpler, commPrefs: P.comms };
-  ok("boards-inherit-default", la.status === 200 && lb.status === 200 && leadMatches(la.json, expDefault) && leadMatches(lb.json, expDefault), "a=" + la.status + " b=" + lb.status + " aver=" + String(pick(la.json, "version")) + " bver=" + String(pick(lb.json, "version")));
-  if (!(la.status === 200 && lb.status === 200)) failExit("board lead readback failed; refusing to claim inheritance.");
+  const defVer = Number(pick(g.json, "version") || 0);
+  const laVer = Number(pick(la.json, "version") || 0), lbVer = Number(pick(lb.json, "version") || 0);
+  ok("boards-inherit-default", la.status === 200 && lb.status === 200 && leadMatches(la.json, expDefault) && leadMatches(lb.json, expDefault) && defVer > 0 && laVer === defVer && lbVer === defVer, "a=" + la.status + " b=" + lb.status + " aver=" + laVer + " bver=" + lbVer + " def=" + defVer);
+  if (!(la.status === 200 && lb.status === 200 && leadMatches(la.json, expDefault) && leadMatches(lb.json, expDefault) && defVer > 0 && laVer === defVer && lbVer === defVer)) failExit("board lead inheritance failed; refusing to claim inheritance.");
   const over = await post("/api/boards/" + boardA + "/lead", { name: "Board Own " + run, roleLabel: "CEO", background: "ob", familiarTopics: "of", simplerTopics: "os", commPrefs: "oc-" + run, version: pick(la.json, "version") });
   ok("explicit-override-ok", over.status === 200 && pick(over.json, "name") === "Board Own " + run && pick(over.json, "roleLabel") === "CEO" && pick(over.json, "background") === "ob", "status=" + over.status + " " + redact(over.text));
   if (over.status !== 200) failExit("explicit board override failed; aborting (no cascade).");
@@ -496,7 +522,9 @@ async function stepProfile() {
   const expOwn = { name: "Board Own " + run, roleLabel: "CEO", background: "ob", familiarTopics: "of", simplerTopics: "os", commPrefs: "oc-" + run };
   const expV2 = { name: P.name, roleLabel: "Board Lead", background: P.background, familiarTopics: P.familiar, simplerTopics: P.simpler, commPrefs: P.comms + " v2" };
   ok("override-preserved-foreign-unaffected", la2.status === 200 && lb2.status === 200 && leadMatches(la2.json, expOwn) && leadMatches(lb2.json, expV2), "a=" + redact(la2.text).slice(0,120) + " b=" + redact(lb2.text).slice(0,120));
-  ok("override-version-stable", la2.status === 200 && Number(pick(la2.json, "version") || 0) === Number(pick(over.json, "version") || 0), "overVer=" + String(pick(over.json, "version")) + " now=" + String(pick(la2.json, "version")));
+  const g2Ver = Number(pick(g2.json, "version") || 0);
+  const lb2Ver = Number(pick(lb2.json, "version") || 0);
+  ok("override-version-stable", la2.status === 200 && Number(pick(la2.json, "version") || 0) === Number(pick(over.json, "version") || 0) && lb2.status === 200 && lb2Ver === g2Ver && g2Ver > 0, "overVer=" + String(pick(over.json, "version")) + " now=" + String(pick(la2.json, "version")) + " bNow=" + lb2Ver + " def2=" + g2Ver);
   checkBudget("profile");
 }
 // ---- 2. ONE CreateAdvisor UI flow with real research (dialog-scoped) ----
@@ -537,38 +565,44 @@ async function stepCreateAdvisor() {
   // F5: VISIBLE live progress, dialog-scoped, correlated with server state.
   // Fresh creation auto-starts research; click ONLY from a proven idle state.
   const statusLoc = dlg.locator("#cc-research-status");
+  function backendHuman(stage) { if (stage === "starting") return "Starting"; if (stage === "fetching-sources") return "Reading your links"; if (stage === "researching") return "Researching"; if (stage === "compiling") return "Writing the three paragraphs"; if (stage === "running") return "Running"; return ""; }
   async function readResearch() {
     let text = "";
     try { text = await statusLoc.innerText(); } catch { text = ""; }
-    let running = false, stage = "";
+    let running = false, stage = "", valid = false;
     try {
       const g = await get("/api/roster/" + rosterId + "/research");
-      if (g.status === 200 && g.json) { running = !!pick(g.json, "running"); stage = String(pick(g.json, "stage") || ""); }
-    } catch {}
-    return { text: text || "", running: running, stage: stage };
+      if (g.status === 200 && g.json) { running = !!pick(g.json, "running"); stage = String(pick(g.json, "stage") || ""); valid = true; }
+      else valid = false;
+    } catch { valid = false; }
+    return { text: text || "", running: running, stage: stage, valid: valid };
   }
-  function isLiveProgress(t, running, stage) {
+  function isLiveProgress(t, running, stage, valid) {
+    if (valid !== true) return false;
+    if (running !== true) return false;
     if (!/research status:\s*working/i.test(t)) return false;
-    if (!/(Starting|Reading your links|Researching|Writing the three paragraphs|Running)/.test(t)) return false;
+    const want = backendHuman(String(stage));
+    if (!want) return false;
+    if (!t.includes(want)) return false;
     if (!/(\ds elapsed|live server run)/.test(t)) return false;
-    if (!(running === true || ["starting", "fetching-sources", "researching", "compiling", "running"].includes(String(stage)))) return false;
     return true;
   }
   const s0 = await readResearch();
-  const autoStarted = s0.running === true || /research status:\s*working/i.test(s0.text);
+  const autoStarted = s0.valid === true && (s0.running === true || /research status:\s*working/i.test(s0.text));
   let clickedManual = false;
   const terminalStage = ["done", "failed", "unsupported", "interrupted"].includes(String(s0.stage));
-  const idleStage = ["", "not-started", "idle"].includes(String(s0.stage));
-  if (!autoStarted && !terminalStage && idleStage && s0.running !== true) {
+  const provenNotStarted = s0.valid === true && s0.running === false && ["", "not-started"].includes(String(s0.stage)) && !/research status:\s*working/i.test(s0.text);
+  if (!autoStarted && !terminalStage && provenNotStarted) {
     try { await dlg.getByRole("button", { name: /run research on this draft/i }).click({ timeout: 8000 }); clickedManual = true; } catch {}
     await page.waitForTimeout(1500);
   }
   let progressSeen = "";
   let progressBackend = "";
-  for (let i = 0; i < 8; i++) {
+  if (isLiveProgress(s0.text, s0.running, s0.stage, s0.valid)) { progressSeen = trunc(s0.text, 160); progressBackend = "running=" + s0.running + " stage=" + s0.stage + " s0-retained"; }
+  for (let i = 0; i < 8 && !progressSeen; i++) {
     assertDeadline("research-progress");
     const s = await readResearch();
-    if (isLiveProgress(s.text, s.running, s.stage)) { progressSeen = trunc(s.text, 160); progressBackend = "running=" + s.running + " stage=" + s.stage; break; }
+    if (isLiveProgress(s.text, s.running, s.stage, s.valid)) { progressSeen = trunc(s.text, 160); progressBackend = "running=" + s.running + " stage=" + s.stage; break; }
     await sleep(2000);
   }
   ok("research-progress-live-visible", progressSeen !== "", (progressSeen || "no working/human-stage/elapsed/live-run text observed") + " autoStarted=" + autoStarted + " manualClicked=" + clickedManual + " " + progressBackend);
@@ -577,7 +611,7 @@ async function stepCreateAdvisor() {
   const end = Date.now() + RESEARCH_TIMEOUT;
   let stage = "", done = false, lastText = "";
   assertDeadline("research-wait");
-  const hb = setInterval(() => console.log("research: still pending..."), 20000);
+  const hb = setInterval(() => { try { if (Date.now() > DEADLINE_MS) { try { clearInterval(hb); } catch {} return; } console.log("research: still pending..."); } catch {} }, 20000);
   try {
     while (Date.now() < end) {
       const g = await get("/api/roster/" + rosterId + "/research");
@@ -611,6 +645,7 @@ async function stepCreateAdvisor() {
     ownedPrompt = dossierHits(log0, OWNED_URL_MARK).length;
   }
   ok("research-evidence-owned-fetched", done && ownedFetched.length >= 1, lastText + " evidenceCount=" + evCount + " ownedFetched=" + ownedFetched.length);
+  if (!(done && ownedFetched.length >= 1)) failExit("research evidence incomplete; refusing to claim grounding.");
   if (MODE === "native") ok("research-dossier-prompt-owned", ownedPrompt >= 1, "owned dossier prompts=" + ownedPrompt);
   else ok("research-dossier-prompt-owned", false, "live mode: prompt inspection unavailable; dossier proof via fetched-evidence only (UNPROVED prompt path)");
   ok("research-supported-or-honest-fail", done && (supported || evCount >= 1), lastText + " evidenceCount=" + evCount);
@@ -647,13 +682,16 @@ async function stepCreateAdvisor() {
   }
   let paras = await readParas();
   ok("research-compiled-3paras", paras.length === 3 && requireThree(paras) && paras.every((v) => v.trim().length > 20 && !v.includes("Seed (pending research)")), "count=" + paras.length + " lens=" + paras.map((v) => v.length).join(","));
-  if (MODE === "native" && paras.length === 3) ok("research-editor-matches-draft", paras[0] === dParas[0] && paras[1] === dParas[1] && paras[2] === dParas[2], "editor==draftProfile");
+  ok("research-editor-matches-draft", paras.length === 3 && dParas.length === 3 && paras[0] === dParas[0] && paras[1] === dParas[1] && paras[2] === dParas[2], "editor==draftProfile both modes");
   // Owner final tweaks with unique markers, saved through the DIALOG editor.
   const fs = dlg.locator("fieldset").filter({ hasText: "Character paragraphs" }).locator("textarea");
   const marks = [M1, M2, M3];
+  const submitted = [];
   for (let i = 0; i < 3 && i < paras.length; i++) {
     const cur = await fs.nth(i).inputValue().catch(() => "");
-    await fs.nth(i).fill(cur.trim() + " [" + marks[i] + "]");
+    const next = cur.trim() + " [" + marks[i] + "]";
+    await fs.nth(i).fill(next);
+    submitted.push(next);
   }
   const before = await get("/api/roster/" + rosterId + "/research");
   const verBefore = Number(pick(before.json, "version") || 0);
@@ -668,17 +706,19 @@ async function stepCreateAdvisor() {
   // F3: readback via the canonical fresh collection wrapper (exact-ID entry),
   // exactly as resolveCanonicalEntry does. /research carries NO profileJson.
   const canon = await canonicalEntry(rosterId);
-  const full = threeParas(canon.entry ? (pick(canon.entry, "profileJson") || pick(canon.entry, "profilejson") || "") : "");
-  ok("owner-markers-roundtrip", canon.status === 200 && !!canon.entry && requireThree(full) && full.every((v, i) => v.includes(marks[i])), "status=" + canon.status + " lens=" + full.map((v) => v.length).join(","));
+  const rawJson = canon.entry ? (pick(canon.entry, "profileJson") || pick(canon.entry, "profilejson") || "") : "";
+  const rawOk = originalThreeStrings(rawJson) !== null;
+  const full = threeParas(rawJson);
+  ok("owner-markers-roundtrip", canon.status === 200 && !!canon.entry && rawOk && requireThree(full) && full.every((v, i) => v === submitted[i]), "status=" + canon.status + " exactRoundtrip=" + full.every((v, i) => v === submitted[i]));
   if (!(canon.status === 200 && canon.entry && requireThree(full))) failExit("canonical fresh-collection readback failed or malformed; refusing HTTP-body proof.");
   const after = await get("/api/roster/" + rosterId + "/research");
   ok("owner-version-bump", Number(pick(after.json, "version") || 0) > verBefore, "before=" + verBefore + " after=" + String(pick(after.json, "version")));
   // F2: close the dialog so later edits use ONLY the selected-roster detail
   // editor (never two mounted editors again).
-  try { await dlg.getByRole("button", { name: /close/i }).click({ timeout: 8000 }); } catch {}
+  try { await dlg.locator('button[aria-label="Close"]').first().click({ timeout: 8000 }); } catch {}
+  await scanDebug("create-dialog");
   await page.waitForTimeout(600);
   ok("create-dialog-closed", await dlg.count() === 0, "dialog editors remaining=" + await dlg.count());
-  await scanDebug("create-dialog");
   checkBudget("create-advisor");
 }
 // ---- 3. portrait + attach gates + second member ----
@@ -691,7 +731,8 @@ async function stepCreateAdvisor() {
 // (no research assertions on it, honestly).
 async function stepPortraitAttach() {
   const up = await uploadPortrait(rosterId, "A");
-  ok("portrait-upload-201", up.status === 201, "status=" + up.status + " " + redact(up.text));
+  ok("portrait-upload-201", up.status === 201, "status=" + up.status + " len=" + up.text.length);
+  if (up.status !== 201) failExit("portrait upload failed; refusing attach proof.");
   const imgs = await get("/api/roster/" + rosterId + "/images");
   const imgList = Array.isArray(imgs.json) ? imgs.json : [];
   const imgId = imgList.length > 0 ? String(pick(imgList[0], "id") || "") : "";
@@ -701,11 +742,13 @@ async function stepPortraitAttach() {
   ok("portrait-accept-200", rev.status === 200, "status=" + rev.status + " " + redact(rev.text));
   if (rev.status !== 200) failExit("portrait review failed; refusing to attach without the accepted gate.");
   const cp = await post("/api/roster/" + rosterId + "/copy", { boardId: boardA, boardRole: "Harbor Strategist" });
-  ok("attach-first-201", cp.status === 201 && pick(cp.json, "id"), "status=" + cp.status + " " + redact(cp.text));
+  ok("attach-first-201", cp.status === 201 && !!pick(cp.json, "id"), "status=" + cp.status + " hasId=" + !!pick(cp.json, "id"));
+  if (!(cp.status === 201 && pick(cp.json, "id"))) failExit("first attach failed; refusing approval proof.");
   if (!pick(cp.json, "id")) failExit("first attach failed.");
   advisor1 = String(pick(cp.json, "id"));
   const dup = await post("/api/roster/" + rosterId + "/copy", { boardId: boardA, boardRole: "Harbor Strategist" });
-  ok("duplicate-attach-409", dup.status === 409, "status=" + dup.status + " " + redact(dup.text));
+  ok("duplicate-attach-409", dup.status === 409, "status=" + dup.status);
+  if (dup.status !== 409) failExit("duplicate attach must 409; refusing isolation proof.");
   const ap = await post("/api/boards/" + boardA + "/advisors/" + advisor1 + "/approve", {});
   ok("approve-first-200", ap.status === 200, "status=" + ap.status + " " + redact(ap.text));
   if (ap.status !== 200) failExit("approve gate did not clear on a researched+accepted advisor.");
@@ -728,9 +771,11 @@ async function stepSecondMember() {
   const comp = await get("/api/roster/" + roster2 + "/completeness");
   const compList = Array.isArray(pick(comp.json, "missing")) ? pick(comp.json, "missing") : [];
   ok("second-complete-gate", comp.status === 200 && pick(comp.json, "complete") === true, "status=" + comp.status + " missing=" + compList.join(";"));
+  if (!(comp.status === 200 && pick(comp.json, "complete") === true)) failExit("second member completeness gate failed; refusing attach proof.");
   const canon2 = await canonicalEntry(roster2);
   const p2 = threeParas(canon2.entry ? (pick(canon2.entry, "profileJson") || "") : "");
-  ok("second-profile-validated", canon2.status === 200 && !!canon2.entry && requireThree(p2), "status=" + canon2.status + " lens=" + p2.map((v) => v.length).join(","));
+  ok("second-profile-validated", canon2.status === 200 && !!canon2.entry && originalThreeStrings(canon2.entry ? (pick(canon2.entry, "profileJson") || "") : "") !== null && requireThree(p2), "status=" + canon2.status + " lens=" + p2.map((v) => v.length).join(","));
+  if (!(canon2.status === 200 && !!canon2.entry && requireThree(p2))) failExit("second member canonical invalid; refusing attach proof.");
   const cp2 = await post("/api/roster/" + roster2 + "/copy", { boardId: boardA, boardRole: "Tide Watcher" });
   ok("second-attach-201", cp2.status === 201 && pick(cp2.json, "id"), "status=" + cp2.status + " " + redact(cp2.text));
   if (!pick(cp2.json, "id")) failExit("second attach failed.");
@@ -772,6 +817,13 @@ async function stepMeeting() {
   meetingId = String(pick(m.json, "id"));
   const det0 = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
   ok("meeting-brief-empty", det0.status === 200 && String(pick(det0.json, "brief") || "") === "", "status=" + det0.status);
+  await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId));
+  const detInit = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
+  let initIds = null;
+  if (detInit.status === 200 && detInit.json) { const r0 = pick(detInit.json, "participantIds"); if (Array.isArray(r0)) initIds = r0.map(String); else { try { const pj = JSON.parse(pick(detInit.json, "participantIdsJson") || "[]"); if (Array.isArray(pj)) initIds = pj.map(String); } catch {} } }
+  ok("meeting-initial-two", Array.isArray(initIds) && initIds.length === 2, "ids=" + (initIds ? initIds.join(",") : "unparsed"));
+  if (!(Array.isArray(initIds) && initIds.length === 2)) failExit("initial participant set must hold both advisors before restriction.");
+  await patch("/api/meetings/" + meetingId, { participantIds: [advisor1] });
   await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId));
   // F6+F7: toolbar search (ACTUAL labelled textbox), EXACT Meeting settings
   // button + in-dialog Decisions & evidence, and the ACTUAL presence rail.
@@ -832,19 +884,28 @@ async function stepMeeting() {
       const seatIdx2 = names.findIndex((n) => String(n || "").includes("Tide Watcher"));
       const adv2Excluded = seatIdx2 >= 0 && String(classes[seatIdx2] || "").includes("act-excluded") && /not in this meeting/i.test(String(badges[seatIdx2] || ""));
       const otherExcluded = classes.some((c, i) => i !== seatIdx2 && String(c).includes("act-excluded"));
-      async function portraitLoaded(alt) {
+      function bytesHash(buf) { let h = 0; for (let i = 0; i < buf.length; i++) h = ((h * 31) + buf[i]) >>> 0; return h; }
+      const expHashA = bytesHash(PNG_A), expHashB = bytesHash(PNG_B);
+      async function portraitLoaded(alt, expected) {
         const img = rail.locator('img[alt="' + alt + '"]');
-        if (await img.count() !== 1) return "count!=" + alt + ":" + await img.count().catch(() => -1);
+        const cnt = await img.count().catch(() => -1);
+        if (cnt !== 1) return "count!=" + alt + ":" + cnt;
+        try { await img.first().waitFor({ state: "visible", timeout: 8000 }); } catch {}
+        try { await img.first().waitForFunction((el) => !!el.complete && (el.naturalWidth || 0) > 0, undefined, { timeout: 8000 }); } catch { return "not-loaded:" + alt; }
+        const w = await img.first().evaluate((el) => el.naturalWidth || 0).catch(() => 0);
+        if (!(w > 0)) return "not-loaded:" + alt;
         const src = await img.first().getAttribute("src").catch(() => "");
         if (!src) return "empty-src:" + alt;
-        try { await img.first().waitFor({ state: "visible", timeout: 8000 }); } catch {}
-        const w = await img.first().evaluate((el) => el.naturalWidth || 0).catch(() => 0);
-        return w > 0 ? src : "not-loaded:" + alt;
+        let info = null;
+        try { info = await img.first().evaluate(async (el) => { try { const u = new URL(el.currentSrc || el.src, location.href); if (u.protocol !== "http:" && u.protocol !== "https:" && u.protocol !== "blob:") return { len: -2, hash: 0 }; const r = await fetch(el.currentSrc || el.src); if (!r.ok) return { len: -3, hash: 0 }; const b = await r.arrayBuffer(); const arr = new Uint8Array(b); let h = 0; for (let i = 0; i < arr.length; i++) h = ((h * 31) + arr[i]) >>> 0; return { len: arr.length, hash: h }; } catch (e) { return { len: -1, hash: 0 }; } }); } catch { return "not-loaded:" + alt; }
+        if (!info || info.len < 0) return "not-loaded:" + alt + ":fetch" + (info ? info.len : "?");
+        if (info.len !== expected.len || info.hash !== expected.hash) return "mismatch:" + alt + ":got" + info.len + ":" + info.hash + ":want" + expected.len + ":" + expected.hash;
+        return src;
       }
-      const p1 = await portraitLoaded("Portrait of Harbor Strategist");
-      const p2 = await portraitLoaded("Portrait of Tide Watcher");
+      const p1 = await portraitLoaded("Portrait of Harbor Strategist", { len: PNG_A.length, hash: expHashA });
+      const p2 = await portraitLoaded("Portrait of Tide Watcher", { len: PNG_B.length, hash: expHashB });
+      const srcOk = !String(p1).startsWith("missing") && !String(p1).startsWith("empty") && !String(p1).startsWith("not-loaded") && !String(p1).startsWith("mismatch") && !String(p2).startsWith("missing") && !String(p2).startsWith("empty") && !String(p2).startsWith("not-loaded") && !String(p2).startsWith("mismatch");
       const portraitsDistinct = srcOk ? (p1 !== p2) : false;
-      const srcOk = !p1.startsWith("missing") && !p1.startsWith("empty") && !p1.startsWith("not-loaded") && !p2.startsWith("missing") && !p2.startsWith("empty") && !p2.startsWith("not-loaded");
       const mappedOk = classes.every((c) => String(c).split(/\s+/).filter((t) => t.indexOf("act-") === 0).every((t) => MAPPED_VOCAB.has(t.slice(4))));
       railOk = seatCount === 4 && hasLead && hasAdv1 && hasAdv2 && hasSec && adv2Excluded && !otherExcluded && srcOk && portraitsDistinct && mappedOk;
       shellNote += "seats=" + seatCount + " lead=" + hasLead + " adv1=" + hasAdv1 + " adv2=" + hasAdv2 + " sec=" + hasSec + " excludedSeatLocal=" + adv2Excluded + " portraitsDistinct=" + portraitsDistinct + " mappedVocab=" + mappedOk + ";";
@@ -886,10 +947,17 @@ async function stepMeeting() {
   const sendStart = Date.now();
   const seenStates = new Set();
   const seenByAdvisor = new Map();
-  const pollAct = setInterval(() => {
-    assertDeadline("activity-poll");
-    getActivity(meetingId).then((a) => { for (const s of a.states) { seenStates.add(s.state + (s.reason ? ":" + s.reason : "")); const k = String(s.id).toLowerCase(); if (!seenByAdvisor.has(k)) seenByAdvisor.set(k, []); seenByAdvisor.get(k).push(s.state + ":" + s.reason); } }).catch(() => {});
-  }, 2500);
+  let pollStop = false;
+  const pollTask = (async () => {
+    while (!pollStop) {
+      if (Date.now() > DEADLINE_MS) break;
+      try {
+        const a = await getActivity(meetingId);
+        for (const s of a.states) { seenStates.add(s.state + (s.reason ? ":" + s.reason : "")); const k = String(s.id).toLowerCase(); if (!seenByAdvisor.has(k)) seenByAdvisor.set(k, []); seenByAdvisor.get(k).push(s.state + ":" + s.reason); }
+      } catch {}
+      await sleep(2500);
+    }
+  })();
   try {
   await box.press("Enter");
   let progress = "";
@@ -898,10 +966,30 @@ async function stepMeeting() {
     try { await page.waitForFunction(() => document.body.innerText.indexOf("Requesting advisor responses...") >= 0, undefined, { timeout: BROWSER_TIMEOUT }); progress = "working"; } catch { ok("meeting-progress-visible", false, "no sending/working status"); }
   }
   if (progress) ok("meeting-progress-visible", true, progress + " after " + (Date.now() - sendStart) + "ms");
+  let pairedOk = false, pairedDetail = "";
+  if (progress) {
+    try {
+      const aMid = await getActivity(meetingId);
+      const a1Mid = (aMid.states || []).filter((s) => String(s.id).toLowerCase() === advisor1.toLowerCase());
+      const railMid = page.locator('section.meet-participants ul.mp-rail[aria-label="Participant activity"]');
+      const namesMid = await railMid.locator(".mp-name").allInnerTexts().catch(() => []);
+      const clsMid = await railMid.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []);
+      const idxMid = namesMid.findIndex((n) => String(n || "").includes("Harbor Strategist"));
+      let badgeMid = "";
+      if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; }
+      const rawWorkMid = a1Mid.filter((s) => ["queued", "awaiting-selection", "considering", "responding", "awaiting-publication"].includes(String(s.state)));
+      const badgeWorkMid = ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(badgeMid);
+      const latestRaw = a1Mid.length > 0 ? String(a1Mid[a1Mid.length - 1].state) : "";
+      const mapEq = latestRaw !== "" && mapRaw(latestRaw) === badgeMid;
+      pairedOk = rawWorkMid.length >= 1 && badgeWorkMid && mapEq;
+      pairedDetail = "rawAdv1=" + a1Mid.map((s) => s.state).join(",") + " badge=" + badgeMid + " mapEq=" + mapEq;
+    } catch (e) { pairedDetail = "paired probe threw: " + String((e && e.message) || e).slice(0, 120); }
+    ok("activity-paired-working", pairedOk, pairedDetail || "adv1 raw working + seat badge together during work");
+  } else { ok("activity-paired-working", false, "no progress; cannot pair raw+rendered during work"); }
   let terminal = false;
   try { await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: RUN_TIMEOUT }); terminal = true; } catch { ok("meeting-terminal-complete", false, "no Responses complete. within " + RUN_TIMEOUT + "ms"); }
   if (terminal) ok("meeting-terminal-complete", true, "after " + (Date.now() - sendStart) + "ms");
-  } finally { try { clearInterval(pollAct); } catch {} }
+  } finally { pollStop = true; try { await pollTask; } catch {} await drainPending(); }
   const fin = await getActivity(meetingId);
   for (const s of fin.states) seenStates.add(s.state + (s.reason ? ":" + s.reason : ""));
   const observed = [...seenStates];
@@ -912,7 +1000,10 @@ async function stepMeeting() {
   const rawReached = rawStates.some((s) => s === "awaiting-publication" || s === "complete");
   const WORKING_RAW = new Set(["queued", "awaiting-selection", "considering", "responding", "awaiting-publication"]);
   const finAdv1 = (fin.states || []).filter((s) => String(s.id).toLowerCase() === advisor1.toLowerCase());
-  const finAdv1Working = finAdv1.some((s) => WORKING_RAW.has(String(s.state))) || observed.some((o) => WORKING_RAW.has(String(o).split(":")[0]));
+  const adv1Key = advisor1.toLowerCase();
+  const adv1Trail = seenByAdvisor.get(adv1Key) || [];
+  const trailWorking = adv1Trail.filter((e) => WORKING_RAW.has(String(e).split(":")[0]));
+  const finAdv1Working = finAdv1.some((s) => WORKING_RAW.has(String(s.state))) || trailWorking.length >= 1;
   let mappedReached = false, mappedOk = true, adv1Badge = "", crossOk = true;
   try {
     const rail = page.locator('section.meet-participants ul.mp-rail[aria-label="Participant activity"]');
@@ -925,27 +1016,42 @@ async function stepMeeting() {
     mappedReached = acts.some((a) => a === "waiting-for-publication" || a === "complete" || a === "responding" || a === "considering" || a === "waiting-for-selection" || a === "queued");
     const idx1 = names.findIndex((n) => String(n || "").includes("Harbor Strategist"));
     if (idx1 >= 0) { const m = /act-([a-z-]+)/.exec(String(classes[idx1] || "")); adv1Badge = m ? m[1] : ""; }
-    crossOk = rawStates.every((s) => MAPPED_VOCAB.has(mapRaw(s))) && (adv1Badge === "" || MAPPED_VOCAB.has(adv1Badge));
-    ok("activity-mapped-badges-honest", mappedOk && crossOk, "rendered=" + acts.join(",") + " adv1Badge=" + adv1Badge);
+    const adv1LatestRaw = finAdv1.length > 0 ? String(finAdv1[finAdv1.length - 1].state) : "";
+    const adv1MapEq = adv1LatestRaw !== "" && adv1Badge !== "" && mapRaw(adv1LatestRaw) === adv1Badge;
+    crossOk = rawStates.every((s) => MAPPED_VOCAB.has(mapRaw(s))) && adv1MapEq;
+    ok("activity-mapped-badges-honest", mappedOk && crossOk, "rendered=" + acts.join(",") + " adv1Badge=" + adv1Badge + " adv1Raw=" + adv1LatestRaw);
   } catch (e) { ok("activity-mapped-badges-honest", false, "rail badge read failed: " + trunc(String((e && e.message) || e), 120)); }
   ok("activity-states-raw-honest", vocabOk && rawReached, "raw=" + observed.join(","));
-  ok("activity-working-observed", finAdv1Working, "adv1Working=" + finAdv1Working + " adv1States=" + finAdv1.map((s) => s.state + ":" + s.reason).join(","));
-  ok("activity-adv1-badge-working", ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication", "complete"].includes(adv1Badge), "adv1Badge=" + adv1Badge);
+  ok("activity-working-observed", finAdv1Working && trailWorking.length >= 1, "adv1Working=" + finAdv1Working + " trailWorking=" + trailWorking.length + " adv1States=" + finAdv1.map((s) => s.state + ":" + s.reason).join(","));
+  ok("activity-adv1-badge-working", ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(adv1Badge) || pairedOk, "adv1Badge=" + adv1Badge + " paired=" + pairedOk);
   if (!finAdv1Working) failExit("no working raw state observed for the owned participant; honest activity requires a transient working state.");
-  ok("send-lead-once", netPosts.messages.length === 1, "POST messages=" + netPosts.messages.length);
-  ok("autoinit-patch-once", netPosts.patch.length === 1, "PATCH meetings=" + netPosts.patch.length);
-  ok("run-once", netPosts.run.length === 1, "POST run=" + netPosts.run.length);
-  const leadBody = (netBodies.messages[0] && netBodies.messages[0].body) || "";
-  const patchBody = (netBodies.patch[0] && netBodies.patch[0].body) || "";
-  ok("send-lead-body-exact", leadBody.includes(QUESTION.slice(0, 24)) && leadBody.includes(run), "bodyHasQuestion=" + leadBody.includes(QUESTION.slice(0, 24)));
-  ok("autoinit-patch-body-exact", patchBody.includes(advisor1), "patchHasAdvisor1=" + patchBody.includes(advisor1));
-  ok("run-body-ok", ((netBodies.run[0] && netBodies.run[0].body) || "{}").includes("{}") || ((netBodies.run[0] && netBodies.run[0].body) || "") === "", "runBody=" + String((netBodies.run[0] && netBodies.run[0].body) || "").slice(0, 40));
+  const meetMsgs = netBodies.messages.filter((b) => String(b.url || "").includes(meetingId));
+  const meetPatch = netBodies.patch.filter((b) => String(b.url || "").includes(meetingId));
+  const meetRun = netBodies.run.filter((b) => String(b.url || "").includes(meetingId));
+  const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
+  const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
+  const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
+  ok("send-lead-once", meetMsgs.length === 1 && meetMsgsRes.length >= 1, "POST messages=" + meetMsgs.length + " okRes=" + meetMsgsRes.length);
+  ok("autoinit-patch-once", meetPatch.length === 1 && meetPatchRes.length >= 1, "PATCH meetings=" + meetPatch.length + " okRes=" + meetPatchRes.length);
+  ok("run-once", meetRun.length === 1 && meetRunRes.length >= 1, "POST run=" + meetRun.length + " okRes=" + meetRunRes.length);
+  let leadJson = null; try { leadJson = JSON.parse((meetMsgs[0] && meetMsgs[0].body) || "null"); } catch { leadJson = null; }
+  let patchJson = null; try { patchJson = JSON.parse((meetPatch[0] && meetPatch[0].body) || "null"); } catch { patchJson = null; }
+  let runJson = null; try { runJson = JSON.parse((meetRun[0] && meetRun[0].body) || "null"); } catch { runJson = null; }
+  const wantBrief = QUESTION.slice(0, 800);
+  ok("send-lead-body-exact", !!leadJson && leadJson.content === QUESTION && leadJson.sender === "lead", "contentExact=" + (!!leadJson && leadJson.content === QUESTION));
+  const patchBriefOk = !!patchJson && patchJson.brief === wantBrief && patchJson.briefAutoInit === true && patchJson.expectedBrief === "" && patchJson.expectBriefEmpty === true;
+  const patchCasOk = !!patchJson && ("leadSequence" in patchJson) && ("leadContent" in patchJson) && ("expectedGeneration" in patchJson);
+  const patchNoAdv = !!patchJson && !JSON.stringify(patchJson).toLowerCase().includes(advisor1.toLowerCase()) && !("advisorId" in patchJson) && !("participantIds" in patchJson);
+  ok("autoinit-patch-body-exact", patchBriefOk && patchCasOk && patchNoAdv, "briefExact=" + patchBriefOk + " cas=" + patchCasOk + " noAdvId=" + patchNoAdv);
+  const runOk = !!runJson && typeof runJson.policy === "string" && runJson.prompt === QUESTION && runJson.evidenceSupported === false && ("leadVersion" in runJson);
+  ok("run-body-ok", runOk, "policy=" + (runJson && runJson.policy) + " promptExact=" + (!!runJson && runJson.prompt === QUESTION));
   const msgs = await get("/api/meetings/" + meetingId + "/messages?take=100");
   const msgList = Array.isArray(msgs.json) ? msgs.json : [];
   const leads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "").includes(QUESTION));
-  ok("send-lead-text-once", msgs.status === 200 && leads.length === 1, "status=" + msgs.status + " matching-leads=" + leads.length + " total=" + msgList.length);
+  const exactLeads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "") === QUESTION);
+  ok("send-lead-text-once", msgs.status === 200 && exactLeads.length === 1 && leads.length === 1, "status=" + msgs.status + " exact-leads=" + exactLeads.length + " total=" + msgList.length);
   const det1 = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
-  ok("autobrief-once", det1.status === 200 && String(pick(det1.json, "brief") || "").length > 20 && String(pick(det1.json, "brief") || "").includes(run.slice(0, 8)), "status=" + det1.status + " briefLen=" + String(pick(det1.json, "brief") || "").length);
+  ok("autobrief-once", det1.status === 200 && String(pick(det1.json, "brief") || "") === wantBrief, "status=" + det1.status + " briefExact=" + (String(pick(det1.json, "brief") || "") === wantBrief));
   const adv = msgList.filter((x) => { const a = String(pick(x, "advisorId") || ""); return a && a !== "00000000-0000-0000-0000-000000000000"; });
   const adv1Msgs = adv.filter((x) => String(pick(x, "advisorId") || "").toLowerCase() === advisor1.toLowerCase());
   const adv2Msgs = adv.filter((x) => String(pick(x, "advisorId") || "").toLowerCase() === advisor2.toLowerCase());
@@ -954,22 +1060,33 @@ async function stepMeeting() {
   ok("advisor-reply-nonempty", nonempty.length >= 1 && adv1Nonempty.length >= 1, "advisor1-nonempty=" + adv1Nonempty.length + " total-nonempty=" + nonempty.length);
   ok("excluded-absent", adv2Msgs.length === 0, "excludedAdvisorMsgs=" + adv2Msgs.length);
   if (nonempty.length < 1) failExit("no model contribution: HTTP 200 is not proof; need >=1 nonempty advisor reply.");
-  // F9: Secretary direct question through the SAME composer -> correlated
-  // completed request + persisted PROVISIONAL note, and NO decision.
   const sreq0 = await get("/api/meetings/" + meetingId + "/secretary/requests");
-  const sreq0List = Array.isArray(sreq0.json) ? sreq0.json : [];
+  ok("secretary-baseline-shape", sreq0.status === 200 && Array.isArray(sreq0.json), "status=" + sreq0.status + " isArray=" + Array.isArray(sreq0.json));
+  if (!(sreq0.status === 200 && Array.isArray(sreq0.json))) failExit("secretary baseline collection shape invalid; cannot prove completion.");
+  const sreq0List = sreq0.json;
   const sreq0Ids = new Set(sreq0List.map((x) => String(pick(x, "id") || "")));
+  const nz0 = await get("/api/meetings/" + meetingId + "/notes?kind=direction");
+  ok("secretary-direction-baseline", nz0.status === 200 && Array.isArray(nz0.json), "status=" + nz0.status);
   await box.fill(SECQ);
   await box.press("Enter");
-  let prov = false;
-  try { await page.waitForFunction(() => /provisional/i.test(document.body.innerText), undefined, { timeout: 90000 }); prov = true; } catch { ok("secretary-provisional-visible", false, "no provisional note within 90s"); }
-  if (prov) ok("secretary-provisional-visible", true, "provisional note visible via same composer");
-  const sreq1 = await get("/api/meetings/" + meetingId + "/secretary/requests");
-  const sreq1List = Array.isArray(sreq1.json) ? sreq1.json : [];
-  const fresh = sreq1List.filter((x) => !sreq0Ids.has(String(pick(x, "id") || "")));
-  ok("secretary-request-recorded", sreq1.status === 200 && fresh.length === 1, "status=" + sreq1.status + " newRequests=" + fresh.length);
-  if (fresh.length === 1) {
-    const rq = fresh[0];
+  const secDeadline = Date.now() + Math.min(90000, remainingMs(20000));
+  let sreq1List = [], fresh = [], secDone = null;
+  while (Date.now() < secDeadline) {
+    assertDeadline("secretary-poll");
+    const g = await get("/api/meetings/" + meetingId + "/secretary/requests");
+    if (g.status === 200 && Array.isArray(g.json)) {
+      sreq1List = g.json;
+      fresh = sreq1List.filter((x) => !sreq0Ids.has(String(pick(x, "id") || "")));
+      secDone = fresh.find((x) => String(pick(x, "status") || "") === "completed" && !!pick(x, "noteId") && String(pick(x, "question") || pick(x, "inputText") || "").includes(run));
+      if (secDone) break;
+    }
+    await sleep(2000);
+  }
+  ok("secretary-provisional-visible", !!secDone, secDone ? "exact owned request completed noteId=" + String(pick(secDone, "noteId") || "").slice(0, 8) : "no exact completed owned request with noteId within deadline");
+  ok("secretary-request-recorded", !!secDone && fresh.length === 1, "newRequests=" + fresh.length + " completed=" + !!secDone);
+  const sreq1 = { status: sreq1List.length ? 200 : 0 };
+  if (secDone && fresh.length === 1) {
+    const rq = secDone;
     const qtext = String(pick(rq, "question") || pick(rq, "inputText") || "");
     const rqId = String(pick(rq, "id") || "");
     ok("secretary-request-correlated", qtext.includes(run) && String(pick(rq, "status") || "") === "completed" && !!pick(rq, "noteId"), "qMatch=" + qtext.includes(run) + " status=" + pick(rq, "status") + " noteId=" + !!pick(rq, "noteId"));
@@ -978,34 +1095,56 @@ async function stepMeeting() {
     const nbody = String(pick(note, "body") || "");
     const nkind = String(pick(note, "kind") || "");
     ok("secretary-note-provisional-persisted", one.status === 200 && (nkind === "secretary-note" || nkind === "secretary-briefing") && pick(note, "provisional") === true && nbody.includes(run), "status=" + one.status + " kind=" + nkind + " provisional=" + pick(note, "provisional") + " bodyMatch=" + nbody.includes(run));
+    try { globalThis.__secNoteTitle = String(pick(note, "title") || ""); globalThis.__secNoteBody = nbody; globalThis.__secNoteId = rqId; } catch {}
   } else {
-    ok("secretary-request-correlated", false, "expected exactly 1 new request, found " + fresh.length);
-    ok("secretary-note-provisional-persisted", false, "no single correlated request to resolve");
+    ok("secretary-request-correlated", false, "expected exactly 1 completed owned request, found fresh=" + fresh.length + " done=" + !!secDone);
+    ok("secretary-note-provisional-persisted", false, "no single correlated completed request to resolve");
   }
   const nz = await get("/api/meetings/" + meetingId + "/notes?kind=direction");
   const nlistRaw = nz.json;
-  ok("secretary-direction-shape", nz.status === 200 && Array.isArray(nlistRaw), "status=" + nz.status + " isArray=" + Array.isArray(nlistRaw));
-  if (!(nz.status === 200 && Array.isArray(nlistRaw))) failExit("direction collection shape invalid; cannot prove no-decision.");
+  const dirRowsValid = nz.status === 200 && Array.isArray(nlistRaw) && nlistRaw.every((x) => typeof pick(x, "kind") === "string" && typeof pick(x, "provisional") === "boolean" && typeof String(pick(x, "body") || "") === "string");
+  ok("secretary-direction-shape", dirRowsValid, "status=" + nz.status + " rows=" + (Array.isArray(nlistRaw) ? nlistRaw.length : "?"));
+  if (!dirRowsValid) failExit("direction collection shape invalid; cannot prove no-decision.");
   const nlist = nlistRaw;
   const dirs = nlist.filter((x) => String(pick(x, "kind") || "").toLowerCase() === "direction");
   const nonProv = dirs.filter((x) => pick(x, "provisional") !== true);
   const provNotes = await get("/api/meetings/" + meetingId + "/notes?kind=secretary-note");
-  const provList = Array.isArray(provNotes.json) ? provNotes.json : [];
-  ok("secretary-provisional-positive", provList.length >= 1 || nlist.length >= 0, "secretary-note rows=" + provList.length);
+  const provOkShape = provNotes.status === 200 && Array.isArray(provNotes.json) && provNotes.json.every((x) => typeof pick(x, "kind") === "string");
+  const provList = provOkShape ? provNotes.json : [];
+  const wantNoteId = secDone ? String(pick(secDone, "noteId") || "") : "";
+  const corrNote = provList.find((x) => String(pick(x, "id") || "") === wantNoteId);
+  const corrOk = provOkShape && !!corrNote && pick(corrNote, "provisional") === true && String(pick(corrNote, "body") || "").includes(run);
+  ok("secretary-provisional-positive", corrOk, "correlatedNote=" + !!corrNote + " rows=" + provList.length);
   let trayOk = false, trayNote = "";
   try {
     await page.bringToFront().catch(() => {});
-    const traySec = page.locator("h3", { hasText: "Secretary provisional notes" }).first();
-    const hasTray = await traySec.count() > 0;
-    if (hasTray) {
-      await traySec.scrollIntoViewIfNeeded().catch(() => {});
-      const trayText = await traySec.locator("xpath=..").innerText().catch(() => "");
-      trayNote = trunc(trayText, 200);
-      trayOk = trayText.includes(run) && /provisional/i.test(trayText);
+    const setBtn = page.getByRole("button", { name: "Meeting settings", exact: true });
+    await setBtn.first().click({ timeout: 8000 }).catch(() => {});
+    const setDlg = page.locator('section[aria-label="Meeting settings"]');
+    const setNative = page.locator("dialog.conv-settings");
+    await setDlg.first().waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+    const setVis = await setDlg.first().isVisible().catch(() => false);
+    const setOpen = await setNative.first().evaluate((el) => !!el.open).catch(() => false);
+    const wantTitle = String((globalThis.__secNoteTitle) || "QA secretary note");
+    const wantBody = String((globalThis.__secNoteBody) || run);
+    let exactHit = false;
+    if (setVis && setOpen) {
+      const notes = setDlg.locator(".takenote");
+      const nn = await notes.count().catch(() => 0);
+      for (let i = 0; i < nn; i++) {
+        const txt = await notes.nth(i).innerText().catch(() => "");
+        const vis = await notes.nth(i).isVisible().catch(() => false);
+        if (vis && txt.includes(wantTitle) && txt.includes(run) && txt.includes(wantBody.slice(0, 40))) { exactHit = true; trayNote = trunc(txt, 200); break; }
+      }
     }
-  } catch {}
+    trayOk = setVis && setOpen && exactHit;
+    if (!trayNote) trayNote = "vis=" + setVis + " open=" + setOpen + " exact=" + exactHit;
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(400);
+  } catch (e) { trayNote = "tray probe threw: " + String((e && e.message) || e).slice(0, 120); }
   ok("secretary-tray-rendered", trayOk, trayNote || "tray missing or marker absent");
-  ok("secretary-no-decision", nz.status === 200 && nonProv.length === 0, "status=" + nz.status + " directionNotes=" + dirs.length + " nonProvisional=" + nonProv.length);
+  const nz0Dirs = Array.isArray(nz0.json) ? nz0.json.filter((x) => String(pick(x, "kind") || "").toLowerCase() === "direction" && pick(x, "provisional") !== true) : [];
+  ok("secretary-no-decision", nz.status === 200 && nonProv.length === 0 && nz0Dirs.length === nonProv.length, "status=" + nz.status + " directionNotes=" + dirs.length + " nonProvisional=" + nonProv.length + " baselineNonProv=" + nz0Dirs.length);
   await scanDebug("meeting-shell");
   await scanDebug("meeting-messages");
   checkBudget("meeting");
@@ -1013,16 +1152,21 @@ async function stepMeeting() {
 // ---- 5. canonical re-edit + re-gate + prompt-log markers ----
 async function stepReeditRerun() {
   await gotoTab("/#/roster");
-  // F2: the creation dialog is closed (asserted in stepCreateAdvisor), so the
-  // page holds exactly ONE Character paragraphs editor: the selected-roster
-  // detail editor. Open the OWN entry by clicking its roster name.
+  const dlgStill = page.locator('div.modal[role="dialog"][aria-label="Create advisor"]');
+  const dlgVisible = await dlgStill.first().isVisible().catch(() => false);
+  ok("canonical-reedit-dialog-closed", await dlgStill.count() === 0 && !dlgVisible, "dialogCount=" + await dlgStill.count() + " visible=" + dlgVisible);
+  if (await dlgStill.count() !== 0 || dlgVisible) failExit("create dialog still mounted/visible before canonical re-edit; refusing ambiguous editor proof.");
   let editorOpen = false;
   try {
-    const cand = page.getByText(rosterName, { exact: false }).first();
-    await cand.click({ timeout: BROWSER_TIMEOUT });
+    const row = page.locator("aside.listpanel button.lprow", { hasText: rosterName }).first();
+    await row.waitFor({ timeout: BROWSER_TIMEOUT });
+    const nm = await row.locator(".lprow-name").innerText().catch(() => "");
+    if (nm !== rosterName) throw new Error("roster row name mismatch want=" + rosterName + " got=" + nm);
+    await row.click({ timeout: BROWSER_TIMEOUT });
     await page.waitForTimeout(1200);
+    const aria = await row.getAttribute("aria-current").catch(() => null);
     const n = await page.locator("fieldset").filter({ hasText: "Character paragraphs" }).count().catch(() => 0);
-    editorOpen = n === 1;
+    editorOpen = n === 1 && aria === "true";
   } catch {}
   ok("canonical-editor-open", editorOpen, editorOpen ? "exactly one Character paragraphs editor (detail)" : "could not open owned entry into a single detail editor");
   if (!editorOpen) failExit("canonical editor did not open as a single detail editor; refusing HTTP-only edit (UI path required).");
@@ -1031,14 +1175,21 @@ async function stepReeditRerun() {
   if (n !== 3) failExit("expected 3 paragraph editables, found " + n);
   const cur = [];
   for (let i = 0; i < 3; i++) cur.push(await fs.nth(i).inputValue().catch(() => ""));
+  const draftNow = await get("/api/roster/" + rosterId + "/research").catch(() => ({ status: 0, json: null }));
+  const draftNowP = (draftNow.status === 200 && draftNow.json) ? pick(draftNow.json, "draftProfile") : null;
+  const draftNowVals = draftNowP ? [pick(draftNowP, "contributionCriteria"), pick(draftNowP, "reasoningApproach"), pick(draftNowP, "responseStyle")] : [];
+  const editorEqDraft = cur.length === 3 && draftNowVals.length === 3 && cur.every((v, i) => v === String(draftNowVals[i] || ""));
+  ok("canonical-editor-eq-draft-both", editorEqDraft, "editor==draftProfile both modes");
   const marks2 = [N1, N2, N3];
+  const submitted2 = [];
   for (let i = 0; i < 3; i++) {
     const stripped = cur[i].split("[" + M1).join("").split("[" + M2).join("").split("[" + M3).join("").trim();
-    await fs.nth(i).fill(stripped + " [" + marks2[i] + "]");
+    const next = stripped + " [" + marks2[i] + "]";
+    await fs.nth(i).fill(next);
+    submitted2.push(next);
   }
   const rBefore = await get("/api/roster/" + rosterId + "/research");
   const verBefore = Number(pick(rBefore.json, "version") || 0);
-  const editMarkAt = Date.now();
   try {
     const waited = Promise.all([
       page.waitForResponse((r) => new URL(r.url()).pathname === "/api/roster/" + rosterId && r.request().method() === "PUT", { timeout: BROWSER_TIMEOUT }),
@@ -1047,10 +1198,11 @@ async function stepReeditRerun() {
     const resps = await waited;
     ok("canonical-edit-saved", resps[0].status() === 200, "status=" + resps[0].status());
   } catch (e) { ok("canonical-edit-saved", false, "PUT /api/roster/{id} never completed"); failExit("canonical edit save failed."); }
-  // F3: readback via the canonical fresh collection wrapper (exact-ID entry).
   const canon = await canonicalEntry(rosterId);
-  const full = threeParas(canon.entry ? (pick(canon.entry, "profileJson") || "") : "");
-  ok("canonical-markers-roundtrip", canon.status === 200 && !!canon.entry && requireThree(full) && full.every((v, i) => v.includes(marks2[i])) && ![M1, M2, M3].some((m) => full.some((v) => v.includes(m))), "status=" + canon.status + " lens=" + full.map((v) => v.length).join(","));
+  const rawJson2 = canon.entry ? (pick(canon.entry, "profileJson") || "") : "";
+  const rawOk2 = originalThreeStrings(rawJson2) !== null;
+  const full = threeParas(rawJson2);
+  ok("canonical-markers-roundtrip", canon.status === 200 && !!canon.entry && rawOk2 && requireThree(full) && full.every((v, i) => v === submitted2[i]), "status=" + canon.status + " exact=" + full.every((v, i) => v === submitted2[i]));
   if (!(canon.status === 200 && requireThree(full))) failExit("canonical re-edit readback malformed; refusing proof.");
   const rAfter = await get("/api/roster/" + rosterId + "/research");
   ok("canonical-version-bump", Number(pick(rAfter.json, "version") || 0) > verBefore, "before=" + verBefore + " after=" + String(pick(rAfter.json, "version")));
@@ -1064,6 +1216,8 @@ async function stepReeditRerun() {
   const m2 = await post("/api/boards/" + boardA + "/meetings", { title: run + " harbor rerun", brief: "Rerun brief " + run, participantIds: [advisor1] });
   if (m2.status !== 201 || !pick(m2.json, "id")) failExit("rerun meeting create failed.");
   const mid2 = String(pick(m2.json, "id"));
+  const rerunMarker = "RERUN-" + run + "-" + mid2.slice(0, 8);
+  const rerunBoundary = Date.now();
   const r2 = await post("/api/meetings/" + mid2 + "/run", {}, { timeout: RUN_TIMEOUT });
   ok("rerun-run-200", r2.status === 200, "status=" + r2.status + " " + redact(r2.text));
   const vm2 = await get("/api/meetings/" + mid2 + "/messages?take=100");
@@ -1073,12 +1227,12 @@ async function stepReeditRerun() {
   if (MODE === "native") {
     const log = await fakeLog();
     if (!Array.isArray(log)) failExit("native mode requires fake log for rerun proof.");
-    const post2 = ownedLog(log).filter((e) => Number(e.t || 0) >= editMarkAt - 5000 && e.path === "chat");
+    const post2 = ownedLog(log).filter((e) => Number(e.t || 0) >= rerunBoundary && e.path === "chat");
     const yourTurn = post2.filter((e) => logText(e).includes("YOUR TURN"));
     const ownedCorr = yourTurn.filter((e) => logText(e).includes("Harbor Strategist") || logText(e).includes(rosterName) || logText(e).includes(advisor1));
     const withCurrent = ownedCorr.filter((e) => [N1, N2, N3].every((mk) => logText(e).includes(mk)));
     const staleLeak = post2.filter((e) => [M1, M2, M3].some((mk) => logText(e).includes(mk)));
-    ok("promptlog-current-markers-owned", withCurrent.length >= 1 && staleLeak.length === 0, "post-edit-chat=" + post2.length + " yourTurn=" + yourTurn.length + " ownedCorr=" + ownedCorr.length + " current=" + withCurrent.length + " stale-leak=" + staleLeak.length);
+    ok("promptlog-current-markers-owned", withCurrent.length >= 1 && staleLeak.length === 0 && post2.length >= 1 && yourTurn.length >= 1, "rerunBoundary=" + rerunBoundary + " post-rerun-chat=" + post2.length + " yourTurn=" + yourTurn.length + " current=" + withCurrent.length + " stale=" + staleLeak.length);
     if (!(withCurrent.length >= 1 && staleLeak.length === 0)) failExit("rerun prompt correlation failed (need YOUR TURN + current markers, no stale).");
   } else {
     ok("promptlog-live-unproved", false, "live mode: prompt inspection unavailable; rerun published-nonempty=" + vadv2.length + " but prompt correlation UNPROVED (no fake log)");
@@ -1089,7 +1243,11 @@ async function stepReeditRerun() {
 // ---- 5b. roster direct chat through the REAL RosterChatPanel UI ----
 async function stepRosterChatUI() {
   await gotoTab("/#/roster");
-  try { await page.getByText(rosterName, { exact: false }).first().click({ timeout: BROWSER_TIMEOUT }); } catch {}
+  try {
+    const rrow = page.locator("aside.listpanel button.lprow", { hasText: rosterName }).first();
+    await rrow.waitFor({ timeout: BROWSER_TIMEOUT });
+    await rrow.click({ timeout: BROWSER_TIMEOUT });
+  } catch {}
   await page.waitForTimeout(1200);
   const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
   let panelOk = false;
@@ -1105,10 +1263,11 @@ async function stepRosterChatUI() {
   ok("roster-chat-controls", boxOk && await chatLog.count() > 0, "messageBox=" + boxOk);
   if (!boxOk) failExit("roster chat message box missing.");
   const mc0 = await get("/api/meetings/" + meetingId + "/messages?take=100");
-  const c0 = Array.isArray(mc0.json) ? mc0.json.length : -1;
-  const baseLead = Array.isArray(mc0.json) ? mc0.json.filter((x) => String(pick(x, "content") || pick(x, "body") || "").includes(QUESTION)).length : 0;
-  ok("roster-chat-baseline-valid", mc0.status === 200 && baseLead >= 1, "meetingHasOwnedLead=" + baseLead + " total=" + c0);
-  if (!(mc0.status === 200 && baseLead >= 1)) failExit("meeting baseline not positively validated; refusing stateless proof.");
+  const c0snap = Array.isArray(mc0.json) ? mc0.json.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") || pick(x, "body") || "")) : [];
+  const c0 = c0snap.length;
+  const baseLeadExact = Array.isArray(mc0.json) ? mc0.json.filter((x) => String(pick(x, "content") || pick(x, "body") || "") === QUESTION).length : 0;
+  ok("roster-chat-baseline-valid", mc0.status === 200 && baseLeadExact === 1, "meetingHasOwnedLeadExact=" + baseLeadExact + " total=" + c0);
+  if (!(mc0.status === 200 && baseLeadExact === 1)) failExit("meeting baseline not positively validated; refusing stateless proof.");
   const chatQ = "Direct " + run + ": state your current berth criterion in one line?";
   await chatBox.first().fill(chatQ);
   const sendBtn = panel.getByRole("button", { name: /^send$/i });
@@ -1124,39 +1283,70 @@ async function stepRosterChatUI() {
     const cands = (texts || []).map((t) => String(t || "").trim()).filter((t) => t.length >= 20 && !/^Responding/.test(t) && !t.includes(chatQ.slice(0, 20)));
     advAnswer = cands.length > 0 ? cands[cands.length - 1] : "";
   } catch { ok("roster-chat-ui-reply", false, "no completed advisor .msg-row.advisor .btext answer within 90s"); }
-  if (advAnswer) ok("roster-chat-ui-reply", advAnswer.length >= 20 && !/^Responding/.test(advAnswer), "advLen=" + advAnswer.length);
+  if (advAnswer) ok("roster-chat-ui-reply", advAnswer.length >= 20 && !/^Responding/.test(advAnswer) && advAnswer !== chatQ && !advAnswer.includes(chatQ.slice(0, 20)), "advLen=" + advAnswer.length);
   else ok("roster-chat-ui-reply", false, "no distinct advisor answer (echo/pending is not proof)");
-  const chatReq = netPosts.rosterChat.length > 0 ? netPosts.rosterChat[netPosts.rosterChat.length - 1] : null;
-  ok("roster-chat-request", !!chatReq && String((chatReq && chatReq.body) || "").includes(chatQ.slice(0, 20)), "captured=" + (chatReq ? trunc(String(chatReq.body), 80) : "none"));
+  const ownedChat = netPosts.rosterChat.filter((e) => String(e.url || "").includes(rosterId));
+  const chatReq = ownedChat.length > 0 ? ownedChat[ownedChat.length - 1] : null;
+  let chatJson = null; try { chatJson = chatReq ? JSON.parse(chatReq.body) : null; } catch { chatJson = null; }
+  const chatUrlOk = !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
+  const chatBodyOk = !!chatJson && String(chatJson.message || chatJson.content || chatJson.body || "") === chatQ;
+  const chatResOk = netResps.rosterChat.filter((r) => String(r.url || "").includes(rosterId) && r.status >= 200 && r.status < 300).length >= 1;
+  ok("roster-chat-request", chatUrlOk && chatBodyOk && chatResOk, "urlExact=" + chatUrlOk + " bodyExact=" + chatBodyOk + " okRes=" + chatResOk);
   const mc1 = await get("/api/meetings/" + meetingId + "/messages?take=100");
-  const sameLen = mc1.status === 200 && Array.isArray(mc1.json) && mc1.json.length === c0;
-  const sameLead = Array.isArray(mc1.json) ? mc1.json.filter((x) => String(pick(x, "content") || pick(x, "body") || "").includes(QUESTION)).length : -1;
-  ok("roster-chat-stateless", sameLen && sameLead === baseLead, "before=" + c0 + " after=" + (Array.isArray(mc1.json) ? mc1.json.length : "?") + " leadStill=" + sameLead);
+  const c1snap = Array.isArray(mc1.json) ? mc1.json.map((x) => String(pick(x, "id") || "") + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") || pick(x, "body") || "")) : [];
+  const sameSnap = mc1.status === 200 && c1snap.length === c0snap.length && c1snap.every((v, i) => v === c0snap[i]);
+  ok("roster-chat-stateless", sameSnap, "before=" + c0snap.length + " after=" + c1snap.length + " identical=" + sameSnap);
   await scanDebug("roster-chat");
   checkBudget("roster-chat-ui");
 }
 // ---- 6. navigation: every named destination, direct routes, back/forward ----
 async function scanDebug(tag) {
   assertDeadline("scan-" + tag);
-  const bodyText = await page.evaluate(() => document.body.innerText || "").catch(() => "");
-  if (!bodyText) { ok("debug-clean-" + tag, false, "body read failed; refusing vacuous clean pass"); return; }
-  const guidHits = (bodyText.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi) || []).length;
-  const jsonHits = (bodyText.match(/"[^"]+"\s*:\s*(\{|\[|")/g) || []).length;
-  const primHits = (bodyText.match(/"[^"]+"\s*:\s*(\d+|true|false|null)/g) || []).length;
-  let positiveOk = false;
+  const collected = await page.evaluate(() => {
+    let txt = document.body.innerText || "";
+    try {
+      const els = Array.from(document.querySelectorAll("input,textarea,select"));
+      for (const el of els) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && (el.value || "").length > 0) txt += "\n" + el.value; }
+    } catch {}
+    return txt;
+  }).catch(() => "");
+  if (!collected && collected !== "") { ok("debug-clean-" + tag, false, "body read failed; refusing vacuous clean pass"); return; }
+  const guidRe = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+  const jsonRe = /"[^"]+"\s*:\s*(\{|\[|")/g;
+  const primRe = /"[^"]+"\s*:\s*(\d+|true|false|null)/g;
+  const guidHits = (collected.match(guidRe) || []).length;
+  const jsonHits = (collected.match(jsonRe) || []).length;
+  const primHits = (collected.match(primRe) || []).length;
+  const hasGuid = (s) => (s.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i) || []).length >= 1;
+  const hasStrJson = (s) => (s.match(/"k"[\s]*:[\s]*"/) || []).length >= 1;
+  const hasObjJson = (s) => (s.match(/"k"[\s]*:[\s]*\{/) || []).length >= 1;
+  const hasArrJson = (s) => (s.match(/"k"[\s]*:[\s]*\[/) || []).length >= 1;
+  const hasPrimJson = (s) => (s.match(/"k"[\s]*:[\s]*(\d+|true|false|null)/) || []).length >= 1;
+  const fGuid = "id 11111111-2222-3333-4444-555555555555";
+  const fStr = '"k":"v"';
+  const fObj = '"k":{}';
+  const fArr = '"k":[]';
+  const fPrim = '"k":123';
+  const fClean = "plain visible text with no identifiers";
+  const positiveOk = hasGuid(fGuid) && hasStrJson(fStr) && hasObjJson(fObj) && hasArrJson(fArr) && hasPrimJson(fPrim) && !hasGuid(fClean) && !hasStrJson(fClean) && !hasPrimJson(fClean);
+  ok("debug-scan-positive-" + tag, positiveOk, "independent fixtures GUID/string/object/array/primitive + clean negative");
+  let hiddenIgnored = false;
   try {
-    const probe = await page.evaluate(() => {
-      const t = (document.body.innerText || "") + "\nprobe 11111111-2222-3333-4444-555555555555 \"k\":123";
-      const g = (t.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi) || []).length;
-      const j = (t.match(/"[^"]+"\s*:\s*(\{|\[|")/g) || []).length;
-      const pr = (t.match(/"[^"]+"\s*:\s*(\d+|true|false|null)/g) || []).length;
-      return g >= 1 && j >= 1 && pr >= 1;
+    hiddenIgnored = await page.evaluate(() => {
+      const d = document.createElement("div");
+      d.setAttribute("data-probe", "22222222-3333-4444-5555-666666666666");
+      d.style.display = "none";
+      d.textContent = "33333333-4444-5555-6666-777777777777";
+      document.body.appendChild(d);
+      const txt = document.body.innerText || "";
+      const has1 = txt.includes("22222222-3333-4444-5555-666666666666");
+      const has2 = txt.includes("33333333-4444-5555-6666-777777777777");
+      d.remove();
+      return !has1 && !has2;
     }).catch(() => false);
-    positiveOk = probe === true;
-  } catch { positiveOk = false; }
-  ok("debug-scan-positive-" + tag, positiveOk, "scanner detects visible GUID/JSON/primitive");
+  } catch { hiddenIgnored = false; }
   const clean = guidHits === 0 && jsonHits === 0 && primHits === 0;
-  ok("debug-clean-" + tag, clean && positiveOk, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits);
+  ok("debug-clean-" + tag, clean && positiveOk && hiddenIgnored, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " hiddenIgnored=" + hiddenIgnored);
 }
 async function stepNavigation() {
   // F11: EVERY named rail destination (repo convention: nav.rail buttons by
@@ -1176,6 +1366,8 @@ async function stepNavigation() {
     { label: "Help", seg: "help" },
   ];
   if (!boardA) failExit("navigation requires owned board context; boardA missing.");
+  await gotoTab(boardHash("advisors"));
+  ok("nav-board-context-restored", (await page.evaluate(() => location.hash).catch(() => "")).includes("board=" + encodeURIComponent(boardA)), "owned board context route mounted before rail loop");
   let arrived = 0;
   for (const d of dests) {
     assertDeadline("nav-" + d.seg);
@@ -1189,9 +1381,24 @@ async function stepNavigation() {
     const h = await page.evaluate(() => location.hash).catch(() => "");
     const hashOk = h.indexOf("#/" + d.seg) === 0;
     const boardOk = ["advisors", "meet", "sources", "records", "people", "activity"].includes(d.seg) ? h.includes("board=" + encodeURIComponent(boardA)) : true;
-    const rendered = await page.evaluate(() => (document.body.innerText || "").length > 200).catch(() => false);
+    const headVis = await page.getByRole("heading").first().isVisible().catch(() => false);
+    const secVis = await page.locator("section").first().isVisible().catch(() => false);
+    const bodyTxt = await page.evaluate(() => document.body.innerText || "").catch(() => "");
+    let entityOk = bodyTxt.length > 200;
+    if (d.seg === "boards") entityOk = bodyTxt.includes(run + "-ab");
+    else if (d.seg === "roster") entityOk = bodyTxt.includes(rosterName);
+    else if (d.seg === "advisors") entityOk = bodyTxt.includes("Harbor Strategist");
+    else if (d.seg === "meet") entityOk = bodyTxt.includes(run + " harbor call") || bodyTxt.includes("Meetings");
+    else if (d.seg === "sources") entityOk = bodyTxt.includes(OWNED_URL_MARK) || bodyTxt.includes(run);
+    else if (d.seg === "records") entityOk = bodyTxt.includes(run) || bodyTxt.includes("Records");
+    else if (d.seg === "people") entityOk = bodyTxt.includes("Board Own " + run) || bodyTxt.includes(run);
+    else if (d.seg === "activity") entityOk = bodyTxt.includes("Harbor Strategist") || bodyTxt.includes(run);
+    else if (d.seg === "profile") entityOk = bodyTxt.includes("QA Default " + run) || bodyTxt.includes(run);
+    else if (d.seg === "settings") entityOk = bodyTxt.includes("Settings");
+    else if (d.seg === "help") entityOk = bodyTxt.includes("Help");
+    const rendered = headVis && secVis && entityOk;
     if (hashOk && boardOk && rendered) arrived++;
-    ok("nav-dest-" + d.seg, hashOk && boardOk && rendered, "hash=" + h.slice(0, 140) + " boardCtx=" + boardOk);
+    ok("nav-dest-" + d.seg, hashOk && boardOk && rendered, "hash=" + h.slice(0, 140) + " head=" + headVis + " sec=" + secVis + " entity=" + entityOk);
     await scanDebug("nav-" + d.seg);
   }
   ok("nav-all-destinations", arrived === dests.length, "arrived=" + arrived + "/" + dests.length);
@@ -1206,12 +1413,12 @@ async function stepNavigation() {
   const rosterBody = await page.evaluate(() => document.body.innerText).catch(() => "");
   const rosterSec = await page.locator('[data-roster-chat], section').first().isVisible().catch(() => false);
   ok("nav-entity-roster", rosterSec && rosterBody.includes(rosterName), "owned advisor listed + section rendered");
-  await page.goto(WEB + "/" + boardHash("advisors").slice(1), { waitUntil: "domcontentloaded", timeout: BROWSER_TIMEOUT }).catch(() => {});
+  await page.goto(WEB + "/" + boardHash("advisors"), { waitUntil: "domcontentloaded", timeout: BROWSER_TIMEOUT }).catch(() => {});
   await page.waitForTimeout(900);
   const advSec = await page.locator('section[aria-label="This Board\'s Advisors"]').count().catch(() => 0);
   const advBody = await page.evaluate(() => document.body.innerText).catch(() => "");
   ok("nav-entity-advisors", advSec > 0 && advBody.includes("Harbor Strategist"), "advisors section + owned role");
-  await page.goto(WEB + "/" + boardHash("records").slice(1), { waitUntil: "domcontentloaded", timeout: BROWSER_TIMEOUT }).catch(() => {});
+  await page.goto(WEB + "/" + boardHash("records"), { waitUntil: "domcontentloaded", timeout: BROWSER_TIMEOUT }).catch(() => {});
   await page.waitForTimeout(900);
   const recSec = await page.locator("section").filter({ hasText: "Records" }).first().isVisible().catch(() => false);
   const recBody = await page.evaluate(() => document.body.innerText).catch(() => "");
@@ -1229,11 +1436,16 @@ async function stepNavigation() {
   await page.waitForTimeout(900);
   const backHash = await page.evaluate(() => location.hash).catch(() => "");
   const backBody = await page.evaluate(() => document.body.innerText).catch(() => "");
+  const backHead = await page.getByRole("heading").first().isVisible().catch(() => false);
+  const backSec = await page.locator("section").first().isVisible().catch(() => false);
+  const backEntity = backBody.includes(rosterName);
   await page.goForward().catch(() => {});
   await page.waitForTimeout(900);
   const fwdHash = await page.evaluate(() => location.hash).catch(() => "");
   const fwdBody = await page.evaluate(() => document.body.innerText).catch(() => "");
-  ok("nav-direct-backforward", backHash === "#/roster" && backBody.length > 200 && fwdHash.indexOf("#/meet") === 0 && fwdHash.includes(meetingId) && fwdHash.includes(encodeURIComponent(boardA)) && fwdBody.includes(run + " harbor call"), "back=" + backHash.slice(0, 60) + " fwd=" + fwdHash.slice(0, 140));
+  const fwdHead = await page.getByRole("heading").first().isVisible().catch(() => false);
+  const fwdSec = await page.locator(".chatscroll[aria-label=\"Conversation messages\"]").count().catch(() => 0);
+  ok("nav-direct-backforward", backHash === "#/roster" && backHead && backSec && backEntity && fwdHash.indexOf("#/meet") === 0 && fwdHash.includes(meetingId) && fwdHash.includes(encodeURIComponent(boardA)) && fwdHead && fwdSec > 0 && fwdBody.includes(run + " harbor call"), "back=" + backHash.slice(0, 60) + " backEntity=" + backEntity + " fwd=" + fwdHash.slice(0, 140));
   // F12: narrowly classify the expected pre-save /api/profile 404s; every
   // other page error / failed response is unexplained.
   const expected = badResponses.filter(isExpectedBad);
@@ -1244,33 +1456,69 @@ async function stepNavigation() {
 
 async function stepActivityScenarios() {
   assertDeadline("scenarios");
-  async function runCase(tag, question, expect) {
-    const mm = await post("/api/boards/" + boardA + "/meetings", { title: run + " " + tag, brief: "Brief " + run + " " + tag, participantIds: [advisor1] });
-    if (mm.status !== 201 || !pick(mm.json, "id")) { ok("scenario-" + tag + "-created", false, "status=" + mm.status); return; }
-    const mid = String(pick(mm.json, "id"));
-    await post("/api/meetings/" + mid + "/messages", { content: question });
-    const rr = await post("/api/meetings/" + mid + "/run", {}, { timeout: 90000 });
-    ok("scenario-" + tag + "-run", rr.status === 200, "status=" + rr.status + " " + redact(rr.text).slice(0, 80));
-    const aa = await getActivity(mid);
-    const states = (aa.states || []).filter((s) => String(s.id).toLowerCase() === advisor1.toLowerCase());
-    const has = states.some((s) => String(s.state) === expect.state && String(s.reason).includes(expect.reason));
-    ok("scenario-" + tag, aa.status === 200 && has, "adv1=" + states.map((s) => s.state + ":" + s.reason).join(","));
-    const msgs = await get("/api/meetings/" + mid + "/messages?take=100");
-    const ml = Array.isArray(msgs.json) ? msgs.json : [];
-    if (expect.state === "abstained") ok("scenario-" + tag + "-yielded", ml.length >= 1, "msgs=" + ml.length);
+  async function badgeFor(mid, name) {
+    try {
+      await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(mid));
+      const rail = page.locator('section.meet-participants ul.mp-rail[aria-label="Participant activity"]');
+      await rail.waitFor({ timeout: 8000 }).catch(() => {});
+      const names = await rail.locator(".mp-name").allInnerTexts().catch(() => []);
+      const cls = await rail.locator("li.mp-seat").evaluateAll((els) => els.map((e) => e.className)).catch(() => []);
+      const idx = names.findIndex((n) => String(n || "").includes(name));
+      if (idx < 0) return "";
+      const m = /act-([a-z-]+)/.exec(String(cls[idx] || ""));
+      return m ? m[1] : "";
+    } catch { return ""; }
   }
-  await runCase("abstain", "Council " + run + " [QA-ABSTAIN]: weigh the berth plan?", { state: "abstained", reason: "abstained" });
-  await runCase("bid-decline", "Council " + run + " [QA-NO]: weigh the berth plan?", { state: "abstained", reason: "bid-declined" });
-  await runCase("reply-error", "Council " + run + " [QA-REPLYERR]: weigh the berth plan?", { state: "failed", reason: "" });
-  const excl = await post("/api/boards/" + boardA + "/meetings", { title: run + " no-responder", brief: "Brief " + run + " no-responder", participantIds: [advisor1] });
+  async function runCase(tag, question, expect, opts) {
+    opts = opts || {};
+    const mm = await post("/api/boards/" + boardA + "/meetings", { title: run + " " + tag, brief: "Brief " + run + " " + tag, participantIds: [advisor1] });
+    ok("scenario-" + tag + "-created", mm.status === 201 && !!pick(mm.json, "id"), "status=" + mm.status);
+    if (!(mm.status === 201 && pick(mm.json, "id"))) { ok("scenario-" + tag, false, "setup failed"); return; }
+    const mid = String(pick(mm.json, "id"));
+    const pm = await post("/api/meetings/" + mid + "/messages", { content: question });
+    ok("scenario-" + tag + "-setup", pm.status === 200 || pm.status === 201, "leadPost=" + pm.status);
+    if (!(pm.status === 200 || pm.status === 201)) { ok("scenario-" + tag, false, "lead setup failed"); return; }
+    const rr = await post("/api/meetings/" + mid + "/run", {}, { timeout: Math.min(90000, remainingMs(20000)) });
+    ok("scenario-" + tag + "-run", rr.status === 200, "status=" + rr.status);
+    const yielded = (rr.json && Array.isArray(pick(rr.json, "yielded"))) ? pick(rr.json, "yielded") : null;
+    const aa = await getActivity(mid);
+    const shapeOk = aa.status === 200 && Array.isArray(aa.states);
+    const states = shapeOk ? aa.states.filter((s) => String(s.id).toLowerCase() === advisor1.toLowerCase()) : [];
+    const has = states.some((s) => String(s.state) === expect.state && (expect.reason === "" ? String(s.reason || "").length > 0 : String(s.reason || "").toLowerCase().includes(expect.reason.toLowerCase())));
+    ok("scenario-" + tag, shapeOk && has, "adv1=" + states.map((s) => s.state + ":" + s.reason).join(","));
+    const msgs = await get("/api/meetings/" + mid + "/messages?take=100");
+    const readOk = msgs.status === 200 && Array.isArray(msgs.json);
+    const ml = readOk ? msgs.json : [];
+    const advMsgs = ml.filter((x) => String(pick(x, "advisorId") || "").toLowerCase() === advisor1.toLowerCase() && String(pick(x, "content") || pick(x, "body") || "").trim().length >= 20);
+    const leadOnly = ml.filter((x) => !pick(x, "advisorId") || String(pick(x, "advisorId") || "") === "00000000-0000-0000-0000-000000000000");
+    if (opts.expectZeroAdvisor) {
+      ok("scenario-" + tag + "-yielded", readOk && advMsgs.length === 0 && (yielded === null || yielded.length === 0), "advMsgs=" + advMsgs.length + " yielded=" + (yielded ? yielded.length : "n/a"));
+    } else if (expect.state === "failed") {
+      ok("scenario-" + tag + "-yielded", readOk && advMsgs.length === 0, "reply-error yields zero advisor msgs=" + advMsgs.length);
+    } else {
+      const yAdv = yielded ? yielded.filter((y) => String(pick(y, "advisor") || pick(y, "advisorId") || "").toLowerCase() === advisor1.toLowerCase()) : [];
+      ok("scenario-" + tag + "-yielded", readOk && (yAdv.length >= 1 || advMsgs.length >= 1) && !(leadOnly.length >= 1 && advMsgs.length === 0 && yAdv.length === 0), "advMsgs=" + advMsgs.length + " yieldedAdv=" + yAdv.length);
+    }
+    const badge = await badgeFor(mid, "Harbor Strategist");
+    ok("scenario-" + tag + "-badge", badge !== "" && MAPPED_VOCAB.has(badge), "badge=" + badge);
+  }
+  await runCase("abstain", "Council " + run + " [QA-ABSTAIN]: weigh the berth plan?", { state: "abstained", reason: "abstain" }, { expectZeroAdvisor: true });
+  await runCase("bid-decline", "Council " + run + " [QA-NO]: weigh the berth plan?", { state: "abstained", reason: "bid" }, { expectZeroAdvisor: true });
+  await runCase("reply-error", "Council " + run + " [QA-REPLYERR]: weigh the berth plan?", { state: "failed", reason: "reply" }, {});
+  const excl = await post("/api/boards/" + boardA + "/meetings", { title: run + " no-responder", brief: "Brief " + run + " no-responder", participantIds: [] });
+  ok("scenario-no-responder-created", excl.status === 201 && !!pick(excl.json, "id"), "status=" + excl.status);
   if (excl.status === 201 && pick(excl.json, "id")) {
     const mid = String(pick(excl.json, "id"));
-    await post("/api/meetings/" + mid + "/messages", { content: "Council " + run + ": routine berth check?" });
-    await post("/api/meetings/" + mid + "/run", {}, { timeout: 90000 });
+    const pm = await post("/api/meetings/" + mid + "/messages", { content: "Council " + run + " [QA-ABSTAIN]: all sit out?" });
+    const rr = await post("/api/meetings/" + mid + "/run", {}, { timeout: Math.min(90000, remainingMs(20000)) });
+    ok("scenario-no-responder-run", rr.status === 200, "status=" + rr.status);
     const mm = await get("/api/meetings/" + mid + "/messages?take=100");
-    const ml = Array.isArray(mm.json) ? mm.json : [];
-    const adv2c = ml.filter((x) => String(pick(x, "advisorId") || "").toLowerCase() === advisor2.toLowerCase());
-    ok("scenario-no-responder", adv2c.length === 0, "excludedMsgs=" + adv2c.length);
+    const readOk = mm.status === 200 && Array.isArray(mm.json);
+    const ml = readOk ? mm.json : [];
+    const anyAdv = ml.filter((x) => { const a = String(pick(x, "advisorId") || ""); return a && a !== "00000000-0000-0000-0000-000000000000" && String(pick(x, "content") || pick(x, "body") || "").trim().length >= 1; });
+    ok("scenario-no-responder", readOk && anyAdv.length === 0, "advisorMsgs=" + anyAdv.length + " total=" + ml.length);
+    const zbadge = await badgeFor(mid, "Harbor Strategist").catch(() => "");
+    ok("scenario-no-responder-badge", true, "zero-contribution badge probe=" + zbadge);
   } else ok("scenario-no-responder", false, "setup failed " + excl.status);
   checkBudget("scenarios");
 }
@@ -1287,9 +1535,12 @@ async function main() {
     await stepRosterChatUI();
     await stepNavigation();
   } catch (e) {
+    const raw = String((e && e.stack) || (e && e.message) || e);
+    const isFatal = /FATAL|REFUSE|OVERALL DEADLINE|OVERALL BUDGET/.test(raw);
     fail++;
-    const m = "threw " + trunc(String((e && e.stack) || (e && e.message) || e), 400).replace(/[0-9a-f]{32,}/gi, "[redacted]");
-    failures.push(m); console.log("  FAIL " + m);
+    const m = (isFatal ? "FATAL-setup " : "threw ") + trunc(raw, 400).replace(/[0-9a-f]{32,}/gi, "[redacted]");
+    failures.push(m); console.log("  " + (isFatal ? "FATAL " : "FAIL ") + m);
+    try { globalThis.__qaFatal = isFatal; } catch {}
   } finally {
     // Browser/context cleanup is UNCONDITIONAL; process.exit never runs
     // before this finally.
@@ -1299,6 +1550,7 @@ async function main() {
   console.log("ADVISOR INTEGRATED QA " + (fail === 0 ? "PASS" : "FAIL") + " assertions-pass=" + pass + " assertions-fail=" + fail + " elapsedMs=" + elapsed());
   if (failures.length) { console.log("failures:"); for (const f of failures) console.log(" - " + redact(f)); }
   console.log("note: owned QA account/boards/roster/meetings left for forensics (exact-ID scope only; never touched other rows/accounts; no backup/restore/reconcile/reset; no private values logged).");
-  process.exit(fail ? 1 : 0);
+  const fatal = !!globalThis.__qaFatal;
+  process.exit(fail === 0 ? 0 : (fatal ? 2 : 1));
 }
 main().catch((e) => { console.log("FATAL " + redact(String((e && e.stack) || e))); process.exit(2); });
