@@ -503,6 +503,23 @@ async function fetchAuth<T>(u: string, init: RequestInit, wantJson = true): Prom
       try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
     }
   }
+  // CURRENT-expiry synchronous retirement: /auth/me 200 + authenticated:false with a
+  // held nonempty token retires transport authority SYNCHRONOUSLY at receipt,
+  // before any held blob/download continuation can run. The originating
+  // epoch/token/user must still match CURRENT identity (protects fresh login
+  // from a queued old result); empty-token anonymous never retires. The
+  // dispatch is synchronous, so the purge (epoch bump + abort + revoke)
+  // executes before continuations. Once-only dedupe is shared in the handler.
+  if (r.ok && u.includes("/api/auth/me") && myToken) {
+    try {
+      const __parsed = text ? JSON.parse(text) : null;
+      if (__parsed && (__parsed as { authenticated?: boolean }).authenticated === false) {
+        if (epochNow() === myEpoch && currentToken() === myToken && currentUser() === myUser) {
+          try { window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } })); } catch {}
+        }
+      }
+    } catch {}
+  }
   if (!r.ok) throw new Error(`${r.status} ${text}`);
   // HTTP 204 means deliberate no-content success (e.g. grant/invite delete);
   // accept it explicitly. Other empty bodies still fail closed for JSON calls.
@@ -552,14 +569,18 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
   const myToken = currentToken();
   const myUser = currentUser();
   const ctrl = new AbortController();
-  try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl; } catch {}
+  try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl;
+    try { var arr = (((window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts) ?? []); arr.push(ctrl); (window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts = arr; } catch {} } catch {}
   const r = await fetch(u, { headers: withUser(), signal: ctrl.signal });
   // Blob transport joins the central 401 transition: an expired or revoked
   // session expires the app identity instead of failing silently.
   if (r.status === 401) {
     try {
       const latest = currentToken();
-      if (latest === myToken) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } }));
+      // Empty-token anonymous never enters the expired-session purge; only a
+      // held nonempty token whose originating epoch/user still match CURRENT
+      // identity expires. Once-only dedupe is shared in the handler.
+      if (myToken && latest === myToken && epochNow() === myEpoch && currentUser() === myUser) window.dispatchEvent(new CustomEvent("simceo-auth-failed", { detail: { epoch: myEpoch, token: myToken, user: myUser } }));
     } catch {}
   }
   const buf = await r.arrayBuffer();
@@ -1000,7 +1021,70 @@ function AuthPanel() {
   const [msg, setMsg] = useState("");
   const status = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
   const meQ = useQuery({ queryKey: ["me"], queryFn: () => get<{ user: string; authenticated: boolean }>("/api/auth/me") });
-  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<{ id: string; boardId: string; meetingId: string; userKey: string }[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  type MineRow = { id: string; boardId: string; meetingId: string; userKey: string; active?: boolean; canRejoin?: boolean; meetingTitle?: string; boardName?: string; inviteId?: string };
+  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  const [rejoinBusy, setRejoinBusy] = useState("");
+  const rejoinOpRef = useRef(0);
+  const rejoin = async (m: MineRow) => {
+    // Per-rejoin operation claim: a newer rejoin retires this callback.
+    // Origin identity for THIS rejoin: the selected row plus the requesting
+    // account. A changed account retires this callback: it must never
+    // announce success for another identity.
+    const __reOp = (rejoinOpRef.current += 1);
+    const __reEpoch = epochNow(); const __reToken = currentToken(); const __reUser = currentUser();
+    const __reAlive = (): boolean => rejoinOpRef.current === __reOp && epochNow() === __reEpoch && currentToken() === __reToken && currentUser() === __reUser;
+    const __selBoard = String(m.boardId); const __selMeet = String(m.meetingId); const __selUser = String(m.userKey);
+    setMsg("");
+    setRejoinBusy(m.meetingId);
+    try {
+      // Scoped invite hint: accept first so /join sees the fresh grant.
+      if ((m as MineRow).inviteId) {
+        try { await post<unknown>(`/api/invites/${(m as MineRow).inviteId}/accept`, {}); } catch (e) {
+          const s = String(e);
+          if (!s.includes("not pending") && !s.includes("already") && !s.includes("accepted")) throw e;
+        }
+      }
+      if (!__reAlive()) return;
+      // Typed /join capture: the returned Membership DTO (Id/BoardId/MeetingId/
+      // UserKey/Active per Domain.Entities Membership) binds THIS result. Accept
+      // either casing; Active must be an explicit boolean true below.
+      const __joined = await post<Record<string, unknown>>(`/api/meetings/${m.meetingId}/join`, {});
+      if (!__reAlive()) return;
+      const __jId = String((__joined as Record<string, unknown>)["id"] ?? (__joined as Record<string, unknown>)["Id"] ?? "");
+      const __jBoard = String((__joined as Record<string, unknown>)["boardId"] ?? (__joined as Record<string, unknown>)["BoardId"] ?? "");
+      const __jMeet = String((__joined as Record<string, unknown>)["meetingId"] ?? (__joined as Record<string, unknown>)["MeetingId"] ?? "");
+      const __jUser = String((__joined as Record<string, unknown>)["userKey"] ?? (__joined as Record<string, unknown>)["UserKey"] ?? "");
+      const __jActive = ((__joined as Record<string, unknown>)["active"] ?? (__joined as Record<string, unknown>)["Active"]);
+      // The /join result must resolve to THIS selection: exact board + meeting
+      // + user with active === true and a returned membership id. A restore of
+      // the meeting onto another board (or another user) resolves elsewhere
+      // and must fail here, never claim the selected row rejoined.
+      if (!__jId || __jBoard !== __selBoard || __jMeet !== __selMeet || __jUser.toLowerCase() !== __selUser.toLowerCase()) throw new Error("Rejoin verification failed: join resolved a different board/meeting/user.");
+      if (__jActive !== true) throw new Error("Rejoin verification failed: join did not activate membership.");
+      // Fresh readback verification: the readback row must EXACTLY match the
+      // returned membership (id + board + meeting + user) with active === true.
+      // Missing active never counts (strict true only). Readback errors, empty
+      // lists, or a row for another board/meeting/user never announce success.
+      let __fresh: MineRow[] = [];
+      try {
+        __fresh = await get<MineRow[]>(`/api/me/memberships`);
+      } catch (e) {
+        throw new Error("Rejoin verification failed: membership readback failed.");
+      }
+      if (!__reAlive()) return;
+      const __ok = (__fresh ?? []).some((r) => String((r as MineRow).id ?? (r as unknown as Record<string, unknown>)["Id"] ?? "") === __jId && String((r as MineRow).boardId) === __selBoard && String((r as MineRow).meetingId) === __selMeet && String((r as MineRow).userKey ?? "").toLowerCase() === __selUser.toLowerCase() && (r as MineRow).active === true);
+      if (!__ok) throw new Error("Rejoin verification failed: no active membership for this board/meeting/user.");
+      // Identity + operation guard: a changed account or a newer rejoin
+      // retires this callback instead of announcing a stale success.
+      if (!__reAlive()) return;
+      try { await qcPanel.refetchQueries({ queryKey: ["my-memberships"] }); } catch {}
+      if (!__reAlive()) return;
+      try { qcPanel.invalidateQueries({ queryKey: ["meetings"] }); } catch {}
+      try { qcPanel.invalidateQueries({ queryKey: ["messages", m.meetingId] }); } catch {}
+      setMsg("Rejoined meeting.");
+    } catch (e) { if (!__reAlive()) return; setMsg(String(e)); }
+    finally { if (rejoinOpRef.current === __reOp) setRejoinBusy(""); }
+  };
   const doRegister = async () => {
     setMsg("");
     try {
@@ -1061,9 +1145,16 @@ function AuthPanel() {
       {(mine.data ?? []).length > 0 && (
         <div>
           <h4>My meetings</h4>
-          {(mine.data ?? []).map((m) => (
-            <div key={m.id} className="row"><span>An assigned meeting</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button></div>
-          ))}
+          {(mine.data ?? []).map((m) => {
+            const mm = m as MineRow;
+            const nm = (mm.meetingTitle && mm.meetingTitle.trim()) ? mm.meetingTitle : "An assigned meeting";
+            const sub = (mm.boardName && mm.boardName.trim()) ? ` (${mm.boardName})` : "";
+            const isActive = mm.active !== false;
+            const canRejoin = !!mm.canRejoin && !isActive;
+            return (
+              <div key={mm.id} className="row"><span>{nm}{sub}{isActive ? "" : " (left)"}</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: mm.boardId, meeting: mm.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button>{isActive ? (<button type="button" onClick={() => leave(mm.meetingId)}>Leave</button>) : null}{canRejoin ? (<button type="button" disabled={rejoinBusy === mm.meetingId} onClick={() => rejoin(mm)}>{rejoinBusy === mm.meetingId ? "Joining..." : "Join again"}</button>) : null}</div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1427,7 +1518,13 @@ export default function App() {
   const [usagePurpose, setUsagePurpose] = useState("");
   const authStatusQ = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
   const anonPrivateBlocked = !currentToken() && authStatusQ.data?.authRequired !== false;
-  const sessQ = useQuery({ queryKey: ["sess"], queryFn: () => get<{ user: string; authenticated: boolean }>(`/api/auth/me`), retry: false, refetchInterval: 30000 });
+  const sessQ = useQuery({ queryKey: ["sess"], queryFn: async () => {
+    // No global request-origin store: the synchronous 200-false retirement in
+    // fetchAuth carries the originating epoch/token/user bound to THAT result.
+    // A passive fallback keyed off the latest request origin is removed so a
+    // queued old result can never purge a fresh identity.
+    return get<{ user: string; authenticated: boolean }>(`/api/auth/me`);
+  }, retry: false, refetchInterval: 30000 });
   const [sessExpiredFlag, setSessExpiredFlag] = useState(false);
   useEffect(() => { try { if (sessQ.data && sessQ.data.authenticated) setSessExpiredFlag(false); } catch {} }, [sessQ.data]);
   const sessExpired = sessExpiredFlag || (() => { try { return !!currentToken() && !!sessQ.data && !sessQ.data.authenticated; } catch { return false; } })();
@@ -1454,11 +1551,22 @@ export default function App() {
   // purge (expiry, revocation, leave) BEFORE any held save/reload callback can
   // resolve, so stale completions can never repopulate cleared state.
   const profileOpRef = useRef(0);
+  // Once-only dedupe for CURRENT-expiry purges (shared by 401 and 200-false):
+  // key is the stable nonempty session TOKEN (opaque unique session id,
+  // independent of purge epoch and demo display user), retained across
+  // purges/polls so the same expired token purges once. A new successful
+  // login issues a new token, naturally distinct. Anonymous (no token) and
+  // fresh-login (authenticated or identity-changed) never purge.
+  const lastExpiredPurgeRef = useRef("");
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
+    try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
     try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
-    try { profileOpRef.current++; } catch {}
+    try { try { for (const c of (((window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts) ?? [])) { try { c.abort(); } catch {} } } catch {}
+    try { (window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts = []; } catch {}
+    try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = undefined; } catch {}
+    profileOpRef.current++; } catch {}
     try { setProfileReloading(false); } catch {}
     try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort?.abort(); } catch {}
     try { for (const u of ((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs ?? [])) { try { URL.revokeObjectURL(u); } catch {} } } catch {}
@@ -1495,12 +1603,31 @@ export default function App() {
     try { window.location.hash = "#/boards"; } catch {}
     try { setLive(false); } catch {}
   };
+  // No passive sessQ.data fallback: every 200-false retires synchronously at
+  // receipt inside fetchAuth with the originating epoch/token/user bound to
+  // THAT result. A data-effect fallback keyed off cached data or the latest
+  // request origin is removed so it can neither reset dedupe nor re-dispatch.
   useEffect(() => {
     const onAuthFailed = (e: Event) => {
       try {
         const d = (e as CustomEvent<{ epoch: number; token: string; user: string }>).detail;
-        if (!d) return;
-        if (epochNow() !== d.epoch || currentToken() !== d.token) return; // stale failure; ignore
+        if (!d || !d.token) return; // empty-token anonymous never purges
+        // Fresh-login / stale protection: originating epoch/token/user must
+        // still match CURRENT identity at receipt time.
+        if (epochNow() !== d.epoch || currentToken() !== d.token || currentUser() !== d.user) return;
+        // Once-only per expired session TOKEN, shared by 401 and 200-false
+        // paths (both route through this event with originating detail).
+        // The purge bumps the epoch but retains the token, so later polls for
+        // the SAME expired token dedupe instead of purging again. Freshness
+        // (origin epoch/token/user still current) is enforced above; only the
+        // stable token forms the dedupe key.
+        const key = d.token;
+        try {
+          const seen = (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey ?? lastExpiredPurgeRef.current;
+          if (seen === key) return;
+        } catch {}
+        try { lastExpiredPurgeRef.current = key; } catch {}
+        try { (window as unknown as { __simceoExpiredPurgeKey?: string }).__simceoExpiredPurgeKey = key; } catch {}
         setSessExpiredFlag(true);
         purgePrivate("expired");
       } catch {}
@@ -8808,7 +8935,7 @@ const testModel = useMutation({
                 <>
               {" "}
               <WikiResources boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} api={wikiApi} onChanged={() => { try { qc.invalidateQueries(); } catch {} }} />
-                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} transport={{ get, post, put, del, upload, download: (u: string, f: string) => authedDownload(u, f), origin: () => originIdentity(), stale: (o: { epoch: number; token: string; user: string }) => originStale(o) }} />
+                <SourcesGovernance boardId={boardId} meetingId={meetingId} meetings={(meetings.data ?? []).map((m: any) => ({ id: m.id, title: m.title }))} actAs={appliedActAs} readOnly={!(canWriteBoard || canActMeeting)} canManage={canManageBoard} canReadBoard={canWriteBoard || capBoard === "read" || canManageBoard} allowedMeetings={((caps.data as { meetings?: string[] } | undefined)?.meetings ?? [])} transport={{ get, post, put, del, upload, download: (u: string, f: string) => authedDownload(u, f), origin: () => originIdentity(), stale: (o: { epoch: number; token: string; user: string }) => originStale(o) }} />
                 </>)}
             </section>
           )}{" "}

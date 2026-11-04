@@ -112,6 +112,15 @@ if (app.Environment.IsDevelopment()) { }
 
 
 
+// Inherited shipping-test isolation: --selftest must never touch a configured
+// PostgreSQL backend. Fail closed BEFORE any PG wiring/recovery when
+// USE_POSTGRES=1 so fixture boards cannot write through static Pg.Backend.
+// Memory selftest (no USE_POSTGRES) is preserved below.
+if (args.Contains("--selftest") && string.Equals(Environment.GetEnvironmentVariable("USE_POSTGRES"), "1", StringComparison.Ordinal))
+{
+  Console.Error.WriteLine("SELFTEST FATAL: --selftest refuses to run with USE_POSTGRES=1 (would write fixtures to configured PostgreSQL). Unset USE_POSTGRES to run the memory selftest.");
+  Environment.Exit(2);
+}
 var pgStore = app.Services.GetRequiredService<InMemoryStore>();
 string? pgCs = null;
 if (Environment.GetEnvironmentVariable("USE_POSTGRES") == "1")
@@ -1572,22 +1581,85 @@ app.MapPost("/api/boards/{boardId:guid}/meetings", (InMemoryStore s, HttpRequest
 app.MapGet("/api/meetings/{meetingId:guid}/messages", (InMemoryStore s, HttpRequest req, Guid meetingId, long? after, int take = 60) =>
 {
   take = Math.Clamp(take, 1, 100);
-  if (!s.Meetings.TryGetValue(meetingId, out var mtg)) return Results.NotFound("meeting");
-  if (!PeopleOps.Can(s, req, mtg.BoardId, meetingId, "read")) return PeopleOps.Denied();
-  if (!s.Messages.TryGetValue(meetingId, out var list)) return Results.Ok(Array.Empty<Message>());
-  lock (s.MessageLock)
+  try
   {
-    var q = list.AsEnumerable();
-    if (after.HasValue) q = q.Where(m => m.Sequence > after.Value);
-    else q = q.OrderByDescending(m => m.Sequence).Take(take).OrderBy(m => m.Sequence);
-    return Results.Ok(q.OrderBy(m => m.Sequence).Take(take).ToList());
+    return Atomic.Run(s, () =>
+    {
+      if (PeopleOps.HasInvalidToken(s, req)) return Results.Json(new { error = "Invalid or expired session token." }, statusCode: 401);
+      string curUser;
+      try
+      {
+        if (PeopleOps.IsSecure(s))
+        {
+          if (!AuthOps.TrySession(s, req, out var su) || string.IsNullOrWhiteSpace(su)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+          curUser = su;
+        }
+        else { curUser = AuthOps.TrySession(s, req, out var eu) ? eu : PeopleOps.UserOf(s, req); }
+      }
+      catch (InvalidOperationException) { return Results.Json(new { error = "Security state unavailable." }, statusCode: 503); }
+      if (!s.Meetings.TryGetValue(meetingId, out var cur) || cur == null) return Results.NotFound("meeting");
+      var bid = cur.BoardId;
+      Guid restoreBefore;
+      try { restoreBefore = s.RestoreEpochId; } catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      string access;
+      try { access = PeopleOps.AccessFor(s, bid, meetingId, curUser); } catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      if (access == "none" || (access == "open" && PeopleOps.IsSecure(s))) return PeopleOps.Denied();
+      try
+      {
+        var existing = s.Memberships.Values.FirstOrDefault(m => m.BoardId == bid && m.MeetingId == meetingId && string.Equals(m.UserKey, curUser, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && existing.Active) { }
+        else if (existing != null && !existing.Active)
+        {
+          if (PeopleOps.HasIndependentAuthority(s, bid, curUser)) { }
+          else return PeopleOps.Denied();
+        }
+        else if (existing == null)
+        {
+          var nm = new Membership { BoardId = bid, MeetingId = meetingId, UserKey = curUser, Active = true, JoinedAt = DateTime.UtcNow };
+          s.Memberships[nm.Id] = nm;
+        }
+      }
+      catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+      // Post-staging failures MUST throw out of the unit to ROLLBACK the staged
+      // membership. Returning a 503 from inside the callback would commit.
+      // Markers are mapped outside to fixed safe errors (no exception/SQL/path leak).
+      try
+      {
+        if (s.RestoreEpochId != restoreBefore) throw new InvalidOperationException("restored");
+        if (!s.Meetings.TryGetValue(meetingId, out var cur2) || cur2 == null || cur2.BoardId != bid) throw new KeyNotFoundException("meeting");
+      }
+      catch (KeyNotFoundException) { throw; }
+      catch (InvalidOperationException) { throw; }
+      catch { throw new InvalidOperationException("storage"); }
+      List<Message> copy;
+      try
+      {
+        if (!s.Messages.TryGetValue(meetingId, out var list) || list == null) return Results.Ok(Array.Empty<Message>());
+        var q = list.AsEnumerable();
+        if (after.HasValue) q = q.Where(m => m.Sequence > after.Value);
+        else q = q.OrderByDescending(m => m.Sequence).Take(take).OrderBy(m => m.Sequence);
+        copy = q.OrderBy(m => m.Sequence).Take(take).Select(m => new Message { BoardId = m.BoardId, MeetingId = m.MeetingId, Sequence = m.Sequence, AdvisorId = m.AdvisorId, Sender = m.Sender, AdvisorName = m.AdvisorName, Content = m.Content, ParentSequence = m.ParentSequence, Stance = m.Stance, Status = m.Status, CreatedAt = m.CreatedAt }).ToList();
+      }
+      catch (InvalidOperationException) { throw; }
+      catch (KeyNotFoundException) { throw; }
+      catch { throw new InvalidOperationException("storage"); }
+      return Results.Ok(copy);
+    });
   }
+  catch (KeyNotFoundException) { return Results.NotFound("meeting"); }
+  catch (InvalidOperationException iox) when (iox.Message == "restored") { return Results.Conflict("Domain was restored during join"); }
+  catch (InvalidOperationException) { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+  catch { return Results.Json(new { error = "Message read failed." }, statusCode: 500); }
 });
+
 
 app.MapPost("/api/meetings/{meetingId:guid}/messages", async (InMemoryStore s, IHubContext<BoardHub> hub, HttpRequest req, Guid meetingId, Message input) =>
 {
   if (!s.Meetings.TryGetValue(meetingId, out var meeting)) return Results.NotFound("meeting");
   if (PeopleOps.Check(s, req, meeting.BoardId, meetingId, "discuss") is { } deniedMsg) return deniedMsg;
+  // Durable membership on successful ordinary discuss entry (implicit).
+  var ensuredPost = PeopleOps.EnsureMeetingMembership(s, req, meeting.BoardId, meetingId, explicitJoin: false);
+  if (ensuredPost.Error is not null) return ensuredPost.Error;
   IResult? msgGate = null;
   long savedGenMsg = 0;
   Guid savedRestoreIdMsg = Guid.Empty;

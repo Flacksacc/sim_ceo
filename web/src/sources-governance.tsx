@@ -6,7 +6,7 @@ type GovSource = {
   approved: boolean; excluded: boolean; reviewState: string; origin: string;
   familyKey: string; indexState: string; indexGeneration: number; indexError: string;
   indexCompletedAt?: string | null; sectionCount: number; isHead: boolean;
-  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null;
+  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null; policyAllows?: boolean;
   createdAt: string;
 };
 type ReviewGroup = {
@@ -51,8 +51,20 @@ const post = <T,>(actAs: string, u: string, b?: unknown): Promise<T> =>
 const putPolicy = (actAs: string, bid: string, blockedTypes: string, mode: string) =>
   fetch("/api/boards/" + bid + "/source-policy", { method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders(actAs) }, body: JSON.stringify({ blockedTypes, mode }) }).then(j<unknown>);
 
-export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; transport?: GovTransport; fixture?: { groups?: ReviewGroup[] | null; policy?: { blockedTypes: string; mode: string } | null; ctx?: unknown; recallHits?: { kind: string; ref: string; text: string; score: number }[]; hist?: Record<string, HistEvent[]>; secs?: Record<string, SecResp | null> } }) {
-  const { boardId, meetingId, meetings, actAs, readOnly, canManage } = props;
+export default function SourcesGovernance(props: { boardId: string; meetingId: string; meetings: { id: string; title: string }[]; actAs: string; readOnly?: boolean; canManage?: boolean; canReadBoard?: boolean; allowedMeetings?: string[]; transport?: GovTransport; fixture?: { groups?: ReviewGroup[] | null; policy?: { blockedTypes: string; mode: string } | null; ctx?: unknown; recallHits?: { kind: string; ref: string; text: string; score: number }[]; hist?: Record<string, HistEvent[]>; secs?: Record<string, SecResp | null> } }) {
+  const { boardId, meetingId, meetings, actAs, readOnly, canManage, canReadBoard, allowedMeetings } = props;
+  const boardReadable = canReadBoard === true || canManage === true;
+  const allowedSet = new Set((allowedMeetings ?? []).map((m) => (m ?? "").toLowerCase()));
+  function canDownloadRow(s: GovSource): { ok: boolean; why: string } {
+    if (boardReadable) return { ok: true, why: "" };
+    if ((s as any).policyAllows === false) return { ok: false, why: "Blocked by current board policy (wiki-only or extension block)." };
+    const approved = (s.reviewState ?? "").toLowerCase() === "approved" && !s.excluded;
+    if (!approved) return { ok: false, why: "Available after approval (meeting guests see approved originals only)." };
+    if ((s.scope ?? "board") !== "meeting") return { ok: false, why: "Board originals are available to board readers; meeting guests see metadata only." };
+    const mid = (s.meetingId ?? "").toLowerCase();
+    if (!mid || !allowedSet.has(mid)) return { ok: false, why: "Not in your meeting scope." };
+    return { ok: true, why: "" };
+  }
   const canWrite = !readOnly;
   const canManagePolicy = canManage === true;
   // Host transport carries the canonical identity/epoch and the central 401
@@ -262,7 +274,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
                 <span className="badge">Scope is immutable &mdash; to place this file in another scope, upload it again there as a new pending version.</span>
                 {canWrite && (<button aria-label={sourceActionLabel("Reindex", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "reindex")}>Reindex</button>)}
                 {canWrite && (<button aria-label={sourceActionLabel("Retry extraction for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => act(s.id, "retry")}>Retry extraction</button>)}
-                <button aria-label={sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>
+                {(() => { const d = canDownloadRow(s); const lbl = sourceActionLabel("Download original of", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length); return d.ok ? (<button aria-label={lbl} onClick={() => downloadFile(s.id, s.fileName)}>Download original</button>) : (<button aria-label={lbl} disabled title={d.why}>Download original</button>); })()}
                 <button aria-label={sourceActionLabel("Show history for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadHist(s.id)}>History</button>
                 <button aria-label={sourceActionLabel("Show sections for", s.fileName, s.version, vi + 1, varr.length, scopeLabel(g.scope, meetingTitle(meetings, g.meetingId)), gi + 1, garr.length)} onClick={() => loadSecs(s.id)}>Sections</button>
               </div>
