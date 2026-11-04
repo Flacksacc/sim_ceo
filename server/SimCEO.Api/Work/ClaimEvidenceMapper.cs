@@ -61,7 +61,8 @@ public static class ClaimEvidenceMapper
   // SID index for owner-fetched evidence: S1..Sn in reqUrls order.
   public static Dictionary<string, string> BuildSidMap(IReadOnlyList<string> ownerUrls)
   {
-    var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    // SID keys (S1..Sn) are case-sensitive identifiers; URL values compare strictly via UrlsMatch. Ordinal storage.
+    var map = new Dictionary<string, string>(StringComparer.Ordinal);
     for (var i = 0; i < ownerUrls.Count; i++)
     {
       var u = (ownerUrls[i] ?? "").Trim();
@@ -316,7 +317,7 @@ public static class ClaimEvidenceMapper
     return t;
   }
 
-  private static ValidatedClaim MapOneCore(string line, IReadOnlyDictionary<string, string> sidMap, Func<string, List<PoolPassage>?> lookup)
+  private static ValidatedClaim MapOneCore(string line, IReadOnlyDictionary<string, string> sidMap, Func<string, (string canonicalUrl, List<PoolPassage>? passages)> lookup)
   {
     var (kind, text, rawRefs) = ParseClaimLine(line);
     if (string.IsNullOrWhiteSpace(text)) return new ValidatedClaim("", "unverified", false, new List<ValidatedRef>());
@@ -327,8 +328,9 @@ public static class ClaimEvidenceMapper
     foreach (var (urlOrSid, quote) in rawRefs)
     {
       if (!TryResolveUrl(urlOrSid, sidMap, out var resolved)) continue;
-      var passages = lookup(resolved);
+      var (retainedUrl, passages) = lookup(resolved);
       if (passages is null || passages.Count == 0) continue;
+      if (string.IsNullOrWhiteSpace(retainedUrl)) retainedUrl = resolved;
       var nQuote = Normalize(quote);
       if (nQuote.Length < MinQuoteChars) continue;
       PoolPassage? match = null;
@@ -342,7 +344,8 @@ public static class ClaimEvidenceMapper
         if (passage.Fetched) break;
       }
       if (match is null) continue;
-      var canon = resolved;
+      // Return the retained pool URL (canonical key), not the model-resolved spelling.
+      var canon = retainedUrl;
       bool dup = false;
       foreach (var s in seen) { if (UrlsMatch(s, canon)) { dup = true; break; } }
       if (dup) continue;
@@ -366,8 +369,8 @@ public static class ClaimEvidenceMapper
     return MapOneCore(line, sidMap,
       (string resolved) =>
       {
-        if (TryLookupMulti(resolved, pool, out _, out var passages)) return passages;
-        return null;
+        if (TryLookupMulti(resolved, pool, out var canon, out var passages)) return (canon, passages);
+        return ("", null);
       });
   }
 

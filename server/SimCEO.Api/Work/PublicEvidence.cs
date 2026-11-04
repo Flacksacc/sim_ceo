@@ -59,8 +59,8 @@ public sealed class PublicEvidenceFetcher
   {
     var original = citations.ToList();
     if (original.Count == 0) return original;
+    // Strict URI identity: /Case vs /case, query case, trailing slash are distinct candidates. Ordinal storage + strict scan.
     var need = new List<string>();
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var c in original)
     {
       if (!string.IsNullOrWhiteSpace(c.Excerpt)) continue;
@@ -68,12 +68,12 @@ public sealed class PublicEvidenceFetcher
       if (u.Length == 0) continue;
       if (!u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
           !u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) continue;
-      if (!seen.Add(u)) continue;
+      if (EvidenceUri.ContainsStrict(need, u)) continue;
       if (need.Count >= MaxUrlsPerCall) break;
       need.Add(u);
     }
     if (need.Count == 0) return original;
-    var cache = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
+    var cache = new Dictionary<string, (string Title, string Excerpt, bool Fetched, string Origin)>(StringComparer.Ordinal);
     using var gate = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
     var tasks = need.Select(async url =>
     {
@@ -82,16 +82,21 @@ public sealed class PublicEvidenceFetcher
       finally { gate.Release(); }
     }).ToList();
     var results = await Task.WhenAll(tasks).ConfigureAwait(false);
-    foreach (var r in results) cache[r.Url] = r.Fetched;
+    foreach (var r in results)
+    {
+      if (string.IsNullOrWhiteSpace(r.Fetched.Excerpt)) continue;
+      var key = EvidenceUri.FindKey(cache.Keys, r.Url) ?? r.Url;
+      cache[key] = (r.Fetched.Title, r.Fetched.Excerpt, true, "application-fetch");
+    }
     var hydrated = new List<ModelGateway.Citation>(original.Count);
     foreach (var c in original)
     {
       if (!string.IsNullOrWhiteSpace(c.Excerpt)) { hydrated.Add(c); continue; }
       var u = (c.Url ?? "").Trim();
-      if (u.Length == 0 || !cache.TryGetValue(u, out var f) || string.IsNullOrWhiteSpace(f.Excerpt))
+      if (u.Length == 0 || !EvidenceUri.TryGetStrict(cache, u, out _, out var f) || string.IsNullOrWhiteSpace(f.Excerpt))
       { hydrated.Add(c); continue; }
       var title = string.IsNullOrWhiteSpace(c.Title) ? f.Title : c.Title;
-      hydrated.Add(new ModelGateway.Citation(c.Url ?? "", title ?? "", f.Excerpt ?? ""));
+      hydrated.Add(new ModelGateway.Citation(c.Url ?? "", title ?? "", f.Excerpt ?? "", true, "application-fetch"));
     }
     return hydrated;
   }

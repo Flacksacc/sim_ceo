@@ -481,7 +481,8 @@ public static class CharacterBehavior
       return (true, null, urls);
     if (arr.ValueKind != JsonValueKind.Array)
       return (false, "sourceUrls must be an array of up to " + MaxSourceUrls + " http(s) URLs.", urls);
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Strict identity for source-input dedup: Ordinal storage + strict scan via EvidenceUri (ClaimEvidenceMapper.UrlsMatch).
+    var seen = new List<string>();
     foreach (var e in arr.EnumerateArray())
     {
       if (e.ValueKind != JsonValueKind.String)
@@ -494,7 +495,8 @@ public static class CharacterBehavior
           || string.IsNullOrWhiteSpace(uri.Host)
           || !string.IsNullOrEmpty(uri.UserInfo))
         return (false, "Each source URL must be a valid public http(s) URL without credentials.", urls);
-      if (seen.Add(uri.AbsoluteUri)) urls.Add(uri.AbsoluteUri);
+      var norm = uri.AbsoluteUri;
+      if (!SimCEO.Api.Work.EvidenceUri.ContainsStrict(seen, norm) && !SimCEO.Api.Work.EvidenceUri.ContainsStrict(urls, norm)) { seen.Add(norm); urls.Add(norm); }
       if (urls.Count > MaxSourceUrls)
         return (false, "Up to " + MaxSourceUrls + " source URLs allowed.", urls);
     }

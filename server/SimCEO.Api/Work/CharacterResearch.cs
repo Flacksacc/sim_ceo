@@ -112,7 +112,7 @@ public static class CharacterResearch
               urls.AddRange(explicitUrls.Take(CharacterBehavior.MaxSourceUrls));
             else if (stored.SourceUrls.Count > 0)
               foreach (var u in stored.SourceUrls.Take(CharacterBehavior.MaxSourceUrls))
-                if (!urls.Contains(u)) urls.Add(u);
+                if (!EvidenceUri.ContainsStrict(urls, u)) urls.Add(u);
             var foc = hasFocus ? explicitFocus : (stored.Focus ?? "");
             if ((!hasBackground && string.IsNullOrWhiteSpace(bg)) || (!hasUrls && urls.Count == 0))
             {
@@ -130,7 +130,7 @@ public static class CharacterResearch
                       if (e.ValueKind != JsonValueKind.String) continue;
                       var u = (e.GetString() ?? "").Trim();
                       if (u.Length == 0) continue;
-                      if (urls.Count < CharacterBehavior.MaxSourceUrls && !urls.Contains(u)) urls.Add(u);
+                      if (urls.Count < CharacterBehavior.MaxSourceUrls && !EvidenceUri.ContainsStrict(urls, u)) urls.Add(u);
                     }
                 }
               }
@@ -179,7 +179,8 @@ public static class CharacterResearch
         // existing safe fetcher (SSRF-pinned, 5s per URL, max 3 per call).
         // Excerpts found here ground the dossier call; missing excerpts are
         // reported honestly per URL (fetched:false), never invented.
-        var fetchedExcerpts = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
+        // Strict identity: Ordinal storage + EvidenceUri scan. No case-insensitive full-URL dict.
+        var fetchedExcerpts = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.Ordinal);
         if (reqUrls.Count > 0)
         {
           CharacterBehavior.SetProgress(capturedJob, "fetching-sources");
@@ -202,7 +203,8 @@ public static class CharacterResearch
               {
                 if (!string.IsNullOrWhiteSpace(h.Excerpt))
                 {
-                  fetchedExcerpts[h.Url] = (h.Title ?? "", h.Excerpt ?? "");
+                  var fkey = EvidenceUri.FindKey(fetchedExcerpts.Keys, h.Url) ?? h.Url;
+                  fetchedExcerpts[fkey] = (h.Title ?? "", h.Excerpt ?? "");
                   fetchedSources.Add(new { url = h.Url, title = h.Title ?? "", excerpt = h.Excerpt ?? "", fetched = true });
                 }
                 else
@@ -283,12 +285,26 @@ public static class CharacterResearch
             MarkFetched(kv.Key);
           }
         }
+        // Gateway provenance: provider snippets stay fetched=false/provider-search; successful
+        // application fetches (gateway hydration) arrive fetched=true/application-fetch and must
+        // not be downgraded. A failed owner fetch followed by a provider snippet stays unfetched.
         foreach (var cite in g.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
         {
           AddCitedUrl(cite.Url);
           if (!string.IsNullOrWhiteSpace(cite.Excerpt))
           {
-            AddPassage(cite.Url, cite.Title ?? "", cite.Excerpt ?? "", false, "provider-search");
+            if (cite.Fetched)
+            {
+              var go = string.IsNullOrWhiteSpace(cite.Origin) ? "application-fetch" : cite.Origin;
+              AddPassage(cite.Url, cite.Title ?? "", cite.Excerpt ?? "", true, go);
+              MarkFetched(cite.Url);
+            }
+            else
+            {
+              var po = string.IsNullOrWhiteSpace(cite.Origin) ? "provider-search" : cite.Origin;
+              if (po != "provider-search" && po != "unfetched") po = "provider-search";
+              AddPassage(cite.Url, cite.Title ?? "", cite.Excerpt ?? "", false, po);
+            }
           }
         }
         var rawLines = g.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
@@ -305,9 +321,10 @@ public static class CharacterResearch
             var hydrated = await webFetcher.HydrateAsync(synth, subject, ct).ConfigureAwait(false);
             foreach (var h in hydrated)
             {
-              if (!string.IsNullOrWhiteSpace(h.Excerpt))
+              if (!string.IsNullOrWhiteSpace(h.Excerpt) && h.Fetched)
               {
-                AddPassage(h.Url, h.Title ?? "", h.Excerpt ?? "", true, "hydrated-fetch");
+                var ho = string.IsNullOrWhiteSpace(h.Origin) ? "application-fetch" : h.Origin;
+                AddPassage(h.Url, h.Title ?? "", h.Excerpt ?? "", true, ho);
                 MarkFetched(h.Url);
                 AddCitedUrl(h.Url);
               }
@@ -317,7 +334,7 @@ public static class CharacterResearch
         catch (OperationCanceledException) { throw; }
         catch { }
         var validated = ClaimEvidenceMapper.MapAll(rawLines, multiPool, sidMap);
-        var citedExcerpts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var citedExcerpts = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var kv in multiPool)
         {
           string? pick = null;
@@ -456,8 +473,24 @@ public static class CharacterResearch
             bool anyFetched = IsUrlFetched(u);
             bool ownerSup = false;
             foreach (var r in reqUrls) { if (ClaimEvidenceMapper.UrlsMatch(r, u)) { ownerSup = true; break; } }
-            if (anyFetched && ownerSup) return "owner-fetch";
-            if (anyFetched) return "hydrated-fetch";
+            // Actual provenance: prefer the real fetched passage origin when present.
+            if (anyFetched)
+            {
+              foreach (var kv in multiPool)
+              {
+                if (!ClaimEvidenceMapper.UrlsMatch(kv.Key, u)) continue;
+                foreach (var passage in kv.Value)
+                {
+                  if (passage.Fetched && !string.IsNullOrWhiteSpace(passage.Excerpt))
+                  {
+                    var o = (passage.Origin ?? "").Trim();
+                    if (!string.IsNullOrWhiteSpace(o)) return o;
+                  }
+                }
+              }
+              if (ownerSup) return "owner-fetch";
+              return "application-fetch";
+            }
             foreach (var kv in multiPool)
             {
               if (!ClaimEvidenceMapper.UrlsMatch(kv.Key, u)) continue;
@@ -472,7 +505,7 @@ public static class CharacterResearch
             @ref = u,
             url = u,
             title = PoolTitleFor(u),
-            excerpt = citedExcerpts.TryGetValue(u, out var exu) ? exu : "",
+            excerpt = (EvidenceUri.TryGetStrict(citedExcerpts, u, out _, out var exu) ? exu : ""),
             fetched = IsUrlFetched(u),
             origin = PoolOriginFor(u),
             ownerSupplied = reqUrls.Any(r => ClaimEvidenceMapper.UrlsMatch(r, u)),
@@ -706,7 +739,8 @@ public static class CharacterResearch
       var u = reqUrls[si];
       var sid = "S" + (si + 1);
       string part;
-      if (fetchedExcerpts.TryGetValue(u, out var fe) && !string.IsNullOrWhiteSpace(fe.Excerpt))
+      bool gotFe = EvidenceUri.TryGetStrict(fetchedExcerpts, u, out _, out var fe);
+      if (gotFe && !string.IsNullOrWhiteSpace(fe.Excerpt))
         part = "[" + sid + "] " + u + " :: \"" + fe.Excerpt + "\"";
       else
         part = "[" + sid + "] " + u + " :: (fetch failed; do not cite as verified)";
@@ -728,7 +762,7 @@ public static class CharacterResearch
           var u = reqUrls[si];
           var sid = "S" + (si + 1);
           string excerpt = "";
-          if (fetchedExcerpts.TryGetValue(u, out var fe)) excerpt = (fe.Excerpt ?? "").Trim();
+          if (EvidenceUri.TryGetStrict(fetchedExcerpts, u, out _, out var fe2)) excerpt = (fe2.Excerpt ?? "").Trim();
           if (excerpt.Length > 320) excerpt = excerpt.Substring(0, 320) + " [...excerpt trimmed for budget...]";
           string part2;
           if (!string.IsNullOrWhiteSpace(excerpt))

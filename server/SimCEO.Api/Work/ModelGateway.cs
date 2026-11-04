@@ -930,7 +930,10 @@ public sealed class ModelGateway
     }
   }
 
-  public sealed record Citation(string Url, string Title, string Excerpt);
+  // Optional fetch metadata (compatible): provider snippets stay Fetched=false/Origin=provider-search or unfetched;
+  // successful PublicEvidenceFetcher hydration sets Fetched=true/Origin=application-fetch and flows through
+  // gateway + CharacterResearch + ai-draft inventory + claim refs. No gateway rewrite.
+  public sealed record Citation(string Url, string Title, string Excerpt, bool Fetched = false, string Origin = "");
   public sealed record GroundedResult(string Text, bool RanSearch, string? ResponseId,
     List<Citation> Citations, int InTokens, int OutTokens, int SearchCalls, decimal? Cost);
 
@@ -1087,7 +1090,7 @@ public sealed class ModelGateway
                   if (string.IsNullOrEmpty(u)) u = GetStr(hit, "URL");
                   var t = GetStr(hit, "title");
                   if (string.IsNullOrEmpty(t)) t = GetStr(hit, "Title");
-                  citations.Add(new Citation(u, t, GetSearchSnippet(hit)));
+                  { var snip = GetSearchSnippet(hit); citations.Add(new Citation(u, t, snip, false, string.IsNullOrWhiteSpace(snip) ? "unfetched" : "provider-search")); }
                 }
             }
             else if (string.Equals(type, "message", StringComparison.Ordinal))
@@ -1115,7 +1118,7 @@ public sealed class ModelGateway
                   {
                     if (a.ValueKind != JsonValueKind.Object) continue;
                     if (!string.Equals(GetStr(a, "type"), "url_citation", StringComparison.Ordinal)) continue;
-                    citations.Add(new Citation(GetStr(a, "url"), GetStr(a, "title"), ""));
+                    citations.Add(new Citation(GetStr(a, "url"), GetStr(a, "title"), "", false, "unfetched"));
                   }
               }
             }

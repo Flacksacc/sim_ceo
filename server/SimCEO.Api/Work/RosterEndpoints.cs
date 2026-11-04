@@ -400,10 +400,16 @@ public static class RosterOps
 
   public static bool SameSourceUrls(string? inputsJson, List<string> urls)
   {
+    // Strict URI identity: /Case vs /case, query case, trailing slash are distinct inputs.
     var stored = CharacterBehavior.ParseInputs(inputsJson).SourceUrls;
-    var a = new HashSet<string>(stored, StringComparer.OrdinalIgnoreCase);
-    var b = new HashSet<string>(urls ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
-    return a.SetEquals(b);
+    var rhs = urls ?? new List<string>();
+    var da = new List<string>();
+    foreach (var u in stored) SimCEO.Api.Work.EvidenceUri.AddDistinct(da, u);
+    var db = new List<string>();
+    foreach (var u in rhs) SimCEO.Api.Work.EvidenceUri.AddDistinct(db, u);
+    if (da.Count != db.Count) return false;
+    foreach (var u in da) if (!SimCEO.Api.Work.EvidenceUri.ContainsStrict(db, u)) return false;
+    return true;
   }
   public static void UnapproveBoardCopies(InMemoryStore s, Guid rosterId)
   {
@@ -828,8 +834,15 @@ public static class RosterEndpoints
         string akey = cite.Url.Trim();
         foreach (var k in new List<string>(aiPoolMulti.Keys)) { if (SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(k, akey)) { akey = k; break; } }
         if (!aiPoolMulti.TryGetValue(akey, out var alist)) { alist = new List<SimCEO.Api.Work.PoolPassage>(); aiPoolMulti[akey] = alist; }
-        alist.Add(new SimCEO.Api.Work.PoolPassage(cite.Title ?? "", cite.Excerpt ?? "", false, "provider-search"));
+        // Propagate actual gateway provenance: provider snippets stay fetched=false/provider-search;
+        // successful application fetches stay fetched=true with their origin (never downgraded).
+        bool cf = cite.Fetched;
+        string co = (cite.Origin ?? "").Trim();
+        if (cf && string.IsNullOrWhiteSpace(co)) co = "application-fetch";
+        if (!cf) co = "provider-search";
+        alist.Add(new SimCEO.Api.Work.PoolPassage(cite.Title ?? "", cite.Excerpt ?? "", cf, co));
       }
+      // SID-keyed (S1..Sn), not URL-keyed: keys are case-insensitive identifiers; URL values compare strictly via UrlsMatch.
       var aiSid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
       var aiLines = dossier.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
       var aiValidated = SimCEO.Api.Work.ClaimEvidenceMapper.MapAll(aiLines, aiPoolMulti, aiSid);
@@ -864,7 +877,11 @@ public static class RosterEndpoints
       var draftRefs = aiDraftUrls.Select(u =>
       {
         var hit = dossier.Citations.FirstOrDefault(c => SimCEO.Api.Work.ClaimEvidenceMapper.UrlsMatch(c.Url ?? "", u));
-        return new { kind = "source", @ref = u, url = u, title = hit?.Title ?? "", excerpt = hit?.Excerpt ?? "", fetched = false, origin = string.IsNullOrWhiteSpace(hit?.Excerpt) ? "unfetched" : "provider-search", ownerSupplied = false };
+        bool hf = hit?.Fetched ?? false;
+        string ho = (hit?.Origin ?? "").Trim();
+        if (hf && string.IsNullOrWhiteSpace(ho)) ho = "application-fetch";
+        if (!hf) ho = string.IsNullOrWhiteSpace(hit?.Excerpt) ? "unfetched" : "provider-search";
+        return new { kind = "source", @ref = u, url = u, title = hit?.Title ?? "", excerpt = hit?.Excerpt ?? "", fetched = hf, origin = ho, ownerSupplied = false };
       }).ToList();
       var draftClaims = new List<object>();
       foreach (var vc in aiValidated)
