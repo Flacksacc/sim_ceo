@@ -1288,7 +1288,7 @@ app.MapGet("/api/boards/{id:guid}", (InMemoryStore s, HttpRequest req, Guid id) 
   return PeopleOps.Denied();
 });
 
-app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, string? q, string? type, string? tag, Guid? boardId) =>
+app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, string? q, string? type, string? tag, Guid? boardId, int? skip) =>
 {
   if (PeopleOps.BadToken(s, req) is { } badR) return badR;
   if (PeopleOps.IsSecure(s) && !AuthOps.TrySession(s, req, out _)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
@@ -1318,7 +1318,7 @@ app.MapGet("/api/roster", (InMemoryStore s, HttpRequest req, Guid accountId, str
     list = list.Where(r => r.Tags.Contains(tag, StringComparison.OrdinalIgnoreCase));
   if (boardId.HasValue)
     list = list.Where(r => s.Advisors.Values.Any(a => a.BoardId == boardId.Value && a.RosterEntryId == r.Id && !a.Removed));
-  return Results.Ok(list.OrderByDescending(r => r.UpdatedAt).Take(200)
+  return Results.Ok(list.OrderByDescending(r => r.UpdatedAt).ThenBy(r => r.Id).Skip(Math.Max(0, skip ?? 0)).Take(200)
     .Select(r => { var (ok, missing) = RosterOps.Completeness(s, r.Id);
       var __readBoards = RosterOps.BoardsFor(s, r.Id);
       try { __readBoards = s.Advisors.Values.Where(a => a.RosterEntryId == r.Id && !a.Removed && PeopleOps.Can(s, req, a.BoardId, null, "read"))

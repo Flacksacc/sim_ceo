@@ -320,7 +320,7 @@ public static class WizardGuide
         return Results.Ok(new
         {
           board = prior, advisors = priorAdvisors, resumed = true,
-          portraitReview = "pending: accept a portrait for each advisor before approval",
+          portraitReview = "Review the selected roster advisors before approving them for meetings",
         });
       }
       // Owner-aware validation: inheriting boards need no lead fields when the
@@ -331,7 +331,15 @@ public static class WizardGuide
       var blockers = BlockersForOwner(d, hasDefaultCreate);
       if (blockers.Count > 0) return Results.Json(new { blockers }, statusCode: 409);
       var f = ReadFields(d);
-      var seats = f.Advisors.Where(seat => !string.IsNullOrWhiteSpace(seat.Role)).Take(11).ToList();
+      var seats = f.Advisors;
+      foreach (var seat in seats)
+      {
+        if (!s.Roster.TryGetValue(seat.RosterEntryId, out var entry) || entry.Archived)
+          return Results.Json(new { error = "A selected advisor is no longer available. Choose another advisor from your roster." }, statusCode: 409);
+        if (PeopleOps.IsSecure(s) && !RosterEndpoints.CanReadRoster(s, req, entry)) return PeopleOps.Denied();
+        if (!RosterOps.Completeness(s, entry.Id).complete)
+          return Results.Json(new { error = "Finish the selected advisor's profile in the roster before adding them." }, statusCode: 409);
+      }
       bool wantsOverrideCreate = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
       bool saveBoardLead = wantsOverrideCreate || !hasDefaultCreate;
       if (saveBoardLead && string.IsNullOrWhiteSpace(f.LeadName))
@@ -339,8 +347,6 @@ public static class WizardGuide
       var board = new Board { Id = Guid.NewGuid(), Name = f.Name, Mission = f.Mission, Stage = f.Stage, OwnerKey = ownerKey, CreatedAt = DateTime.UtcNow };
       var created = new List<object>();
       var createdAdvisors = new List<Guid>();
-      var createdRoster = new List<Guid>();
-      var createdImages = new List<Guid>();
       Guid savedLeadId = Guid.Empty;
       try
       {
@@ -361,48 +367,30 @@ public static class WizardGuide
             if (saved is null) throw new InvalidOperationException(leadError ?? "Lead save failed.");
             savedLeadId = saved.Id;
           }
-      // Fictional wizard advisors enter the explicit portrait review lifecycle
-      // with a clearly-marked pending placeholder: copy succeeds, but approval
-      // still requires an accepted portrait (same trust gate as every advisor).
-      foreach (var seat in seats)
-      {
-        var seatName = string.IsNullOrWhiteSpace(seat.Name) ? seat.Role.Trim() : seat.Name.Trim();
-        var entry = new RosterEntry
-        {
-          Id = Guid.NewGuid(), AccountId = d.AccountId, OwnerKey = ownerKey, Type = AdvisorType.FictionalCharacter,
-          Name = seatName, Description = seat.Role.Trim() + " helping with: " + f.Mission,
-          ProfileJson = RosterOps.CharacterJson(seatName, seat.Role.Trim(), f.Mission),
-          Version = 1, UpdatedAt = DateTime.UtcNow,
-        };
-        s.Roster[entry.Id] = entry;
-        createdRoster.Add(entry.Id);
-        var placeholder = new AdvisorImage
-        {
-          Id = Guid.NewGuid(), RosterEntryId = entry.Id, Kind = "wizard-placeholder",
-          Review = "pending", Provenance = "wizard:placeholder-pending-explicit-review",
-          ContentType = "image/png", Data = WizardPlaceholderPng,
-        };
-        s.Images[placeholder.Id] = placeholder;
-        createdImages.Add(placeholder.Id);
-        var (copy, copyError, _) = RosterOps.TryCopy(s, entry.Id, board.Id, seat.Role.Trim());
-        if (copy is null) throw new InvalidOperationException(copyError ?? "Advisor copy failed.");
-        createdAdvisors.Add(copy.Id);
-        created.Add(new { advisor = copy.Id, role = copy.BoardRole });
-      }
+          // Membership always references the selected canonical roster entries.
+          // Never manufacture new characters or replace their portraits here.
+          foreach (var seat in seats)
+          {
+            if (!s.Roster.TryGetValue(seat.RosterEntryId, out var entry) || entry.Archived)
+              throw new InvalidOperationException("A selected roster advisor is no longer available.");
+            var canRead = !PeopleOps.IsSecure(s) || RosterEndpoints.CanReadRoster(s, req, entry);
+            var (copy, copyError, _) = RosterOps.TryCopy(s, entry.Id, board.Id, entry.Name, callerCanReadRoster: canRead);
+            if (copy is null) throw new InvalidOperationException(copyError ?? "Advisor could not be added.");
+            createdAdvisors.Add(copy.Id);
+            created.Add(new { advisor = copy.Id, role = copy.BoardRole });
+          }
           d.Status = createdPrefix + board.Id;
           d.Version++;
           s.WizardDrafts[d.Id] = d;
           s.WizardDrafts.Flush();
           s.Boards.Flush();
-          s.Roster.Flush();
-          s.Images.Flush();
           s.Advisors.Flush();
           s.LeadProfiles.Flush();
           Atomic.Audit(s, new AuditEvent { BoardId = board.Id, Action = "wizard.create", Detail = JsonSerializer.Serialize(new { board = board.Id, advisors = created.Count }) });
           return Results.Created("/api/boards/" + board.Id, new
           {
             board, advisors = created,
-            portraitReview = "pending: accept a portrait for each advisor before approval",
+            portraitReview = "Review the selected roster advisors before approving them for meetings",
           });
         });
       }
@@ -413,8 +401,6 @@ public static class WizardGuide
         // the compensation below and keep the original rolled-back wording.
         var createOutcome = CommitOutcome.MapCommitFailure(ex, "Board creation");
         if (createOutcome is not null) return createOutcome;
-        foreach (var imgId in createdImages) s.Images.TryRemove(imgId, out _);
-        foreach (var rid in createdRoster) s.Roster.TryRemove(rid, out _);
         foreach (var aid in createdAdvisors) s.Advisors.TryRemove(aid, out _);
         if (savedLeadId != Guid.Empty) s.LeadProfiles.TryRemove(savedLeadId, out _);
         s.Boards.TryRemove(board.Id, out _);
@@ -424,11 +410,8 @@ public static class WizardGuide
     }
   }
 
-  private static readonly byte[] WizardPlaceholderPng = Convert.FromBase64String(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
-
   private sealed record WizardFields(string Name, string Mission, string Stage, string Preset, string LeadName, string LeadRole, string LeadBackground, string LeadFamiliar, string LeadSimpler, string LeadComm, List<Seat> Advisors, bool LeadOverride);
-  private sealed record Seat(string Role, string Name);
+  private sealed record Seat(string Role, string Name, Guid RosterEntryId);
   private sealed record Blocker(string field, int step, string message);
 
   private static string Str(JsonElement e, string name)
@@ -463,7 +446,8 @@ public static class WizardGuide
         {
           if (a.ValueKind != JsonValueKind.Object) continue;
           var role = Str(a, "role");
-          if (!string.IsNullOrWhiteSpace(role)) advisors.Add(new Seat(role, Str(a, "name")));
+          Guid.TryParse(Str(a, "rosterEntryId"), out var rosterId);
+          advisors.Add(new Seat(role, Str(a, "name"), rosterId));
         }
       return new WizardFields(Str(root, "name"), Str(root, "mission"), Str(root, "stage"), d.PresetKey,
         hasLead ? Str(l, "name") : "", hasLead ? Str(l, "roleLabel") : "", hasLead ? Str(l, "background") : "",
@@ -485,8 +469,12 @@ public static class WizardGuide
     var list = new List<Blocker>();
     if (string.IsNullOrWhiteSpace(f.Name)) list.Add(new Blocker("name", 1, "Give the board a name."));
     if (string.IsNullOrWhiteSpace(f.Mission)) list.Add(new Blocker("mission", 1, "Describe what the board is for."));
-    if (f.Advisors.Count == 0) list.Add(new Blocker("advisors", 2, "Add at least one advisor."));
+    if (f.Advisors.Count == 0) list.Add(new Blocker("advisors", 2, "Choose at least one advisor from your roster."));
     if (f.Advisors.Count > 10) list.Add(new Blocker("advisors", 2, "A board holds at most ten advisors."));
+    if (f.Advisors.Any(a => a.RosterEntryId == Guid.Empty))
+      list.Add(new Blocker("advisors", 2, "Choose existing advisors from your roster."));
+    if (f.Advisors.Select(a => a.RosterEntryId).Distinct().Count() != f.Advisors.Count)
+      list.Add(new Blocker("advisors", 2, "Choose each advisor only once."));
     bool wantsOverride = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
     if (wantsOverride)
     {
@@ -644,7 +632,7 @@ public static class WizardGuide
     if (string.IsNullOrWhiteSpace(f.Name)) return "What should we call this board?";
     if (string.IsNullOrWhiteSpace(f.Mission)) return "What decision should this board help you make?";
     if (string.IsNullOrWhiteSpace(f.Stage)) return "Where do things stand right now?";
-    if (f.Advisors.Count == 0) return "Which seats do you want on this board, and what expertise is missing?";
+    if (f.Advisors.Count == 0 || f.Advisors.Any(a => a.RosterEntryId == Guid.Empty)) return "Choose your advisors from the roster on the Advisors step.";
     bool wantsOverride = f.LeadOverride || !string.IsNullOrWhiteSpace(f.LeadName) || !string.IsNullOrWhiteSpace(f.LeadBackground) || !string.IsNullOrWhiteSpace(f.LeadFamiliar) || !string.IsNullOrWhiteSpace(f.LeadSimpler) || !string.IsNullOrWhiteSpace(f.LeadComm);
     if (wantsOverride)
     {
@@ -684,23 +672,8 @@ public static class WizardGuide
       case "name": case "boardname": root["name"] = value; break;
       case "mission": case "goal": case "decision": root["mission"] = value; break;
       case "stage": case "situation": root["stage"] = value; break;
-      case "advisors": case "seats": case "roles":
-      {
-        var arr = root["advisors"] as JsonArray ?? new JsonArray();
-        var have = new HashSet<string>(arr.OfType<JsonObject>().Select(o => (o["role"]?.GetValue<string>() ?? "").Trim().ToLowerInvariant()));
-        var changed = false;
-        foreach (var part in value.Split(new[] { ",", ";", "\n" }, StringSplitOptions.RemoveEmptyEntries))
-        {
-          var role = part.Trim();
-          if (role.Length == 0 || role.Length > 80 || have.Contains(role.ToLowerInvariant())) continue;
-          arr.Add(new JsonObject { ["role"] = role, ["name"] = "" });
-          have.Add(role.ToLowerInvariant());
-          changed = true;
-        }
-        if (!changed) return false;
-        root["advisors"] = arr;
-        break;
-      }
+      // Roster membership is an explicit checkbox choice, never an AI-generated role.
+      case "advisors": case "seats": case "roles": return false;
       case "leadname": case "lead": case "ceo": root["lead"] = LeadWith(root, "name", value); break;
       case "leadbackground": case "background": root["lead"] = LeadWith(root, "background", value); break;
       case "leadcomm": case "commprefs": case "voice": root["lead"] = LeadWith(root, "commPrefs", value); break;
@@ -723,8 +696,8 @@ public static class WizardGuide
     return "You guide Sim CEO board setup. Current draft: name=" + f.Name + "; mission=" + f.Mission + "; stage=" + f.Stage
       + "; advisors=" + seats + "; lead=" + f.LeadName + " (" + f.LeadComm + "). Recent turns: " + string.Join(" | ", recent)
       + ". Reply with JSON only, no other text: {\"analysis\": \"...\", \"updates\": {\"<field>\": \"<value>\"}, \"nextQuestion\": \"...\"}."
-      + " Analysis under 60 words. Only set fields the owner just provided, using exactly these keys: name, mission, stage, advisors (comma-separated roles), leadName, leadBackground, leadComm."
-      + " The next question asks for the single most important missing piece, one question only.";
+      + " Analysis under 60 words. Only set fields the owner just provided, using exactly these keys: name, mission, stage, leadName, leadBackground, leadComm."
+      + " Advisors are selected separately from the roster; do not suggest or change membership. The next question asks for the single most important missing piece, one question only.";
   }
   private static InterviewParsed? ParseInterviewJson(string raw)
   {

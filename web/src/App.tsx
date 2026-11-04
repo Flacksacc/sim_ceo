@@ -27,6 +27,7 @@ import { describeHistoryEntry, friendlyError, friendlyRecordStatus, humanEvidenc
 import "./human-feedback.css";
 import { convertRecordedBlobToWav } from "./voiceCodec";
 import WikiResources from "./wiki-resources";
+import { WizardRosterPicker } from "./wizard-roster-picker";
 type Board = { id: string; name: string; mission: string; archived?: boolean };
 type Meeting = { id: string; title: string; state: number };
 type Msg = {
@@ -1515,7 +1516,7 @@ export default function App() {
     if (settingsMeetingRef.current !== meetingId) closeMeetingSettings();
   }, [settingsOpen, meetingId]);
   const [presetKey, setPresetKey] = useState("strategy");
-  type WizardSeat = { role: string; name: string };
+  type WizardSeat = { role: string; name: string; rosterEntryId?: string };
   const [wizard, setWizard] = useState({
     name: "",
     mission: "",
@@ -1531,8 +1532,6 @@ export default function App() {
       commPrefs: DEFAULT_COMM_PREFS,
     },
   });
-  const [seatRole, setSeatRole] = useState("");
-  const [seatName, setSeatName] = useState("");
   const [accountId] = useState(() => {
     const k = "simceo-account";
     let a = localStorage.getItem(k);
@@ -1620,7 +1619,7 @@ export default function App() {
       // Public presets/commands/invite-public are intentionally retained.
       for (const k of ["messages", "delivery", "meeting-detail", "board-detail", "boards",
         "meetings", "records", "record", "record-review", "setup", "guest-settings", "lead", "profile",
-        "sources", "notes", "notes-history", "directions", "roster", "roster-count", "roster-names", "roster-images",
+        "sources", "notes", "notes-history", "directions", "roster", "roster-count", "roster-names", "wizard-roster", "roster-images",
         "images", "advisors", "invites", "grants", "jobs", "usage", "audit", "spending",
         "modelcalls", "status", "model-status", "caps", "voice", "wizreview", "meeting-views", "briefings", "briefing", "me"]) {
         try { qc.removeQueries({ queryKey: [k] }); } catch {}
@@ -2869,15 +2868,15 @@ export default function App() {
       // what this accepted hydration writes (same fallbacks as the setters).
       const wPrev = wizardRef.current;
       const mergedLead = { ...wPrev.lead, ...(f.lead ?? {}) };
-      const mergedSeats: { role: string; name: string }[] = Array.isArray(f.advisors)
-        ? f.advisors.map((s: { role: string; name: string }) => ({ role: s.role ?? "", name: s.name ?? "" }))
+      const mergedSeats: WizardSeat[] = Array.isArray(f.advisors)
+        ? f.advisors.map((s: WizardSeat) => ({ role: s.role ?? "", name: s.name ?? "", rosterEntryId: s.rosterEntryId }))
         : wPrev.seats;
       setWizard((w) => ({
         ...w,
         name: f.name ?? w.name,
         mission: f.mission ?? w.mission,
         stage: f.stage ?? w.stage,
-        seats: Array.isArray(f.advisors) ? f.advisors.map((s: { role: string; name: string }) => ({ role: s.role ?? "", name: s.name ?? "" })) : w.seats,
+        seats: Array.isArray(f.advisors) ? f.advisors.map((s: WizardSeat) => ({ role: s.role ?? "", name: s.name ?? "", rosterEntryId: s.rosterEntryId })) : w.seats,
         lead: { ...w.lead, ...(f.lead ?? {}) },
       }));
       if (d.presetKey) setPresetKey(d.presetKey);
@@ -2934,16 +2933,6 @@ export default function App() {
       refreshWizVersionOnly();
     },
   });
-  const applyGuideRoles = (roles?: { role: string }[]) => {
-    if (!roles || roles.length === 0) return;
-    const have = new Set(wizard.seats.map((s) => s.role.toLowerCase()));
-    const add = roles
-      .filter((r) => r.role && !have.has(r.role.toLowerCase()))
-      .slice(0, 10 - wizard.seats.length)
-      .map((r) => ({ role: r.role, name: "" }));
-    if (add.length > 0)
-      setWizard({ ...wizard, seats: [...wizard.seats, ...add] });
-  };
   const createBoardFromWizard = useMutation({
     mutationFn: () =>
       post<{ board: Board; advisors: { advisor: string; role: string }[] }>(
@@ -3022,8 +3011,6 @@ export default function App() {
           commPrefs: "",
         },
       });
-      setSeatRole("");
-      setSeatName("");
       setPresetKey("strategy");
       setGuide(null);
       setIturns([]);
@@ -3031,7 +3018,7 @@ export default function App() {
       setIquestion("");
       setIanswer("");
       setTab("advisors");
-      notify("Board created. Accept a portrait for each advisor, then approve.");
+      notify("Board created with your selected roster advisors. Review them in Board Advisors.");
     },
     onError: (e) => toastErr(e),
   });
@@ -3095,6 +3082,33 @@ const rosterNames = useQuery({
       `/api/roster?${new URLSearchParams({ accountId })}`,
     ),
     enabled: !sessGate && !anonPrivateBlocked,
+});
+const wizardRoster = useQuery({
+  queryKey: ["wizard-roster", accountId],
+  enabled: tab === "wizard" && !sessGate && !anonPrivateBlocked,
+  queryFn: async () => {
+    const identity = { epoch: epochNow(), token: currentToken(), user: currentUser() };
+    const found = new Map<string, RosterRow>();
+    for (let skip = 0; ; skip += 200) {
+      if (blobStale(identity)) throw Object.assign(new Error("Roster identity changed"), { stale: true });
+      const page = await get<RosterRow[]>(`/api/roster?${new URLSearchParams({ accountId, skip: String(skip) })}`);
+      if (blobStale(identity)) throw Object.assign(new Error("Roster identity changed"), { stale: true });
+      for (const row of page) found.set(row.entry.id, row);
+      if (page.length < 200) break;
+    }
+    return [...found.values()].sort((a, b) => a.entry.name.localeCompare(b.entry.name));
+  },
+});
+const selectedWizardSeats = wizard.seats.filter(s => !!s.rosterEntryId);
+const wizardSelectionsValid = selectedWizardSeats.length > 0 && selectedWizardSeats.length <= 10 &&
+  wizard.seats.length === selectedWizardSeats.length && !wizardRoster.isError && wizardRoster.isSuccess &&
+  selectedWizardSeats.every(s => wizardRoster.data?.some(r => r.entry.id === s.rosterEntryId && r.complete));
+const toggleWizardAdvisor = (id: string, checked: boolean) => setWizard(w => {
+  const seats = w.seats.filter(s => !!s.rosterEntryId);
+  if (!checked) return { ...w, seats: seats.filter(s => s.rosterEntryId !== id) };
+  const row = wizardRoster.data?.find(r => r.entry.id === id);
+  if (!row?.complete || seats.length >= 10 || seats.some(s => s.rosterEntryId === id)) return w;
+  return { ...w, seats: [...seats, { rosterEntryId: id, name: row.entry.name, role: row.entry.name }] };
 });
 // Selection provenance: the clickable roster list renders from rosterNames
 // (unfiltered) while rosterRows is the filtered search list. Resolve detail
@@ -7047,80 +7061,13 @@ const testModel = useMutation({
                   {" "}
                   <h3>
                     {" "}
-                    Who should be on the board? ({wizard.seats.length}/10){" "}
+                    Who should be on the board? ({selectedWizardSeats.length}/10){" "}
                   </h3>{" "}
-                  <p>
-                    {" "}
-                    Seats become advisor profiles when the board is created. You
-                    review and approve each one afterwards.{" "}
-                  </p>{" "}
-                  {wizard.seats.map((s, i) => (
-                    <div key={i} className="takenote">
-                      {" "}
-                      <b>{s.role}</b> {s.name && <span> · {s.name}</span>}{" "}
-                      <button
-                        type="button"
-                        className="btn ghost"
-                        onClick={() =>
-                          setWizard({
-                            ...wizard,
-                            seats: wizard.seats.filter((_, j) => j !== i),
-                          })
-                        }
-                      >
-                        {" "}
-                        Remove{" "}
-                      </button>{" "}
-                    </div>
-                  ))}{" "}
-                  {wizard.seats.length === 0 && (
-                    <p className="muted">
-                      {" "}
-                      No seats yet. Add roles below or ask the guide for
-                      recommendations.{" "}
-                    </p>
-                  )}{" "}
-                  <label>
-                    {" "}
-                    Role{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={seatRole}
-                      onChange={(e) => setSeatRole(e.target.value)}
-                      placeholder="e.g. Finance reviewer"
-                    />{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Name, optional{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={seatName}
-                      onChange={(e) => setSeatName(e.target.value)}
-                      placeholder="Leave blank to decide later"
-                    />{" "}
-                  </label>{" "}
-                  <div className="meetctl">
-                    {" "}
-                    <button
-                      type="button"
-                      disabled={!seatRole.trim() || wizard.seats.length >= 10 || (!!wizId && wizVersion == null)}
-                      onClick={() => {
-                        setWizard({
-                          ...wizard,
-                          seats: [
-                            ...wizard.seats,
-                            { role: seatRole.trim(), name: seatName.trim() },
-                          ],
-                        });
-                        setSeatRole("");
-                        setSeatName("");
-                      }}
-                    >
-                      {" "}
-                      Add seat{" "}
-                    </button>{" "}
-                  </div>{" "}
+                  <p>Choose up to ten advisors from your roster. Their existing profiles and portraits will be used.</p>
+                  {wizard.seats.some(s => !s.rosterEntryId) && <p role="status">Choose advisors below to replace this draft's older role suggestions.</p>}
+                  <WizardRosterPicker rows={wizardRoster.data ?? []} selected={wizard.seats}
+                    disabled={!!wizId && wizVersion == null} loading={wizardRoster.isLoading} error={wizardRoster.isError}
+                    onRetry={() => { void wizardRoster.refetch(); }} onToggle={toggleWizardAdvisor} />
                   <div className="meetctl">
                     {" "}
                     <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
@@ -7137,7 +7084,7 @@ const testModel = useMutation({
                     <button
                       type="button"
                       className="primary"
-                      disabled={wizard.seats.length === 0 || wizSave.isPending || (!!wizId && wizVersion == null)}
+                      disabled={!wizardSelectionsValid || wizSave.isPending || (!!wizId && wizVersion == null)}
                       onClick={() => {
                         wizSave.mutate(3);
                         setWizard({ ...wizard, step: 3 });
@@ -7296,7 +7243,7 @@ const testModel = useMutation({
                   </div>{" "}
                 </div>
               )}{" "}
-              {wizard.step < 4 && (
+              {wizard.step < 4 && wizard.step !== 2 && (
                 <div className="card" aria-label="Guided interview">{" "}
                   <h3>Guided interview</h3>{" "}
                   <p>Answer one question at a time. Answers save to the draft and fill fields.</p>{" "}
@@ -7317,7 +7264,7 @@ const testModel = useMutation({
                   {(wizReview.data?.fields ?? []).length > 0 && (<div><h4>Setup fields</h4><ul>{(wizReview.data?.fields ?? []).map((f) => <li key={f.field}>Step {f.step} - {f.field}: {f.status}</li>)}</ul></div>)}{" "}
                 </div>
               )}{" "}
-              {wizard.step < 4 && (
+              {wizard.step < 4 && wizard.step !== 2 && (
                 <div className="card" aria-label="Board setup guide">
                   {" "}
                   <h3>Setup guide</h3>{" "}
@@ -7447,50 +7394,6 @@ const testModel = useMutation({
                           </button>{" "}
                         </div>
                       )}{" "}
-                      {guide.fields?.roles && guide.fields.roles.length > 0 && (
-                        <div>
-                          {" "}
-                          <h4>Suggested seats</h4>{" "}
-                          {(guide.fields.roles ?? []).map((r, i) => (
-                            <div key={i} className="takenote">
-                              {" "}
-                              <b>{r.role}</b> {r.why && <div>{r.why}</div>}{" "}
-                              <button
-                                type="button"
-                                disabled={
-                                  (!!wizId && wizVersion == null) ||
-                                  wizard.seats.length >= 10 ||
-                                  wizard.seats.some(
-                                    (s) =>
-                                      s.role.toLowerCase() ===
-                                      r.role.toLowerCase(),
-                                  )
-                                }
-                                onClick={() =>
-                                  setWizard({
-                                    ...wizard,
-                                    seats: [
-                                      ...wizard.seats,
-                                      { role: r.role, name: "" },
-                                    ],
-                                  })
-                                }
-                              >
-                                {" "}
-                                Add seat{" "}
-                              </button>{" "}
-                            </div>
-                          ))}{" "}
-                          <button
-                            type="button"
-                            disabled={wizard.seats.length >= 10 || (!!wizId && wizVersion == null)}
-                            onClick={() => applyGuideRoles(guide.fields?.roles)}
-                          >
-                            {" "}
-                            Add all suggested{" "}
-                          </button>{" "}
-                        </div>
-                      )}{" "}
                     </>
                   )}{" "}
                 </div>
@@ -7554,6 +7457,7 @@ const testModel = useMutation({
                       className="primary"
                       disabled={
                         !wizId ||
+                        !wizardSelectionsValid ||
                         createBoardFromWizard.isPending ||
                         (wizReview.data?.blockers ?? []).length > 0
                       }
