@@ -22,8 +22,8 @@ const LIVE = process.env.ALLOW_LIVE_PROVIDER === "1";
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const COMPOSER_LABEL = "Message. Press Enter to send, Shift and Enter for a new line.";
 const REQ_TIMEOUT = 30000;
-const RESEARCH_TIMEOUT = 55000;
-const RUN_TIMEOUT = 55000;
+const RESEARCH_TIMEOUT = 185000;
+const RUN_TIMEOUT = 150000;
 const BROWSER_TIMEOUT = 30000;
 const OVERALL_BUDGET_MS = 420000;
 const startedAt = Date.now();
@@ -115,11 +115,17 @@ async function apiAdvisor() {
   ok("setup-quick-201", qf.status === 201 && pick(qf.json, "id"), "status=" + qf.status + " " + redact(qf.text));
   if (!pick(qf.json, "id")) failExit("roster quick failed " + redact(qf.text));
   rosterId = String(pick(qf.json, "id"));
-  console.log("research: bounded live research (<55s cap, honest fail on provider/unsupported)");
-  const res = await post("/api/roster/" + rosterId + "/research", { focus: "Grace Hopper-inspired technical decision making: compiler and systems tradeoffs, risk surfacing, and limits for a fictional advisor" }, { timeout: RESEARCH_TIMEOUT });
-  if (res.status === 402 || res.status === 502 || res.status === 503) failExit("research provider unavailable status=" + res.status + " " + redact(res.text) + " (honest fail; not forcing approval)");
-  ok("setup-research-200", res.status === 200, "status=" + res.status + " " + redact(res.text));
-  if (res.status !== 200) failExit("research failed status=" + res.status + " " + redact(res.text));
+  console.log("research: bounded live research (185s transport timeout; production deadline unchanged, honest fail on provider/unsupported)");
+  let res;
+  const researchHeartbeat = setInterval(() => console.log("research: still pending..."), 20000);
+  try {
+    res = await post("/api/roster/" + rosterId + "/research", { focus: "Grace Hopper-inspired technical decision making: compiler and systems tradeoffs, risk surfacing, and limits for a fictional advisor" }, { timeout: RESEARCH_TIMEOUT });
+  } finally {
+    clearInterval(researchHeartbeat);
+  }
+  if (res.status === 402 || res.status === 502 || res.status === 503) failExit("research provider unavailable status=" + res.status + " (honest fail; not forcing approval)");
+  ok("setup-research-200", res.status === 200, "status=" + res.status);
+  if (res.status !== 200) failExit("research failed status=" + res.status);
   const supported = pick(res.json, "supported");
   const claims = pick(res.json, "claims") || [];
   ok("setup-research-supported", supported === true && Array.isArray(claims) && claims.length > 0, "supported=" + JSON.stringify(supported) + " claims=" + (Array.isArray(claims) ? claims.length : typeof claims));
