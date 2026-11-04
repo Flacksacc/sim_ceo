@@ -632,6 +632,66 @@ Backup `.tmp/update-20261104-174241-UTC-eb762e4b`; rollback
 Original database/volumes retained, own browsers closed, no test servers or
 coding agents used. Broader parity remains paused.
 
+### 2026-11-04 — Contextual orchestrator, parallel replies and peer review
+
+Latest user scope delivered by `94c4950`, `fdb45a6`, `6ebc699`, and final layout
+`173ae2e`. One orchestrator call reads every eligible advisor's canonical
+profile/background and the CEO/conversation context, then selects qualified
+advisors. Explicitly named advisor/output requests override ordinary relevance
+declines, within existing roster, portrait and participation gates. The existing
+policy bounds the number of selected advisors.
+
+All selected initial responses start in parallel (up to the board's ten seats).
+Each completed response commits individually and immediately notifies the
+meeting hub. After the first wave, each responding advisor receives all first
+replies and may make one substantive follow-up or abstain. Valid peer targets
+are threaded to actual peer message sequences; self/unknown targets cannot
+create false peer links. At most two posts per advisor per CEO turn; the global
+post bound is twice the existing advisor-selection cap. Same-turn retries do
+not repeat posted responses. No invented challenge marker or forced debate.
+
+Meeting packets now include the full saved CEO profile, including Background,
+plus the advisor's background/description as essential context. Conversational
+guidance prioritizes distinctive expertise, known user circumstances, requested
+formats and focused clarification without invented credentials or personal
+anecdotes. Direct roster chat also includes the caller's default profile and
+latest ten history turns; profile changes during generation reject stale chat.
+Future research compiles these principles into the same three editable fields.
+
+The portrait/activity team strip is now immediately above the composer, with
+every board advisor, Orchestrator and Secretary. Activity comes from the real
+operation snapshot; the selector, workers and secretary animate only for their
+actual states. Non-selected advisors display Not selected. The strip scrolls
+horizontally on narrow screens and honors reduced-motion preferences. The
+composer has an opaque backing so these controls remain readable over messages.
+
+Native frontend/backend/release builds passed. Fresh isolated fake-provider
+integration (`qa/parallel-dialogue-qa.mjs`) passed: actual browser delivery before
+a slower worker completes, parallel dispatch, personalized packets, both peer
+contexts, one threaded follow-up, explicit-output override, abstention, retry
+deduplication, pause/partial progress, cancellation/drain/unlock, advisor/default
+profile edits and malformed-selector handling. Evidence:
+`.tmp/parallel-dialogue-qa-checked.log`. Grounded research regression: 49/0
+(`.tmp/parallel-dialogue-grounding-regression.log`); portrait identity unit checks
+also passed. The initial fake-provider CRLF identity mismatch is retained in
+the earlier log and was corrected before the successful runs.
+
+Final live read-only checks passed in light/dark themes and narrow layouts:
+team placement/all participants, actual portraits for old/new message identity,
+missing metadata/broken-byte fallback, zero domain writes/page errors, unchanged
+roster/messages/membership/approval data. Evidence:
+`.tmp/parallel-dialogue-live-check-complete.log`; inspected screenshots:
+`output/parallel-dialogue-review/2026-11-04`. Actual generative advice quality
+remains for the requested human testing; automated pipeline tests used the
+isolated provider, not new messages in the user's meetings.
+
+Healthy on 5173, image
+`sha256:6d7615921bf124e8ec2a5a8dc71ea5dde92bba48d6c0d39aaac355007d800f2f`.
+Backup `.tmp/update-20261104-181611-UTC-6b338997`; rollback
+`simceo-essentials-app:rollback-20261104-181611-6b338997`.
+Original database/volumes retained. Owned QA services and browser processes
+exited; no coding agents used, `tmp.txt` untouched. Full parity remains paused.
+
 ## Selected-advisor tabs: deployed November 4, 2026
 
 The selected roster advisor now has Profile, Chat and References tabs. Profile
