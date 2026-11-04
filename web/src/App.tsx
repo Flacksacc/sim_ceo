@@ -2290,6 +2290,7 @@ export default function App() {
         return;
       }
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        if ((e.target as HTMLElement | null)?.closest(".conv-command-prompt, .conv-title-editor, .conv-settings, [role=menu]")) return;
         try {
           if ((e as KeyboardEvent).repeat) return;
           if ((e as KeyboardEvent).isComposing) return;
