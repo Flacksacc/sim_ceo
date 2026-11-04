@@ -78,9 +78,9 @@ let runCalls = 0;
 let lastRunBody = null;
 let runBehavior = "success"; let failMessages = null; let capsOverride = null; let leadVersionStub = 7; let secretaryBehavior = "success"; let secretaryBodies = [];
 let patchBehavior = "success"; let lastPatchBody = null; let patchCalls = 0; let lastMessagesBody = null;
-let gates = { messages: null, run: null, secretary: null, patch: null };
+let gates = { messages: null, run: null, secretary: null, patch: null, detail: null };
 function deferred() { let r = null; const promise = new Promise((res) => { r = res; }); return { promise, release: r }; }
-function resetProbeState() { messages = freshMessages(); meetings = freshMeetings(); runCalls = 0; lastRunBody = null; runBehavior = "success"; failMessages = null; capsOverride = null; leadVersionStub = 7; secretaryBehavior = "success"; secretaryBodies = []; patchBehavior = "success"; lastPatchBody = null; patchCalls = 0; lastMessagesBody = null; gates = { messages: null, run: null, secretary: null, patch: null }; }
+function resetProbeState() { messages = freshMessages(); meetings = freshMeetings(); runCalls = 0; lastRunBody = null; runBehavior = "success"; failMessages = null; capsOverride = null; leadVersionStub = 7; secretaryBehavior = "success"; secretaryBodies = []; patchBehavior = "success"; lastPatchBody = null; patchCalls = 0; lastMessagesBody = null; gates = { messages: null, run: null, secretary: null, patch: null, detail: null }; }
 const fixtureFallback = fx.fixtureHandler(reqLog, []);
 async function apiStub(route) {
   const req = route.request();
@@ -102,7 +102,7 @@ async function apiStub(route) {
   if ((m = p.match(/^\/api\/boards\/([^/]+)\/guest-settings$/))) return J({ id: m[1], name: B1.name, mission: B1.mission, stage: "Seed", discussionPolicy: "balanced", dataUse: "standard", lead: null, meetingIds: ["m-one", "m-two", "m-empty"] }); if ((m = p.match(/^\/api\/boards\/([^/]+)\/status$/))) return J({ board: B1.name, active: true, dirty: false, name: true, lead: true, leadVersion: LEAD_VERSION, advisors: { total: 1, approved: 1 }, meetings: { total: 2, active: 2 }, sourcesPending: 0, jobsFailed: 0, policy: "balanced", retainAudio: false });
   if ((m = p.match(/^\/api\/boards\/([^/]+)\/advisors$/))) return J([{ id: "a-1", boardId: "b-alpha", boardRole: "CFO Ada", approved: true, removed: false }]);
   if ((m = p.match(/^\/api\/boards\/([^/]+)\/meetings$/)) && method === "GET") return J([meetings["m-one"], meetings["m-two"], meetings["m-empty"]].filter((x) => !!x));
-  if ((m = p.match(/^\/api\/boards\/([^/]+)\/meetings\/([^/]+)$/)) && method === "GET") { const mt = meetings[m[2]]; if (!mt || mt.boardId !== m[1]) return J({ error: "unknown meeting" }, 404); return J(mt); }
+  if ((m = p.match(/^\/api\/boards\/([^/]+)\/meetings\/([^/]+)$/)) && method === "GET") { if (gates.detail) await gates.detail.promise; const mt = meetings[m[2]]; if (!mt || mt.boardId !== m[1]) return J({ error: "unknown meeting" }, 404); return J(mt); }
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/delivery$/))) { const list = messages[m[1]] || []; const last = list.length ? list[list.length - 1].sequence : 0; return J({ state: "Active", deliveredRevision: last, messages: list.length, lastSequence: last }); }
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages$/)) && method === "GET") return J(messages[m[1]] || []);
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages$/)) && method === "POST") {
@@ -805,11 +805,53 @@ async function testTransport401WhileHeld() {
   ok("held401-retry-run-once", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
   ok("held401-retry-no-repost", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
 }
+
+async function testHeldDetailAuthoritativeSendBlocked() {
+  // REAL held-DETAIL proof: list is served but authoritative GET detail is held.
+  // While loading (meetingValid false, curMeeting null-or-stale), typing + Enter
+  // must NOT POST lead nor PATCH/run, draft stays intact. After release of a
+  // valid numeric state-0 (AwaitingBrief) detail, Send enables and one Enter
+  // chains exactly once. Honest fail if product is not actually safe.
+  resetProbeState();
+  capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
+  await page.goto(webBase + "#/meet?board=b-alpha&meeting=m-one");
+  await page.waitForSelector("textarea[aria-label=\"" + COMPOSER_LABEL + "\"]", { timeout: 20000 });
+  await page.getByRole("heading", { name: "Pricing move QA session", exact: true }).first().waitFor({ timeout: 20000 });
+  const mark = reqLog.length;
+  gates.detail = deferred();
+  await page.evaluate((h) => { window.location.hash = h; }, "#/meet?board=b-alpha&meeting=m-empty");
+  await page.waitForSelector("textarea[aria-label=\"" + COMPOSER_LABEL + "\"]", { timeout: 20000 });
+  await sleep(700);
+  const box = composer();
+  const btn = sendButton();
+  await box.fill("Held detail lead must not send early");
+  await sleep(400);
+  ok("helddetail-send-disabled-while-loading", await btn.isDisabled(), "send stays disabled until authoritative detail loads");
+  await box.press("Enter");
+  await sleep(900);
+  ok("helddetail-no-lead-while-loading", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 0, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+  ok("helddetail-no-patch-while-loading", countFrom(mark, "PATCH", "/api/meetings/m-empty") === 0, "patch=" + countFrom(mark, "PATCH", "/api/meetings/m-empty"));
+  ok("helddetail-no-run-while-loading", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+  ok("helddetail-draft-intact-while-loading", (await box.inputValue()) === "Held detail lead must not send early", "early draft preserved, no blind send");
+  gates.detail.release();
+  gates.detail = null;
+  await page.getByRole("heading", { name: "Empty brief session", exact: true }).first().waitFor({ timeout: 20000 });
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Awaiting brief", { timeout: 20000 });
+  ok("helddetail-badge-awaiting-brief", true, "authoritative numeric state 0 renders Awaiting brief");
+  await page.waitForFunction(() => { const b = document.querySelector(".composer-bar button.primary"); return b && !b.disabled; }, null, { timeout: 20000 });
+  ok("helddetail-send-enabled-after-load", await btn.isEnabled(), "draft plus valid numeric detail enables Send");
+  ok("helddetail-draft-survives-load", (await box.inputValue()) === "Held detail lead must not send early", "early draft survives detail release");
+  await box.press("Enter");
+  await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
+  ok("helddetail-lead-once", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
+  ok("helddetail-patch-once", countFrom(mark, "PATCH", "/api/meetings/m-empty") === 1, "patch=" + countFrom(mark, "PATCH", "/api/meetings/m-empty"));
+  ok("helddetail-run-once", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 1, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
+}
 async function main() {
   try {
     await launch();
     const only = (process.env.QA_ONLY || "").split(",").map((s) => s.trim()).filter((s) => !!s);
-    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible, testSendDeniedRequires4xx, testHeldPatchOverlapNewSurvives, testPatchFailureReplyFrozen, testWhitespaceBriefAutoInit, testTransport401WhileHeld];
+    const all = [testSendChainsRunOnce, testSecretaryRouting, testRunFailureRetryNoRepost, testProvider502Mapped, testLeadPostFailureHonest, testRapidEnterGuard, testHeldRunNavigationFrozen, testNoRespondersTerminal, testIdentityRetirement, testVersionConflictPin, testContributorBriefGate, testDiscussGuestNoPatch, testHeldPatchSingleRun, testApplyIdentityRetirement, testLateABANewOp, testLeadUncertainNoAutorepost, testSecretaryRetryVisible, testSendDeniedRequires4xx, testHeldPatchOverlapNewSurvives, testPatchFailureReplyFrozen, testWhitespaceBriefAutoInit, testTransport401WhileHeld, testHeldDetailAuthoritativeSendBlocked];
     const tests = only.length ? all.filter((t) => only.indexOf(t.name) >= 0) : all;
     for (const t of tests) {
       try { await t(); } catch (e) { fail++; const m = t.name + " threw " + String((e && e.message) || e).slice(0, 600); failures.push(m); console.log("  FAIL " + m); outLine("FAIL " + m); try { outLine("PAGE-TAIL " + (await bodyText()).slice(-2500)); } catch (e2) {} }
