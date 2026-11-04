@@ -1,6 +1,6 @@
 /* CreateAdvisor — simplified character-based creation/editor.
    Uses global theme tokens so light/dark both pass contrast. */
-.cc-flow { max-width: 56rem; }
+.cc-flow { width: 100%; min-width: 0; }
 .cc-lede { margin-top: 0; color: var(--muted); }
 .cc-step { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 0.9rem 1rem 1rem; margin: 0 0 1rem; }
 .cc-step > legend { padding: 0 0.4rem; font-weight: 650; }
@@ -9,8 +9,11 @@
 .cc-field > span { display: block; margin-bottom: 0.25rem; }
 .cc-hint { display: block; font-weight: 400; color: var(--muted); font-size: 0.82rem; }
 .cc-field input { width: 100%; }
-.cc-area { width: 100%; min-height: 9rem; resize: vertical; line-height: 1.55; }
-.cc-area-short { width: 100%; min-height: 4.5rem; resize: vertical; line-height: 1.55; }
+.cc-area { width: 100%; min-height: 9rem; max-height: none; overflow: hidden; resize: none; line-height: 1.55; }
+.cc-area-short { width: 100%; min-height: 4.5rem; max-height: none; overflow: hidden; resize: none; line-height: 1.55; }
+.cc-field-working { display: inline-flex; align-items: center; gap: 0.4rem; margin-left: 0.7rem; color: var(--muted); font-size: 0.85rem; font-weight: 400; }
+.cc-spinner { display: inline-block; width: 0.85rem; height: 0.85rem; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: cc-research-spin 0.9s linear infinite; }
+@keyframes cc-research-spin { to { transform: rotate(360deg); } }
 .cc-links input { width: 100%; margin-top: 0.35rem; }
 .cc-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.8rem; align-items: center; }
 .cc-status { margin-top: 0.8rem; padding: 0.6rem 0.75rem; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--panel-2); }
@@ -31,5 +34,6 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .cc-flow * { transition: none; }
+  .cc-spinner { animation: none; }
 }
 .cc-count { font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; }

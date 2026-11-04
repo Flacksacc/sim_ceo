@@ -719,7 +719,8 @@ public static class CharacterResearch
   public static string BuildDossierPrompt(string subject, string focus, string desc, string background, IReadOnlyList<string> reqUrls, IReadOnlyDictionary<string, (string Title, string Excerpt)> fetchedExcerpts)
   {
     var focusTag = string.IsNullOrWhiteSpace(focus) ? "" : " Focus: " + focus.Trim() + ".";
-    var formatBlock = " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <S1|full-url> :: \"<exact supporting quote>\" [ ;; <S1|full-url> :: \"<exact quote>\" ]"
+    var formatBlock = " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: source :: \"exact supporting quote\"."
+      + " Replace source with ONE source identifier such as S1 from the owner-source list, OR ONE full https URL. Never combine an identifier and URL with a pipe. Do not write placeholder angle brackets. Separate additional references with ;; followed by source :: \"exact quote\"."
       + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
       + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source retrieval excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only."
       + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage.";

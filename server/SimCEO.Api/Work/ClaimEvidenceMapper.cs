@@ -79,6 +79,20 @@ public static class ClaimEvidenceMapper
     if (t.Length == 0) return false;
     t = t.Trim().Trim('[', ']', '<', '>', '"', (char)39, (char)32, (char)9);
     if (t.Length == 0) return false;
+    // Older prompts accidentally demonstrated <S1|full-url>. Accept the
+    // explicit URL only; a bound identifier must agree with that exact URL.
+    // The normal retrieved-passage and exact-quote checks still apply below.
+    var separator = t.IndexOf('|');
+    if (separator >= 0)
+    {
+      var sid = t.Substring(0, separator).Trim();
+      var explicitUrl = t.Substring(separator + 1).Trim();
+      if (!System.Text.RegularExpressions.Regex.IsMatch(sid, @"^S[1-9][0-9]*$")) return false;
+      if (explicitUrl.Contains('|') || !TryParseHttpUri(explicitUrl, out _)) return false;
+      if (sidMap.TryGetValue(sid, out var boundUrl) && !UrlsMatch(boundUrl, explicitUrl)) return false;
+      url = explicitUrl;
+      return true;
+    }
     if (sidMap.TryGetValue(t, out var mapped))
     {
       url = mapped;

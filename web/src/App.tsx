@@ -3028,7 +3028,16 @@ export default function App() {
     enabled: !!selRoster && !sessGate,
   });
   const [createOpen, setCreateOpen] = useState(false);
-  const closeCreate = () => setCreateOpen(false);
+  const [advisorDirty, setAdvisorDirty] = useState(false);
+  const canLeaveAdvisor = () => !advisorDirty || window.confirm("Leave this advisor? Your unsaved changes will be lost.");
+  const closeCreate = () => { if (canLeaveAdvisor()) { setCreateOpen(false); setAdvisorDirty(false); } };
+  const openCreate = () => { if (canLeaveAdvisor()) { setCreateOpen(true); setAdvisorDirty(false); } };
+  useEffect(() => {
+    if (!advisorDirty) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [advisorDirty]);
   const [portraitRev, setPortraitRev] = useState(0);
   const reviewImg = useMutation({
     mutationFn: (args: { id: string; decision: string }) =>
@@ -3037,6 +3046,10 @@ export default function App() {
     onError: (e) => toastErr(e),
   });
   const selectRoster = (id: string) => {
+    if (!createOpen && id === selRoster) return;
+    if (!canLeaveAdvisor()) return;
+    setCreateOpen(false);
+    setAdvisorDirty(false);
     setSelRoster(id);
     setAudId(id);
     setAq("");
@@ -6314,7 +6327,7 @@ const testModel = useMutation({
               <div className="sub-empty">Roster is empty</div>
             )}{" "}
             {tab === "roster" && (
-              <button type="button" className="lprow create" onClick={() => { setCreateOpen(true); setTimeout(() => createNameRef.current?.focus(), 50); }}>{" "}
+              <button type="button" className="lprow create" onClick={openCreate}>{" "}
                 <span className="lprow-name">+ Create new Advisor</span>{" "}
               </button>
             )}{" "}
@@ -7783,7 +7796,7 @@ const testModel = useMutation({
           {tab === "roster" && (
             <section aria-label="My Advisor Roster">
               {" "}
-              <h2>{selRow ? selRow.entry.name : "My Advisor Roster (unlimited)"}{" "}</h2>{" "}
+              <h2>{createOpen ? "Create advisor" : selRow ? selRow.entry.name : "My Advisor Roster (unlimited)"}{" "}</h2>{" "}
               <p>
                 {" "}
                 Roster entries are reusable profile templates. Profile changes apply across boards;
@@ -7791,7 +7804,26 @@ const testModel = useMutation({
               </p>{" "}
                 <div className="roster-detail" aria-label="Selected advisor">
                   {" "}
-                  {selRow ? (
+                  {createOpen ? (
+                    <CreateAdvisor
+                      accountId={accountId}
+                      get={get}
+                      post={post}
+                      put={put}
+                      originIdentity={originIdentity}
+                      originStale={originStale}
+                      originRevision={originRevision()}
+                      resolveCanonicalEntry={resolveCanonicalEntry}
+                      onDirtyChange={setAdvisorDirty}
+                      onCreated={(entry) => {
+                        refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
+                        setSelRoster(entry.id);
+                        setAudId(entry.id);
+                      }}
+                      onInvalidated={() => refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research")}
+                      onClose={closeCreate}
+                    />
+                  ) : selRow ? (
                     <div className="card" data-roster-entry-id={selRow.entry.id}>{" "}
                       <h3>{selRow.entry.name}</h3>{" "}
                       <span className="badge">{" "}{selRow.complete ? "complete" : "incomplete: " + selRow.missing.join(", ")}{" "}</span>{" "}
@@ -7908,6 +7940,7 @@ const testModel = useMutation({
                           originRevision={originRevision()}
                           resolveCanonicalEntry={resolveCanonicalEntry}
                           freshCreation={false}
+                          onDirtyChange={setAdvisorDirty}
                           onSaved={() => {
                             refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
                           }}
@@ -7921,36 +7954,6 @@ const testModel = useMutation({
                   <p className="muted">Select an advisor from the list to see their record.</p>
                   )}{" "}
                 </div>{" "}
-              {createOpen && (
-                <div className="modal-backdrop" onClick={closeCreate}>
-                  {" "}
-                  <div className="modal" role="dialog" aria-modal="true" aria-label="Create advisor" onClick={(e) => e.stopPropagation()}>
-                    {" "}
-                    <div className="meetctl">
-                      {" "}
-                      <button type="button" className="btn ghost" onClick={closeCreate} aria-label="Close">{" "}X{" "}</button>{" "}
-                    </div>{" "}
-                    <CreateAdvisor
-                      accountId={accountId}
-                      get={get}
-                      post={post}
-                      put={put}
-                      originIdentity={originIdentity}
-                      originStale={originStale}
-                      originRevision={originRevision()}
-                      resolveCanonicalEntry={resolveCanonicalEntry}
-                      onCreated={(entry) => {
-                        refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
-                        try { setSelRoster(entry.id); setAudId(entry.id); } catch { /* noop */ }
-                      }}
-                      onInvalidated={() => {
-                        refresh(...CANONICAL_SAVE_INVALIDATIONS, "roster-research");
-                      }}
-                      onClose={closeCreate}
-                    />{" "}
-                  </div>{" "}
-                </div>
-              )}{" "}
             </section>
           )}{" "}
           {tab === "advisors" && (
