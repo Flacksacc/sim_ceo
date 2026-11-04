@@ -134,8 +134,8 @@ function procIdentity(pid, timeoutMs) {
   if (!Number.isInteger(pid) || pid <= 0) return { status: "absent", pid: pid, creation: "", cmd: "", exe: "" };
   timeoutMs = Number(timeoutMs);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = 8000;
-  timeoutMs = Math.max(1000, Math.min(8000, Math.floor(timeoutMs)));
-  const ps = "Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\" | Select-Object ProcessId,CreationDate,CommandLine,ExecutablePath | ConvertTo-Json -Compress";
+  timeoutMs = Math.max(1, Math.min(8000, Math.floor(timeoutMs)));
+  const ps = "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\" -ErrorAction Stop | Select-Object ProcessId,CreationDate,CommandLine,ExecutablePath | ConvertTo-Json -Compress";
   let r;
   try {
     r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { timeout: timeoutMs, windowsHide: true, encoding: "utf8" });
@@ -143,7 +143,9 @@ function procIdentity(pid, timeoutMs) {
   if (!r || r.error) return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: String((r && r.error && r.error.message) || "spawn-error").slice(0, 80) };
   if (r.signal) return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "signal" };
   const out = String((r.stdout || "")).trim();
+  const errOut = String((r.stderr || "")).trim();
   if (r.status !== 0) { return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-exit-" + r.status }; }
+  if (errOut !== "") { return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-stderr-" + errOut.slice(0, 80) }; }
   if (out === "" || out === "null") return { status: "absent", pid: pid, creation: "", cmd: "", exe: "" };
   let j = null;
   try { j = JSON.parse(out); } catch (e) { return { status: "unavailable", pid: pid, creation: "", cmd: "", exe: "", error: "cim-parse" }; }
@@ -160,25 +162,34 @@ function procIdentityBounded(pid, deadline) {
   if (!(rem > 0)) return { status: "unavailable", pid: Number(pid), creation: "", cmd: "", exe: "", error: "cleanup-deadline-exceeded" };
   try { return procIdentity(pid, Math.min(8000, rem)); } catch (e) { return { status: "unavailable", pid: Number(pid), creation: "", cmd: "", exe: "", error: "cim-threw" }; }
 }
-function procNameFallback(pid) {
+function procNameFallback(pid, timeoutMs) {
+  pid = Number(pid);
+  timeoutMs = Number(timeoutMs);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return "";
+  timeoutMs = Math.max(1, Math.min(8000, Math.floor(timeoutMs)));
   try {
-    const r = spawnSync("tasklist.exe", ["/FI", "PID eq " + Number(pid), "/FO", "CSV", "/NH"], { timeout: 8000, windowsHide: true, encoding: "utf8" });
+    const r = spawnSync("tasklist.exe", ["/FI", "PID eq " + pid, "/FO", "CSV", "/NH"], { timeout: timeoutMs, windowsHide: true, encoding: "utf8" });
     const out = String((r && r.stdout) || "");
     const m = out.match(/"([^"]+)","(\d+)"/);
-    if (m && Number(m[2]) === Number(pid)) return m[1];
+    if (m && Number(m[2]) === pid) return m[1];
     return "";
   } catch (e) { return ""; }
+}
+function procNameFallbackBounded(pid, deadline) {
+  const rem = Number(deadline) - Date.now();
+  if (!(rem > 0)) return "";
+  return procNameFallback(pid, Math.min(8000, rem));
 }
 function baseNameLower(p) { try { const b = String(p).split(/[\\/]/).pop() || ""; return b.toLowerCase(); } catch { return ""; } }
 let _dotnetAbs = ""; let _whereTried = false;
 function whichAbs(cmd) { try { const r = spawnSync("where.exe", [cmd], { timeout: 8000, windowsHide: true, encoding: "utf8" }); const l = String((r && r.stdout) || "").split(/\r?\n/).map((x) => x.trim()).filter(Boolean); for (const c of l) { try { if (fs.existsSync(c)) return c; } catch {} } return l.length ? l[0] : ""; } catch { return ""; } }
-function dotnetHostAbs() { if (_dotnetAbs) return _dotnetAbs; if (!_whereTried) { _whereTried = true; const w = whichAbs("dotnet.exe") || whichAbs("dotnet"); if (w) _dotnetAbs = w; } if (!_dotnetAbs) _dotnetAbs = "dotnet"; return _dotnetAbs; }
-function nodeHostAbs() { try { if (process.execPath && fs.existsSync(process.execPath)) return process.execPath; } catch {} return "node"; }
+function dotnetHostAbs() { if (_dotnetAbs) return _dotnetAbs; if (!_whereTried) { _whereTried = true; const w = whichAbs("dotnet.exe") || whichAbs("dotnet"); if (w) _dotnetAbs = w; } if (!_dotnetAbs) return ""; return _dotnetAbs; }
+function nodeHostAbs() { try { if (process.execPath && fs.existsSync(process.execPath)) return process.execPath; } catch {} return ""; }
 function apiHostAbs() { return dotnetHostAbs(); }
 function fakeHostAbs() { return nodeHostAbs(); }
 function normPathLower(v) { try { return String(v || "").replace(/\//g, "\\").toLowerCase(); } catch { return ""; } }
 function splitArgv(cmd) { const out = []; let cur = ""; let q = null; const t = String(cmd || ""); for (let i = 0; i < t.length; i++) { const c = t[i]; if (q) { if (c === q) q = null; else cur += c; } else if (c === "\"" || c === "'") q = c; else if (/\s/.test(c)) { if (cur !== "") { out.push(cur); cur = ""; } } else cur += c; } if (cur !== "") out.push(cur); return out; }
-function argvEqualsExact(kind, cmdStr, exeAbs, expectedArgs) { const toks = splitArgv(cmdStr); if (toks.length < 1) return false; const hostTok = normPathLower(toks[0]); const hostExp = normPathLower(exeAbs); const hostBaseOk = (kind === "api") ? (hostTok.endsWith("dotnet") || hostTok.endsWith("dotnet.exe")) : (hostTok.endsWith("node") || hostTok.endsWith("node.exe")); if (!hostBaseOk) return false; if (hostExp && hostExp !== "" && hostExp !== "dotnet" && hostExp !== "node") { if (hostTok !== hostExp) return false; } const rest = toks.slice(1); const norm = rest.map((x) => String(x)); const expN = expectedArgs.map((x) => String(x)); if (norm.length === expN.length && norm.every((v, i) => normPathLower(v) === normPathLower(expN[i]))) return true; if (kind === "fake" && norm.length === 2 && normPathLower(norm[0]) === normPathLower(expectedArgs[0]) && /^--port=15398$/i.test(norm[1]) && expectedArgs[1] === "--port" && expectedArgs[2] === String(15398)) return true; return false; }
+function argvEqualsExact(kind, cmdStr, exeAbs, expectedArgs) { const toks = splitArgv(cmdStr); if (toks.length < 1) return false; const hostTok = normPathLower(toks[0]); const hostExp = normPathLower(exeAbs); if (!hostExp || hostExp === "" || hostExp === "dotnet" || hostExp === "node") return false; if (!path.isAbsolute(String(exeAbs || ""))) return false; const hostBaseOk = (kind === "api") ? (hostTok.endsWith("dotnet") || hostTok.endsWith("dotnet.exe")) : (hostTok.endsWith("node") || hostTok.endsWith("node.exe")); if (!hostBaseOk) return false; if (hostTok !== hostExp) return false; const rest = toks.slice(1); const norm = rest.map((x) => String(x)); const expN = expectedArgs.map((x) => String(x)); if (norm.length === expN.length && norm.every((v, i) => normPathLower(v) === normPathLower(expN[i]))) return true; if (kind === "fake" && norm.length === 2 && normPathLower(norm[0]) === normPathLower(expectedArgs[0]) && /^--port=15398$/i.test(norm[1]) && expectedArgs[1] === "--port" && expectedArgs[2] === String(15398)) return true; return false; }
 function expectedApiArgs() { return [EXPECTED_API_DLL]; }
 function expectedFakeArgs() { return [EXPECTED_FAKE_JS, "--port", String(FAKE_PORT)]; }
 function validateInitialIdentity(kind, ident, expectedAbs) {
@@ -198,11 +209,13 @@ function validateInitialIdentity(kind, ident, expectedAbs) {
   if (kind === "api") { if (!(base === "dotnet" || base === "dotnet.exe")) return false; hostAbs = apiHostAbs(); wantArgs = expectedApiArgs(); }
   else if (kind === "fake") { if (!(base === "node" || base === "node.exe")) return false; hostAbs = fakeHostAbs(); wantArgs = expectedFakeArgs(); }
   else return false;
-  let resolvedHost = hostAbs;
-  try { if (path.isAbsolute(String(hostAbs))) resolvedHost = path.resolve(String(hostAbs)); } catch {}
+  if (!hostAbs || !path.isAbsolute(String(hostAbs))) return false;
+  let resolvedHost = "";
+  try { resolvedHost = path.resolve(String(hostAbs)); } catch { return false; }
+  if (!resolvedHost || !path.isAbsolute(String(resolvedHost))) return false;
   const exeLow = normPathLower(resolvedExe);
-  const hostLow = (resolvedHost && String(resolvedHost) !== "dotnet" && String(resolvedHost) !== "node") ? normPathLower(resolvedHost) : "";
-  if (hostLow && exeLow !== hostLow) return false;
+  const hostLow = normPathLower(resolvedHost);
+  if (!hostLow || exeLow !== hostLow) return false;
   const cmdStr = String(ident.cmd || "");
   if (!cmdStr) return false;
   if (!argvEqualsExact(kind, cmdStr, resolvedHost, wantArgs)) return false;
@@ -222,6 +235,18 @@ function identityMatches(recorded, current, wantKind) {
   const base = baseNameLower(ce);
   if (wantKind === "api" && !(base === "dotnet" || base === "dotnet.exe")) return false;
   if (wantKind === "fake" && !(base === "node" || base === "node.exe")) return false;
+  return true;
+}
+function controllerMatches(recorded, current) {
+  if (!recorded || !current) return false;
+  if (recorded.status !== "alive" || current.status !== "alive") return false;
+  if (Number(recorded.pid) !== Number(current.pid)) return false;
+  if (String(recorded.creation || "") === "" || String(current.creation || "") === "") return false;
+  if (String(recorded.creation) !== String(current.creation)) return false;
+  const rc = String(recorded.cmd || ""), cc = String(current.cmd || "");
+  if (!rc || !cc || rc !== cc) return false;
+  const re = String(recorded.exe || ""), ce = String(current.exe || "");
+  if (!re || !ce || re.toLowerCase() !== ce.toLowerCase()) return false;
   return true;
 }
 function runBounded(file, args, opts) {
@@ -367,8 +392,9 @@ function verifyPublishedEndpointConfigStrict() {
 function writeBuildManifest(success, extra, pre) {
   const commit = (pre && pre.commit) || sourceCommit();
   const dirty = (pre && pre.dirty) || sourceDirtyList();
-  const inputs = (pre && pre.inputs) || prodInputFiles();
-  const inputsCaptured = (pre && pre.inputs) ? "pre-build" : "at-write";
+  const hasPreHashes = !!(pre && pre.inputHashes && typeof pre.inputHashes === "object" && !Array.isArray(pre.inputHashes));
+  const inputsCaptured = hasPreHashes ? "pre-build" : "at-write";
+  const preHashesForWrite = hasPreHashes ? pre.inputHashes : null;
   const inv = publishOutputInventory();
   const qaFile = path.join(REPO, "qa", "advisor-integrated-qa.mjs");
   const fakeFile = EXPECTED_FAKE_JS;
@@ -380,7 +406,7 @@ function writeBuildManifest(success, extra, pre) {
     version: 1, kind: "own-build-manifest", success: !!success, at: Date.now(),
     commit: commit, dirty: dirty.dirty, dirtyFiles: dirty.files,
     nodeVersion: nodeV, dotnetVersion: dotnetV, builderPid: process.pid,
-    inputs: hashMap(inputs, REPO),
+    inputs: preHashesForWrite || hashMap(prodInputFiles(), REPO),
     inputsCaptured: inputsCaptured,
     outputs: { dllSha: inv.dllSha, dllSize: inv.dllSize, depsSha: inv.depsSha, rcSha: inv.rcSha, wwwrootSha: inv.idxSha, js: inv.js, css: inv.css, appsettings: inv.appsettingsHashes, dlls: inv.dlls, wwwrootAll: inv.wwwrootAll },
     qaSha: sha256File(qaFile), fakeSha: sha256File(fakeFile), helperSha: sha256File(helperFile),
@@ -406,6 +432,7 @@ function verifyBuildManifestForStart() {
   if (curCss !== recCss) { console.log("FATAL current served CSS differs from build manifest (rebuild before start)"); process.exit(2); }
   const curQa = sha256File(path.join(REPO, "qa", "advisor-integrated-qa.mjs"));
   if (!b.inputs || typeof b.inputs !== "object" || Array.isArray(b.inputs)) { console.log("FATAL build manifest missing production input hashes (rebuild before start)"); process.exit(2); }
+  if (b.inputsCaptured !== "pre-build") { console.log("FATAL build manifest inputs not pre-build hashed (rebuild before start)"); process.exit(2); }
   const curInputs = hashMap(prodInputFiles(), REPO);
   if (JSON.stringify(curInputs) !== JSON.stringify(b.inputs)) { console.log("FATAL current production inputs differ from successful build manifest (rebuild before start)"); process.exit(2); }
   if (!inv.depsSha || inv.depsSha !== b.outputs.depsSha) { console.log("FATAL current deps.json differs from build manifest (rebuild before start)"); process.exit(2); }
@@ -505,7 +532,8 @@ async function cmdBuild() {
   const preCommit = sourceCommit();
   const preDirty = sourceDirtyList();
   const preInputs = prodInputFiles();
-  const pre = { commit: preCommit, dirty: preDirty, inputs: preInputs };
+  const preInputHashes = hashMap(preInputs, REPO);
+  const pre = { commit: preCommit, dirty: preDirty, inputs: preInputs, inputHashes: preInputHashes };
   logBoth("pre-build inputs hashed n=" + preInputs.length + " commit=" + String(preCommit).slice(0, 12));
   const webLog = path.join(LOGDIR, "build-web.log");
   let npmCmd = "npm.cmd";
@@ -527,7 +555,7 @@ async function cmdBuild() {
         let ciOut = "", ciErr = "";
         ci.stdout.on("data", (d) => { ciOut += String(d); });
         ci.stderr.on("data", (d) => { ciErr += String(d); });
-        const ciCode = await new Promise((resolve) => { const to = setTimeout(() => { try { ci.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); ci.on("close", (c) => { clearTimeout(to); resolve(c); }); ci.on("error", () => { clearTimeout(to); resolve(127); }); });
+        const ciCode = await new Promise((resolve) => { const to = setTimeout(() => { try { ci.kill(); } catch (e) {} resolve(124); }, Math.max(1, deadline - Date.now())); ci.on("close", (c) => { clearTimeout(to); resolve(c); }); ci.on("error", () => { clearTimeout(to); resolve(127); }); });
         try { fs.appendFileSync(webLog, ciOut + "\n" + ciErr); } catch (e) {}
         if (ciCode !== 0) { logBoth("FATAL npm ci failed code=" + ciCode); writeBuildManifest(false, { error: "npm-ci-" + ciCode }, pre); process.exit(2); }
       } else { logBoth("skip npm ci (node_modules fresh)"); }
@@ -539,7 +567,7 @@ async function cmdBuild() {
     let wOut = "", wErr = "";
     w.stdout.on("data", (d) => { wOut += String(d); });
     w.stderr.on("data", (d) => { wErr += String(d); });
-    const wCode = await new Promise((resolve) => { const to = setTimeout(() => { try { w.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); w.on("close", (c) => { clearTimeout(to); resolve(c); }); w.on("error", () => { clearTimeout(to); resolve(127); }); });
+    const wCode = await new Promise((resolve) => { const to = setTimeout(() => { try { w.kill(); } catch (e) {} resolve(124); }, Math.max(1, deadline - Date.now())); w.on("close", (c) => { clearTimeout(to); resolve(c); }); w.on("error", () => { clearTimeout(to); resolve(127); }); });
     try { fs.appendFileSync(webLog, wOut + "\n" + wErr); } catch (e) {}
     if (wCode !== 0) { logBoth("FATAL web build failed code=" + wCode); writeBuildManifest(false, { error: "web-build-" + wCode }, pre); process.exit(2); }
     if (Date.now() >= deadline) { logBoth("FATAL build budget exceeded after web"); writeBuildManifest(false, { error: "budget-web" }, pre); process.exit(2); }
@@ -548,7 +576,7 @@ async function cmdBuild() {
     let aOut = "", aErr = "";
     a.stdout.on("data", (d) => { aOut += String(d); });
     a.stderr.on("data", (d) => { aErr += String(d); });
-    const aCode = await new Promise((resolve) => { const to = setTimeout(() => { try { a.kill(); } catch (e) {} resolve(124); }, Math.max(1000, deadline - Date.now())); a.on("close", (c) => { clearTimeout(to); resolve(c); }); a.on("error", () => { clearTimeout(to); resolve(127); }); });
+    const aCode = await new Promise((resolve) => { const to = setTimeout(() => { try { a.kill(); } catch (e) {} resolve(124); }, Math.max(1, deadline - Date.now())); a.on("close", (c) => { clearTimeout(to); resolve(c); }); a.on("error", () => { clearTimeout(to); resolve(127); }); });
     try { fs.appendFileSync(apiLog, aOut + "\n" + aErr); } catch (e) {}
     if (aCode !== 0) { logBoth("FATAL dotnet publish failed code=" + aCode); writeBuildManifest(false, { error: "dotnet-publish-" + aCode }, pre); process.exit(2); }
     const distDir = path.join(REPO, "web", "dist");
@@ -561,6 +589,9 @@ async function cmdBuild() {
       logBoth("staged wwwroot from web/dist");
     } catch (e) { logBoth("FATAL wwwroot stage failed: " + String((e && e.message) || e).slice(0, 160)); writeBuildManifest(false, { error: "wwwroot-stage" }, pre); process.exit(2); }
     verifyPublishedEndpointConfigStrict();
+    const postInputs = prodInputFiles();
+    const postHashes = hashMap(postInputs, REPO);
+    if (JSON.stringify(postHashes) !== JSON.stringify(pre.inputHashes)) { logBoth("FATAL production inputs drifted during build (rebuild from clean)"); writeBuildManifest(false, { error: "input-drift-during-build" }, pre); process.exit(2); }
     const m = writeBuildManifest(true, {}, pre);
     logBoth("own build ok commit=" + m.commit.slice(0,12) + " dll=" + String(m.outputs.dllSha).slice(0,12) + " wwwroot=" + String(m.outputs.wwwrootSha).slice(0,12) + " elapsed=" + (Date.now() - t0));
   } catch (e) {
@@ -584,8 +615,8 @@ async function cmdStart() {
   try { fs.mkdirSync(KEYRING, { recursive: true }); } catch (e) {}
   let stale = null; try { stale = JSON.parse(fs.readFileSync(PIDFILE, "utf8")); } catch (e) {}
   if (stale && (Number(stale.apiPid) > 0 || Number(stale.fakePid) > 0)) {
-    const aCur = procIdentity(Number(stale.apiPid) || 0, Math.max(1000, Math.min(8000, startDeadline - Date.now())));
-    const fCur = procIdentity(Number(stale.fakePid) || 0, Math.max(1000, Math.min(8000, startDeadline - Date.now())));
+    const aCur = procIdentityBounded(Number(stale.apiPid) || 0, startDeadline);
+    const fCur = procIdentityBounded(Number(stale.fakePid) || 0, startDeadline);
     const aOwned = stale.apiIdent && aCur.status === "alive" && identityMatches(stale.apiIdent, aCur, "api");
     const fOwned = stale.fakeIdent && fCur.status === "alive" && identityMatches(stale.fakeIdent, fCur, "fake");
     if (aOwned || fOwned) { console.log("FATAL refuse: pidfile owns live children (creation-identity match)"); process.exit(2); }
@@ -603,6 +634,12 @@ async function cmdStart() {
   if (aOpen || fOpen) { console.log("FATAL refuse: occupied ports"); process.exit(2); }
   const env = apiEnv();
   assertControlledEnv(env);
+  const apiHost = apiHostAbs();
+  const fakeHost = fakeHostAbs();
+  if (!apiHost || !path.isAbsolute(String(apiHost))) { console.log("FATAL api host unresolved (fail-closed, no bare dotnet fallback)"); process.exit(2); }
+  if (!fakeHost || !path.isAbsolute(String(fakeHost))) { console.log("FATAL fake host unresolved (fail-closed, no bare node fallback)"); process.exit(2); }
+  const controllerIdentLive0 = procIdentityBounded(controllerPid, startDeadline);
+  if (!controllerIdentLive0 || controllerIdentLive0.status !== "alive") { console.log("FATAL controller identity UNAVAILABLE before spawn (cannot prove ownership); status=" + String(controllerIdentLive0 && controllerIdentLive0.status)); process.exit(2); }
   const nonce = Date.now().toString(36) + "-" + Math.floor(Math.random() * 16777215).toString(16);
   const apiLog = fs.openSync(path.join(LOGDIR, "api-15396.log"), "a");
   const apiErr = fs.openSync(path.join(LOGDIR, "api-15396.err.log"), "a");
@@ -622,7 +659,7 @@ async function cmdStart() {
     process.exit(code || 2);
   }
   try {
-    api = track(spawn(apiHostAbs(), [EXPECTED_API_DLL], { cwd: API_DIR, env: env, detached: false, stdio: ["ignore", apiLog, apiErr], windowsHide: true }));
+    api = track(spawn(apiHost, [EXPECTED_API_DLL], { cwd: API_DIR, env: env, detached: false, stdio: ["ignore", apiLog, apiErr], windowsHide: true }));
   } catch (e) { console.log("FATAL api spawn threw: " + String((e && e.message) || e).slice(0,160)); await cleanupFresh("api-spawn-throw", null); process.exit(2); }
   try {
     api.on("error", () => { if (supervisionActive && !stopping) failCleanupAndExit("api-error", 2); });
@@ -631,7 +668,7 @@ async function cmdStart() {
   let fakeLogFd = null;
   try {
     fakeLogFd = fs.openSync(path.join(LOGDIR, "fake-15398.log"), "a");
-    fake = track(spawn(fakeHostAbs(), [EXPECTED_FAKE_JS, "--port", String(FAKE_PORT)], { cwd: REPO, env: process.env, detached: false, stdio: ["ignore", fakeLogFd, fakeLogFd], windowsHide: true }));
+    fake = track(spawn(fakeHost, [EXPECTED_FAKE_JS, "--port", String(FAKE_PORT)], { cwd: REPO, env: process.env, detached: false, stdio: ["ignore", fakeLogFd, fakeLogFd], windowsHide: true }));
   } catch (e) { console.log("FATAL fake spawn threw: " + String((e && e.message) || e).slice(0,160)); await cleanupFresh("fake-spawn-throw", null); process.exit(2); }
   try {
     fake.on("error", () => { if (supervisionActive && !stopping) failCleanupAndExit("fake-error", 2); });
@@ -651,8 +688,8 @@ async function cmdStart() {
   let boot = { ok: false };
   try {
     await sleep(800);
-    const apiIdentLive = procIdentity(api.pid, Math.max(1000, Math.min(8000, startDeadline - Date.now())));
-    const fakeIdentLive = procIdentity(fake.pid, Math.max(1000, Math.min(8000, startDeadline - Date.now())));
+    const apiIdentLive = procIdentityBounded(api.pid, startDeadline);
+    const fakeIdentLive = procIdentityBounded(fake.pid, startDeadline);
     if (apiIdentLive.status === "unavailable" || fakeIdentLive.status === "unavailable") {
       console.log("FATAL child identity UNAVAILABLE immediately after spawn (retain, no kill ambiguity)");
       try { fs.writeFileSync(FAILFILE, JSON.stringify({ at: Date.now(), api: apiIdentLive, fake: fakeIdentLive })); } catch (e) {}
@@ -664,15 +701,21 @@ async function cmdStart() {
       await cleanupFresh("identity-mismatch", null);
       process.exit(2);
     }
-    const rec = { apiPid: api.pid, fakePid: fake.pid, apiIdent: apiIdentLive, fakeIdent: fakeIdentLive, startedAt: Date.now(), nonce: nonce, controllerPid: controllerPid, commit: prov.build.commit, startHead: prov.startHead, instance: EXPECTED_INSTANCE, manifest: { dllSha: prov.build.outputs.dllSha, wwwrootSha: prov.build.outputs.wwwrootSha, qaSha: prov.build.qaSha, fakeSha: prov.build.fakeSha, helperSha: prov.build.helperSha } };
+    const rec = { apiPid: api.pid, fakePid: fake.pid, apiIdent: apiIdentLive, fakeIdent: fakeIdentLive, startedAt: Date.now(), nonce: nonce, controllerPid: controllerPid, controllerIdent: controllerIdentLive0, commit: prov.build.commit, startHead: prov.startHead, instance: EXPECTED_INSTANCE, manifest: { dllSha: prov.build.outputs.dllSha, wwwrootSha: prov.build.outputs.wwwrootSha, qaSha: prov.build.qaSha, fakeSha: prov.build.fakeSha, helperSha: prov.build.helperSha } };
     try { fs.writeFileSync(PIDFILE, JSON.stringify(rec)); } catch (e) { console.log("FATAL pidfile write failed"); await cleanupFresh("pidfile-write-fail", null); process.exit(2); }
     try { fs.writeFileSync(RUNFILE, JSON.stringify(rec)); } catch (e) {}
-    try { fs.writeFileSync(MANIFESTFILE, JSON.stringify({ nonce: nonce, controllerPid: controllerPid, commit: prov.build.commit, startHead: prov.startHead, at: Date.now(), instance: EXPECTED_INSTANCE, apiPid: api.pid, fakePid: fake.pid, apiIdent: apiIdentLive, fakeIdent: fakeIdentLive, dllSha: prov.build.outputs.dllSha, wwwrootSha: prov.build.outputs.wwwrootSha, qaSha: prov.build.qaSha, fakeSha: prov.build.fakeSha, helperSha: prov.build.helperSha })); } catch (e) {}
+    try { fs.writeFileSync(MANIFESTFILE, JSON.stringify({ nonce: nonce, controllerPid: controllerPid, controllerIdent: controllerIdentLive0, commit: prov.build.commit, startHead: prov.startHead, at: Date.now(), instance: EXPECTED_INSTANCE, apiPid: api.pid, fakePid: fake.pid, apiIdent: apiIdentLive, fakeIdent: fakeIdentLive, dllSha: prov.build.outputs.dllSha, wwwrootSha: prov.build.outputs.wwwrootSha, qaSha: prov.build.qaSha, fakeSha: prov.build.fakeSha, helperSha: prov.build.helperSha })); } catch (e) {}
     console.log("spawned api=" + api.pid + " fake=" + fake.pid + " nonce=" + nonce + " controller=" + controllerPid);
     try { boot = await waitBoot(startDeadline); }
     catch (e) { console.log("FATAL boot threw: " + String((e && e.message) || e).slice(0,160)); await cleanupFresh("boot-throw", rec); process.exit(2); }
     if (!boot.ok) { console.log("FATAL boot verification failed within deadline"); await cleanupFresh("boot-expiry", rec); process.exit(2); }
     if (boot.fakeEntries !== 0) { console.log("FATAL refuse: fake not fresh"); await cleanupFresh("fake-not-fresh", rec); process.exit(2); }
+    const ctrlCur = procIdentityBounded(controllerPid, startDeadline);
+    const apiCur = procIdentityBounded(api.pid, startDeadline);
+    const fakeCur = procIdentityBounded(fake.pid, startDeadline);
+    if (!ctrlCur || ctrlCur.status !== "alive" || !apiCur || apiCur.status !== "alive" || !fakeCur || fakeCur.status !== "alive") { console.log("FATAL pre-handoff identity UNAVAILABLE (controller=" + String(ctrlCur && ctrlCur.status) + " api=" + String(apiCur && apiCur.status) + " fake=" + String(fakeCur && fakeCur.status) + "); retaining"); await cleanupFresh("pre-handoff-unavailable", rec); process.exit(2); }
+    if (!controllerMatches(controllerIdentLive0, ctrlCur)) { console.log("FATAL controller identity changed before handoff (creation/cmd/exe mismatch)"); await cleanupFresh("controller-changed", rec); process.exit(2); }
+    if (!identityMatches(apiIdentLive, apiCur, "api") || !identityMatches(fakeIdentLive, fakeCur, "fake")) { console.log("FATAL child identity changed before handoff (creation/cmd/exe mismatch)"); await cleanupFresh("child-changed", rec); process.exit(2); }
     console.log("boot ok instance=" + boot.health.instance + " store=" + boot.ready.store + " manifest dll=" + String(prov.build.outputs.dllSha).slice(0,12) + " qa=" + String(prov.build.qaSha).slice(0,12));
   } catch (e) {
     console.log("FATAL start threw: " + String((e && e.message) || e).slice(0, 200));
@@ -692,13 +735,13 @@ async function cmdStop() {
     const cur = procIdentityBounded(pid, stopDeadline);
     if (cur.status === "absent") { console.log("skip " + name + " pid=" + pid + " already dead (absent)"); continue; }
     if (cur.status === "unavailable") {
-      const fb = procNameFallback(pid);
+      const fb = procNameFallbackBounded(pid, stopDeadline);
       console.log("retain " + name + " pid=" + pid + " identity UNAVAILABLE (query failed; fallback=" + fb + "); not killing, retaining metadata");
       unavailableSeen = true;
       continue;
     }
     if (!recorded || !recorded.creation || recorded.status !== "alive") {
-      const fb = procNameFallback(pid);
+      const fb = procNameFallbackBounded(pid, stopDeadline);
       console.log("refuse " + name + " pid=" + pid + " (no recorded creation identity; fallback=" + fb + " insufficient for ownership)");
       refusedReuse = true;
       continue;
@@ -742,7 +785,26 @@ async function cmdStop() {
   try { fs.unlinkSync(PIDFILE); } catch (e) {}
   try { if (fs.existsSync(FAILFILE)) fs.unlinkSync(FAILFILE); } catch (e) {}
 }
-async function cmdStatus() { const deadline = Date.now() + 15000; const h = await getJson(WEB + "/health", 5000, deadline); const r = await getJson(WEB + "/ready", 5000, deadline); const f = await getJson(FAKE + "/__log", 5000, deadline); console.log("health=" + h.status + " instance=" + ((h.json && h.json.instance) || "?") + " ready=" + r.status + " store=" + ((r.json && r.json.store) || "?") + " fake=" + f.status); }
+async function cmdStatus() {
+  const deadline = Date.now() + 15000;
+  let rec = null;
+  try { rec = JSON.parse(fs.readFileSync(PIDFILE, "utf8")); } catch (e) { rec = null; }
+  if (!rec) { try { rec = JSON.parse(fs.readFileSync(MANIFESTFILE, "utf8")); } catch (e) { rec = null; } }
+  if (rec && (Number(rec.apiPid) > 0 || Number(rec.fakePid) > 0 || Number(rec.controllerPid) > 0)) {
+    const cCur = procIdentityBounded(Number(rec.controllerPid) || 0, deadline);
+    const aCur = procIdentityBounded(Number(rec.apiPid) || 0, deadline);
+    const fCur = procIdentityBounded(Number(rec.fakePid) || 0, deadline);
+    const cOk = rec.controllerIdent && cCur.status === "alive" && controllerMatches(rec.controllerIdent, cCur);
+    const aOk = rec.apiIdent && aCur.status === "alive" && identityMatches(rec.apiIdent, aCur, "api");
+    const fOk = rec.fakeIdent && fCur.status === "alive" && identityMatches(rec.fakeIdent, fCur, "fake");
+    if (cCur.status === "unavailable" || aCur.status === "unavailable" || fCur.status === "unavailable") { console.log("status REFUSED identity UNAVAILABLE controller=" + cCur.status + " api=" + aCur.status + " fake=" + fCur.status + " (cannot prove liveness; retaining)"); process.exit(2); }
+    if (!cOk || !aOk || !fOk) { console.log("status REFUSED identity mismatch controller=" + String(!!cOk) + " api=" + String(!!aOk) + " fake=" + String(!!fOk) + " (PID reuse or restart; not accepted)"); process.exit(2); }
+    console.log("status identity verified controller=" + cCur.pid + " api=" + aCur.pid + " fake=" + fCur.pid);
+  } else {
+    console.log("status no recorded identities (stack down or never started)");
+  }
+  const h = await getJson(WEB + "/health", 5000, deadline); const r = await getJson(WEB + "/ready", 5000, deadline); const f = await getJson(FAKE + "/__log", 5000, deadline); console.log("health=" + h.status + " instance=" + ((h.json && h.json.instance) || "?") + " ready=" + r.status + " store=" + ((r.json && r.json.store) || "?") + " fake=" + f.status);
+}
 const cmd = String(process.argv[2] || "");
 if (cmd === "start") { cmdStart().catch((e) => { console.log("FATAL " + String((e && e.message) || e).slice(0, 200)); process.exit(2); }); }
 else if (cmd === "stop") { cmdStop().catch((e) => { console.log("FATAL " + String((e && e.message) || e).slice(0, 200)); process.exit(2); }); }
