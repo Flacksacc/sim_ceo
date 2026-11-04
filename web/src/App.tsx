@@ -1548,12 +1548,6 @@ export default function App() {
   // Initialized from the module transport so a remount keeps the same applied identity.
   const [appliedActAs, setAppliedActAs] = useState(() => { try { return typeof actAs === "string" ? actAs : ""; } catch { return ""; } });
   const [mq, setMq] = useState("");
-  // Meeting selector starts collapsed on narrow viewports so the toolbar,
-  // first messages, and composer are visible on load; desktop starts open.
-  // One collection only: filters + agenda nav stay inside, expandable.
-  const [meetNavOpen, setMeetNavOpen] = useState<boolean>(() => {
-    try { return !window.matchMedia("(max-width: 820px)").matches; } catch { return true; }
-  });
   const [mstate, setMstate] = useState("");
   const [uday, setUday] = useState("");
   const [ufrom, setUfrom] = useState("");
@@ -2216,9 +2210,9 @@ export default function App() {
   const listpanelScroll = useRef<Record<string, number>>({});
   useEffect(() => {
     const el = listpanelRowsRef.current;
-    const saved = listpanelScroll.current[tab];
-    if (el && saved) el.scrollTop = saved;
-  }, [tab]);
+    const saved = listpanelScroll.current[tab === "roster" ? "roster" : boardId || "boards"];
+    if (el) el.scrollTop = saved ?? 0;
+  }, [tab, boardId]);
   const [pill, setPill] = useState({ top: 0, height: 0, show: false });
   const [navTip, setNavTip] = useState<{ label: string; top: number; left: number } | null>(null);
   const showNavTip = (label: string, el: HTMLElement) => {
@@ -2314,7 +2308,7 @@ export default function App() {
         const i = e.key === "0" ? 9 : Number(e.key) - 1;
         const visible = navGroups
           .flatMap((g) => g.items)
-          .filter(([k]) => boardId || !needsBoard.includes(k));
+          .filter(([k]) => !needsBoard.includes(k));
         if (i < visible.length) {
           e.preventDefault();
           setTab(visible[i][0]);
@@ -6135,8 +6129,14 @@ const testModel = useMutation({
       window.removeEventListener("popstate", apply);
     };
   });
+  const showBoardMeetings = !!boardId && (tab === "boards" || needsBoard.includes(tab));
+  const showListPanel = showBoardMeetings || tab === "boards" || tab === "roster";
+  const sidebarMeetings = isGuest ? (meetingOk && curMeeting ? [curMeeting] : []) : meetings.data ?? [];
+  const backToBoards = () => {
+    setMeetingId(""); setRecId(""); setMeetPicks([]); setBoardId(""); setTab("boards");
+  };
   return (
-    <div className={"shell" + (navOpen ? " nav-open" : "") + (tab === "boards" || tab === "roster" ? "" : " no-panel")}>
+    <div className={"shell" + (navOpen ? " nav-open" : "") + (showListPanel ? "" : " no-panel")}>
       {" "}
       <nav
         className="rail"
@@ -6175,7 +6175,7 @@ const testModel = useMutation({
           />{" "}
           {navGroups.map((g, gi) => {
             const items = g.items.filter(
-              ([k]) => boardId || !needsBoard.includes(k),
+              ([k]) => !needsBoard.includes(k),
             );
             if (items.length === 0) return null;
             return (
@@ -6278,30 +6278,38 @@ const testModel = useMutation({
         </div>{" "}
       </nav>{" "}
 
-      {(tab === "boards" || tab === "roster") && (
+      {showListPanel && (
         <aside
           className="listpanel"
-          aria-label={tab === "boards" ? "Boards" : tab === "roster" ? "Roster" : "Meetings"}
+          aria-label={showBoardMeetings ? "Board meetings" : tab === "roster" ? "Roster" : "Boards"}
         >
           {" "}
           <div className="listpanel-head">
             {" "}
             <div className="listpanel-title">
-              {tab === "boards" ? "Boards" : tab === "roster" ? "Roster" : "Meetings"}
+              {showBoardMeetings ? <div className="board-meeting-heading">
+                <button type="button" className="btn ghost icon" aria-label="Back to boards" title="Back to boards" onClick={backToBoards}>←</button>
+                <span>{boardDenied ? "Board unavailable" : boardDetail.data?.name ?? "Loading board…"}</span>
+              </div> : tab === "roster" ? "Roster" : "Boards"}
             </div>{" "}
             <div className="listpanel-sub">
-              {tab === "boards"
-                ? (boards.isLoading || boards.data === undefined ? `... boards` : `${scopeRows.length} boards`)
-                : tab === "roster"
-                  ? `${(rosterNames.data ?? []).length} people`
-                  : `${(meetings.data ?? []).length} meetings`}{" "}
-              {tab !== "boards" && boardId && (
-                <>
-                  {" "}· {boardDetail.data?.name ?? (boards.data ?? []).find((b) => b.id === boardId)?.name ?? "Board"}{" "}
-                </>
-              )}{" "}
+              {showBoardMeetings
+                ? `${sidebarMeetings.length} meetings`
+                : tab === "roster" ? `${(rosterNames.data ?? []).length} people`
+                : boards.isLoading || boards.data === undefined ? "Loading boards…" : `${scopeRows.length} boards`}
             </div>{" "}
           </div>{" "}
+          {showBoardMeetings && boardOk && !boardDenied && !isGuest && (
+            <div className="listpanel-filters">
+              <input aria-label="Search meetings" placeholder="Search meetings" value={mq} onChange={e => setMq(e.target.value)} />
+              <select aria-label="Meeting state filter" value={mstate} onChange={e => setMstate(e.target.value)}>
+                <option value="">All states</option>
+                <option value="AwaitingBrief">Awaiting brief</option><option value="Active">Active</option>
+                <option value="Paused">Paused</option><option value="WrappingUp">Wrapping up</option>
+                <option value="ClosedWithRecord">Closed with record</option><option value="ClosedWithoutPublication">Closed without publication</option>
+              </select>
+            </div>
+          )}
           {tab === "roster" && (
             <div className="listpanel-filters">
               {" "}
@@ -6316,9 +6324,9 @@ const testModel = useMutation({
               <input aria-label="Tag filter" placeholder="tag" value={rtag} onChange={(e) => setRtag(e.target.value)} />{" "}
             </div>
           )}{" "}
-          <div className="listpanel-rows" role="list" ref={listpanelRowsRef} onScroll={(e) => { listpanelScroll.current[tab] = e.currentTarget.scrollTop; }}>
+          <div className="listpanel-rows" role="list" ref={listpanelRowsRef} onScroll={(e) => { listpanelScroll.current[tab === "roster" ? "roster" : boardId || "boards"] = e.currentTarget.scrollTop; }}>
             {" "}
-            {tab === "boards" &&
+            {tab === "boards" && !showBoardMeetings &&
               scopeRows.map((b) => (
                 <button
                   key={b.id}
@@ -6327,16 +6335,32 @@ const testModel = useMutation({
                   className={b.id === boardId ? "lprow active" : "lprow"}
                   title={b.mission || b.name}
                   aria-current={b.id === boardId ? "true" : undefined}
-                  onClick={() => setBoardId(b.id)}
+                  onClick={() => { setBoardId(b.id); setMeetingId(""); setMq(""); setMstate(""); }}
                 >
                   {" "}
                   <span className="lprow-name">{b.name}</span>{" "}
                   <span className="lprow-sub">{b.mission || "No mission yet"}</span>{" "}
                 </button>
               ))}{" "}
-            {tab === "boards" && !boards.isLoading && !boards.isError && boards.data !== undefined && scopeRows.length === 0 && (
+            {tab === "boards" && !showBoardMeetings && !boards.isLoading && !boards.isError && boards.data !== undefined && scopeRows.length === 0 && (
               <div className="sub-empty">{boardScope === "archived" ? "No archived boards." : boardScope === "all" ? "No boards in this view." : "No boards yet"}</div>
             )}{" "}
+            {showBoardMeetings && boardOk && !boardDenied && <>
+              {sidebarMeetings.map(m => <button key={m.id} type="button" role="listitem"
+                className={m.id === meetingId ? "lprow active" : "lprow"}
+                aria-current={m.id === meetingId ? "true" : undefined}
+                onClick={() => { setMeetingId(m.id); setTab("meet"); setNavOpen(false); }}>
+                <span className="lprow-name">{m.title}</span>
+                <span className="lprow-sub">{meetingStateLabel(m.state)}</span>
+              </button>)}
+              {!isGuest && meetings.isLoading && <p className="sub-empty" role="status">Loading meetings…</p>}
+              {!isGuest && meetings.isError && <div className="sub-empty" role="alert">Could not load meetings. <button type="button" onClick={() => meetings.refetch()}>Try again</button></div>}
+              {!meetings.isLoading && !meetings.isError && sidebarMeetings.length === 0 && <p className="sub-empty">{mq || mstate ? "No meetings match these filters." : "No meetings yet."}</p>}
+              {canManageBoard && <button type="button" className="lprow create" disabled={createMeeting.isPending}
+                onClick={() => { setMq(""); setMstate(""); setTab("meet"); createMeeting.mutate(); }}>
+                <span className="lprow-name">{createMeeting.isPending ? "Creating…" : "+ New meeting"}</span>
+              </button>}
+            </>}
             {tab === "roster" &&
               (rosterNames.data ?? []).map((r) => (
                 <button
@@ -6452,6 +6476,15 @@ const testModel = useMutation({
               <p role="status">Session verification pending — private content is hidden until the current session is verified. Unsent per-account drafts are preserved for re-authentication.</p>
             </section>
           ) : (<>
+          {showBoardMeetings && boardOk && !boardDenied && (
+            <details className="board-tools">
+              <summary>Board settings</summary>
+              <nav aria-label="Board tools">
+                {([["boards", "Board overview"], ["advisors", "Board Advisors"], ["sources", "Sources"], ["records", "Records"], ["people", "People"], ["activity", "Activity"]] as [Tab, string][]).map(([key, label]) =>
+                  <button key={key} type="button" className={tab === key ? "btn primary" : "btn ghost"} aria-current={tab === key ? "page" : undefined} onClick={e => { setTab(key); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{label}</button>)}
+              </nav>
+            </details>
+          )}
           {tab === "boards" && (
             <section aria-label="Boards">
               <AuthPanel />
@@ -8174,73 +8207,7 @@ const testModel = useMutation({
                   ) : (
                     <>
                   {" "}
-                  <details className="meet-left" open={meetNavOpen} onToggle={(e) => { try { setMeetNavOpen((e.target as HTMLDetailsElement).open); } catch {} }}>
-                    {" "}
-                    <summary>Meetings ({(meetings.data ?? []).length}) — {curMeeting?.title ?? "Select a meeting"}</summary>{" "}
-                    <input
-                      aria-label="Search meetings"
-                      placeholder="Search title or brief"
-                      value={mq}
-                      onChange={(e) => setMq(e.target.value)}
-                    />{" "}
-                    <select
-                      aria-label="State filter"
-                      value={mstate}
-                      onChange={(e) => setMstate(e.target.value)}
-                    >
-                      {" "}
-                      <option value="">All states</option>{" "}
-                      <option value="AwaitingBrief">Awaiting brief</option>{" "}
-                      <option value="Active">Active</option>{" "}
-                      <option value="Paused">Paused</option>{" "}
-                      <option value="WrappingUp">Wrapping up</option>{" "}
-                      <option value="ClosedWithRecord">
-                        {" "}
-                        Closed with record{" "}
-                      </option>{" "}
-                      <option value="ClosedWithoutPublication">
-                        {" "}
-                        Closed without publication{" "}
-                      </option>{" "}
-                    </select>{" "}
-                    <ol className="agenda" aria-label="Meetings">
-                      {" "}
-                      {(meetings.data ?? []).map((m, i) => (
-                        <li key={m.id}>
-                          {" "}
-                          <button
-                            type="button"
-                            className={m.id === meetingId ? "active" : ""}
-                            aria-current={
-                              m.id === meetingId ? "true" : undefined
-                            }
-                            onClick={() => setMeetingId(m.id)}
-                          >
-                            {" "}
-                            <span className="agenda-n" aria-hidden="true">
-                              {" "}
-                              {i + 1}{" "}
-                            </span>{" "}
-                            <span className="agenda-t" title={m.title}>
-                              {" "}
-                              {m.title}{" "}
-                            </span>{" "}
-                          </button>{" "}
-                        </li>
-                      ))}{" "}
-                    </ol>{" "}
-                    {(meetings.data ?? []).length === 0 &&
-                      (allMeetings.data ?? []).length === 0 && (
-                        <p>{isGuest ? "Your assigned meeting is open in the discussion panel." : "No meetings yet"}</p>
-                      )}{" "}
-                    {(meetings.data ?? []).length === 0 &&
-                      (allMeetings.data ?? []).length > 0 && (
-                        <p role="status">
-                          No meetings match this filter — the open meeting
-                          stays selected below.
-                        </p>
-                      )}{" "}
-                  </details>{" "}
+
                   {meetingDenied ? (
                     <div className="card" role="alert">
                       {" "}

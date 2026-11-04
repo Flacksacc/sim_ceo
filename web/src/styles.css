@@ -509,6 +509,11 @@ button.active .nav-badge { background: var(--sidebar-ink); border-color: var(--s
 .listpanel { background: var(--sidebar); color: var(--sidebar-ink); border-right: 1px solid var(--sidebar-border); display: flex; flex-direction: column; min-height: 0; height: 100dvh; position: sticky; top: 0; overflow: hidden; }
 .listpanel-head { padding: 16px 14px 10px; border-bottom: 1px solid var(--sidebar-border); }
 .listpanel-title { font-size: 0.95rem; font-weight: 650; }
+.board-meeting-heading { display: flex; align-items: center; gap: 8px; }
+.board-meeting-heading span { min-width: 0; overflow-wrap: anywhere; }
+.board-tools { margin-bottom: 16px; }
+.board-tools summary { cursor: pointer; font-weight: 600; width: fit-content; }
+.board-tools nav { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 10px; }
 .listpanel-sub { font-size: 0.75rem; color: var(--sidebar-muted); margin-top: 2px; }
 .listpanel-rows { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
 .lprow { display: flex; flex-direction: column; align-items: stretch; gap: 1px; width: 100%; text-align: left; background: none; border: none; border-radius: 8px; padding: 8px 10px; cursor: pointer; color: var(--sidebar-ink); min-height: 0; }

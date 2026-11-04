@@ -2654,13 +2654,8 @@ async function scanDebug(tag) {
   ok("debug-clean-" + tag, detClean && controlsOk, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " controls=" + controlsOk);
 }
 async function stepNavigation() {
-  // F11: EVERY named rail destination (repo convention: nav.rail buttons by
-  // exact name, hash arrival with board context, as in qa/navigation.cjs). No
-  // skipped destinations: arrived must equal total.
-  // 11 rail destinations + 1 direct-only wizard (navGroups has no wizard/Create rail button:
-  // inventing a 12th rail control would be wrong) with SCOPED heading+section+owned entity.
-  // Dedicated Nav matrix (247/2, source 941, second wizard fix rerun pending) covers deep/back-forward/mobile;
-  // this integration proves real API-backed arrival at every destination with actual headings/entities.
+  // Global destinations stay in the rail; board tools and meeting selection
+  // use their visible controls. Every destination still proves scoped content.
   const dests = [
     { label: "Boards", seg: "boards", sec: 'section[aria-label="Boards"]', head: "Boards", entity: run + "-ab" },
     { label: "Roster", seg: "roster", sec: 'section[aria-label="My Advisor Roster"]', head: null, entity: rosterName },
@@ -2678,6 +2673,19 @@ async function stepNavigation() {
   if (!boardA) failExit("navigation requires owned board context; boardA missing.");
   await gotoTab(boardHash("advisors"));
   ok("nav-board-context-restored", (await ev(() => location.hash).catch(() => "")).includes("board=" + encodeURIComponent(boardA)), "owned board context route mounted before rail loop");
+  await page.getByRole('button', { name: 'Back to boards', exact: true }).click();
+  const boardList = page.locator('aside[aria-label="Boards"]');
+  await boardList.waitFor();
+  const globalRail = await page.locator('nav.rail .rail-items button').allTextContents();
+  await boardList.getByRole('listitem').filter({ hasText: run + '-ab' }).click();
+  const meetingList = page.locator('aside[aria-label="Board meetings"]');
+  await meetingList.waitFor();
+  ok('nav-board-drilldown-heading', (await meetingList.locator('.listpanel-title').innerText()).includes(run + '-ab'), 'Board name appears beside back arrow');
+  ok('nav-global-rail-stable', JSON.stringify(globalRail) === JSON.stringify(await page.locator('nav.rail .rail-items button').allTextContents()), 'Selecting a board adds no global rail buttons');
+  await meetingList.getByRole('listitem').filter({ hasText: run + ' harbor call' }).click();
+  await page.locator('section[aria-label="Meetings and conversation"] .meet-center').waitFor();
+  ok('nav-meeting-drilldown-chat', (await ev(() => location.hash)).startsWith('#/meet') && (await ev(() => location.hash)).includes(meetingId), 'Meeting click opens its conversation route');
+  ok('nav-single-meeting-list', await page.locator('.meet-left').count() === 0 && await meetingList.isVisible(), 'One meeting list remains in the sidebar');
   async function assertDest(d) {
     assertDeadline("nav-assert-" + d.seg);
     const secLoc = page.locator(d.sec).first();
@@ -2717,6 +2725,14 @@ async function stepNavigation() {
       await gotoBounded(WEB + "/#/wizard", "nav-goto").catch(() => null);
       await wft(900);
       clicked = true;
+    } else if (["advisors", "sources", "records", "people", "activity"].includes(d.seg)) {
+      if (!await page.locator('.board-tools').isVisible()) await locClick(page.locator('nav.rail').getByRole('button', { name: 'Boards', exact: true }), 'nav-board-tools-return');
+      await locClick(page.locator('.board-tools summary'), 'nav-open-board-tools');
+      await locClick(page.getByRole('navigation', { name: 'Board tools', exact: true }).getByRole('button', { name: d.label, exact: true }), 'nav-board-tool-' + d.seg);
+      clicked = true;
+    } else if (d.seg === 'meet') {
+      await locClick(page.locator('aside[aria-label="Board meetings"]').getByRole('listitem').filter({ hasText: run + ' harbor call' }), 'nav-select-meeting');
+      clicked = true;
     } else {
       try { await locClick(page.locator("nav.rail").getByRole("button", { name: d.label, exact: true }), "nav-click-" + d.seg); clicked = true; }
       catch {
@@ -2724,8 +2740,8 @@ async function stepNavigation() {
       }
     }
     if (d.seg === "wizard") { console.log("  note - nav-wizard-direct-only (no rail button by design; direct visit, not rail coverage)"); }
-    else { ok("nav-rail-clickable-" + d.seg, clicked, "rail control " + d.label + " clickable=" + clicked); }
-    if (!clicked) failExit("nav rail prerequisite failed at " + d.seg + "; rail failure recorded separately from direct-route success (no Create fallback counts).");
+    else { ok("nav-control-clickable-" + d.seg, clicked, "visible navigation control " + d.label + " clickable=" + clicked); }
+    if (!clicked) failExit("navigation prerequisite failed at " + d.seg);
     await wft(900);
     const r = await assertDest(d);
     if (r.ok) arrived++;
@@ -2733,8 +2749,8 @@ async function stepNavigation() {
     if (!r.ok) failExit("destination " + d.seg + " must render scoped heading+section+entity; " + r.detail);
     await scanDebug("nav-" + d.seg);
   }
-  ok("nav-all-destinations", arrived === dests.length, "rail=11 + wizard-direct-only=1 total=" + arrived + "/" + dests.length);
-  if (arrived !== dests.length) failExit("navigation must reach 11 rail destinations plus direct-only wizard with board context.");
+  ok("nav-all-destinations", arrived === dests.length, "global rail, board tools, meetings and direct-only wizard total=" + arrived + "/" + dests.length);
+  if (arrived !== dests.length) failExit("navigation must reach every destination with board context.");
   // Direct routes use the SAME scoped predicates as the rail loop.
   await gotoBounded(WEB + "/#/boards", "nav-goto").catch(() => null);
   await wft(900);
