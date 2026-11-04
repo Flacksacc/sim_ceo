@@ -967,3 +967,25 @@ Healthy localhost:5173 image:
 Backup `.tmp/update-20261104-194442-UTC-b504a30a`; original DB/volumes retained.
 Published source to https://github.com/Flacksacc/sim_ceo. Owned QA services and
 browsers stopped; no agents used; tmp.txt untouched; broader parity goal paused.
+
+### 2026-11-04 — Rename meetings from the header
+
+Implemented `47746db`: meeting header has Rename meeting with an inline name
+field and Save/Cancel controls (Enter saves, Escape cancels, blank names blocked).
+The header's New meeting button and helper copy are removed; sidebar creation
+remains. Rename sends a title-only PATCH and refreshes the selected heading,
+sidebar and settings title. The response stays bound to its originating meeting
+and user. Failed saves preserve edits; settings hydration now tracks title changes.
+
+Frontend/release builds passed. Native browser/API checks in
+`qa/meeting-name-qa.mjs` passed persistence/reload, sidebar/settings updates,
+blank/cancel/error handling, title-only payload, unchanged brief/participants/
+state/history, switching meetings during a delayed save, and mobile layout:
+`.tmp/meeting-name-qa.log`. Live light/dark desktop and mobile checks passed
+without actual meeting writes or page errors (`.tmp/meeting-name-live-check.log`).
+
+Healthy localhost:5173 image:
+`sha256:7abe633294f9143fccadba2453aad84b5a7afa4fe5917312f0bed8ec66465c80`.
+Backup `.tmp/update-20261104-195210-UTC-ba3f0dbc`; original DB/volumes retained.
+Source pushed to Flacksacc/sim_ceo. Owned QA services and browser contexts closed;
+no agents used; tmp.txt untouched; broader parity goal remains paused.
