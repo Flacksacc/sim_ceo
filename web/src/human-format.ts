@@ -249,39 +249,138 @@ export function humanizeOmission(omitted: string[]): string {
 // Wire and snapshot bytes stay server side. These helpers only change what people see.
 const GUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
 const HEX32_RE = /[0-9a-fA-F]{32}/g;
+const NREF_RE = /\bn-[A-Za-z0-9_\-]{3,}\b/g;
+function scrubIds(s: string): string {
+  return (s ?? "").replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference").replace(NREF_RE, "a reference");
+}
+const OMITTED_RE = /\[Omitted from packet[^\]]*\]/g;
 export function stripOmittedManifest(body: string): string {
   const s = body ?? "";
-  const cut = s.replace(/\[Omitted from packet[^\]]*\]/g, "");
+  const cut = s.replace(OMITTED_RE, "");
   return cut.trim();
 }
+function omittedWarning(body: string): string {
+  return OMITTED_RE.test(body ?? "") ? " Some input was omitted from the packet and was not cited." : "";
+}
+// Per-field allowlist for projected JSON. Only these human-meaningful fields
+// render; anything else falls back to a safe neutral line (never raw JSON).
+const TEXT_FIELDS = ["question", "text", "body", "content", "excerpt", "title", "background", "description", "summary", "detail", "strengths", "methods", "evidenceNeeded", "limits", "collaboration"] as const;
+function shortJoin(parts: string[], cap: number): string {
+  const joined = parts.filter((s) => (s ?? "").trim() !== "").join(" / ");
+  if (joined.length <= cap) return joined;
+  const slice = joined.slice(0, cap);
+  const sp = slice.lastIndexOf(" ");
+  return (sp > 40 ? slice.slice(0, sp) : slice) + " ...";
+}
+function valueToText(v: unknown): string {
+  if (typeof v === "string") return scrubIds(v.trim());
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) {
+    const bits = v.map((e) => valueToText(e)).filter((s) => s !== "");
+    return shortJoin(bits, 220);
+  }
+  return "";
+}
+function projectObject(o: Record<string, unknown>, cap: number): string {
+  const bits: string[] = [];
+  if (typeof o.question === "string" && o.question.trim() !== "") bits.push("Question: " + scrubIds(o.question.trim()));
+  for (const k of TEXT_FIELDS) {
+    if (k === "question" || k === "title") continue;
+    const v = o[k];
+    if (typeof v === "string" && v.trim() !== "") {
+      const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : k + ": ";
+      bits.push(label + scrubIds(v.trim()));
+    } else if (Array.isArray(v) && v.length > 0) {
+      const inner = v.map((e) => valueToText(e)).filter((s) => s !== "");
+      if (inner.length > 0) bits.push((k === "text" ? "" : k + ": ") + shortJoin(inner, 160));
+    }
+  }
+  if (bits.length > 0) return shortJoin(bits, cap);
+  return "";
+}
+function projectJson(raw: unknown, cap: number, fallback: string): string {
+  if (typeof raw === "string") {
+    const s = scrubIds(raw.trim());
+    return s === "" ? fallback : s.slice(0, cap);
+  }
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return fallback;
+    const bits = raw.map((e) => {
+      if (e === null || e === undefined) return "";
+      if (typeof e === "string") return scrubIds(e.trim());
+      if (typeof e === "object" && !Array.isArray(e)) return projectObject(e as Record<string, unknown>, 160);
+      return valueToText(e);
+    }).filter((s) => s !== "");
+    if (bits.length === 0) return fallback;
+    return shortJoin(bits, cap);
+  }
+  if (raw !== null && typeof raw === "object") {
+    const hit = projectObject(raw as Record<string, unknown>, cap);
+    return hit === "" ? fallback : hit;
+  }
+  return fallback;
+}
+function tryParseJson(s: string): { ok: boolean; value: unknown } {
+  const t = (s ?? "").trim();
+  if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null };
+  try { return { ok: true, value: JSON.parse(t) }; } catch { return { ok: false, value: null }; }
+}
+export function humanNoteTitle(title: string): string {
+  const t = (title ?? "").trim();
+  if (t === "") return "(untitled note)";
+  const parsed = tryParseJson(t);
+  if (parsed.ok) {
+    const hit = projectJson(parsed.value, 160, "");
+    if (hit !== "") return hit;
+    return "(untitled note)";
+  }
+  return scrubIds(t).slice(0, 160);
+}
 export function humanNoteBody(body: string): string {
-  const base = stripOmittedManifest(body ?? "");
-  if (base === "") return "";
-  return base.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+  const raw = body ?? "";
+  const warn = omittedWarning(raw);
+  const base = stripOmittedManifest(raw);
+  if (base === "") return warn.trim() === "" ? "" : warn.trim();
+  const parsed = tryParseJson(base);
+  if (parsed.ok) {
+    const hit = projectJson(parsed.value, 600, "");
+    const out = (hit === "" ? "Note detail is available in context." : hit) + warn;
+    return out.trim();
+  }
+  return (scrubIds(base) + warn).trim();
 }
 export function humanEvidenceTitle(title: string, kind: string, version: number | null): string {
   const t = (title ?? "").trim();
   if (t === "") return "Supporting excerpt";
+  const parsed = tryParseJson(t);
+  if (parsed.ok) {
+    const hit = projectJson(parsed.value, 160, "");
+    if (hit !== "") return hit;
+    return "Supporting excerpt";
+  }
   const m = t.match(/^record v(\d+)(?:\s*\[.*\])?\s*$/i);
   if (m || kind === "record") {
     const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
     return v !== "" ? "Approved record, version " + v : "Approved record";
   }
-  return t.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+  return scrubIds(t).slice(0, 160);
 }
 export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
   const x = (excerpt ?? "").trim();
   if (x === "") return "";
-  const parts = x.split(/\r?\n/).map((ln) => ln.replace(/^\s*-\s*\[[^\]]*\]\s*/, "").trim()).filter((ln) => ln !== "");
-  const candidate = parts.length > 0 ? parts.join("\n") : x;
-  const c = candidate.trim();
-  if (c.startsWith("{") || c.startsWith("[")) {
-    try { const parsed = JSON.parse(c); void parsed; } catch { /* fall through to text */ }
-    if (c.startsWith("{")) {
-      return kind === "dossier" ? "Advisor profile detail is available on the roster. This excerpt stays hidden in review." : "Supporting detail is available in context. This excerpt stays hidden in review.";
-    }
+  const warn = omittedWarning(x);
+  const noMan = stripOmittedManifest(x);
+  const parts = noMan.split(/\r?\n/).map((ln) => ln.replace(/^\s*-\s*\[[^\]]*\]\s*/, "").trim()).filter((ln) => ln !== "");
+  const candidate = (parts.length > 0 ? parts.join("\n") : noMan).trim();
+  if (candidate === "") return warn.trim();
+  const parsed = tryParseJson(candidate);
+  if (parsed.ok) {
+    const fallback = kind === "dossier" ? "Advisor profile detail is available on the roster." : "Supporting detail is available in context.";
+    const hit = projectJson(parsed.value, 600, "");
+    const out = (hit === "" ? fallback : hit) + warn;
+    return out.trim();
   }
-  return candidate.replace(GUID_RE, "a reference").replace(HEX32_RE, "a reference");
+  return (scrubIds(candidate) + warn).trim();
 }
 export function looksLikeItemsJson(text: string): boolean {
   const t = (text ?? "").trim();

@@ -21,7 +21,7 @@ import { buildPresence, provenanceParts, resolveProvenanceImage } from "./meetin
 import "./roster-integrity.css";
 import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
 import { RecordComparison, RecordItemEditor, RecordVersionRow } from "./human-record-items";
-import { describeHistoryEntry, friendlyError, friendlyRecordStatus, humanEvidenceExcerpt, humanEvidenceTitle, humanizeOmission, humanNoteBody, parseRecordItems } from "./human-format";
+import { describeHistoryEntry, friendlyError, friendlyRecordStatus, humanEvidenceExcerpt, humanEvidenceTitle, humanizeOmission, humanNoteBody, humanNoteTitle, parseRecordItems } from "./human-format";
 import "./human-feedback.css";
 import { convertRecordedBlobToWav } from "./voiceCodec";
 import WikiResources from "./wiki-resources";
@@ -3429,25 +3429,28 @@ const tabCount = (k: Tab): number | null => {
   const [revText, setRevText] = useState("");
   const revTextRev = useRef(0);
   const revTextOwner = useRef("");
-  // Whole-draft ownership retires with its context: board and meeting switches
-  // and record deselect clear the owner so a deliberate same-ID reselect
-  // rehydrates. Same-draft refetches keep the owner and preserve newer typing.
-  useEffect(() => { try { revTextOwner.current = ""; } catch { /* noop */ } }, [boardId, meetingId]);
-  useEffect(() => { if (!recId) { try { revTextOwner.current = ""; } catch { /* noop */ } } }, [recId]);
+  const revBaseRef = useRef<{ id: string; version: number; hash: string; reviewToken: string; watermark: number; revision: number } | null>(null);
+  // Whole-draft ownership AND typed revision retire together with their
+  // context: any board/meeting/record switch clears owner, typed revision,
+  // and base authority so the next hydration starts pristine from the new
+  // authoritative snapshot. Same-draft refetches keep all three and preserve
+  // newer typing.
+  useEffect(() => {
+    try { revTextOwner.current = ""; } catch { /* noop */ }
+    try { revTextRev.current = 0; } catch { /* noop */ }
+    try { revBaseRef.current = null; } catch { /* noop */ }
+    setRevText("");
+  }, [boardId, meetingId, recId]);
   useEffect(() => {
     if (recDetail.data) {
       const nid = (recDetail.data as RecordDraft).id;
-      // Whole-draft editor ownership: only a deliberate record selection
-      // (new draft id, first load, or board/meeting switch) replaces newer
-      // typing. Same-draft detail refreshes preserve in-progress edits.
+      // Selection defaults: seed the checkbox set on first load of a draft.
+      // The whole-document text hydrates from the authoritative review
+      // snapshot below (same bytes as the submitted guards), never from this
+      // detail row, so manager and guest views cannot diverge.
       if (revTextOwner.current !== nid) {
-        // Draft item text is redacted server-side for read-only roles: coerce
-        // to empty string so the editor stays controlled and the list below
-        // renders the restricted notice instead of crashing on undefined.
-        setRevText(recDetail.data.itemsJson ?? "");
-        revTextOwner.current = nid;
         try {
-          const ids = (JSON.parse(recDetail.data.itemsJson) as { id?: string }[])
+          const ids = (JSON.parse(recDetail.data.itemsJson ?? "[]") as { id?: string }[])
             .map((i) => i.id ?? "")
             .filter(Boolean);
           setSelItems(ids);
@@ -3486,6 +3489,22 @@ const tabCount = (k: Tab): number | null => {
   const isActionableReview = recOk && !!recReview.data && !recReview.isError && !showReviewError && recReview.data.stateValid === true && reviewPendingCount > 0 && !reviewDecided && !reviewSuperseded;
   const canApproveRecord = canManageMeeting && isActionableReview === true;
   const canContributeReview = canActMeeting && isActionableReview === true;
+  // Amendment has its own eligibility, separate from the pending-review
+  // predicate: only a final approved record (decided + approved status, not
+  // superseded) can amend under its own CAS guards. A partially decided or
+  // open draft can never amend; it must revise the open version instead.
+  const isFinalApproved = recOk && !!recReview.data && !recReview.isError && !showReviewError && !!reviewDraft && reviewDecided && reviewStatus.toLowerCase() === "approved" && !reviewSuperseded;
+  const canAmendRecord = canManageMeeting && isFinalApproved === true;
+  // A typed whole-document editor that predates newer per-item authority is
+  // stale: submitting it with fresh guards would overwrite the item revision
+  // disguised as current. Surface it so the owner reconciles explicitly.
+  const revEditorStale = (() => {
+    const b = revBaseRef.current;
+    const d = reviewDraft as RecordDraft | undefined;
+    if (!b || !d || b.id !== d.id) return false;
+    if (revTextRev.current === 0) return false;
+    return b.version !== d.version || (b.hash ?? "") !== (d.hash ?? "") || (b.reviewToken ?? "") !== (d.reviewToken ?? "") || (b.watermark ?? 0) !== (d.watermark ?? 0) || (b.revision ?? 0) !== (d.reviewRevision ?? 0);
+  })();
   const ordinalOf = (itemId: string): number => reviewPending.indexOf(itemId) + 1;
   const ordinalLabel = (itemId: string): string => { const n = ordinalOf(itemId); return n > 0 ? "decision " + String(n) : "decision"; };
   useEffect(() => {
@@ -3522,13 +3541,30 @@ const tabCount = (k: Tab): number | null => {
     return () => { live = false; };
   }, [reviewPredIds.join(","), reviewSuccIds.join(","), boardId, meetingId]);
   useEffect(() => {
-    const ad = authDraft as RecordDraft | undefined;
+    // Pristine hydration from the authoritative review snapshot: the displayed
+    // text and the submitted guards always come from the same reviewDraft
+    // bytes. Typed editors keep owner text AND their base authority; a newer
+    // per-item authority never silently rewrites older typing.
+    const ad = reviewDraft as RecordDraft | undefined;
     if (!ad) return;
-    if (revTextRev.current !== 0) return;
-    if (revTextOwner.current !== "" && revTextOwner.current !== ad.id) return;
-    const fresh = ad.itemsJson ?? "";
-    setRevText((cur) => (cur === fresh ? cur : fresh));
-  }, [authDraft && (authDraft as RecordDraft).itemsJson]);
+    const nid = ad.id;
+    const snap = { id: nid, version: ad.version, hash: ad.hash ?? "", reviewToken: ad.reviewToken ?? "", watermark: ad.watermark ?? 0, revision: ad.reviewRevision ?? 0 };
+    if (revTextOwner.current !== nid) {
+      // Draft item text is redacted server-side for read-only roles: coerce
+      // to empty string so the editor stays controlled and the list below
+      // renders the restricted notice instead of crashing on undefined.
+      setRevText(ad.itemsJson ?? "");
+      revTextOwner.current = nid;
+      revTextRev.current = 0;
+      revBaseRef.current = snap;
+      return;
+    }
+    if (revTextRev.current === 0) {
+      const fresh = ad.itemsJson ?? "";
+      setRevText((cur) => (cur === fresh ? cur : fresh));
+      revBaseRef.current = snap;
+    }
+  }, [reviewDraft && (reviewDraft as RecordDraft).id, reviewDraft && (reviewDraft as RecordDraft).itemsJson, reviewDraft && (reviewDraft as RecordDraft).version, reviewDraft && (reviewDraft as RecordDraft).hash, reviewDraft && (reviewDraft as RecordDraft).reviewToken, reviewDraft && (reviewDraft as RecordDraft).watermark]);
   const [itemTexts, setItemTexts] = useState<Record<string, string>>({});
   const itemTextRev = useRef<Record<string, number>>({});
   const editKey = (draftId: string, itemId: string) => `${draftId}:${itemId}`;
@@ -3771,10 +3807,22 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const reviseRec = (amend: boolean) => {
-    if (!recOk || !canContributeReview) return;
+    if (!recOk) return;
+    if (amend ? !canAmendRecord : !canContributeReview) return;
     const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    // Stale typed editor: never submit older text with fresh guards. Keep
+    // the base revision/hash and require explicit reconcile or conflict;
+    // no old overwrite is disguised as fresh.
+    const base = revBaseRef.current;
+    if (base && base.id === d.id && revTextRev.current !== 0) {
+      const cur = { version: d.version, hash: d.hash ?? "", reviewToken: d.reviewToken ?? "", watermark: d.watermark ?? 0, revision: d.reviewRevision ?? 0 };
+      if (base.version !== cur.version || base.hash !== cur.hash || base.reviewToken !== cur.reviewToken || base.watermark !== cur.watermark || base.revision !== cur.revision) {
+        setReviewError({ key: `${boardId}:${meetingId}:${recId}:${canonicalUser()}:${fullIdentityToken()}`, message: "The whole-document editor predates a newer per-item change. Reload the editor from the current review or retype against the new authority; the older text was not submitted." });
+        return;
+      }
+    }
     let items: unknown = [];
     try {
       items = JSON.parse(revText);
@@ -8737,14 +8785,32 @@ const testModel = useMutation({
                         Refresh review{" "}
                       </button>)}{" "}
                       {!!recReview.data && !recReview.isError && !showReviewError && (
-                        <p role="status">
-                          {" "}
-                          Review version {(authDraft as RecordDraft).version} · reviewed input {(authDraft as RecordDraft).watermark} · current input {recReview.data.meetingWatermark}{(authDraft as RecordDraft).watermark !== recReview.data.meetingWatermark ? " — new input arrived" : ""}:{" "}
-                          {(recReview.data.approved ?? []).length} approved · {(recReview.data.discarded ?? []).length} set aside ·{" "}
-                          {(recReview.data.pending ?? []).length} waiting.{" "}
-                        </p>
+                        (() => {
+                          const d = authDraft as RecordDraft;
+                          const isGuest = !(recReview.data && ("stateValid" in (recReview.data as object)));
+                          const wm = (d as unknown as { watermark?: unknown }).watermark;
+                          const wmText = typeof wm === "number" ? String(wm) : "unknown";
+                          const stale = typeof wm === "number" && wm !== recReview.data.meetingWatermark;
+                          if (isGuest) {
+                            return (
+                              <p role="status">
+                                {" "}
+                                Review version {d.version} - reviewed input {wmText} - current input {recReview.data.meetingWatermark}{stale ? " - new input arrived" : ""}:{" "}
+                                {(recReview.data.approved ?? []).length} approved in this version. Pending and set-aside counts are withheld for read-only review.{" "}
+                              </p>
+                            );
+                          }
+                          return (
+                            <p role="status">
+                              {" "}
+                              Review version {d.version} - reviewed input {wmText} - current input {recReview.data.meetingWatermark}{stale ? " - new input arrived" : ""}:{" "}
+                              {(recReview.data.approved ?? []).length} approved - {(recReview.data.discarded ?? []).length} set aside -{" "}
+                              {(recReview.data.pending ?? []).length} waiting.{" "}
+                            </p>
+                          );
+                        })()
                       )}{" "}
-                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.pending ?? []).length > 0 && (
+                      {!!recReview.data && !recReview.isError && !showReviewError && isActionableReview && (recReview.data.pending ?? []).length > 0 && (
                         <div className="card">
                           {" "}
                           <h4>Decisions waiting for review</h4>{" "}
@@ -8760,10 +8826,12 @@ const testModel = useMutation({
     return (
       <li key={pid} className="human-item">
         <div className="human-item-body">
+          {canApproveRecord && (
           <label className="human-item-check">
             <input type="checkbox" aria-label={"Select decision " + String(n)} checked={checked}
               onChange={(e) => setSelItems(checked ? selItems.filter((x) => x !== pid) : [...selItems, pid])} />
           </label>
+          )}
           <span className="human-item-text">{ptext === "" ? "(decision text unavailable)" : ptext}</span>{" "}
           {canApproveRecord && (
             <button type="button" onClick={() => itemApprove(pid)} aria-label={"Approve decision " + String(n)}>
@@ -8804,7 +8872,7 @@ const testModel = useMutation({
                           {(recReview.data.notes ?? []).map((n) => (
                             <div key={n.id} className="human-item">
                               <div className="human-item-body">
-                                <span className="human-item-text">{n.title === "" ? "(untitled note)" : n.title}</span>{" "}
+                                <span className="human-item-text">{humanNoteTitle(n.title)}</span>{" "}
                                 <StatusChip label={n.kind === "secretary-note" ? "Secretary provisional note" : n.kind === "secretary-briefing" ? "Secretary briefing" : n.kind === "note" ? "Working note" : n.kind === "briefing" ? "Briefing" : n.kind} tone={n.kind === "secretary-note" || n.kind === "secretary-briefing" ? "progress" : "open"} />{" "}
                                 <p>{humanNoteBody(n.body) === "" ? "(no text)" : humanNoteBody(n.body)}</p>{" "}
                               </div>
@@ -8942,42 +9010,106 @@ const testModel = useMutation({
                                             {(() => {
                         if (isActionableReview) return null;
                         const ad = authDraft as RecordDraft;
-                        let texts: string[] = [];
+                        const isGuest = !(recReview.data && ("stateValid" in (recReview.data as object)));
+                        const approvedSet = new Set(((recReview.data?.approved ?? []) as string[]));
+                        let hist: string[] = [];
                         try {
                           const parsed = parseRecordItems(ad.itemsJson ?? "[]");
-                          const ap = new Set(((recReview.data?.approved ?? []) as string[]));
-                          texts = parsed.items.filter((it) => ap.has(it.key)).map((it) => it.text);
-                        } catch { texts = []; }
-                        if (texts.length === 0) {
+                          hist = parsed.items.filter((it) => approvedSet.has(it.key)).map((it) => it.text);
+                        } catch { hist = []; }
+                        if (hist.length === 0) {
                           try {
                             const gd = ad as unknown as { approvedItems?: { text?: unknown }[] };
                             const src = gd.approvedItems ?? [];
-                            texts = src.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
-                          } catch { texts = []; }
+                            hist = src.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
+                          } catch { hist = []; }
                         }
-                        if (texts.length === 0) {
-                          try {
-                            const gd2 = ad as unknown as { effective?: { approvedItems?: { text?: unknown }[] } };
-                            const src2 = gd2.effective?.approvedItems ?? [];
-                            texts = src2.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
-                          } catch { texts = []; }
+                        const succ = ((recReview.data?.successors ?? []) as string[]);
+                        const isHead = succ.length === 0 && !reviewSuperseded;
+                        const effects = ((recReview.data?.lineageEffects ?? []) as { id: string; text: string; status: string; fromVersion: number; toVersion: number }[]);
+                        let effGuest: { text: string; version: number }[] = [];
+                        try {
+                          const gd2 = ad as unknown as { effective?: { approvedItems?: { text?: unknown; approvedBy?: { version?: unknown } }[] } };
+                          effGuest = (gd2.effective?.approvedItems ?? []).map((e) => ({
+                            text: typeof e.text === "string" ? e.text : "",
+                            version: typeof e.approvedBy?.version === "number" ? (e.approvedBy.version as number) : 0,
+                          })).filter((e) => e.text !== "");
+                        } catch { effGuest = []; }
+                        if (hist.length === 0 && effects.length === 0 && effGuest.length === 0) return null;
+                        if (isHead && reviewDecided) {
+                          const all = hist.length > 0 ? hist : (isGuest ? effGuest.map((e) => e.text) : effects.map((e) => e.text));
+                          if (all.length === 0) return null;
+                          return (
+                            <div className="card">
+                              {" "}
+                              <h4>Approved decisions (current record)</h4>{" "}
+                              <p>This version is the authoritative head. The text below is the current record.</p>{" "}
+                              <ol className="human-item-list">
+                                {all.map((tx, k) => (
+                                  <li key={"ap-" + String(k)} className="human-item">
+                                    <div className="human-item-body">
+                                      <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
+                                    </div>
+                                  </li>
+                                ))}
+                              </ol>{" "}
+                            </div>
+                          );
                         }
-                        if (texts.length === 0) return null;
                         return (
-                          <div className="card">
-                            {" "}
-                            <h4>Approved decisions</h4>{" "}
-                            <p>No pending decisions remain. Approved text below is the current record.</p>{" "}
-                            <ol className="human-item-list">
-                              {texts.map((tx, i) => (
-                                <li key={"ap-" + String(i)} className="human-item">
-                                  <div className="human-item-body">
-                                    <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
-                                  </div>
-                                </li>
-                              ))}
-                            </ol>{" "}
-                          </div>
+                          <>
+                            {hist.length > 0 && (
+                              <div className="card">
+                                {" "}
+                                <h4>Approved in this version (historical)</h4>{" "}
+                                <p>Historical approved text of version {ad.version}; it is not the current effective record.</p>{" "}
+                                <ol className="human-item-list">
+                                  {hist.map((tx, k) => (
+                                    <li key={"hap-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>{" "}
+                              </div>
+                            )}
+                            <div className="card">
+                              {" "}
+                              <h4>Current effective record</h4>{" "}
+                              <p>Authoritative approved text across the line{isGuest ? "; pending counts are withheld for read-only review" : ""}.</p>{" "}
+                              {!isGuest && effects.length > 0 && (
+                                <ol className="human-item-list">
+                                  {effects.map((e, k) => (
+                                    <li key={"eff-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{e.text === "" ? "(approved decision)" : e.text}</span>{" "}
+                                        <span className="muted">{e.status}, versions {e.fromVersion} to {e.toVersion}.</span>{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>
+                              )}
+                              {isGuest && effGuest.length > 0 && (
+                                <ol className="human-item-list">
+                                  {effGuest.map((e, k) => (
+                                    <li key={"geff-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{e.text}</span>{" "}
+                                        {e.version > 0 && (<span className="muted">approved in version {e.version}.</span>)}{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>
+                              )}
+                              {!isGuest && effects.length === 0 && (
+                                <p className="muted">No approved decisions stand on the current line yet.</p>
+                              )}
+                              {isGuest && effGuest.length === 0 && (
+                                <p className="muted">No readable approved text is available for this review.</p>
+                              )}
+                            </div>
+                          </>
                         );
                       })()}{" "}
 
@@ -9047,9 +9179,20 @@ const testModel = useMutation({
                         {" "}
                         Request revision (new version){" "}
                       </button>)}{" "}
-                      {canApproveRecord && (<button onClick={() => reviseRec(true)}>
+                      {canAmendRecord && (<button onClick={() => reviseRec(true)}>
                         {" "}
                         Amend approved record{" "}
+                      </button>)}{" "}
+                      {revEditorStale && canContributeReview && (<button type="button" onClick={() => {
+                        const d = reviewDraft as RecordDraft | undefined;
+                        if (!d) return;
+                        setRevText(d.itemsJson ?? "");
+                        revTextRev.current = 0;
+                        revBaseRef.current = { id: d.id, version: d.version, hash: d.hash ?? "", reviewToken: d.reviewToken ?? "", watermark: d.watermark ?? 0, revision: d.reviewRevision ?? 0 };
+                        setReviewError(null);
+                      }}>
+                        {" "}
+                        Reload editor from current review{" "}
                       </button>)}{" "}
                       {canContributeReview && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
