@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer, useWindowVirtualizer } from "@tanstack/react-virtual";
 import { HubConnectionBuilder, type HubConnection } from "@microsoft/signalr";
 import SourcesGovernance from "./sources-governance";
+import { AdvisorSections, AdvisorReferences } from "./advisor-sections";
 import { CreateAdvisor, CharacterEditor, CANONICAL_SAVE_INVALIDATIONS, fetchFreshCanonicalEntry, isRosterResearchRunning, shouldShowResearchWorking } from "./advisor-creation";
 import { useMeetingActivity } from "./meeting-activity";
 import {
@@ -172,6 +173,7 @@ type RosterRow = {
     researchRequested: boolean;
     evidenceCount: number;
     researchJson?: string;
+    researchInputsJson?: string;
     ownerKey?: string;
   };
   imageCount: number;
@@ -7821,6 +7823,7 @@ const testModel = useMutation({
                     />
                   ) : selRow ? (
                     <div className="card" data-roster-entry-id={selRow.entry.id}>{" "}
+                      <AdvisorSections key={selRow.entry.id + ":" + canonicalUser()} profile={<>
                       <h3>{selRow.entry.name}</h3>{" "}
                       <span className="badge">{" "}{selRow.complete ? "complete" : "incomplete: " + selRow.missing.join(", ")}{" "}</span>{" "}
                       <span className="badge">{" "}{selRow.imageCount} portrait{selRow.imageCount === 1 ? "" : "s"}{" "}</span>{" "}
@@ -7912,19 +7915,6 @@ const testModel = useMutation({
                         {portraitMsg && <p role="status">{portraitMsg}</p>}{" "}
                       </div>{" "}
                       {selRow && (
-                        <RosterChatPanel
-                          key={'roster-chat-' + selRow.entry.id}
-                          rosterId={selRow.entry.id}
-                          identity={canonicalUser()}
-                          advisorName={selRow.entry.name}
-                          rosterVersion={selRow.entry.version}
-                          complete={selRow.complete}
-                          missing={selRow.missing}
-                          canChat={!!selRow}
-                          api={{ post }}
-                        />
-                      )}{" "}
-                      {selRow && (
                         <CharacterEditor
                           key={'character-editor-' + selRow.entry.id}
                           entry={{ researchJson: "", researchJobId: "", researchBaseVersion: 0, ...selRow.entry } as any}
@@ -7945,6 +7935,26 @@ const testModel = useMutation({
                           }}
                         />
                       )}{" "}
+                      </>} chat={
+                        <RosterChatPanel
+                          key={'roster-chat-' + selRow.entry.id}
+                          rosterId={selRow.entry.id}
+                          identity={canonicalUser()}
+                          advisorName={selRow.entry.name}
+                          rosterVersion={selRow.entry.version}
+                          complete={selRow.complete}
+                          missing={selRow.missing}
+                          canChat={!!selRow}
+                          api={{ post }}
+                        />
+                      } references={<AdvisorReferences
+                        entry={selRow.entry}
+                        researchJson={selResearchData?.researchJson}
+                        running={selResearchRunning}
+                        loading={selResearchLoading}
+                        error={!!selResearchDataError}
+                        onRefresh={() => void selResearch.refetch()}
+                      />} />
                     </div>
                   ) : (
                   <p className="muted">Select an advisor from the list to see their record.</p>

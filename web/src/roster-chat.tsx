@@ -128,8 +128,8 @@ export function RosterChatPanel(p: RosterChatProps) {
     <div className="card roster-chat" data-roster-chat={p.rosterId}>
       <h3>Chat with this advisor</h3>
       <p>
-        Private chat with {p.advisorName || "this advisor"}. Nothing here
-        joins a meeting, a record, or a board.
+        Ask {p.advisorName || "this advisor"} a question to get a feel for
+        their perspective and how they respond.
       </p>
       {blocked ? (
         <p role="alert">
