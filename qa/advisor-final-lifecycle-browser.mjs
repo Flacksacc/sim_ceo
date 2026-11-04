@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 
-const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\msedge.exe";
+const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dist = path.join(here, "..", "web", "dist");
 const outPath = (() => { try { return path.join(here, "..", ".tmp", "advisor-final-lifecycle-qa-result.txt"); } catch (e) { return ""; } })();

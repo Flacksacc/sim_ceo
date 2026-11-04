@@ -4,7 +4,9 @@ import { FriendlyError } from "./human-disclosure";
 
 export function extractCharacterServerText(raw: string): { status: number; serverError: string } {
   const input = String(raw ?? "");
-  const m = /^(\d{3})\s([\s\S]*)$/.exec(input);
+  const direct = /^(\d{3})\s([\s\S]*)$/.exec(input);
+  const prefixed = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s*->\s*(\d{3})\s?([\s\S]*)$/.exec(input);
+  const m = direct ?? prefixed;
   const status = m ? parseInt(m[1], 10) : 0;
   const body = (m ? m[2] : input).trim();
   let serverError = "";
