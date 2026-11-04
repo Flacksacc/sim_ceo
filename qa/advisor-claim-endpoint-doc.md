@@ -10,9 +10,13 @@ qa/advisor-claim-endpoint-fake.mjs, qa/advisor-claim-endpoint-qa.mjs, this doc.
   unique instance qa-claim-endpoint-15500, absolute CONTENTROOT/keyring, refuses
   occupied ports, controlled child env (dummy fake only, no NODE hooks/PG/.env),
   no other worktrees, no PG/Docker, env real provider human.
-- Provenance BEFORE first mutation: git HEAD present plus DLL SHA recorded;
-  QA_FRESH_BUILD=1 builds fresh inside harness, else QA_EXPECTED_SOURCE_REV +
-  QA_EXPECTED_DLL_SHA must match (stale prebuilt refused, FATAL).
+- Provenance BEFORE first mutation (honest, no build inside harness): git HEAD
+  present plus publish DLL SHA256 recorded; QA_EXPECTED_SOURCE_REV (full 40-hex)
+  + QA_EXPECTED_DLL_SHA (sha256 of publish/SimCEO.Api.dll) must both match or
+  harness FATALS (stale prebuilt refused). QA_FRESH_BUILD never built anything
+  and its old bypass is removed: QA_FRESH_BUILD=1 now fails fast with
+  provenance-fresh-build-removed. Primary must fresh-publish (dotnet publish)
+  from the combined source, record HEAD+DLL SHA, then rerun this harness pinned.
 - Registers a real private QA user, then actual POST /api/roster/ai-draft twice:
   unsupported (CLAIMENDPOINT-UNSUPPORTED + CLMEP-U marker) and supported
   max-budget (2000-char focus + CLMEP-S marker, evidenceCount 5 distinct).
@@ -55,10 +59,27 @@ qa/advisor-claim-endpoint-fake.mjs, qa/advisor-claim-endpoint-qa.mjs, this doc.
 
 ## Run (only when 15500/15502 free and safe; primary fresh publish/rerun after merge)
 
-QA_FRESH_BUILD=1 node qa/advisor-claim-endpoint-qa.mjs
-# or pinned: QA_EXPECTED_SOURCE_REV=<full sha> QA_EXPECTED_DLL_SHA=<sha256> node qa/advisor-claim-endpoint-qa.mjs
+# Primary (combined source, e.g. e74a68f): fresh-publish then record pins:
+#   dotnet publish server/SimCEO.Api/SimCEO.Api.csproj -c Release -o ../own-15500-15502/publish
+#   git rev-parse HEAD  # -> QA_EXPECTED_SOURCE_REV
+#   sha256sum ../own-15500-15502/publish/SimCEO.Api.dll  # -> QA_EXPECTED_DLL_SHA
+# Then pinned (only supported invocation; no build inside harness):
+QA_EXPECTED_SOURCE_REV=<full 40-hex HEAD> QA_EXPECTED_DLL_SHA=<sha256 dll> node qa/advisor-claim-endpoint-qa.mjs
+# QA_FRESH_BUILD=1 is removed and fails fast; it never built.
 
 Exit 0 PASS, 1 FAIL (incl. cleanup failure), 2 FATAL/setup. Leaves owned rows for forensics (exact-ID scope only).
+
+## Fixes in this revision (no assertion weakening)
+
+- Diagnostics no longer eagerly throw: all JSON.stringify(x).slice extras use
+  safe truncJson(x, n) (undefined -> "undefined"), so a missing claim reports
+  FAIL with bounded context instead of FATAL Cannot read properties of undefined
+  (reading slice). Assertion conditions unchanged.
+- FATAL path prints bounded message + stack (2000 chars) + accumulated
+  results (last 25, 4000 chars) before exit, and cleanup runs in finally so
+  ports/children are always reaped; pidfile retained only when uncertain.
+- This branch does not contain production inventory fix e8871e0 (source-only);
+  primary reruns the combined actual current source with fresh publish + pins.
 
 ## Unexecuted and why (truthful limits)
 
