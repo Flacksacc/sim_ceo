@@ -989,3 +989,34 @@ Healthy localhost:5173 image:
 Backup `.tmp/update-20261104-195210-UTC-ba3f0dbc`; original DB/volumes retained.
 Source pushed to Flacksacc/sim_ceo. Owned QA services and browser contexts closed;
 no agents used; tmp.txt untouched; broader parity goal remains paused.
+
+### 2026-11-04 — Meeting command menu and General settings
+
+Implemented `2729ab5` and shortcut guard `c4468b4`. Meeting settings now opens a
+menu grouped into Orchestrator (request advisor responses, pause, resume, end)
+and Secretary (ask, summarize, prepare briefing), plus General settings opening
+the existing panel. Existing header command buttons and the duplicate briefing
+input in that panel are removed. Custom secretary requests and briefing topics
+use small inline forms; commands route through the existing guarded handlers.
+Menu commands preserve the unsent composer, show real Secretary progress and
+respect meeting state, permissions and pending work. Ctrl+Enter in command,
+rename or settings editors cannot submit the unrelated composer draft.
+
+Menu supports keyboard arrows/Home/End/Escape, outside-click dismissal and focus
+return. Viewport placement opens above/below the trigger and caps scrolling so
+all actions remain reachable on narrow screens.
+
+Frontend/release builds passed. Native command tests passed all eight actions,
+API payload/routing, no effects from opening/navigating, original settings panel,
+composer preservation, shortcut isolation, normal Send, lifecycle state gating,
+and desktop/mobile geometry (`.tmp/meeting-command-menu-qa.log`). Parallel
+meeting regressions and rename regressions passed (`-dialogue-qa.log` and
+`-rename-qa.log` with the same prefix). Live light/dark desktop and narrow checks
+passed without page errors or domain writes, including blocked mutation routes
+while testing the keyboard guard (`.tmp/meeting-command-menu-live-check.log`).
+
+Healthy localhost:5173 image:
+`sha256:871dc60ac8515e91a25f80bfa6a50c11412e9dd0b9b4d4fd302cba8c690aa203`.
+Backup `.tmp/update-20261104-201016-UTC-90cd4762`; original DB/volumes retained.
+Source pushed to Flacksacc/sim_ceo. Owned QA services and browsers stopped;
+no agents used; tmp.txt untouched; broader parity goal remains paused.
