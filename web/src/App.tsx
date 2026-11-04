@@ -6944,12 +6944,6 @@ const testModel = useMutation({
                     value={wizard.stage} onChange={e => setWizard({ ...wizard, stage: e.target.value })}
                     placeholder="e.g. Early idea, deciding this month" />
                 </label>
-                <label>Starting shape
-                  <select disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
-                    value={presetKey} onChange={e => setPresetKey(e.target.value)}>
-                    {(presets.data ?? []).map(p => <option key={p.key} value={p.key}>{p.title}</option>)}
-                  </select>
-                </label>
                 <h3>Advisors ({selectedWizardSeats.length}/10)</h3>
                 <p>Choose up to ten advisors from your roster.</p>
                 {wizard.seats.some(s => !s.rosterEntryId) && <p role="status">Choose advisors below to replace this draft's older role suggestions.</p>}
