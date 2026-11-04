@@ -141,3 +141,14 @@ Remaining UNPROVEN (explicit; no weakened core integration, no dropped failures 
 - Owned QA account/boards/roster/meetings are intentionally left for forensics
   (exact-ID scope only; no row cleanup by design). Browser/context cleanup is
   unconditional.
+
+## Muse runtime closure 8b4 follow-up (QA/doc only, no product edits)
+- Base b852aed plus 8b4a4da detector init repair preserved (det before use, node check passes, playwright-core 1.64.1).
+- Primary runtime 109 PASS 4 FAIL 122s: excluded seat now PASS, portraits NONE on both seats. Primary diagnosed product bug in App usePresencePortraits which bails when copyImageProvenance is empty despite accepted roster image.
+  Dedicated production work in .tmp/advisor-presence-default-portrait repairs readonly resolution coherent with backend ReviewedPortraitFingerprint. QA intentionally not weakened to force image or select, portraits remain strict FAIL until product lands, reported here as known pending production defect.
+- Roster chat panelCount 178 remains highly suspicious because source has exactly one RosterChatPanel mount (roster-chat.tsx data-roster-chat, App.tsx single mount with key).
+  QA now collects causal native evidence on panel missing without weakening: Playwright exact count with id plus bare count, native document.querySelectorAll bare count plus exact filter count, total divs, actual location hash URL, first three data-roster-chat attribute prefixes plus closest section aside main heading, owned row aria-current plus fresh collection identity, plus OS tmp screenshot limited to owned QA synthetic content.
+  No tokens or keys or storage dump, no HTTP only chat replacement, still FATAL on missing panel.
+- Service verification before any mutation: 15300 TCP connect false and HTTP refused (API down), 15302 TCP true and GET __log 200 (fake up).
+  No services launched or stopped, no source product edits, no human ports, no PG Docker env keys real provider memory global kills. Loopback targets verified as 127.0.0.1 15300 and 15302 only.
+  Own actual QA run is blocked pending primary restart of compiled 15300 server, no owned accounts created in this follow-up. Node check passes. Primary reruns plus dedicated review still required for full d896 closure including paired send CAS, collector detector, labels, abstain failed seats, secretary nonce, rerun ordinary question plus paras, roster version paired FULL snapshot with CreatedAt, deadlines drain abort cleanup.
