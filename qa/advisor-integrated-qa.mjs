@@ -2441,8 +2441,8 @@ async function stepRosterChatUI() {
   panelOk = singular;
   if (!panelOk) failExit("roster chat panel not singular for same exact entry after proven selection; refusing HTTP-only chat. " + panelDiag);
   const headOk = await panel.getByText("Chat with this advisor", { exact: false }).count().then((c) => c > 0).catch(() => false);
-  const boardfreeOk = await panel.getByText(/nothing here joins a meeting/i).count().then((c) => c > 0).catch(() => false);
-  ok("roster-chat-boardfree-contract", headOk && boardfreeOk, "heading=" + headOk + " boardfree-note=" + boardfreeOk);
+  const introOk = await panel.getByText(/get a feel for their perspective and how they respond/i).count().then((c) => c > 0).catch(() => false);
+  ok("roster-chat-friendly-introduction", headOk && introOk, "heading=" + headOk + " introduction=" + introOk);
   const chatLog = panel.locator('[role="log"]');
   const chatBox = panel.getByLabel(/message /i);
   const boxOk = await chatBox.count() > 0;
