@@ -191,7 +191,7 @@ try {
     cdpInstanceWs = (vj && vj.webSocketDebuggerUrl) || "";
     const lr = await fetch(CDP + "/json/list", { signal: AbortSignal.timeout(10000) });
     const lj = await lr.json();
-    if (Array.isArray(lj)) cdpBeforeIds = lj.map((t) => t && t.id).filter(Boolean);
+    if (Array.isArray(lj)) cdpBeforeIds = lj.filter((t) => t?.type === "page").map((t) => t.id).filter(Boolean);
   } catch (e) { throw new Error("cdp-before capture failed: " + (e && e.message ? e.message : String(e))); }
   if (!cdpInstanceWs) throw new Error("cdp-before instance identity missing");
   if (!Array.isArray(cdpBeforeIds) || cdpBeforeIds.length < 1) throw new Error("cdp-before target list empty: fresh binding requires nonempty pre-run set");
@@ -520,7 +520,7 @@ try {
     ok("editable-transcript-exact", transcriptAppended(draftVal, "typed hello DURINGREC DURING-HELD"), JSON.stringify(draftVal).slice(0, 300));
     // Exact stored bytes: the App persists drafts to localStorage under the
     // account-scoped draft key; the stored text must equal the shown draft.
-    const storedVal = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+    const storedVal = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid]);
     ok("stored-draft-exact", storedVal === draftVal, "stored=" + JSON.stringify(String(storedVal).slice(0, 200)));
     const c1 = await fakeCounts();
     ok("fresh-provider-hit", c1.transcribe === c0.transcribe + 1, JSON.stringify(c1));
@@ -940,8 +940,8 @@ try {
       // SEVENTH: exact stored A/B draft bytes IMMEDIATELY before old A
       // release while B decode is STILL held (not only after B completion,
       // which can overwrite corruption).
-      abaStoredABefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
-      abaStoredBBefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      abaStoredABefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+      abaStoredBBefore = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
       ok("aba-stored-a-before", abaStoredABefore === "aba-origin", "storedA=" + JSON.stringify(String(abaStoredABefore).slice(0, 200)));
       ok("aba-stored-b-before", abaStoredBBefore === "aba-second", "storedB=" + JSON.stringify(String(abaStoredBBefore).slice(0, 200)));
     }
@@ -964,8 +964,8 @@ try {
       // SEVENTH: exact stored bytes IMMEDIATELY after old A release while B
       // is STILL held: neither key may have changed; B pending IDs retained,
       // A actually released, fresh B proxy baseline retained.
-      const abaStoredAAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid]);
-      const abaStoredBAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      const abaStoredAAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid]);
+      const abaStoredBAfter = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
       ok("aba-stored-a-stable", abaStoredAAfter === abaStoredABefore, "before=" + JSON.stringify(String(abaStoredABefore).slice(0, 120)) + " after=" + JSON.stringify(String(abaStoredAAfter).slice(0, 120)));
       ok("aba-stored-b-stable", abaStoredBAfter === abaStoredBBefore && abaStoredBAfter === "aba-second", "before=" + JSON.stringify(String(abaStoredBBefore).slice(0, 120)) + " after=" + JSON.stringify(String(abaStoredBAfter).slice(0, 120)));
       ok("aba-b-pending-ids-retained", true, "bDec=" + bDec);
@@ -980,7 +980,7 @@ try {
     ok("aba-new-exact-draft", transcriptAppended(String(bdraft), "aba-second"), JSON.stringify(String(bdraft).slice(0, 200)));
     {
       // Exact stored bytes: App persists drafts under account-scoped key.
-      const storedB = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":anon"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
+      const storedB = await page.evaluate((args) => { try { return localStorage.getItem("simceo-draft:" + args[0] + ":" + args[1] + ":owner"); } catch { return "LS-FAIL"; } }, [bid, mid2]);
       ok("aba-stored-draft-exact", storedB === bdraft, "stored=" + JSON.stringify(String(storedB).slice(0, 200)));
     }
     const c1 = await fakeCounts();
@@ -1023,14 +1023,14 @@ try {
     if (rd === null || rd === undefined) throw new Error("remount textarea missing");
     ok("remount-exact-draft", draftStrictEquals(String(rd), "remount-origin"), JSON.stringify(String(rd).slice(0, 300)));
   }
-  // Controlled identity remount in the surviving document: a real React App
+  // Controlled anonymous-profile remount in the surviving document: a real React App
   // unmount/remount via simceo-auth-change with a new identity (epoch bump).
   // Server-side authority is proven separately by qa/voice-account-driver.mjs
   // against real register/login/session credentials; this block covers the
   // component remount only, never an account change.
   // The old held provider response must never touch the new identity UI;
-  // per-user drafts stay scoped; a new op works under the new identity and
-  // the origin draft is intact after switching back.
+  // canonical owner drafts stay intact (changing an anonymous label is NOT authority);
+  // a new operation works and survives the next remount without the old response leaking.
   {
     const c0 = await fakeCounts();
     await gotoMeet(mid);
@@ -1068,7 +1068,7 @@ try {
     await gotoMeet(mid);
     const nbox = await requireBox();
     const ndraft = await nbox.inputValue();
-    ok("epoch-new-identity-scoped", staleWriteAbsent(String(ndraft), ""), JSON.stringify(String(ndraft).slice(0, 200)));
+    ok("epoch-remount-preserves-canonical-draft", staleWriteAbsent(String(ndraft), "epoch-origin"), JSON.stringify(String(ndraft).slice(0, 200)));
     await nbox.fill("epoch2-new", { timeout: 15000 });
     const c1 = await fakeCounts();
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
@@ -1090,7 +1090,7 @@ try {
     await page.waitForTimeout(1500);
     await gotoMeet(mid);
     const backDraft = await (await requireBox()).inputValue();
-    ok("epoch-origin-intact", staleWriteAbsent(String(backDraft), "epoch-origin"), JSON.stringify(String(backDraft).slice(0, 300)));
+    ok("epoch-same-authority-new-draft-intact", transcriptAppended(String(backDraft), "epoch2-new"), JSON.stringify(String(backDraft).slice(0, 300)));
   }
   // ACTUAL controlled fake->API 502, held via the forwarding branch: the
   // owned fake returns 502 once, the REAL API observes the provider failure,
@@ -1306,7 +1306,7 @@ try {
     const errBody = await page.locator("body").innerText();
     ok("error-visible", errBody.includes("Microphone unavailable") || errBody.includes("Dictation failed"), errBody.slice(0, 500));
     await page.evaluate(() => { window.__voiceStubMode = "tone"; });
-    ok("mic-denial-toast-exact", errBody.includes("Microphone unavailable."), errBody.slice(0, 500));
+    ok("mic-denial-toast-exact", errBody.includes("Microphone unavailable or permission denied. Grant microphone access"), errBody.slice(0, 500));
   }
   ok("no-native-dialogs", dialogs.length === 0, JSON.stringify(dialogs));
   ok("no-console-errors", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));

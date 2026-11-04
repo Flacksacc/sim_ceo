@@ -26,7 +26,9 @@ const beforeWs = before.json && before.json.webSocketDebuggerUrl;
 ok("cdp-instance-before", typeof beforeWs === "string" && beforeWs.length > 0, String(beforeWs));
 const beforeList = await cdpJson("/json/list");
 ok("cdp-list-before", beforeList.status === 200 && Array.isArray(beforeList.json), "status=" + beforeList.status);
-const beforeIds = Array.isArray(beforeList.json) ? beforeList.json.map((t) => t && t.id).filter(Boolean) : [];
+// Service workers/iframes may disappear naturally. Preserve every preexisting
+// page, which is the user-facing target the child must never close.
+const beforeIds = Array.isArray(beforeList.json) ? beforeList.json.filter((t) => t?.type === "page").map((t) => t.id).filter(Boolean) : [];
 ok("cdp-targets-present-before", beforeIds.length >= 1, "ids=" + beforeIds.length);
 const logW = fs.createWriteStream(LOG, { flags: "w" });
 const errW = fs.createWriteStream(ERRLOG, { flags: "w" });

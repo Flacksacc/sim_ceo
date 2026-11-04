@@ -266,13 +266,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/asr/transcribe") {
     counts.transcribe++;
-    if (nextTranscribeFailure) {
-      const failure = nextTranscribeFailure;
-      nextTranscribeFailure = null;
-      res.writeHead(failure.status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: failure.body }));
-      return;
-    }
+    const failure = nextTranscribeFailure;
+    nextTranscribeFailure = null;
     try {
       const ctype = String(req.headers["content-type"] || "");
       const mp = parseMultipart(rawBuf, ctype);
@@ -305,6 +300,11 @@ const server = http.createServer(async (req, res) => {
       const sha = audioBytes ? crypto.createHash("sha256").update(audioBytes).digest("hex").slice(0, 16) : "";
       lastTranscribe = { n: counts.transcribe, bytes: rawBuf.length, audioBytes: audioBytes ? audioBytes.length : 0, foundRiff: !!audioBytes && audioBytes.indexOf(Buffer.from("RIFF")) >= 0, validWav: valid, sampleRate: sr, channels: ch, bits, dataBytes, encoding: enc, rms, nz, zc, durSec: dur, freqEst: freq, audioSha256: sha, partNames, wavError };
     } catch { /* keep last */ }
+    if (failure) {
+      res.writeHead(failure.status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: failure.body }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ transcript: "qa transcript", text: "qa transcript", audioProcessedMs: 2000 }));
     return;
