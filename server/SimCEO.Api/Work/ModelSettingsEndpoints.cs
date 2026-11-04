@@ -5,24 +5,27 @@ using SimCEO.Api.Work;
 
 namespace SimCEO.Api;
 
-// Owner-managed Muse model connection. The API key override lives in the
+// Shared Muse model connection. The API key override lives in the
 // backend store only: it is seeded from META_API_KEY, can be replaced at
 // runtime via PUT, and is never returned to the browser (status exposes a
 // masked hint). Changing settings resets the last connection test.
 public static class ModelSettingsEndpoints
 {
+  // Demo visitors and every valid secure-mode session may use Settings.
+  // Recheck this inside mutation/publication boundaries to retire revoked sessions.
+  private static IResult? SettingsAccess(InMemoryStore store, HttpRequest request)
+  {
+    if (PeopleOps.BadToken(store, request) is { } badToken) return badToken;
+    if (PeopleOps.IsSecure(store) && !AuthOps.TrySession(store, request, out _))
+      return Results.Json(new { error = "Authentication required." }, statusCode: 401);
+    return null;
+  }
+
   public static void MapModelSettings(this WebApplication app)
   {
     app.MapGet("/api/model/status", (InMemoryStore s, HttpRequest req) =>
     {
-      if (PeopleOps.IsSecure(s))
-      {
-        if (PeopleOps.BadToken(s, req) is { } badMs) return badMs;
-        if (!AuthOps.TrySession(s, req, out var ms)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-        var admMs = PeopleOps.AdminEmail(s);
-        var isAdmMs = !string.IsNullOrWhiteSpace(admMs) && string.Equals(admMs, ms, StringComparison.OrdinalIgnoreCase);
-        if (!isAdmMs) return PeopleOps.Denied();
-      }
+      if (SettingsAccess(s, req) is { } statusDenied) return statusDenied;
       var storedKey = PolicyStore.ReadApiKey(s);
       string storedChat;
       try { storedChat = PolicyStore.ReadChatModel(s); }
@@ -47,16 +50,7 @@ public static class ModelSettingsEndpoints
 
     app.MapPut("/api/model/settings", (InMemoryStore s, HttpRequest req, JsonElement body) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badSet) return badSet;
-      if (PeopleOps.IsSecure(s))
-      {
-        if (!AuthOps.TrySession(s, req, out var ss)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-        var admSs = PeopleOps.AdminEmail(s);
-        if (string.IsNullOrWhiteSpace(admSs) || !string.Equals(admSs, ss, StringComparison.OrdinalIgnoreCase))
-          return Results.Json(new { error = "Only the installation admin can change model settings." }, statusCode: 403);
-      }
-      else if (!PeopleOps.IsOwner(req))
-        return Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403);
+      if (SettingsAccess(s, req) is { } settingsDenied) return settingsDenied;
       if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest("body must be a JSON object.");
       var allowed = new[] { ModelPolicy.SparkStandard, ModelPolicy.SparkContributor, ModelPolicy.Wonder };
       // Parse + type-validate the FULL payload first: no partial mutation on
@@ -79,13 +73,7 @@ public static class ModelSettingsEndpoints
       try { Atomic.Run(s, () =>
       {
         // Fresh authority INSIDE the mutation unit (not just the outer check).
-        if (PeopleOps.IsSecure(s))
-        {
-          if (!AuthOps.TrySession(s, req, out var ssIn)) { setGuardErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
-          var admIn = PeopleOps.AdminEmail(s);
-          if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, ssIn, StringComparison.OrdinalIgnoreCase)) { setGuardErr = Results.Json(new { error = "Only the installation admin can change model settings." }, statusCode: 403); return; }
-        }
-        else if (!PeopleOps.IsOwner(req)) { setGuardErr = Results.Json(new { error = "Only the owner can change model settings." }, statusCode: 403); return; }
+        if (SettingsAccess(s, req) is { } settingsChanged) { setGuardErr = settingsChanged; return; }
         var effKey = keyPresent ? newKey! : PolicyStore.ReadApiKey(s);
         var effChat = chatPresent ? newChat! : PolicyStore.ReadChatModel(s);
         PolicyStore.WriteConnection(s, effKey, effChat);
@@ -99,16 +87,7 @@ public static class ModelSettingsEndpoints
 
     app.MapPost("/api/model/test", async (InMemoryStore s, HttpRequest req, CancellationToken ct) =>
     {
-      if (PeopleOps.BadToken(s, req) is { } badTest) return badTest;
-      if (PeopleOps.IsSecure(s))
-      {
-        if (!AuthOps.TrySession(s, req, out var ts)) return Results.Json(new { error = "Authentication required." }, statusCode: 401);
-        var admTs = PeopleOps.AdminEmail(s);
-        if (string.IsNullOrWhiteSpace(admTs) || !string.Equals(admTs, ts, StringComparison.OrdinalIgnoreCase))
-          return Results.Json(new { error = "Only the installation admin can test the model connection." }, statusCode: 403);
-      }
-      else if (!PeopleOps.IsOwner(req))
-        return Results.Json(new { error = "Only the owner can test the model connection." }, statusCode: 403);
+      if (SettingsAccess(s, req) is { } testDenied) return testDenied;
       string keyBefore, chatBefore; (Guid epochId, long epochRev) testPin;
       try
       {
@@ -146,13 +125,7 @@ public static class ModelSettingsEndpoints
       {
         Atomic.Run(s, () =>
         {
-          if (PeopleOps.IsSecure(s))
-          {
-            if (!AuthOps.TrySession(s, req, out var tsIn)) { testGuardErr = Results.Json(new { error = "Authentication required." }, statusCode: 401); return; }
-            var admIn = PeopleOps.AdminEmail(s);
-            if (string.IsNullOrWhiteSpace(admIn) || !string.Equals(admIn, tsIn, StringComparison.OrdinalIgnoreCase)) { testGuardErr = Results.Json(new { error = "Only the installation admin can test the model connection." }, statusCode: 403); return; }
-          }
-          else if (!PeopleOps.IsOwner(req)) { testGuardErr = PeopleOps.Denied(); return; }
+          if (SettingsAccess(s, req) is { } testAccessChanged) { testGuardErr = testAccessChanged; return; }
           // Restore epoch is checked INSIDE the publication unit: a restore
           // during the test discards the stale result instead of publishing it
           // under the new epoch (actual dispatched attempts keep their billing

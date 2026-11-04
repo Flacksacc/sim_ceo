@@ -650,17 +650,9 @@ const navGroups: { label: string; items: [Tab, string][] }[] = [
     ],
   },
   {
-    label: "Manage",
-    items: [
-      ["people", "People"],
-      ["activity", "Activity"],
-    ],
-  },
-  {
     label: "",
     items: [
       ["settings", "Settings"],
-      ["profile", "Profile"],
       ["help", "Help"],
     ],
   },
@@ -4315,9 +4307,7 @@ const tabCount = (k: Tab): number | null => {
 const modelStatus = useQuery({
   queryKey: ["model-status"],
   queryFn: () => get<ModelStatus>("/api/model/status"),
-  // Installation-admin only: verified via board-scope caps. Never probe for
-  // readers, guests, or anonymous identities.
-  enabled: !!boardId && boardOk && capsAdmin && !sessGate,
+  enabled: tab === "settings" && !sessGate && !anonPrivateBlocked,
 });
 const [modelKey, setModelKey] = useState("");
 const [modelChat, setModelChat] = useState("");
@@ -6221,6 +6211,15 @@ const testModel = useMutation({
               {navTip.label}
             </div>
           )}{" "}
+        {!SHOW_ACCOUNT_UI && <div className="railfoot">
+          <div className="navitem">
+            <button type="button" aria-label="Open profile" title="Profile"
+              className={tab === "profile" ? "active" : ""} aria-current={tab === "profile" ? "page" : undefined}
+              onClick={() => { setTab("profile"); setNavOpen(false); }}>
+              <span className="nav-ic" aria-hidden="true"><NavIcon name="profile" /></span>
+            </button>
+          </div>
+        </div>}
         {SHOW_ACCOUNT_UI && <div className="railfoot">
           <div className="profile-wrap rail-profile">
             {" "}
@@ -6357,7 +6356,7 @@ const testModel = useMutation({
               </section>
               {([
                 { title: "Resources", items: [["sources", "Sources"], ["records", "Records"]] },
-                { title: "Board", items: [["boards", "Board overview"], ["advisors", "Board Advisors"], ["people", "People"], ["activity", "Activity"]] },
+                { title: "Board", items: [["boards", "Board overview"], ["advisors", "Board Advisors"]] },
               ] as { title: string; items: [Tab, string][] }[]).map(group => <section key={group.title} className="board-list-section board-pages" aria-label={group.title}>
                 <h2 className="listpanel-section-title">{group.title}</h2>
                 <nav className="board-section-items" aria-label={group.title + " pages"}>
@@ -7773,10 +7772,9 @@ const testModel = useMutation({
 
               <div className="card">
                 {" "}
-                <h3>Model connection (installation admin only)</h3>{" "}
-                {!boardId && (<p role="status">Select a board to verify installation-admin controls.</p>)}{" "}
-                {!!boardId && !capsAdmin && (<p role="status">Restricted to installation admins.</p>)}{" "}
-                {capsAdmin && (<>
+                <h3>Model connection</h3>{" "}
+                {modelStatus.isLoading && <p role="status">Loading model settings…</p>}
+                {modelStatus.isError && <div role="alert">Could not load model settings. <button type="button" onClick={() => modelStatus.refetch()}>Try again</button></div>}
                 {" "}
                 {modelStatus.data && (
                   <p role="status">
@@ -7841,7 +7839,6 @@ const testModel = useMutation({
                     {modelMsg}{" "}
                   </p>
                 )}{" "}
-                </>)}{" "}
               </div>{" "}
               {boardId && isGuest && guestSettings.data && (
                 <div className="card">
