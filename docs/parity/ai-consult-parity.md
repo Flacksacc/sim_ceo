@@ -487,3 +487,53 @@ browsers exited, with test ports verified closed. Only the user's app and
 database remain running. Primary implemented and reviewed this feedback
 directly; no Muse coding agents or new dedicated-agent review were used.
 The broader parity goal remains paused.
+
+## Selected-advisor tabs: deployed November 4, 2026
+
+The selected roster advisor now has Profile, Chat and References tabs. Profile
+retains the existing description, portrait management, research and editing
+controls. Chat contains the existing direct-advisor conversation. References
+shows the supplied description/background, stored reading links, complete
+saved excerpts and claim notes, with readable distinctions between retrieved
+pages, search snippets, unconfirmed links and tentative interpretations.
+Source URL duplicates are merged while path-case distinctions remain intact.
+Executable or credential-bearing links and raw provider/backend metadata are
+not rendered. Search phrases are shown only if present in stored research;
+the feature does not invent historical queries or reconstruct older research
+that the backend did not retain.
+
+Inactive panels stay mounted but are hidden, preserving unsaved profile edits,
+chat drafts and current conversation state across tab switches. Selecting a
+different advisor resets the tab to Profile and retains the existing
+unsaved-edit confirmation. The tabs support arrow keys, Home/End and proper
+tab/tabpanel accessibility relationships.
+
+Source `82f7611`, main merge `87149cd`. Fresh compiled integrated workflow:
+384 PASS / 0 FAIL, 104,802 ms
+(`.tmp/primary-advisor-tabs-integrated-final.log`). Reference parsing/rendering
+checks: 19 PASS / 0 FAIL (`.tmp/primary-advisor-references-qa-final.log`),
+including full excerpts, distinct URLs, provenance labels, safe links,
+cleared/malformed/legacy data and absent-query handling. The first integrated
+run's 383/1 remains preserved: its single failure expected the old Chat help
+sentence. The wording assertion was updated; actual message/board isolation
+checks remained intact and passed on both runs.
+
+Live read-only checks passed in light/dark themes at desktop/mobile widths:
+all ten sources in Brandon's saved research are linked; excerpts expand;
+Profile edits and Chat drafts survive switching tabs; exactly one panel is
+visible; no overflow, domain writes or page exceptions. Existing profile,
+research, portrait, approval and membership data match before/after.
+Evidence: `.tmp/primary-advisor-tabs-live-check.log`; inspected screenshots:
+`output/advisor-tabs-review/2026-11-04`.
+
+Live image
+`sha256:843ea6046c0f3978ff5d81877a1c1ddacd751b905fef59cc260b5225fa9bfb8a`
+and container
+`de99cf79ab7040941d8c28fb79a48ed19e991e216bee83dd0c857ef21768d3a5`
+are healthy with PostgreSQL ready. Fresh backup:
+`.tmp/update-20261104-150212-UTC-3a0839c5`; rollback image:
+`simceo-essentials-app:rollback-20261104-150212-3a0839c5`.
+The existing database and volumes were retained. Deployment completed;
+isolated API/fake/browser test processes exited and test ports were verified
+closed. No background coding agents were used. The full parity goal remains
+paused; this checkpoint completes the requested tabs only.
