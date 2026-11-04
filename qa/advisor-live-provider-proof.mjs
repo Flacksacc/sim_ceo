@@ -29,7 +29,8 @@ const ORIGIN = "http://127.0.0.1:15190";
 const PROJECT_DEFAULT = "simceo-advisor-real-15190";
 const PROJECT_V2 = "simceo-advisor-real-15190-v2";
 const PROJECT_V3 = "simceo-advisor-real-15190-v3";
-const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2, PROJECT_V3];
+const PROJECT_V4 = "simceo-advisor-real-15190-v4";
+const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2, PROJECT_V3, PROJECT_V4];
 const SOURCE_COMMIT_DEFAULT = "509e6a6ea4a9c9078774f8963eca446760878cdc";
 function expectedProject() {
   const v = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
@@ -39,7 +40,7 @@ function expectedProject() {
 function expectedSourceCommit() {
   const raw = (process.env.QA_LIVE_SOURCE_COMMIT || "").trim().toLowerCase();
   const proj = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
-  if ((proj === PROJECT_V2 || proj === PROJECT_V3) && !raw) throw new ProofError("QA_LIVE_SOURCE_COMMIT explicit full 40hex is required for " + proj);
+  if (proj !== PROJECT_DEFAULT && !raw) throw new ProofError("QA_LIVE_SOURCE_COMMIT explicit full 40hex is required for " + proj);
   const v = raw || SOURCE_COMMIT_DEFAULT;
   if (!/^[0-9a-f]{40}$/.test(v)) throw new ProofError("QA_LIVE_SOURCE_COMMIT must be full 40 lowercase hex");
   return v;
@@ -578,7 +579,7 @@ function artifactBase(extra) {
     contract: {
       script: "qa/advisor-live-provider-proof.mjs",
       origin: ORIGIN, project: expectedProject(), sourceCommitExact: expectedSourceCommit(),
-      trustedContainerId: TRUSTED_CONTAINER_ID.slice(0, 12) + "...",
+      trustedContainerId: partial.provenance?.containerId || "primary proof required",
       callBudget: "1 research + 1 roster-chat + 1 audition (no retries/double POST; polls are free GETs)",
       totalBudgetMs: TOTAL_MS, drainMs: DRAIN_MS, researchAbsoluteMs: RESEARCH_ABSOLUTE_MS,
       spending: "observed only (warn/null/false is VALID fresh default); no spending/model PUT",
@@ -698,12 +699,13 @@ async function main() {
     const proof = await readProof();
     partial.provenance = {
       project: proof.project,
-      containerId: String(proof.containerId).slice(0, 32) + "...",
-      imageId: String(proof.imageId).slice(0, 32) + "...",
+      containerId: String(proof.containerId),
+      imageId: String(proof.imageId),
       sourceCommit: proof.sourceCommit, apiOrigin: proof.apiOrigin,
-      indexShaMatch: true, resumed: false,
+      indexShaMatch: false, resumed: false,
     };
     const fresh = await checkFreshness(proof);
+    partial.provenance.indexShaMatch = true;
     partial.freshness = "pristine accountCount=0 authRequired=false";
     const creds = await registerLogin();
     partial.qaEmail = creds.email;

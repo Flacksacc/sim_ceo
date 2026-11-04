@@ -109,3 +109,7 @@ They are not model self-rating or claim-tone proof. Structural counts (e.g. 62/6
 answer still require dedicated AI semantic review (grounding fidelity to the two upstream
 URLs, no overclaiming on uncertain testimony, in-character consistency) before any claim that
 the provider path is qualitatively good. semanticGate PENDING in the artifact records this.
+
+## Direct v4 verification
+The allowlist additionally accepts exactly simceo-advisor-real-15190-v4 with an explicit full source commit. V3 is retained as failed evidence: the provider accepted the request but exhausted its 2048-token output allowance and returned incomplete research. The application now reserves 4096 research output tokens and requests at most eight concise claims, preserving the two-call and whole-run deadlines. V4 is one new fresh attempt in new volumes, with no resume or hidden retry. Artifacts retain full container/image IDs and mark index agreement only after the freshness check passes.
+
