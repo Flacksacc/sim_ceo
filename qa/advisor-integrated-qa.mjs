@@ -1,11 +1,11 @@
 // qa/advisor-integrated-qa.mjs — FINAL integrated advisor milestone QA (Muse-authored, sole script author).
 //
-// Own worktree: .tmp/advisor-integration-qa. This file is the ONLY code change;
-// no App/server edits. Primary mechanically ports this file into the final
-// coherent root and executes it there; this author never runs it (no services,
-// browsers, processes, Docker, .env, or human ports here — node --check only).
-// Unexecuted artifact: assertion counts describe what the script WILL check
-// when primary runs it against the actual compiled combined app.
+// Own worktree: .tmp/advisor-integration-qa. This file is the owned QA change;
+// no App/server edits (source frozen 954; production merged exact). Muse sole-QA author
+// executes it here on the OWN stack (OWN 15396 API + 15398 fake, own headless Edge);
+// launches/binds/verifies its own loopback stack with bounded cleanup of exact owned children.
+// Executed artifact: assertion counts describe what the script checks on actual runs
+// against the actual compiled combined app on the OWN loopback stack (evidence in run logs).
 //
 // Closure revision addressing all 21 findings of the 3207f49 review
 // (frontend 16b0411 in .tmp/advisor-release, server dbb698c; both read-only,
@@ -15,7 +15,7 @@
 // getByRole(textbox, prefix) is used, no refill loops claiming reverts.
 // Uses the dedicated qa/advisor-integrated-fake.mjs (research compile +
 // secretary structured echo) on 15302; standard fake/secretary-fake reused
-// for schema reference. Unexecuted (node --check only); primary runs it.
+// for schema reference. Executed by this author (node --check plus full live runs with evidence).
 //  F1. Opens creation with the ACTUAL button "+ Create new Advisor" (App.tsx
 //      rail) and scopes ALL creation locators to the actual dialog
 //      div.modal[role=dialog][aria-label="Create advisor"].
@@ -80,11 +80,11 @@
 //   QA_WEB=http://127.0.0.1:15300 node qa/advisor-integrated-qa.mjs
 //   ALLOW_LIVE_PROVIDER=1 QA_WEB=http://127.0.0.1:15180 node qa/advisor-integrated-qa.mjs
 //
-// ALLOWLIST: QA_WEB must be http://127.0.0.1:15300 (default, compiled native QA
-// app + API, fake-backed) or http://127.0.0.1:15180 (owned compiled Docker,
-// requires ALLOW_LIVE_PROVIDER=1). QA_FAKE, when set, must be
-// http://127.0.0.1:15302 (primary-owned standard qa/fake-provider.mjs prompt
-// log). Refuses 5173/5080/9333, any other host/port, and credential URLs.
+// ALLOWLIST: QA_WEB must be http://127.0.0.1:15396 (OWN native QA, default) or http://127.0.0.1:15300 (legacy primary
+// app + API, fake-backed). http://127.0.0.1:15180 (owned compiled Docker, PRIMARY ONLY,
+// requires ALLOW_LIVE_PROVIDER=1, never run here). QA_FAKE, when set, must be
+// http://127.0.0.1:15398 (OWN integrated fake) or http://127.0.0.1:15302 (legacy primary; standard qa/fake-provider.mjs prompt
+// log). Refuses 5173/5080/9333/15180-without-flag, any other host/port, and credential URLs. 15396/15398 are the only owned additions.
 // Model keys are never read; the server holds them. Token lives in memory only.
 import crypto from "node:crypto";
 import { chromium } from "playwright-core";
@@ -93,6 +93,7 @@ const QA_WEB = (process.env.QA_WEB || "http://127.0.0.1:15300").trim();
 const LIVE = process.env.ALLOW_LIVE_PROVIDER === "1";
 const FAKE = (process.env.QA_FAKE || "http://127.0.0.1:15302").trim();
 const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+const EXPECTED_INSTANCE = (process.env.QA_EXPECTED_INSTANCE || "qa-author-15396").trim();
 const REQ_TIMEOUT = 30000;
 const RESEARCH_TIMEOUT = 185000;
 const RUN_TIMEOUT = 150000;
@@ -173,7 +174,7 @@ let webUrl = null;
 try { webUrl = new URL(QA_WEB); } catch { console.log("FATAL REFUSE: QA_WEB is not a valid URL."); process.exit(2); }
 if (webUrl.protocol !== "http:") { console.log("FATAL REFUSE: QA_WEB must be plain http loopback."); process.exit(2); }
 if (webUrl.hostname !== "127.0.0.1") { console.log("FATAL REFUSE: QA_WEB must be 127.0.0.1 loopback."); process.exit(2); }
-if (webUrl.port !== "15300" && webUrl.port !== "15180") { console.log("FATAL REFUSE: QA_WEB port must be 15300 or 15180."); process.exit(2); }
+if (webUrl.port !== "15300" && webUrl.port !== "15180" && webUrl.port !== "15396") { console.log("FATAL REFUSE: QA_WEB port must be 15300, 15180, or 15396."); process.exit(2); }
 if (webUrl.username || webUrl.password) { console.log("FATAL REFUSE: credentials-in-URL are never accepted."); process.exit(2); }
 if (webUrl.port === "15180" && !LIVE) { console.log("FATAL REFUSE: port 15180 requires ALLOW_LIVE_PROVIDER=1."); process.exit(2); }
 const WEB = webUrl.origin;
@@ -181,10 +182,10 @@ const FAKE_ENABLED = FAKE !== "" && FAKE !== "none";
 let fakeUrl = null;
 if (FAKE_ENABLED) {
   try { fakeUrl = new URL(FAKE); } catch { console.log("FATAL REFUSE: QA_FAKE is not a valid URL."); process.exit(2); }
-  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || fakeUrl.port !== "15302") { console.log("FATAL REFUSE: QA_FAKE must be http://127.0.0.1:15302 loopback."); process.exit(2); }
+  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || (fakeUrl.port !== "15302" && fakeUrl.port !== "15398")) { console.log("FATAL REFUSE: QA_FAKE must be http://127.0.0.1:15302 or http://127.0.0.1:15398 loopback."); process.exit(2); }
   if (fakeUrl.username || fakeUrl.password) { console.log("FATAL REFUSE: credentials-in-URL are never accepted."); process.exit(2); }
 }
-ok("allowlist-web-ok", WEB === "http://127.0.0.1:15300" || (WEB === "http://127.0.0.1:15180" && LIVE), WEB);
+ok("allowlist-web-ok", WEB === "http://127.0.0.1:15300" || WEB === "http://127.0.0.1:15396" || (WEB === "http://127.0.0.1:15180" && LIVE), WEB);
 
 // ---- owned identity (random account, token in memory only, never logged) ----
 // Deterministic bootstrap: the SAME account id seeds the browser
@@ -443,9 +444,17 @@ async function stepSetup() {
   const me = await get("/api/auth/me");
   ok("setup-me-authenticated", me.status === 200, "status=" + me.status + " " + safeDiag(me));
   if (me.status !== 200) failExit("auth bootstrap failed; aborting cascade.");
+  const health = await get("/health");
+  const instOk = health.status === 200 && health.json && health.json.service === "simceo-api" && String(health.json.instance || "") === EXPECTED_INSTANCE;
+  ok("setup-expected-instance", instOk, "instance=" + String((health.json && health.json.instance) || "?").slice(0, 60) + " want=" + EXPECTED_INSTANCE + " " + safeDiag(health));
+  if (!instOk) failExit("API instance identity mismatch; refusing to mutate a foreign stack. want=" + EXPECTED_INSTANCE);
+  const ready = await get("/ready");
+  const readyOk = ready.status === 200 && ready.json && ready.json.ready === true && String(ready.json.store || "") === "inmemory";
+  ok("setup-memory-backend", readyOk, "store=" + String((ready.json && ready.json.store) || "?") + " " + safeDiag(ready));
+  if (!readyOk) failExit("memory backend not confirmed; refusing PG-backed stack.");
   const log = MODE === "native" ? await fakeLog() : null;
   if (MODE === "native") {
-    ok("fake-loopback-verified", Array.isArray(log), log === null ? "QA_FAKE /__log unreachable (server must be fake-backed at 15302)" : "entries=" + log.length);
+    ok("fake-loopback-verified", Array.isArray(log), log === null ? "QA_FAKE /__log unreachable (server must be fake-backed at " + (fakeUrl ? fakeUrl.origin : "?") + ")" : "entries=" + log.length);
     if (!Array.isArray(log)) failExit("fake prompt log unreachable; refusing to proceed without the required fake loopback proof surface.");
   } else {
     console.log("note: live mode; prompt-log assertions use the explicit live-UNPROVED path (no fake proof accepted).");
@@ -1036,20 +1045,15 @@ async function stepMeeting() {
       await sleep(2500);
     }
   })();
-  let savedLeadResp = null; let savedLeadStatus = 0;
+  let savedLeadResp = null; let savedLeadStatus = 0; let savedLeadRespUrl = "";
   const msgRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/messages" && r.request().method() === "POST"; } catch { return false; } }, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }).catch(() => null);
   try {
   await box.press("Enter");
-  let progress = "";
-  try { await page.waitForFunction(() => document.body.innerText.indexOf("Sending message...") >= 0, undefined, { timeout: 8000 }); progress = "sending"; } catch {}
-  if (!progress) {
-    try { await page.waitForFunction(() => document.body.innerText.indexOf("Requesting advisor responses...") >= 0, undefined, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); progress = "working"; } catch { ok("meeting-progress-visible", false, "no sending/working status"); }
-  }
-  if (progress) ok("meeting-progress-visible", true, progress + " after " + (Date.now() - sendStart) + "ms");
-  try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadResp = await _mr.json(); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
+  try { const _mr = await msgRespPromise; if (_mr) { savedLeadStatus = _mr.status(); try { savedLeadRespUrl = new URL(_mr.url()).pathname; } catch { savedLeadRespUrl = ""; } try { savedLeadResp = await _mr.json(); } catch { savedLeadResp = null; } } } catch { savedLeadResp = null; }
   // pairedOk lives at function scope (ReferenceError fix); serial paced sampling below reuses it.
-  // Serial paced OWN-advisor sampling during run (not one early Sending probe).
-  if (progress) {
+  // Concurrent sampling starts immediately after Enter (no pre-wait); progress is observed inside samples.
+  let progressSeen = "";
+  {
     try {
       const WORKING = new Set(["queued", "awaiting-selection", "considering", "responding", "awaiting-publication"]);
       let samples = 0, goodSamples = 0; const sampleNotes = [];
@@ -1057,6 +1061,7 @@ async function stepMeeting() {
       while (Date.now() < sampleEnd && goodSamples < 2) {
         assertDeadline("paired-sample");
         try {
+          try { const bt0 = await page.evaluate(() => (document.body ? document.body.innerText : "")).catch(() => ""); if (bt0.indexOf("Sending message...") >= 0 && progressSeen === "") progressSeen = "sending"; if (bt0.indexOf("Requesting advisor responses...") >= 0) progressSeen = "working"; } catch {}
           const aMid = await getActivity(meetingId);
           if (aMid && !aMid.malformed && Array.isArray(aMid.states)) {
           const a1Mid = (aMid.states || []).filter((x) => String(x.id).toLowerCase() === String(advisor1).toLowerCase());
@@ -1066,24 +1071,25 @@ async function stepMeeting() {
           const badgeTexts = await railMid.locator(".mp-badge").allInnerTexts().catch(() => []);
           const idxMid = namesMid.findIndex((n) => String(n || "").includes("Harbor Strategist"));
           let badgeMid = "", badgeHuman = "";
-          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = String(badgeTexts[idxMid] || badgeTexts[0] || ""); }
+          if (idxMid >= 0) { const m = /act-([a-z-]+)/.exec(String(clsMid[idxMid] || "")); badgeMid = m ? m[1] : ""; badgeHuman = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().innerText().catch(() => ""); const seatBadgeVis = await railMid.locator("li.mp-seat").nth(idxMid).locator(".mp-badge").first().isVisible().catch(() => false); if (!seatBadgeVis) badgeHuman = ""; }
           const rawWorkMid = a1Mid.filter((x) => WORKING.has(String(x.state)));
           const badgeWorkMid = ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(badgeMid);
-          const humanOk = badgeHuman.trim().length > 0;
+          const EXPECT_LABEL = { "queued": "Queued", "waiting-for-selection": "Waiting to be considered", "considering": "Considering", "responding": "Responding", "waiting-for-publication": "Waiting for publication" }; const humanOk = badgeMid !== "" && badgeHuman === EXPECT_LABEL[badgeMid];
           const latestRaw = a1Mid.length > 0 ? String(a1Mid[a1Mid.length - 1].state) : "";
           const mapEq = latestRaw !== "" && WORKING.has(latestRaw) && mapRaw(latestRaw) === badgeMid;
           samples++;
-          if (rawWorkMid.length >= 1 && badgeWorkMid && humanOk && mapEq) { goodSamples++; sampleNotes.push("raw=" + a1Mid.map((x) => x.state).join(",") + " badge=" + badgeMid + " humanLen=" + badgeHuman.trim().length); }
+          if (rawWorkMid.length >= 1 && badgeWorkMid && humanOk && mapEq) { goodSamples++; sampleNotes.push("raw=" + a1Mid.map((x) => x.state).join(",") + " badge=" + badgeMid + " human=" + badgeHuman); }
           try { const doneEarly = await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: 2500 }); if (doneEarly) break; } catch {}
           }
         } catch (e) { sampleNotes.push("throw:" + String((e && e.message) || e).slice(0, 60)); }
         await sleep(2500);
       }
       pairedOk = goodSamples >= 2;
-      pairedDetail = "samples=" + samples + " good=" + goodSamples + " " + sampleNotes.slice(0, 2).join(" | ");
+      pairedDetail = "samples=" + samples + " good=" + goodSamples + " progress=" + (progressSeen || "none") + " " + sampleNotes.slice(0, 2).join(" | ");
     } catch (e) { pairedDetail = "paired sampling threw: " + String((e && e.message) || e).slice(0, 120); }
     ok("activity-paired-working", pairedOk, pairedDetail || "adv1 raw working + seat badge together during work");
-  } else { ok("activity-paired-working", false, "no progress; cannot pair raw+rendered during work"); }
+    ok("meeting-progress-visible", progressSeen !== "", "progress=" + (progressSeen || "none") + " after " + (Date.now() - sendStart) + "ms");
+  }
   let terminal = false;
   try { await page.waitForFunction(() => document.body.innerText.indexOf("Responses complete.") >= 0, undefined, { timeout: Math.min(RUN_TIMEOUT, Math.max(10000, remainingMs(20000))) }); terminal = true; } catch { ok("meeting-terminal-complete", false, "no Responses complete. within bounded remaining deadline"); }
   if (terminal) ok("meeting-terminal-complete", true, "after " + (Date.now() - sendStart) + "ms");
@@ -1125,18 +1131,20 @@ async function stepMeeting() {
   ok("activity-adv1-badge-working", ["queued", "waiting-for-selection", "considering", "responding", "waiting-for-publication"].includes(adv1Badge) || pairedOk, "adv1Badge=" + adv1Badge + " paired=" + pairedOk);
   if (!finAdv1Working) failExit("no working raw state observed for the owned participant; honest activity requires a transient working state.");
   const meetMsgs = netBodies.messages.filter((b) => String(b.url || "").includes(meetingId));
+  const sendPosts = { messages: netPosts.messages.filter((x) => x >= sendStart), patch: netPosts.patch.filter((x) => x >= sendStart), run: netPosts.run.filter((x) => x >= sendStart) };
   const meetPatch = netBodies.patch.filter((b) => String(b.url || "").includes(meetingId));
   const meetRun = netBodies.run.filter((b) => String(b.url || "").includes(meetingId));
-  const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
-  const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
-  const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300);
+  const meetMsgsRes = netResps.messages.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
+  const meetPatchRes = netResps.patch.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
+  const meetRunRes = netResps.run.filter((r) => String(r.url || "").includes(meetingId) && r.status >= 200 && r.status < 300 && r.t >= sendStart);
   // Once-only with paired identity and response/order boundary: exact owned meeting, 1 request each, each paired to a 2xx response after its request, ordered lead-save -> auto-init -> run.
   let orderOk = false;
   try {
-    const qMsg = netPosts.messages.length === 1 ? netPosts.messages[0] : -1;
-    const qPatch = netPosts.patch.length === 1 ? netPosts.patch[0] : -1;
-    const qRun = netPosts.run.length === 1 ? netPosts.run[0] : -1;
-    orderOk = meetMsgs.length === 1 && meetPatch.length === 1 && meetRun.length === 1 && meetMsgsRes.length === 1 && meetPatchRes.length === 1 && meetRunRes.length === 1 && qMsg > 0 && qPatch >= qMsg && qRun >= qPatch && meetMsgsRes[0].t >= qMsg && meetPatchRes[0].t >= qPatch && meetRunRes[0].t >= qRun;
+    const qMsg = sendPosts.messages.length === 1 ? sendPosts.messages[0] : -1;
+    const qPatch = sendPosts.patch.length === 1 ? sendPosts.patch[0] : -1;
+    const qRun = sendPosts.run.length === 1 ? sendPosts.run[0] : -1;
+    const urlPair = meetMsgs.length === 1 && meetMsgsRes.length === 1 && meetMsgs[0].url === meetMsgsRes[0].url && meetPatch.length === 1 && meetPatchRes.length === 1 && meetPatch[0].url === meetPatchRes[0].url && meetRun.length === 1 && meetRunRes.length === 1 && meetRun[0].url === meetRunRes[0].url;
+    orderOk = urlPair && qMsg > 0 && qPatch >= qMsg && qRun >= qPatch && meetMsgsRes[0].t >= qMsg && meetMsgsRes[0].t <= qPatch && meetPatchRes[0].t >= qPatch && meetPatchRes[0].t <= qRun && meetRunRes[0].t >= qRun;
   } catch { orderOk = false; }
   ok("send-lead-once", meetMsgs.length === 1 && meetMsgsRes.length === 1 && orderOk, "POST messages=1 okRes=1 ordered=" + orderOk);
   ok("autoinit-patch-once", meetPatch.length === 1 && meetPatchRes.length === 1 && orderOk, "PATCH=1 okRes=1 ordered=" + orderOk);
@@ -1148,23 +1156,28 @@ async function stepMeeting() {
   const wantBrief = QUESTION.slice(0, 800);
   ok("send-lead-body-exact", !!leadJson && leadJson.content === QUESTION && leadJson.sender === "lead", "contentExact=" + (!!leadJson && leadJson.content === QUESTION));
   if (!(!!leadJson && leadJson.content === QUESTION)) failExit("lead POST content must exactly equal QUESTION.");
-  const savedSeq = savedLeadResp ? Number(pick(savedLeadResp, "sequence") ?? pick(savedLeadResp, "Sequence") ?? NaN) : NaN;
-  const savedContent = savedLeadResp ? String(pick(savedLeadResp, "content") ?? pick(savedLeadResp, "Content") ?? "") : "";
-  const savedGen = savedLeadResp ? Number(pick(savedLeadResp, "generation") ?? pick(savedLeadResp, "Generation") ?? NaN) : NaN;
-  const savedRestoreId = savedLeadResp ? String(pick(savedLeadResp, "restoreEpochId") ?? pick(savedLeadResp, "RestoreEpochId") ?? "") : "";
-  const savedRestoreRev = savedLeadResp ? Number(pick(savedLeadResp, "restoreEpochRev") ?? pick(savedLeadResp, "RestoreEpochRev") ?? NaN) : NaN;
-  const savedLeadOk = savedLeadStatus >= 200 && savedLeadStatus < 300 && Number.isInteger(savedSeq) && savedSeq > 0 && savedContent === QUESTION && Number.isInteger(savedGen);
+  const savedSeqRaw = savedLeadResp ? (pick(savedLeadResp, "sequence") ?? pick(savedLeadResp, "Sequence")) : undefined;
+  const savedSeq = typeof savedSeqRaw === "number" ? savedSeqRaw : NaN;
+  const savedContentRaw = savedLeadResp ? (pick(savedLeadResp, "content") ?? pick(savedLeadResp, "Content")) : undefined;
+  const savedContent = typeof savedContentRaw === "string" ? savedContentRaw : "";
+  const savedGenRaw = savedLeadResp ? (pick(savedLeadResp, "generation") ?? pick(savedLeadResp, "Generation")) : undefined;
+  const savedGen = typeof savedGenRaw === "number" ? savedGenRaw : NaN;
+  const savedRestoreIdRaw = savedLeadResp ? (pick(savedLeadResp, "restoreEpochId") ?? pick(savedLeadResp, "RestoreEpochId")) : undefined;
+  const savedRestoreId = typeof savedRestoreIdRaw === "string" ? savedRestoreIdRaw : "";
+  const savedRestoreRevRaw = savedLeadResp ? (pick(savedLeadResp, "restoreEpochRev") ?? pick(savedLeadResp, "RestoreEpochRev")) : undefined;
+  const savedRestoreRev = typeof savedRestoreRevRaw === "number" ? savedRestoreRevRaw : NaN;
+  const savedLeadOk = savedLeadStatus >= 200 && savedLeadStatus < 300 && Number.isInteger(savedSeq) && savedSeq > 0 && savedContent === QUESTION && Number.isInteger(savedGen) && savedLeadRespUrl === "/api/meetings/" + meetingId + "/messages";
   ok("send-lead-return-cas", savedLeadOk, "leadSeq=" + savedSeq + " gen=" + savedGen + " contentExact=" + (savedContent === QUESTION));
   if (!savedLeadOk) failExit("lead POST return must carry exact Sequence/Content/Generation for CAS correlation.");
   const patchBriefOk = !!patchJson && patchJson.brief === wantBrief && patchJson.briefAutoInit === true && patchJson.expectedBrief === "" && patchJson.expectBriefEmpty === true;
-  const patchCasOk = !!patchJson && Number(patchJson.leadSequence) === savedSeq && String(patchJson.leadContent) === QUESTION && String(patchJson.leadContent) === savedContent && Number(patchJson.expectedGeneration) === savedGen && String(patchJson.restoreEpochId || "") === String(savedRestoreId || "") && Number(patchJson.restoreEpochRev) === savedRestoreRev;
+  const patchCasOk = !!patchJson && typeof patchJson.leadSequence === "number" && patchJson.leadSequence === savedSeq && typeof patchJson.leadContent === "string" && patchJson.leadContent === QUESTION && patchJson.leadContent === savedContent && typeof patchJson.expectedGeneration === "number" && patchJson.expectedGeneration === savedGen && typeof (patchJson.restoreEpochId || "") === "string" && String(patchJson.restoreEpochId || "") === String(savedRestoreId || "") && typeof patchJson.restoreEpochRev === "number" && patchJson.restoreEpochRev === savedRestoreRev;
   const patchNoAdv = !!patchJson && !JSON.stringify(patchJson).toLowerCase().includes(String(advisor1).toLowerCase()) && !("advisorId" in patchJson) && !("participantIds" in patchJson);
   ok("autoinit-patch-body-exact", patchBriefOk && patchCasOk && patchNoAdv, "briefExact=" + patchBriefOk + " casValues=" + patchCasOk + " noAdvId=" + patchNoAdv);
   if (!(patchBriefOk && patchCasOk)) failExit("PATCH must carry exact lead return CAS values, not key presence.");
-  const runPolicyOk = !!runJson && typeof runJson.policy === "string" && runJson.policy.length > 0;
+  const runPolicyOk = !!runJson && runJson.policy === "balanced";
   const runPromptOk = !!runJson && runJson.prompt === QUESTION;
   const runEvOk = !!runJson && runJson.evidenceSupported === false;
-  const runVerOk = !!runJson && Number.isInteger(Number(runJson.leadVersion)) && Number(runJson.leadVersion) === leadVerPre && Number(runJson.leadVersion) > 0;
+  const runVerOk = !!runJson && typeof runJson.leadVersion === "number" && Number.isInteger(runJson.leadVersion) && runJson.leadVersion === leadVerPre && runJson.leadVersion > 0;
   const runOk = runPolicyOk && runPromptOk && runEvOk && runVerOk;
   ok("run-body-ok", runOk, "policyLen=" + (runJson && String(runJson.policy || "").length) + " promptExact=" + runPromptOk + " evFalse=" + runEvOk + " leadVer=" + (runJson && runJson.leadVersion));
   if (!runOk) failExit("run body must carry actual policy/prompt/evidenceSupported/leadVersion values.");
@@ -1173,6 +1186,10 @@ async function stepMeeting() {
   const leads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "").includes(QUESTION));
   const exactLeads = msgList.filter((x) => String(pick(x, "sender") || "").toLowerCase() === "lead" && String(pick(x, "content") || pick(x, "body") || "") === QUESTION);
   ok("send-lead-text-once", msgs.status === 200 && exactLeads.length === 1 && leads.length === 1, "status=" + msgs.status + " exact-leads=" + exactLeads.length + " total=" + msgList.length);
+  const leadEnt = exactLeads.length === 1 ? exactLeads[0] : null;
+  const leadEntOk = !!leadEnt && String(pick(leadEnt, "boardId") || pick(leadEnt, "BoardId") || "") === String(boardA) && String(pick(leadEnt, "meetingId") || pick(leadEnt, "MeetingId") || "") === String(meetingId);
+  ok("send-lead-identity", leadEntOk, "persisted owned lead carries exact board+meeting identity");
+  if (!leadEntOk) failExit("persisted owned lead must carry exact board and meeting identity.");
   const det1 = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
   ok("autobrief-once", det1.status === 200 && String(pick(det1.json, "brief") || "") === wantBrief, "status=" + det1.status + " briefExact=" + (String(pick(det1.json, "brief") || "") === wantBrief));
   const adv = msgList.filter((x) => { const a = String(pick(x, "advisorId") || ""); return a && a !== "00000000-0000-0000-0000-000000000000"; });
@@ -1451,17 +1468,16 @@ async function stepRosterChatUI() {
   const selOk = ariaCur === "true" && String(clsCur).indexOf("active") >= 0;
   if (!selOk) { const allN = await page.locator("aside.listpanel button.lprow .lprow-name").allInnerTexts().catch(() => []); ok("roster-chat-panel-mounted", false, "selection did not land on owned entry aria=" + ariaCur + " rows=" + (allN || []).length + " " + selDiag); failExit("roster selection identity not proven; refusing panel proof. " + selDiag); }
   await page.waitForTimeout(800);
-  const panelBase = page.locator('div[data-roster-chat="' + rosterId + '"]');
+  const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
   let panelOk = false;
   let panelDiag = "";
-  let waitErr = "none"; try { await panelBase.first().waitFor({ timeout: boundedTimeout(20000, 8000) }); } catch (e) { waitErr = String((e && e.message) || e).slice(0, 160); } const panelExactCount = await panelBase.count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); const panelVisible = page.locator("div[data-roster-chat=\"" + rosterId + "\"]:visible"); const panelVisibleCount = await panelVisible.count().catch(() => -1); const panel = panelVisible.last();
-  { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); let nativeDiag = "native=uncollected"; try { nativeDiag = await page.evaluate((rid) => { try { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let exactN = 0; try { exactN = els.filter((e) => e.getAttribute("data-roster-chat") === rid).length; } catch (e2) { exactN = -2; } let visN = 0; const visHeads = []; try { for (const el of els) { let vis = false; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); vis = r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; } catch (e4) { vis = false; } if (vis) { visN++; if (visHeads.length < 3) { let h = ""; try { const sec = el.closest("section,aside,main"); const hh = sec ? sec.querySelector("h1,h2,h3") : null; h = (hh && hh.innerText ? hh.innerText : "").slice(0, 40); } catch (e5) { h = "head-err"; } visHeads.push("attr=" + String(el.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + h); } } } } catch (e3) { visN = -3; } const headFor = (el) => { try { const sec = el.closest("section,aside,main"); const h = sec ? sec.querySelector("h1,h2,h3") : null; return (h && h.innerText ? h.innerText : "").slice(0, 40); } catch (e3) { return "head-err"; } }; return "nativeCount=" + els.length + " nativeExact=" + exactN + " nativeVisible=" + visN + " totalDivs=" + document.querySelectorAll("div").length + " url=" + String(location.hash || "").slice(0, 80) + " attrs=[" + els.slice(0, 3).map((e) => "attr=" + String(e.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + headFor(e)).join(";") + "] visHeads=[" + visHeads.join(";") + "]"; } catch (e) { return "native-eval-threw"; } }, rosterId).catch(() => "native-eval-failed"); } catch (e) { nativeDiag = "native-harness-threw"; } let shotInfo = "shot=skipped"; try { const osMod = await import("node:os"); const shotPath = String(osMod.tmpdir()).replace(/\\/g, "/") + "/qa-author-roster-" + run + ".png"; await page.screenshot({ path: shotPath }).catch(() => {}); shotInfo = "shot=" + shotPath; } catch (e) { shotInfo = "shot-failed"; } panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " panelExact=" + panelExactCount + " panelVisible=" + panelVisibleCount + " waitErr=" + waitErr + " aria=" + ariaCur + " " + selDiag + " " + nativeDiag + " " + shotInfo; }
-  const anyVisible = panelVisibleCount >= 1; const singleVisible = panelVisibleCount === 1;
-  const singular = panelExactCount === 1 && panelVisibleCount === 1;
-  ok("roster-chat-panel-mounted", anyVisible, anyVisible ? "div[data-roster-chat] visible same-entry=" + String(rosterId).slice(0, 8) + " visiblePanels=" + panelVisibleCount + " extraClones=" + (panelExactCount - panelVisibleCount) + " " + selDiag : "panel not visible; " + panelDiag);
-  ok("roster-chat-panel-singular", singular, "exact=" + panelExactCount + " visible=" + panelVisibleCount + " waitErr=" + waitErr + " " + selDiag);
-  panelOk = anyVisible;
-  if (!panelOk) failExit("roster chat panel not visible for same exact entry after proven selection; refusing HTTP-only chat. " + panelDiag);
+  let waitErr = "none"; try { await panel.first().waitFor({ timeout: boundedTimeout(20000, 8000) }); } catch (e) { waitErr = String((e && e.message) || e).slice(0, 160); } const panelExactCount = await panel.count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); const nativeN = await page.evaluate((rid) => { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let ex = 0; let vv = 0; for (const el of els) { if (el.getAttribute("data-roster-chat") === rid) { ex++; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); if (r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none") vv++; } catch (ee) { } } } return { all: els.length, exact: ex, vis: vv }; }, rosterId).catch(() => null);
+  { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); let nativeDiag = "native=uncollected"; try { nativeDiag = await page.evaluate((rid) => { try { const els = Array.from(document.querySelectorAll("div[data-roster-chat]")); let exactN = 0; try { exactN = els.filter((e) => e.getAttribute("data-roster-chat") === rid).length; } catch (e2) { exactN = -2; } let visN = 0; const visHeads = []; try { for (const el of els) { let vis = false; try { const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); vis = r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none"; } catch (e4) { vis = false; } if (vis) { visN++; if (visHeads.length < 3) { let h = ""; try { const sec = el.closest("section,aside,main"); const hh = sec ? sec.querySelector("h1,h2,h3") : null; h = (hh && hh.innerText ? hh.innerText : "").slice(0, 40); } catch (e5) { h = "head-err"; } visHeads.push("attr=" + String(el.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + h); } } } } catch (e3) { visN = -3; } const headFor = (el) => { try { const sec = el.closest("section,aside,main"); const h = sec ? sec.querySelector("h1,h2,h3") : null; return (h && h.innerText ? h.innerText : "").slice(0, 40); } catch (e3) { return "head-err"; } }; return "nativeCount=" + els.length + " nativeExact=" + exactN + " nativeVisible=" + visN + " totalDivs=" + document.querySelectorAll("div").length + " url=" + String(location.hash || "").slice(0, 80) + " attrs=[" + els.slice(0, 3).map((e) => "attr=" + String(e.getAttribute("data-roster-chat") || "").slice(0, 8) + " head=" + headFor(e)).join(";") + "] visHeads=[" + visHeads.join(";") + "]"; } catch (e) { return "native-eval-threw"; } }, rosterId).catch(() => "native-eval-failed"); } catch (e) { nativeDiag = "native-harness-threw"; } let shotInfo = "shot=skipped"; try { const osMod = await import("node:os"); const shotPath = String(osMod.tmpdir()).replace(/\\/g, "/") + "/qa-author-roster-" + run + ".png"; await page.screenshot({ path: shotPath }).catch(() => {}); shotInfo = "shot=" + shotPath; } catch (e) { shotInfo = "shot-failed"; } panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " panelExact=" + panelExactCount + " waitErr=" + waitErr + " nativeAll=" + (nativeN ? nativeN.all : -1) + " nativeExact=" + (nativeN ? nativeN.exact : -1) + " nativeVis=" + (nativeN ? nativeN.vis : -1) + " aria=" + ariaCur + " " + selDiag + " " + nativeDiag + " " + shotInfo; }
+  const singular = panelExactCount === 1 && !!nativeN && nativeN.exact === 1 && nativeN.vis === 1;
+  ok("roster-chat-panel-mounted", singular, singular ? "div[data-roster-chat] single same-entry=" + String(rosterId).slice(0, 8) + " " + selDiag : "panel not singular; " + panelDiag);
+  ok("roster-chat-panel-singular", singular, "exact=" + panelExactCount + " nativeAll=" + (nativeN ? nativeN.all : -1) + " nativeExact=" + (nativeN ? nativeN.exact : -1) + " nativeVis=" + (nativeN ? nativeN.vis : -1) + " waitErr=" + waitErr + " " + selDiag);
+  panelOk = singular;
+  if (!panelOk) failExit("roster chat panel not singular for same exact entry after proven selection; refusing HTTP-only chat. " + panelDiag);
   const headOk = await panel.getByText("Chat with this advisor", { exact: false }).count().then((c) => c > 0).catch(() => false);
   const boardfreeOk = await panel.getByText(/nothing here joins a meeting/i).count().then((c) => c > 0).catch(() => false);
   ok("roster-chat-boardfree-contract", headOk && boardfreeOk, "heading=" + headOk + " boardfree-note=" + boardfreeOk);
@@ -1483,9 +1499,9 @@ async function stepRosterChatUI() {
   if (!(mc0.status === 200 && baseLeadExact === 1)) failExit("meeting baseline not positively validated; refusing stateless proof.");
   const chatQ = "Direct " + run + ": state your current berth criterion in one line?";
   const chatRespPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/roster/" + rosterId + "/chat" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(95000, Math.max(15000, remainingMs(20000))) }).catch(() => null);
-  const panelHandle = await panelVisible.first().elementHandle().catch(() => null); ok("roster-chat-panel-handle", !!panelHandle, "pinned single visible panel instance"); if (!panelHandle) failExit("no element handle for visible roster panel; refusing HTTP-only chat."); const boxHandle = await panelHandle.$("textarea").catch(() => null); if (!boxHandle) failExit("visible roster panel message box missing."); await boxHandle.fill(chatQ);
-  const btnHandle = await panelHandle.$("button").catch(() => null); if (!btnHandle) failExit("visible roster panel send button missing.");
-  try { await btnHandle.click({ timeout: 8000 }); } catch (e) { let clickDiag = String((e && e.message) || e).slice(0, 200); try { clickDiag += " pt=" + await btnHandle.evaluate((el) => { const r = el.getBoundingClientRect(); const x = Math.round(r.x + r.width / 2); const y = Math.round(r.y + r.height / 2); let ds = "q-na"; try { const tt = document.elementFromPoint(x, y); ds = tt === el ? "self" : (tt ? tt.tagName + "." + String(tt.className || "").slice(0, 50) : "none"); } catch (ee) { ds = "q-na"; } return x + "," + y + " hit=" + ds + " dis=" + !!el.disabled; }).catch(() => "pt-na"); } catch (ee) { clickDiag += " diag-na"; } try { await boxHandle.focus({ timeout: 5000 }); await boxHandle.press("Enter", { timeout: 5000 }); console.log("  note - roster-chat-sent-via-enter " + clickDiag); } catch (e2) { ok("roster-chat-ui-reply", false, "Send never clickable/cannot Enter " + clickDiag + " enterErr=" + String((e2 && e2.message) || e2).slice(0, 120)); failExit("roster chat send failed. " + clickDiag); } }
+  await chatBox.first().fill(chatQ);
+  const sendBtn = panel.getByRole("button", { name: /^send$/i });
+  try { await sendBtn.first().click({ timeout: 8000 }); } catch (e) { let clickDiag = String((e && e.message) || e).slice(0, 200); try { clickDiag += " pt=" + await sendBtn.first().evaluate((el) => { const r = el.getBoundingClientRect(); const x = Math.round(r.x + r.width / 2); const y = Math.round(r.y + r.height / 2); let ds = "q-na"; try { const tt = document.elementFromPoint(x, y); ds = tt === el ? "self" : (tt ? tt.tagName + "." + String(tt.className || "").slice(0, 50) : "none"); } catch (ee) { ds = "q-na"; } return x + "," + y + " hit=" + ds + " dis=" + !!el.disabled; }).catch(() => "pt-na"); } catch (ee) { clickDiag += " diag-na"; } ok("roster-chat-ui-reply", false, "Send never clickable " + clickDiag); failExit("roster chat send failed. " + clickDiag); }
   let advAnswer = "";
   try {
     await page.waitForFunction((rid) => {
@@ -1493,7 +1509,7 @@ async function stepRosterChatUI() {
       for (const r of rows) { const t = (r.innerText || "").trim(); if (t.length >= 20 && !/^Responding/.test(t)) return true; }
       return false;
     }, rosterId, { timeout: 90000 });
-    const texts = await panelHandle.$$eval(".msg-row.advisor .btext", (els) => els.map((e) => e.innerText)).catch(() => []);
+    const texts = await panel.locator(".msg-row.advisor .btext").allInnerTexts().catch(() => []);
     const cands = (texts || []).map((t) => String(t || "").trim()).filter((t) => t.length >= 20 && !/^Responding/.test(t) && !t.includes(chatQ.slice(0, 20)));
     advAnswer = cands.length > 0 ? cands[cands.length - 1] : "";
   } catch { ok("roster-chat-ui-reply", false, "no completed advisor .msg-row.advisor .btext answer within 90s"); }
@@ -1525,24 +1541,28 @@ async function stepRosterChatUI() {
   checkBudget("roster-chat-ui");
 }
 // ---- 6. navigation: every named destination, direct routes, back/forward ----
+function collectVisibleText(root) {
+  const doc = (root && root.ownerDocument) || document;
+  const scope = root || doc;
+  let txt = "";
+  try { txt = (!root || scope === doc || scope === doc.body) ? (doc.body ? doc.body.innerText || "" : "") : (scope.innerText || ""); } catch (e) { txt = ""; }
+  const els = Array.from((!root || scope === doc ? doc : scope).querySelectorAll("input,textarea,select"));
+  for (const el of els) {
+    try {
+      const cs = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+      if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
+      const r = el.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) continue;
+      if ((el.value || "").length > 0) txt += "\n" + el.value;
+    } catch {}
+  }
+  return txt;
+}
 async function scanDebug(tag) {
   assertDeadline("scan-" + tag);
   let collected = null;
   try {
-    collected = await page.evaluate(() => {
-      let txt = document.body ? (document.body.innerText || "") : "";
-      const els = Array.from(document.querySelectorAll("input,textarea,select"));
-      for (const el of els) {
-        try {
-          const cs = window.getComputedStyle(el);
-          if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
-          const r = el.getBoundingClientRect();
-          if (!(r.width > 0 && r.height > 0)) continue;
-          if ((el.value || "").length > 0) txt += "\n" + el.value;
-        } catch {}
-      }
-      return txt;
-    });
+    collected = await page.evaluate(collectVisibleText);
   } catch (e) { failExit("debug collector failed for " + tag + "; refusing empty-clean. " + String((e && e.message) || e).slice(0,120)); }
   if (typeof collected !== "string") failExit("debug collector returned non-string for " + tag + "; FATAL not clean.");
   if (collected.length === 0) failExit("debug collector body empty for " + tag + "; body nonempty required.");
@@ -1555,48 +1575,37 @@ async function scanDebug(tag) {
   const guidHits = detCollected.g ? (collected.match(guidRe) || []).length : 0;
   const jsonHits = detCollected.j ? (collected.match(jsonRe) || []).length : 0;
   const primHits = detCollected.p ? (collected.match(primRe) || []).length : 0;
-  const hasGuid = (t) => det(t).g;
-  const hasStrJson = (t) => det(t).j;
-  const hasObjJson = (t) => det(t).j;
-  const hasArrJson = (t) => det(t).j;
-  const hasPrimJson = (t) => det(t).p;
-  const fGuid = "id 11111111-2222-3333-4444-555555555555";
-  const fStr = '"k":"v"';
-  const fObj = '"k":{}';
-  const fArr = '"k":[]';
-  const fPrim = '"k":123';
-  const fClean = "plain visible text with no identifiers";
-  const positiveOk = hasGuid(fGuid) && hasStrJson(fStr) && hasObjJson(fObj) && hasArrJson(fArr) && hasPrimJson(fPrim) && !hasGuid(fClean) && !hasStrJson(fClean) && !hasPrimJson(fClean);
-  ok("debug-scan-positive-" + tag, positiveOk, "independent fixtures GUID/string/object/array/primitive + clean negative");
-  // Hidden DOM controls/attributes and visibility:hidden are ignored by the same collector (geometry + computed visibility).
-  let hiddenIgnored = false;
+  const QQ = String.fromCharCode(34);
+  let controlsOk = false; let controlsDiag = "unrun";
+  let probePage = null;
   try {
-    hiddenIgnored = await page.evaluate(() => {
-      const wrap = document.createElement("div");
-      wrap.innerHTML = '<input data-probe="22222222-3333-4444-5555-666666666666" value="33333333-4444-5555-6666-777777777777"><span style="visibility:hidden">44444444-5555-6666-7777-888888888888</span>';
-      wrap.style.display = "none";
-      document.body.appendChild(wrap);
-      let txt = document.body.innerText || "";
-      try {
-        const els = Array.from(document.querySelectorAll("input,textarea,select"));
-        for (const el of els) {
-          try {
-            const cs = window.getComputedStyle(el);
-            if (!cs || cs.visibility === "hidden" || cs.display === "none") continue;
-            const r = el.getBoundingClientRect();
-            if (!(r.width > 0 && r.height > 0)) continue;
-            if ((el.value || "").length > 0) txt += "\n" + el.value;
-          } catch {}
-        }
-      } catch {}
-      const hasAttr = txt.includes("22222222-3333-4444-5555-666666666666") || txt.includes("33333333-4444-5555-6666-777777777777");
-      const hasHid = txt.includes("44444444-5555-6666-7777-888888888888");
-      wrap.remove();
-      return !hasAttr && !hasHid;
-    }).catch(() => false);
-  } catch { hiddenIgnored = false; }
-  const clean = guidHits === 0 && jsonHits === 0 && primHits === 0;
-  ok("debug-clean-" + tag, clean && positiveOk && hiddenIgnored, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " hiddenIgnored=" + hiddenIgnored);
+    probePage = await ctx.newPage().catch(() => null);
+    if (!probePage) failExit("debug probe page unavailable for " + tag + "; refusing fixture-only proof.");
+    await probePage.setContent("<p>probe visible words</p><span>id 11111111-2222-3333-4444-555555555555</span><span>" + QQ + "k" + QQ + ":" + QQ + "v" + QQ + "</span><span>" + QQ + "n" + QQ + ":123</span><input value=visible-words>", { waitUntil: "domcontentloaded" });
+    const visTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<span>22222222-3333-4444-5555-666666666666</span>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate(() => { const s = document.querySelector("span"); if (s) s.style.visibility = "hidden"; }).catch(() => {});
+    const hidTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<div><span>33333333-4444-5555-6666-777777777777</span><span>" + QQ + "a" + QQ + ":{}</span><input value=44444444-5555-6666-7777-000000000000></div>", { waitUntil: "domcontentloaded" });
+    await probePage.evaluate(() => { const d = document.querySelector("div"); if (d) d.style.display = "none"; }).catch(() => {});
+    const dispTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.setContent("<div data-qa-attr-probe=55555555-5555-6666-7777-888888888888>plain attribute carrier</div>", { waitUntil: "domcontentloaded" });
+    const attrTxt = await probePage.evaluate(collectVisibleText).catch(() => null);
+    await probePage.close().catch(() => {}); probePage = null;
+    const dV = typeof visTxt === "string" ? det(visTxt) : null;
+    const dH = typeof hidTxt === "string" ? det(hidTxt) : null;
+    const dD = typeof dispTxt === "string" ? det(dispTxt) : null;
+    const dA = typeof attrTxt === "string" ? det(attrTxt) : null;
+    const visOk = !!dV && dV.g && dV.j && dV.p;
+    const hidOk = !!dH && !dH.g && !dH.j && !dH.p;
+    const dispOk = !!dD && !dD.g && !dD.j && !dD.p;
+    const attrOk = !!dA && !dA.g && !dA.j && !dA.p;
+    controlsOk = visOk && hidOk && dispOk && attrOk;
+    controlsDiag = "visible-positive=" + visOk + " hidden=" + hidOk + " display-none=" + dispOk + " attribute=" + attrOk;
+  } catch (e) { controlsOk = false; controlsDiag = "controls threw: " + String((e && e.message) || e).slice(0, 120); try { if (probePage) await probePage.close().catch(() => {}); } catch (ee) { } probePage = null; }
+  ok("debug-scan-positive-" + tag, controlsOk, "actual-collector controls: " + controlsDiag);;
+  const detClean = !detCollected.g && !detCollected.j && !detCollected.p;
+  ok("debug-clean-" + tag, detClean && controlsOk, "guidHits=" + guidHits + " jsonHits=" + jsonHits + " primHits=" + primHits + " controls=" + controlsOk);
 }
 async function stepNavigation() {
   // F11: EVERY named rail destination (repo convention: nav.rail buttons by
