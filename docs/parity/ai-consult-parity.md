@@ -122,7 +122,7 @@ Historical lane interface/review references remain `.tmp/secretary-fourth-interf
 - [ ] Hash/version/watermark + supersession shown; 409 on drift. (Delivered in basic review; the selected browser checks exercise conflict display and an explicit refresh POST. Full-phase acceptance remains open.)
 
 ## Phase 6 -- Source governance depth
-- [ ] pending -> approved/rejected state machine with per-version states. (Backend routes and validators are present in MAIN; selected source/restore checks passed. Full source-governance workflow acceptance is not established by the essentials checkpoint. PRODUCT skill creation remains owned by phase 6 and is not accepted by this milestone.)
+- [ ] pending -> approved/rejected state machine with per-version states. (Backend routes and validators are present in MAIN; selected source/restore checks passed. Full source-governance workflow acceptance is not established by the essentials checkpoint. The historical "PRODUCT skill creation" note refers to creating the root PRODUCT.md context document under the design skill; that document exists. It does not specify an application feature for creating skills.)
 - [ ] Type policies (wiki-only / allow-all-with-exclusions); changes invalidate pending replies + pause. (Shared policy/publication protections are included in the delivered core; full policy workflow acceptance remains open.)
 - [ ] Per-source indexing state + explicit reindex with completion status. (Source index/reindex endpoints are present; complete phase-specific UI and lifecycle acceptance remains open.)
 - [ ] Section-level persisted excerpts. (Source section/version/history endpoints and selected preservation checks are present; full-phase acceptance remains open.)
