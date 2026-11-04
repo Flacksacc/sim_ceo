@@ -275,7 +275,7 @@ function shortJoin(parts: string[], cap: number): string {
 function valueToText(v: unknown): string {
   if (typeof v === "string") {
     const s = (v as string).trim();
-    if (s.startsWith("{") || s.startsWith("[")) return projectNestedString(s, 220);
+    if (s.startsWith("{") || s.startsWith("[") || s.startsWith('"')) return projectNestedString(s, 220);
     return scrubIds(s);
   }
   if (typeof v === "number" || typeof v === "boolean") return String(v);
@@ -290,8 +290,36 @@ function humanKeyLabel(k: string): string {
   const spaced = k.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[-_]+/g, " ").trim().toLowerCase();
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
+// Bounded decode of JSON string layers (max 3). Unwraps extra quoted
+// string layers (double-encoded JSON) to plain JSON. Unknown or truncated
+// layers fail human-safe (neutral fallback); ordinary prose stays intact.
+function unwrapQuotedLayers(s: string, maxLayers = 3): { text: string; layers: number; failedJsonLike: boolean } {
+  let tt = (s ?? "").trim();
+  let layers = 0;
+  while (layers < maxLayers && tt.startsWith('"')) {
+    try {
+      const decoded: unknown = JSON.parse(tt);
+      if (typeof decoded !== "string") break;
+      tt = (decoded as string).trim();
+      layers += 1;
+    } catch {
+      break;
+    }
+  }
+  let failedJsonLike = false;
+  if (layers === 0 && (s ?? "").trim().startsWith('"')) {
+    const orig = (s ?? "").trim();
+    const bs = String.fromCharCode(92);
+    if (orig.length > 1 && (orig.includes(bs + '"') || orig.includes('":') || orig.includes('{"'))) {
+      failedJsonLike = true;
+    }
+  }
+  return { text: tt, layers, failedJsonLike };
+}
 function projectNestedString(s: string, cap: number): string {
-  const tt = (s ?? "").trim();
+  const uw = unwrapQuotedLayers(s, 3);
+  if (uw.failedJsonLike) return "";
+  const tt = uw.text;
   if (!(tt.startsWith("{") || tt.startsWith("["))) return scrubIds(tt).slice(0, cap);
   try {
     const v: unknown = JSON.parse(tt);
@@ -303,19 +331,19 @@ function projectObject(o: Record<string, unknown>, cap: number): string {
   const bits: string[] = [];
   if (typeof o.question === "string" && o.question.trim() !== "") {
     const qt = (o.question as string).trim();
-    const qp = (qt.startsWith("{") || qt.startsWith("[")) ? projectNestedString(qt, 160) : scrubIds(qt);
+    const qp = (qt.startsWith("{") || qt.startsWith("[") || qt.startsWith('"')) ? projectNestedString(qt, 160) : scrubIds(qt);
     if (qp !== "") bits.push("Question: " + qp);
   }
   if (typeof o.title === "string" && (o.title as string).trim() !== "") {
     const tt2 = ((o.title as string).trim());
-    const tp = (tt2.startsWith("{") || tt2.startsWith("[")) ? projectNestedString(tt2, 160) : scrubIds(tt2);
+    const tp = (tt2.startsWith("{") || tt2.startsWith("[") || tt2.startsWith('"')) ? projectNestedString(tt2, 160) : scrubIds(tt2);
     if (tp !== "") bits.push(tp);
   }
   for (const k of TEXT_FIELDS) {
     if (k === "question" || k === "title") continue;
     const v = o[k];
     if (typeof v === "string" && v.trim() !== "") {
-      const vv = (v.trim().startsWith("{") || v.trim().startsWith("[")) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
+      const vv = (v.trim().startsWith("{") || v.trim().startsWith("[") || v.trim().startsWith('"')) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
       if (vv === "") continue;
       const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : humanKeyLabel(k) + ": ";
       bits.push(label + vv);
@@ -329,14 +357,20 @@ function projectObject(o: Record<string, unknown>, cap: number): string {
 }
 function projectJson(raw: unknown, cap: number, fallback: string): string {
   if (typeof raw === "string") {
-    const s = scrubIds(raw.trim());
-    return s === "" ? fallback : s.slice(0, cap);
+    const t = (raw as string).trim();
+    if (t === "") return fallback;
+    if (t.startsWith("{") || t.startsWith("[") || t.startsWith('"')) {
+      const hit = projectNestedString(t, cap);
+      return hit !== "" ? hit : fallback;
+    }
+    const sc = scrubIds(t);
+    return sc === "" ? fallback : sc.slice(0, cap);
   }
   if (Array.isArray(raw)) {
     if (raw.length === 0) return fallback;
     const bits = raw.map((e) => {
       if (e === null || e === undefined) return "";
-      if (typeof e === "string") { const et = (e as string).trim(); if (et.startsWith("{") || et.startsWith("[")) return projectNestedString(et, 160); return scrubIds(et); }
+      if (typeof e === "string") { const et = (e as string).trim(); if (et.startsWith("{") || et.startsWith("[") || et.startsWith('"')) return projectNestedString(et, 160); return scrubIds(et); }
       if (typeof e === "object" && !Array.isArray(e)) return projectObject(e as Record<string, unknown>, 160);
       return valueToText(e);
     }).filter((s) => s !== "");
@@ -357,7 +391,7 @@ function extractTruncatedFields(s: string, cap: number): string {
     try {
       const raw = m[2].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
       const rt = raw.trim();
-      if (rt.startsWith("{") || rt.startsWith("[")) {
+      if (rt.startsWith("{") || rt.startsWith("[") || rt.startsWith('"')) {
         const proj = projectNestedString(rt, 160);
         if (proj === "") continue;
         const label2 = m[1] === "text" || m[1] === "body" || m[1] === "content" || m[1] === "excerpt" ? "" : humanKeyLabel(m[1]) + ": ";
@@ -377,10 +411,12 @@ function projectTruncated(s: string, cap: number, fallback: string): string {
   if (hit !== "") return hit;
   return fallback;
 }
-function tryParseJson(s: string): { ok: boolean; value: unknown } {
-  const t = (s ?? "").trim();
-  if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null };
-  try { return { ok: true, value: JSON.parse(t) }; } catch { return { ok: false, value: null }; }
+function tryParseJson(s: string): { ok: boolean; value: unknown; text: string; truncated: boolean } {
+  const uw = unwrapQuotedLayers(s, 3);
+  if (uw.failedJsonLike) return { ok: false, value: null, text: uw.text, truncated: true };
+  const t = uw.text;
+  if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null, text: t, truncated: false };
+  try { return { ok: true, value: JSON.parse(t), text: t, truncated: false }; } catch { return { ok: false, value: null, text: t, truncated: true }; }
 }
 export function humanNoteTitle(title: string): string {
   const t = (title ?? "").trim();
@@ -391,12 +427,12 @@ export function humanNoteTitle(title: string): string {
     if (hit !== "") return hit;
     return "(untitled note)";
   }
-  if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
-    const hit = projectTruncated(t, 160, "");
+  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+    const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "(untitled note)";
   }
-  return scrubIds(t).slice(0, 160);
+  return scrubIds(parsed.text).slice(0, 160);
 }
 export function humanNoteBody(body: string): string {
   const raw = body ?? "";
@@ -409,11 +445,11 @@ export function humanNoteBody(body: string): string {
     const out = (hit === "" ? "Note detail is available in context." : hit) + warn;
     return out.trim();
   }
-  if (base.trim().startsWith("{") || base.trim().startsWith("[")) {
-    const out = (projectTruncated(base, 600, "Note detail is available in context.") + warn).trim();
+  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+    const out = (projectTruncated(parsed.text, 600, "Note detail is available in context.") + warn).trim();
     return out;
   }
-  return (scrubIds(base) + warn).trim();
+  return (scrubIds(parsed.text) + warn).trim();
 }
 export function humanEvidenceTitle(title: string, kind: string, version: number | null): string {
   const t = (title ?? "").trim();
@@ -429,12 +465,12 @@ export function humanEvidenceTitle(title: string, kind: string, version: number 
     const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
     return v !== "" ? "Approved record, version " + v : "Approved record";
   }
-  if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
-    const hit = projectTruncated(t, 160, "");
+  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+    const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "Supporting excerpt";
   }
-  return scrubIds(t).slice(0, 160);
+  return scrubIds(parsed.text).slice(0, 160);
 }
 export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
   const x = (excerpt ?? "").trim();
@@ -451,12 +487,12 @@ export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
     const out = (hit === "" ? fallback : hit) + warn;
     return out.trim();
   }
-  if (candidate.trim().startsWith("{") || candidate.trim().startsWith("[")) {
+  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
     const fallback = kind === "dossier" ? "Advisor profile detail is available on the roster." : "Supporting detail is available in context.";
-    const out = (projectTruncated(candidate, 600, fallback) + warn).trim();
+    const out = (projectTruncated(parsed.text, 600, fallback) + warn).trim();
     return out;
   }
-  return (scrubIds(candidate) + warn).trim();
+  return (scrubIds(parsed.text) + warn).trim();
 }
 export function looksLikeItemsJson(text: string): boolean {
   const t = (text ?? "").trim();

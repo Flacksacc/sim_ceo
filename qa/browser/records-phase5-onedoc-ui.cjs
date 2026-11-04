@@ -15,13 +15,23 @@ for (const pair of [[ "QA_API", API, 15320 ], [ "QA_WEB", WEB, 15321 ], [ "QA_FA
   if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") { console.error("REFUSE non loopback " + nm); process.exit(2); }
   if (nm === "QA_WEB" && v === API) { /* WEB same API origin allowed */ }
   else if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
-  if (/:5080|:5173|:9333/.test(v)) { console.error("REFUSE reserved port " + nm); process.exit(2); }
+  if (/:5080|:5173|:9333|:15180/.test(v)) { console.error("REFUSE reserved port " + nm); process.exit(2); }
   try { const uu = new URL(v); if (uu.search || uu.hash || uu.username || uu.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo"); process.exit(2); } } catch { console.error("REFUSE bad " + nm); process.exit(2); }
 }
 const PROV = process.env.SIMCEO_INSTANCE || process.env.QA_PROVENANCE || "";
 if (!PROV) { console.error("REFUSE missing provenance: primary must launch the owned API with SIMCEO_INSTANCE set"); process.exit(2); }
+const META_BASE = process.env.META_API_BASE || "";
+const META_KEY = process.env.META_API_KEY || "";
+const EXPECT_BOOT = process.env.QA_FAKE_BOOT || "";
+if (!META_BASE) { console.error("REFUSE missing META_API_BASE: owned launcher must point the API at the scoped fake"); process.exit(2); }
+{ let _u; try { _u = new URL(META_BASE); } catch { console.error("REFUSE bad META_API_BASE"); process.exit(2); }
+  if (_u.hostname !== "127.0.0.1" && _u.hostname !== "localhost") { console.error("REFUSE META_API_BASE non loopback"); process.exit(2); }
+  if (Number(_u.port) !== 15322) { console.error("REFUSE META_API_BASE must be 127.0.0.1:15322 got " + META_BASE); process.exit(2); }
+  if (_u.search || _u.hash || _u.username || _u.password) { console.error("REFUSE META_API_BASE no query/fragment/userinfo"); process.exit(2); } }
+if (META_BASE !== FAKE) { console.error("REFUSE META_API_BASE must equal owned QA_FAKE exactly"); process.exit(2); }
+if (!META_KEY || !META_KEY.startsWith("qa-only")) { console.error("REFUSE META_API_KEY must be qa-only (no real provider keys)"); process.exit(2); }
 const OUT = process.env.QA_SHOTS || ".tmp/records-phase5-shots";
-const T = { goto: 60000, step: 20000, poll: 20000, overall: 600000 };
+const T = { goto: 60000, step: 20000, poll: 20000, overall: 900000 }; // 15min ceiling for loaded machines; cleanup/final-exit stay 15s total
 fs.mkdirSync(OUT, { recursive: true });
 const EDGE_PATHS = ["C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", "C:/Program Files/Microsoft/Edge/Application/msedge.exe"];
 const EDGE = EDGE_PATHS.find((p) => { try { return fs.statSync(p).isFile(); } catch { return false; } });
@@ -96,14 +106,30 @@ async function uploadPortrait(rid, tok) {
 let watchdog;
 let timedOut = false;
 let cleanupFailed = false;
+let cleaned = false;
+let launching = false;
+let browserPromise = null;
+let ctx2, ctx3, p2, p3;
 async function boundedClose(p, ms, label) {
   try { await Promise.race([p(), new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timeout")), ms))]); }
   catch (e) { cleanupFailed = true; console.log("CLEANUP " + label + ": " + String((e && e.message) || e).slice(0, 200)); }
 }
 async function cleanup() {
-  if (watchdog) clearTimeout(watchdog);
-  if (ctx) await boundedClose(() => ctx.close(), 6000, "ctx.close");
-  if (browser) await boundedClose(() => browser.close(), 6000, "browser.close");
+  if (cleaned) return; cleaned = true;
+  if (watchdog) { try { clearTimeout(watchdog); } catch {} watchdog = null; }
+  if (launching && browserPromise) {
+    try {
+      const b = await Promise.race([browserPromise, new Promise((res) => setTimeout(() => res(null), 5000))]);
+      if (b && !browser) browser = b;
+    } catch {}
+    launching = false;
+  }
+  const jobs = [];
+  if (typeof ctx2 !== "undefined" && ctx2) jobs.push(boundedClose(() => ctx2.close(), 5000, "ctx2.close"));
+  if (typeof ctx3 !== "undefined" && ctx3) jobs.push(boundedClose(() => ctx3.close(), 5000, "ctx3.close"));
+  if (typeof ctx !== "undefined" && ctx) jobs.push(boundedClose(() => ctx.close(), 5000, "ctx.close"));
+  if (typeof browser !== "undefined" && browser) jobs.push(boundedClose(() => browser.close(), 5000, "browser.close"));
+  try { await Promise.race([Promise.allSettled(jobs), new Promise((res) => setTimeout(res, 10000))]); } catch {}
 }
 async function main() {
   watchdog = setTimeout(() => {
@@ -112,16 +138,50 @@ async function main() {
     cleanup().finally(() => process.exit(3));
     setTimeout(() => process.exit(3), 15000);
   }, T.overall);
-  browser = await chromium.launch({ executablePath: EDGE, headless: true });
+  launching = true;
+  browserPromise = chromium.launch({ executablePath: EDGE, headless: true });
+  browser = await browserPromise;
+  launching = false;
   ctx = await browser.newContext();
-  await ctx.route("**/*", (route) => { try { const u = new URL(route.request().url()); if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return route.continue(); if (u.hostname.endsWith("fonts.googleapis.com") || u.hostname.endsWith("fonts.gstatic.com")) return route.fulfill({ status: 200, contentType: "text/css", body: "" }); return route.abort(); } catch { return route.abort(); } });
+  const allowedPorts = ["15320", "15321", "15322"];
+  const routeGuard = async (route) => {
+    try {
+      const req = route.request();
+      const u = new URL(req.url());
+      if (u.protocol !== "http:" && u.protocol !== "https:") return route.continue();
+      if ((u.hostname === "127.0.0.1" || u.hostname === "localhost") && allowedPorts.includes(u.port)) return route.continue();
+      return route.abort();
+    } catch { return route.abort(); }
+  };
+  const redirLog = [];
+  const watchResponses = (pg) => {
+    pg.on("response", (r) => {
+      try {
+        const q = r.request();
+        if (q.method() === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: new URL(q.url()).pathname, status: r.status() });
+        const u = new URL(q.url());
+        const isOwned = (u.hostname === "127.0.0.1" || u.hostname === "localhost") && ["15320", "15321", "15322"].includes(u.port);
+        if (isOwned && r.status() >= 300 && r.status() < 400) redirLog.push({ url: new URL(q.url()).pathname, status: r.status() });
+      } catch {}
+    });
+  };
+  await ctx.route("**/*", routeGuard);
   page = await ctx.newPage();
   await page.setViewportSize({ width: 1440, height: 900 });
-  page.on("console", (m) => { if (m.type() === "error") { const t = m.text().slice(0, 300); if (t.includes("Failed to load resource")) return; consoleErrors.push(t); } });
-  page.on("pageerror", (e) => { consoleErrors.push("pageerror: " + String(e).slice(0, 300)); });
-  page.on("response", (r) => {
-    try { const q = r.request(); if (q.method() === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: new URL(q.url()).pathname, status: r.status() }); } catch {}
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const t = m.text().slice(0, 300);
+    if (t.includes("Failed to load resource")) {
+      // Classified expectations only: intentional 409s from stale/superseded/decided writes,
+      // and client-side blocks (net::ERR_) from rejected external/font/human-port routes.
+      // Any other owned-origin HTTP failure is unexpected and kept.
+      if (t.includes("409")) return;
+      if (t.includes("net::ERR_")) return;
+    }
+    consoleErrors.push(t);
   });
+  page.on("pageerror", (e) => { consoleErrors.push("pageerror: " + String(e).slice(0, 300)); });
+  watchResponses(page);
   try {
     await page.goto(WEB, { waitUntil: "domcontentloaded", timeout: T.goto });
     await page.waitForFunction(() => {
@@ -139,7 +199,7 @@ async function main() {
     preflight("preflight-health-instance", h.json && String(h.json.instance || h.json.Instance) === PROV, "instance=" + String(h.json && (h.json.instance || h.json.Instance)));
     const be = await api("GET", "/api/backend", null, null);
     const mode = String((be.json && (be.json.mode || be.json.Mode)) || "").toLowerCase();
-    preflight("preflight-backend-memory", mode === "memory", "mode=" + mode);
+    preflight("preflight-backend-memory", be.status === 200 && mode === "memory", "mode=" + mode + " status=" + String(be.status));
     const fh = await (async () => {
       const ctl = new AbortController();
       const tm = setTimeout(() => ctl.abort(), 30000);
@@ -151,18 +211,19 @@ async function main() {
       } finally { clearTimeout(tm); }
     })();
     preflight("preflight-fake-scoped", fh.status === 200 && fh.json && fh.json.fake === "records5-scoped", String(fh.status));
+    preflight("preflight-fake-owned", !EXPECT_BOOT || (fh.json && fh.json.boot === EXPECT_BOOT), "fake boot mismatch (not the owned launcher fake)");
   }
   const ownerEmail = run + "-owner@qa.invalid";
   const strangerEmail = run + "-stranger@qa.invalid";
   const readerEmail = run + "-reader@qa.invalid";
   const reg = await api("POST", "/api/auth/register", { email: ownerEmail, password: "qa-password-12345" }, null);
-  ok("seed-register", reg.status === 201 && reg.json && reg.json.token, String(reg.status));
+  preflight("seed-register", reg.status === 201 && reg.json && reg.json.token, String(reg.status));
   const owner = reg.json.token;
   const regS = await api("POST", "/api/auth/register", { email: strangerEmail, password: "qa-password-12345" }, null);
-  ok("seed-stranger", regS.status === 201 && regS.json && regS.json.token, String(regS.status));
+  preflight("seed-stranger", regS.status === 201 && regS.json && regS.json.token, String(regS.status));
   const stranger = regS.json.token;
   const regR = await api("POST", "/api/auth/register", { email: readerEmail, password: "qa-password-12345" }, null);
-  ok("seed-reader", regR.status === 201 && regR.json && regR.json.token, String(regR.status));
+  preflight("seed-reader", regR.status === 201 && regR.json && regR.json.token, String(regR.status));
   const reader = regR.json.token;
   await ctx.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: owner, em: ownerEmail });
   await page.reload({ waitUntil: "domcontentloaded", timeout: T.goto });
@@ -174,31 +235,46 @@ async function main() {
     ok("browser-auth-me-owned", me.status === 200 && (me.json.authenticated === true || me.json.Authenticated === true), String(me.status));
   }
   const board = await api("POST", "/api/boards", { name: run + "-board", mission: run + " mission", stage: "qa" }, owner);
-  ok("seed-board", board.status === 201 && board.json.id, String(board.status));
+  preflight("seed-board", board.status === 201 && board.json.id, String(board.status));
   const bid = board.json.id;
   const gR = await api("POST", "/api/boards/" + bid + "/grants", { userKey: readerEmail, access: "read" }, owner);
-  ok("seed-grant-reader", gR.status === 201 || gR.status === 200, String(gR.status));
+  preflight("seed-grant-reader", gR.status === 201 || gR.status === 200, String(gR.status));
   const lead = await api("POST", "/api/boards/" + bid + "/lead", { name: "Bears Lead", roleLabel: "Board Lead", background: "Bears lead background", familiarTopics: "Bears familiar topics", simplerTopics: "Bears simpler topics", commPrefs: "Bears direct comms" }, owner);
-  ok("seed-lead", lead.status === 200, String(lead.status) + " " + lead.text.slice(0, 160));
+  preflight("seed-lead", lead.status === 200, String(lead.status) + " " + lead.text.slice(0, 160));
   const quick = await api("POST", "/api/roster/quick", { accountId: crypto.randomUUID(), name: run + "-advisor", description: "Advisor helping with " + run + " strategy and review work for grounding" }, owner);
-  ok("seed-quick", quick.status === 201 && (quick.json.id || (quick.json.entry && quick.json.entry.id)), String(quick.status));
+  preflight("seed-quick", quick.status === 201 && (quick.json.id || (quick.json.entry && quick.json.entry.id)), String(quick.status));
   const qrid = quick.json.id || (quick.json.entry && quick.json.entry.id);
   const up = await uploadPortrait(qrid, owner);
-  ok("seed-portrait-upload", up.status === 201, String(up.status) + " " + up.text.slice(0, 160));
+  preflight("seed-portrait-upload", up.status === 201, String(up.status) + " " + up.text.slice(0, 160));
   const imgs = await api("GET", "/api/roster/" + qrid + "/images", undefined, owner);
   const imgId = (imgs.json && imgs.json[0] && (imgs.json[0].id || imgs.json[0].Id)) || null;
-  ok("seed-portrait-list", !!imgId, JSON.stringify(imgs.json).slice(0, 160));
+  preflight("seed-portrait-list", !!imgId, JSON.stringify(imgs.json).slice(0, 160));
   const imgRev = await api("POST", "/api/images/" + imgId + "/review", { decision: "accept" }, owner);
-  ok("seed-portrait-accept", imgRev.status === 200, String(imgRev.status));
+  preflight("seed-portrait-accept", imgRev.status === 200, String(imgRev.status));
   const cpAdv = await api("POST", "/api/roster/" + qrid + "/copy", { boardId: bid, boardRole: "Strategist" }, owner);
-  ok("seed-advisor-copy", cpAdv.status === 201 && cpAdv.json.id, String(cpAdv.status));
+  preflight("seed-advisor-copy", cpAdv.status === 201 && cpAdv.json.id, String(cpAdv.status));
   const apAdv = await api("POST", "/api/boards/" + bid + "/advisors/" + cpAdv.json.id + "/approve", {}, owner);
-  ok("seed-advisor-approve", apAdv.status === 200, String(apAdv.status) + " " + apAdv.text.slice(0, 160));
+  preflight("seed-advisor-approve", apAdv.status === 200, String(apAdv.status) + " " + apAdv.text.slice(0, 160));
   const mtg = await api("POST", "/api/boards/" + bid + "/meetings", { title: run + " meet", brief: run + " brief" }, owner);
+  preflight("seed-meeting", mtg.status === 201 && mtg.json.id, String(mtg.status));
   const mid = mtg.json.id;
   const msgSeed = await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears opening drive memo" }, owner);
+  preflight("seed-message", msgSeed.status === 200 || msgSeed.status === 201, String(msgSeed.status));
   const mseq = (msgSeed.json && (msgSeed.json.sequence || msgSeed.json.Sequence)) ?? 1;
-  await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears working note", body: "bears provisional note alpha", kind: "note" }, owner);
+  const wnSeed = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears working note", body: "bears provisional note alpha", kind: "note" }, owner);
+  preflight("seed-note", wnSeed.status === 201, String(wnSeed.status));
+  const wnNested = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears nested note", body: JSON.stringify({ body: JSON.stringify({ text: "visible nested decision", reviewToken: "internal" }), reviewToken: "internal" }), kind: "note" }, owner);
+  preflight("seed-nested-note", wnNested.status === 201, String(wnNested.status));
+  const wnDouble = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears double-encoded note", body: JSON.stringify(JSON.stringify({ text: "visible double-encoded decision", reviewToken: "internal" })), kind: "note" }, owner);
+  preflight("seed-double-note", wnDouble.status === 201, String(wnDouble.status));
+  const wnTrunc = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears truncated note", body: '{"title":"QA truncated title here with enough text to exceed the one hundred and sixty character projection cap so the tolerant path engages properly and shows an ellipsis', kind: "note" }, owner);
+  preflight("seed-trunc-note", wnTrunc.status === 201, String(wnTrunc.status));
+  const wnProtoTrunc = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears protocol truncated note", body: '{"reviewToken":"internal-secret-value-that-is-long-enough-to-exceed-the-field-extraction-limit-0123456789', kind: "note" }, owner);
+  preflight("seed-proto-trunc-note", wnProtoTrunc.status === 201, String(wnProtoTrunc.status));
+  const wnQuoted = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears quoted prose note", body: '"quoted ordinary prose note"', kind: "note" }, owner);
+  preflight("seed-quoted-note", wnQuoted.status === 201, String(wnQuoted.status));
+  const msgNested = await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: JSON.stringify({ text: "visible recent nested decision", reviewToken: "internal" }) }, owner);
+  preflight("seed-nested-message", msgNested.status === 200 || msgNested.status === 201, String(msgNested.status));
   let fakeBoot = ""; let fakeChatBefore = 0;
   {
     const ctl0 = new AbortController(); const tm0 = setTimeout(() => ctl0.abort(), 30000);
@@ -213,7 +289,12 @@ async function main() {
       fakeChatBefore = cj.chat || 0;
     } finally { clearTimeout(tm0); }
   }
-  const sec = await api("POST", "/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE", clientNonce: crypto.randomBytes(8).toString("hex") }, owner);
+  {
+    const u0 = await api("GET", "/api/usage?boardId=" + bid + "&meetingId=" + mid, undefined, owner);
+    preflight("preflight-usage-ledger", u0.status === 200 && Array.isArray(u0.json), String(u0.status));
+    globalThis.__usageBefore = u0.json.length;
+  }
+  const sec = await api("POST", "/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE " + run, clientNonce: crypto.randomBytes(8).toString("hex") }, owner);
   preflight("seed-secretary-note", sec.status === 200 && sec.json && sec.json.note, String(sec.status));
   {
     const ctl1 = new AbortController(); const tm1 = setTimeout(() => ctl1.abort(), 30000);
@@ -224,10 +305,12 @@ async function main() {
       const lr = await fetch(FAKE + "/__log", { signal: ctl1.signal, redirect: "error" });
       const lt = await lr.text(); let lj = null; try { lj = lt ? JSON.parse(lt) : null; } catch { lj = null; }
       const prompts = Array.isArray(lj) ? lj.map((e) => String((e && e.prompt) || "")) : [];
-      preflight("fake-routing-prompt", prompts.some((x) => x.includes("SECRETARY-NOTE")), "no SECRETARY-NOTE in fake log");
+      preflight("fake-routing-prompt", prompts.some((x) => x.includes("SECRETARY-NOTE") && x.includes(run)), "no run-correlated SECRETARY-NOTE in fake log");
       const hr = await fetch(FAKE + "/__health", { signal: ctl1.signal, redirect: "error" });
       const ht = await hr.text(); let hj = null; try { hj = ht ? JSON.parse(ht) : null; } catch { hj = null; }
       preflight("fake-same-instance", hj && hj.boot === fakeBoot, "fake restarted mid-run");
+      const u1 = await api("GET", "/api/usage?boardId=" + bid + "&meetingId=" + mid, undefined, owner);
+      preflight("usage-metered-once", u1.status === 200 && Array.isArray(u1.json) && u1.json.length === globalThis.__usageBefore + 1, "usage=" + JSON.stringify(u1.json).slice(0, 160));
     } finally { clearTimeout(tm1); }
   }
   const gidA = crypto.randomUUID();
@@ -235,13 +318,13 @@ async function main() {
   const gidC = crypto.randomUUID();
   const gidHeldNote = crypto.randomUUID();
   const d1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: gidA, text: "Bears UI approve alpha", refs: [{ kind: "message", ref: mid + ":" + String(mseq) }, { kind: "note", ref: gidHeldNote }] }, { id: gidB, text: "Bears UI pending beta" }, { id: gidC, text: "Bears UI discard gamma" }], owner);
-  ok("seed-draft", d1.status === 201 && d1.json.id, String(d1.status));
+  preflight("seed-draft", d1.status === 201 && d1.json.id, String(d1.status));
   const did = d1.json.id;
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction(() => document.body.innerText.includes("Review version"), null, { timeout: T.poll });
   const ord0 = await pendingOrdinals(did, owner);
   const ordA = ord0[gidA]; const ordB = ord0[gidB]; const ordC = ord0[gidC];
-  ok("ordinals-mapped", ordA > 0 && ordB > 0 && ordC > 0 && new Set([ordA, ordB, ordC]).size === 3, JSON.stringify(ord0));
+  preflight("ordinals-mapped", ordA > 0 && ordB > 0 && ordC > 0 && new Set([ordA, ordB, ordC]).size === 3, JSON.stringify(ord0));
   await shot("onedoc-full");
   ok("one-doc-review", await bodyHas("Review version") && await bodyHas("Bears UI approve alpha"), "one-document review missing");
   ok("one-doc-counts", await bodyHas("3 waiting"), "decision counts missing");
@@ -255,6 +338,13 @@ async function main() {
   ok("one-doc-version", await bodyHas("Version history") && await bodyHas("recorded decision"), "version missing");
   ok("one-doc-no-protocol-leak", !(await bodyHas("reviewToken")) && !(await bodyHas("evidenceSnapshot")), "protocol leak");
   ok("one-doc-no-guid-leak", !(await bodyHas(gidA)) && !(await bodyHas(gidB)) && !(await bodyHas(gidC)), "guid leak");
+  ok("one-doc-nested-visible", await bodyHas("visible nested decision"), "nested JSON not projected to visible text");
+  ok("one-doc-double-visible", await bodyHas("visible double-encoded decision"), "double-encoded JSON not projected");
+  ok("one-doc-truncated-visible", await bodyHas("QA truncated title"), "truncated JSON not projected");
+  ok("one-doc-quoted-prose", await bodyHas("quoted ordinary prose note"), "ordinary quoted prose missing");
+  ok("one-doc-proto-trunc-neutral", await bodyHas("Note detail is available in context."), "protocol-only truncated note missing neutral fallback");
+  ok("one-doc-no-nested-raw", !(await bodyHas('"text"')) && !(await bodyHas("reviewToken")), "raw nested JSON leaked to visible text");
+  ok("one-doc-recent-nested", await bodyHas("visible recent nested decision"), "nested recent message not projected");
   await page.getByLabel("Revised text for decision " + ordB).first().fill("Bears UI revised beta", { timeout: T.step });
   await page.getByRole("button", { name: "Revise decision " + ordB }).first().click({ timeout: T.step });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears UI revised beta", { timeout: T.poll });
@@ -346,19 +436,22 @@ async function main() {
   // Explicit reload editor stale ALL-fields race: type text+detail, stale via per-item revise, reload recovers.
   const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one" }, { id: "R2", text: "Bears reload two" }], owner);
   const rid = rr1.json.id;
-  ok("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
+  preflight("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload two", { timeout: T.poll });
   const editorBoxes = page.locator('textarea.human-editor-text[id*="' + rid + '"]');
-  ok("reload-editor-fields", (await editorBoxes.count()) >= 2, "selected whole-editor text+detail fields missing " + String(await editorBoxes.count()));
+  ok("reload-editor-fields", (await editorBoxes.count()) >= 4, "selected whole-editor text+detail fields missing " + String(await editorBoxes.count()));
   for (let _w = 0; _w < 20; _w++) { try { if ((await editorBoxes.nth(0).inputValue()) === "Bears reload one") break; } catch {} await page.waitForTimeout(300); }
   ok("reload-editor-selected-race", (await editorBoxes.nth(0).inputValue()) === "Bears reload one", "selected whole-editor not targeted (PrepareDraft leak): got " + String(await editorBoxes.nth(0).inputValue()).slice(0, 80));
+  await editorBoxes.nth(0).fill("Bears reload one STALE", { timeout: T.step });
   await editorBoxes.nth(1).fill("Bears stale detail", { timeout: T.step });
   const rg = await api("GET", "/api/records/" + rid, undefined, owner);
   await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
+  const canonReload409Before = await canonState(rid, owner);
   await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
   await page.waitForTimeout(1200);
   ok("reload-stale-race-guided", await bodyHas("Reload editor from current review"), "reload recovery hidden after reviewError");
+  ok("reload-409-no-state-write", (await canonState(rid, owner)) === canonReload409Before, "stale whole-document submit mutated public state");
   const canonReloadBefore = await canonState(rid, owner);
   await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step });
   await page.waitForTimeout(800);
@@ -366,13 +459,30 @@ async function main() {
   const afterReloadDetail = await editorBoxes.nth(1).inputValue();
   ok("reload-stale-race-reset-text", afterReloadText === "Bears reload one", "stale text survived reload: " + afterReloadText.slice(0, 80));
   ok("reload-stale-race-reset-detail", afterReloadDetail === "", "stale detail survived reload: " + afterReloadDetail.slice(0, 80));
+  const afterReloadR2 = await editorBoxes.nth(2).inputValue();
+  const afterReloadR2d = await editorBoxes.nth(3).inputValue();
+  ok("reload-fresh-r2", afterReloadR2 === "Bears reload two revised", "fresh R2 missing after Reload: " + afterReloadR2.slice(0, 80));
+  ok("reload-fresh-r2-detail", afterReloadR2d === "", "fresh R2 detail wrong");
   ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated public state");
+  await editorBoxes.nth(0).fill("Bears reload one FINAL", { timeout: T.step });
+  await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
+  await page.waitForTimeout(2000);
+  {
+    const rrAfter = await api("GET", "/api/records/" + rid + "/review", undefined, owner);
+    const succR = (rrAfter.json.successors || []);
+    ok("reload-submit-new-version", succR.length === 1, JSON.stringify(succR));
+    const rnid = succR[0];
+    const rdet = await api("GET", "/api/records/" + rnid, undefined, owner);
+    let rtexts = "";
+    try { rtexts = JSON.stringify(JSON.parse(rdet.json.itemsJson).map((e) => e.text)); } catch { rtexts = ""; }
+    ok("reload-submit-fresh-guards", rdet.status === 200 && rtexts.includes("Bears reload one FINAL") && rtexts.includes("Bears reload two revised"), rtexts.slice(0, 240));
+  }
   const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
-  ok("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
+  preflight("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
   const sgU = await api("GET", "/api/records/" + buid, undefined, owner);
   const br2 = await api("POST", "/api/records/" + buid + "/revise", { version: sgU.json.version, hash: sgU.json.hash, reviewToken: sgU.json.reviewToken, watermark: sgU.json.watermark, items: [{ id: "U1", text: "Bears other-client revision" }, { id: "U2", text: "Bears stale two v2" }] }, owner);
-  ok("branch-v2", (br2.status === 201 || br2.status === 200) && br2.json.id, String(br2.status));
+  preflight("branch-v2", (br2.status === 201 || br2.status === 200) && br2.json.id, String(br2.status));
   const nid = br2.json.id;
   {
     const bRev = await api("GET", "/api/records/" + buid + "/review", undefined, owner);
@@ -387,7 +497,7 @@ async function main() {
   await page.reload({ waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction(() => document.body.innerText.includes("Review version"), null, { timeout: T.poll });
   await page.waitForTimeout(800);
-  await page.getByRole("button", { name: "Version 2" }).first().click({ timeout: T.step });
+  await page.getByTestId("record-open-" + nid).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
   ok("ui-v2-shows-predecessor", await bodyHas("Open version 1"), "predecessor missing");
   {
@@ -415,6 +525,12 @@ async function main() {
     ok("ui-back-v2-url", urlV2.includes(nid), "back did not reach v2 " + urlV2.slice(-36));
     ok("ui-back-v2-heading", bodyV2.includes("Review version 2"), "selected v2 heading missing after back");
     ok("ui-back-v2-content", bodyV2.includes("Bears stale two v2") && bodyV2.includes("Review version 2"), "v2 selected content missing after back");
+    {
+      const edV2 = page.locator('textarea.human-editor-text[id*="' + nid + '"]');
+      for (let _w = 0; _w < 20; _w++) { try { if ((await edV2.nth(0).inputValue()) === "Bears other-client revision") break; } catch {} await page.waitForTimeout(300); }
+      ok("ui-back-v2-editor", (await edV2.count()) >= 4, "v2 selected editor missing");
+      ok("ui-back-v2-editor-values", (await edV2.nth(0).inputValue().catch(() => "")) === "Bears other-client revision" && (await edV2.nth(2).inputValue().catch(() => "")) === "Bears stale two v2", "v2 selected editor values wrong (history-body false pass)");
+    }
     const fwdOk = await page.goForward({ timeout: T.step }).then(() => true).catch(() => false);
     ok("ui-forward-navigated", fwdOk, "goForward failed");
     await page.waitForTimeout(800);
@@ -423,31 +539,51 @@ async function main() {
     ok("ui-forward-v1-url", urlFwd === urlV1 && urlFwd.includes(buid), "forward hash changed v1=" + urlV1.slice(-12) + " fwd=" + urlFwd.slice(-12));
     ok("ui-forward-v1-heading", bodyFwd.includes("Review version 1"), "selected v1 heading missing after forward");
     ok("ui-forward-v1-content", bodyFwd.includes("Bears branch one") && bodyV1.includes("Bears branch one") && bodyFwd.includes("Review version 1"), "entity text lost across nav");
+    {
+      const edV1 = page.locator('textarea.human-editor-text[id*="' + buid + '"]');
+      for (let _w = 0; _w < 20; _w++) { try { if ((await edV1.nth(0).inputValue()) === "Bears branch one") break; } catch {} await page.waitForTimeout(300); }
+      ok("ui-forward-v1-editor", (await edV1.count()) >= 4, "v1 selected editor missing");
+      ok("ui-forward-v1-editor-values", (await edV1.nth(0).inputValue().catch(() => "")) === "Bears branch one" && (await edV1.nth(2).inputValue().catch(() => "")) === "Bears branch two", "v1 selected editor values wrong (history-body false pass)");
+    }
   }
   // Approved amendment inheritance (separate from undecided branch): v1 approved A/B, amend replace A, approve v2.
   const amA = crypto.randomUUID();
   const amB = crypto.randomUUID();
   const amBase = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: amA, text: "Bears inherit alpha" }, { id: amB, text: "Bears inherit beta" }], owner);
   const amBaseId = amBase.json.id;
-  ok("amend-inherit-ui-base", amBase.status === 201 && amBaseId, String(amBase.status));
+  preflight("amend-inherit-ui-base", amBase.status === 201 && amBaseId, String(amBase.status));
   const amApAll = await api("POST", "/api/records/" + amBaseId + "/approve-all", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
-  ok("amend-inherit-ui-approve-base", amApAll.status === 200, String(amApAll.status));
+  preflight("amend-inherit-ui-approve-base", amApAll.status === 200, String(amApAll.status));
   const amAmend = await api("POST", "/api/records/" + amBaseId + "/amend", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: amA, text: "Bears inherit alpha replaced" }] }; })(), owner);
   const amV2 = amAmend.json.id;
-  ok("amend-inherit-ui-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
+  preflight("amend-inherit-ui-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
   const amApV2 = await api("POST", "/api/records/" + amV2 + "/items/approve", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, itemId: amA }; })(), owner);
-  ok("amend-inherit-ui-approve-v2", amApV2.status === 200, String(amApV2.status));
+  preflight("amend-inherit-ui-approve-v2", amApV2.status === 200, String(amApV2.status));
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amBaseId, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Historical", { timeout: T.poll });
   ok("ui-amend-v1-historical", await bodyHas("Historical") && await bodyHas("Bears inherit alpha"), "amended v1 missing historical");
   ok("ui-amend-v1-effective", await bodyHas("Current effective record") && await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta"), "amended v1 missing current effective");
+  ok("ui-amend-v1-no-controls", (await allApproveControls()) === 0 && (await reviseCount()) === 0 && (await setAsideCount()) === 0, "historical v1 shows approval controls");
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amV2, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decisions (current record)", { timeout: T.poll });
   ok("ui-amend-v2-current", await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta") && await bodyHas("replaced, versions 1 to 2"), "amended v2 missing inherited+replaced with manager versions");
   ok("ui-amend-v2-not-guest-wording-as-manager", !(await bodyHas("approved in version 2")), "manager view must not use guest-only wording");
-  const ctx2 = await browser.newContext();
+  ok("ui-amend-v2-inherited-B", await bodyHas("Bears inherit beta") && await bodyHas("inherited, versions 1 to 1"), "manager effective card lacks inherited B with approving version");
+  const pA = crypto.randomUUID(); const pB = crypto.randomUUID();
+  const pBase = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: pA, text: "Bears partial UI approved" }, { id: pB, text: "Bears partial UI pending" }], owner);
+  preflight("partial-ui-base", pBase.status === 201 && pBase.json.id, String(pBase.status));
+  const pid = pBase.json.id;
+  const pAp = await api("POST", "/api/records/" + pid + "/items/approve", await (async () => { const g = await api("GET", "/api/records/" + pid, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, itemId: pA }; })(), owner);
+  ok("partial-ui-approve", pAp.status === 200, String(pAp.status));
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + pid, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decisions (current record)", { timeout: T.poll });
+  ok("ui-partial-current", await bodyHas("Approved decisions (current record)") && await bodyHas("Bears partial UI approved"), "partial head not current for manager");
+  ok("ui-partial-not-historical", !(await bodyHas("is not the current effective record")), "partial head mislabeled historical");
+  ctx2 = await browser.newContext();
+  await ctx2.route("**/*", routeGuard);
   await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
-  const p2 = await ctx2.newPage();
+  p2 = await ctx2.newPage();
+  watchResponses(p2);
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(2000);
   const sBody = await p2.locator("body").innerText();
@@ -457,11 +593,18 @@ async function main() {
   ok("stranger-no-revise", !sBody.includes("Revise decision") && !sBody.includes("Revised text for decision"), "stranger sees revise");
   ok("stranger-no-setaside", !sBody.includes("Set aside decision"), "stranger sees set-aside");
   ok("stranger-no-protocol", !sBody.includes("reviewToken") && !sBody.includes("evidenceSnapshot") && !sBody.includes("reviewRevision"), "stranger sees protocol");
-  await boundedClose(() => ctx2.close(), 6000, "ctx2.close");
+  await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await p2.waitForTimeout(1500);
+  const rBody = await p2.locator("body").innerText();
+  ok("stranger-no-reload", !rBody.includes("Reload editor from current review"), "stranger sees Reload");
+  ok("stranger-no-revise-rid", !rBody.includes("Revise decision") && !rBody.includes("Request revision"), "stranger sees revision controls on reload fixture");
+
   {
-    const ctx3 = await browser.newContext();
+    ctx3 = await browser.newContext();
+    await ctx3.route("**/*", routeGuard);
     await ctx3.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: reader, em: readerEmail });
-    const p3 = await ctx3.newPage();
+    p3 = await ctx3.newPage();
+    watchResponses(p3);
     await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: T.goto });
     await p3.waitForTimeout(2000);
     const gBody = await p3.locator("body").innerText().catch(() => "");
@@ -474,12 +617,30 @@ async function main() {
     ok("guest-no-revise", !gBody.includes("Revise decision") && !gBody.includes("Revised text for decision"), "guest sees revise");
     ok("guest-no-setaside", !gBody.includes("Set aside decision"), "guest sees set-aside");
     ok("guest-no-protocol", !gBody.includes("reviewToken") && !gBody.includes("evidenceSnapshot") && !gBody.includes("reviewRevision"), "guest sees protocol");
-    await ctx3.close().catch(() => null);
+    ok("guest-no-notes", !gBody.includes("Working notes") && !gBody.includes("bears provisional note alpha") && !gBody.includes("visible nested decision"), "guest sees withheld notes");
+    ok("guest-no-recent", !gBody.includes("Recent meeting input"), "guest sees withheld recent input");
+    ok("guest-no-history", !gBody.includes("Decision history"), "guest sees withheld history");
+    ok("guest-no-discarded-text", !gBody.includes("Bears UI discard gamma"), "guest sees discarded text");
+    await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amV2, { waitUntil: "domcontentloaded", timeout: T.goto });
+    await p3.waitForTimeout(2000);
+    const aBody = await p3.locator("body").innerText().catch(() => "");
+    ok("guest-amend-current", aBody.includes("Bears inherit alpha replaced") && aBody.includes("Bears inherit beta"), "guest misses amended effective text");
+    ok("guest-amend-versions", aBody.includes("approved in version 2") && aBody.includes("approved in version 1"), "guest misses inherited approving versions");
+    ok("guest-amend-no-historical-label", !aBody.includes("is not the current effective record"), "guest v2 mislabeled historical");
+    ok("guest-amend-no-protocol", !aBody.includes("reviewToken") && !aBody.includes("evidenceSnapshot") && !aBody.includes("reviewRevision"), "guest sees protocol on amendment");
+    await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + pid, { waitUntil: "domcontentloaded", timeout: T.goto });
+    await p3.waitForTimeout(2000);
+    const pBody = await p3.locator("body").innerText().catch(() => "");
+    ok("guest-partial-current", pBody.includes("Bears partial UI approved"), "guest misses partial approved text");
+    ok("guest-partial-hides-pending", !pBody.includes("Bears partial UI pending"), "guest sees withheld pending text");
+    ok("guest-partial-version", pBody.includes("approved in version 1"), "guest misses partial approving version");
+    ok("guest-partial-no-protocol", !pBody.includes("reviewToken") && !pBody.includes("evidenceSnapshot") && !pBody.includes("reviewRevision"), "guest sees protocol on partial");
+
   }
   // Beyond-50 chain with singular navigation (owned disposable chain).
   const ch0 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "CH0", text: "Bears chain base" }], owner);
   let chid = ch0.json.id;
-  ok("chain-ui-base", ch0.status === 201 && chid, String(ch0.status));
+  preflight("chain-ui-base", ch0.status === 201 && chid, String(ch0.status));
   for (let v = 0; v < 55; v++) {
     const gg = await api("GET", "/api/records/" + chid, undefined, owner);
     if (gg.status !== 200) { ok("chain-ui-step-" + v, false, String(gg.status)); break; }
@@ -498,6 +659,7 @@ async function main() {
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears chain base", { timeout: T.poll });
   ok("chain-singular-nav-ui", (page.url() || "").includes(chOldestId) && await bodyHas("Bears chain base"), "singular nav failed");
   const de = await api("POST", "/api/meetings/" + mid + "/record/draft", [], owner);
+  preflight("seed-empty-draft", de.status === 201 && de.json.id, String(de.status));
   const eid = de.json.id;
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + eid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForTimeout(2000);
@@ -514,6 +676,7 @@ async function main() {
   const okPosts = postLog.filter((e) => e.status >= 200 && e.status < 300);
   ok("postlog-no-500", badPosts.length === 0, JSON.stringify(badPosts.slice(0, 3)));
   ok("postlog-has-record-posts", okPosts.length >= 4, String(okPosts.length));
+  ok("no-owned-redirects", redirLog.length === 0, JSON.stringify(redirLog.slice(0, 3)));
 }
 main().then(async () => {
   if (timedOut) return;

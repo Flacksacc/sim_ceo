@@ -9193,13 +9193,34 @@ const testModel = useMutation({
                         Amend approved record{" "}
                       </button>)}{" "}
                       {canReloadEditor && (<button type="button" onClick={() => {
-                        const d = reviewDraft as RecordDraft | undefined;
-                        if (!d) return;
-                        setRevText(d.itemsJson ?? "");
-                        revTextRev.current = 0;
-                        revBaseRef.current = { id: d.id, version: d.version, hash: d.hash ?? "", reviewToken: d.reviewToken ?? "", watermark: d.watermark ?? 0, revision: d.reviewRevision ?? 0 };
-                        setEditorGen((g) => g + 1);
-                        setReviewError(null);
+                        const origin = captureRecOrigin();
+                        const revCap = revTextRev.current;
+                        if (!recOk || !canActMeeting) return;
+                        (async () => {
+                          try {
+                            const fresh = await get<RecordReview>("/api/records/" + origin.recId + "/review");
+                            if (!recOriginLive(origin)) return;
+                            const live = liveSelRef.current;
+                            if (live.boardId !== origin.boardId || live.meetingId !== origin.meetingId || live.recId !== origin.recId) return;
+                            const fd = (fresh as RecordReview).draft as RecordDraft | undefined;
+                            if (!fd || (fd as RecordDraft).id !== origin.recId) { noteReviewError(new Error("Refresh returned a different record; review unchanged."), origin); return; }
+                            if (revTextRev.current !== revCap) return;
+                            qc.setQueryData(["record", (fd as RecordDraft).id], fd);
+                            refresh("records", "record");
+                            try { await recReview.refetch(); } catch { /* keep staged snapshot; editor already fresh */ }
+                            if (!recOriginLive(origin)) return;
+                            if (revTextRev.current !== revCap) return;
+                            setRevText((fd as RecordDraft).itemsJson ?? "");
+                            revTextOwner.current = (fd as RecordDraft).id;
+                            revTextRev.current = 0;
+                            revBaseRef.current = { id: (fd as RecordDraft).id, version: (fd as RecordDraft).version, hash: (fd as RecordDraft).hash ?? "", reviewToken: (fd as RecordDraft).reviewToken ?? "", watermark: (fd as RecordDraft).watermark ?? 0, revision: (fd as RecordDraft).reviewRevision ?? 0 };
+                            setEditorGen((g) => g + 1);
+                            setReviewError(null);
+                          } catch (e) {
+                            if (!recOriginLive(origin)) return;
+                            noteReviewError(e, origin);
+                          }
+                        })();
                       }}>
                         {" "}
                         Reload editor from current review{" "}
