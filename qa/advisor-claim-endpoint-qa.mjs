@@ -384,6 +384,16 @@ async function main() {
   ok("character-urls-five-full", cUrls.length === 5 && cUrls.every((u) => u.length === MAX_URL), cUrls.map((u) => u.length).join(","));
   ok("character-urls-distinct", new Set(cUrls).size === 5, "dup urls");
   const tC = Date.now();
+  const maxUrls = [...cUrls];
+  const maxRes = await apost(WEB + "/api/roster/" + cId + "/research", { focus: cFocus, background: cBg, sourceUrls: maxUrls }, 120000);
+  ok("character-oversize-dossier-rejected", maxRes.status === 502 && maxRes.text.includes("compile budget"), "status=" + maxRes.status);
+  const maxGet = await aget(WEB + "/api/roster/" + cId + "/research", 15000);
+  const maxResearch = parseResearchJson(pick(maxGet.json, "researchJson")).json;
+  const maxClaims = maxResearch?.partial?.claims || [];
+  ok("character-oversize-terminal-retains-claims", pick(maxGet.json, "stage") === "failed" && pick(maxGet.json, "running") === false && maxUrls.every((url) => maxClaims.some((c) => (pick(c, "refs") || []).some((r) => refUrl(r) === url))), "claims=" + maxClaims.length);
+  // Explicit recovery with ordinary link lengths; oversized evidence is
+  // never truncated just to make compilation succeed.
+  cUrls.splice(0, cUrls.length, ...maxUrls.map((_, i) => "https://qa.example/char" + (i + 1) + "/" + tail));
   const cRes = await apost(WEB + "/api/roster/" + cId + "/research", { focus: cFocus, background: cBg, sourceUrls: cUrls }, 120000);
   const cElapsed = Date.now() - tC;
   ok("character-research-200", cRes.status === 200, "status=" + cRes.status);
@@ -427,12 +437,12 @@ async function main() {
   const entries = Array.isArray(logs.json) ? logs.json : [];
   const respLogs = entries.filter((e) => e.path === "responses");
   const chatLogs = entries.filter((e) => e.path === "chat");
-  ok("calls-two-per-draft-bounded", respLogs.length === 3 && chatLogs.length === 3, "resp=" + respLogs.length + " chat=" + chatLogs.length);
+  ok("calls-two-per-draft-bounded", respLogs.length === 4 && chatLogs.length === 3, "resp=" + respLogs.length + " chat=" + chatLogs.length);
   function logsFor(marker, p) { return entries.filter((e) => e.path === p && String(e.full || "").includes(marker)); }
   const sDoss = logsFor(MARK_S, "responses");
   ok("supported-dossier-sameflow-grammar", sDoss.length === 1 && sDoss[0].full.includes("KIND |") && sDoss[0].full.includes("EVIDENCE:") && sDoss[0].full.includes("EXACT format") && sDoss[0].full.length <= DOSSIER_BUDGET_CHARS, "n=" + sDoss.length);
   const cDoss = logsFor(MARK_C, "responses");
-  ok("character-dossier-sameflow-sid-grammar", cDoss.length === 1 && cDoss[0].full.includes("EXACT format") && ["S1", "S2", "S3", "S4", "S5"].every((s) => cDoss[0].full.includes("[" + s + "]")) && cUrls.every((u) => cDoss[0].full.includes(u)) && cDoss[0].full.length <= DOSSIER_BUDGET_CHARS, "n=" + cDoss.length);
+  ok("character-dossier-sameflow-sid-grammar", cDoss.length === 2 && cDoss.every((e) => e.full.includes("EXACT format") && ["S1", "S2", "S3", "S4", "S5"].every((s) => e.full.includes("[" + s + "]")) && e.full.length <= DOSSIER_BUDGET_CHARS) && maxUrls.every((u) => cDoss[0].full.includes(u)) && cUrls.every((u) => cDoss[1].full.includes(u)), "n=" + cDoss.length);
   const uDoss = logsFor(MARK_U, "responses");
   ok("unsupported-dossier-sameflow", uDoss.length === 1 && uDoss[0].full.includes(MARK_U), "n=" + uDoss.length);
   const sProf = logsFor(MARK_S, "chat");
@@ -453,7 +463,7 @@ async function main() {
   const factClaims = sClaims.filter((c) => String(pick(c, "text") || "").includes("harbor fact"));
   ok("multi-passage-two-facts", factClaims.length >= 2 && factClaims.every((c) => pick(c, "verified") === true), "facts=" + factClaims.length);
   const counts = await get(FAKE + "/__counts", 8000);
-  ok("counts-bounded-no-third", Number(pick(counts.json, "responses")) === 3 && Number(pick(counts.json, "chat")) === 3, JSON.stringify(counts.json));
+  ok("counts-bounded-no-third", Number(pick(counts.json, "responses")) === 4 && Number(pick(counts.json, "chat")) === 3, JSON.stringify(counts.json));
   const ver = await cleanupAndVerify();
   ok("cleanup-children-exited", ver.apiExited && ver.fakeExited, JSON.stringify(ver));
   ok("cleanup-ports-closed", ver.apiPortClosed && ver.fakePortClosed, JSON.stringify(ver));

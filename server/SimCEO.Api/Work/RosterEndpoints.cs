@@ -612,7 +612,7 @@ public static class RosterEndpoints
             if (tagsProvided) cur.Tags = newTags!;
             cur.Version += 1;
             cur.UpdatedAt = DateTime.UtcNow;
-            if (profileProvided || urlsProvided)
+            if (backgroundChanged || urlsProvided)
             {
               var inp = CharacterBehavior.ParseInputs(cur.ResearchInputsJson);
               var bg = inp.Background;
