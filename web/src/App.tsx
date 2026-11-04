@@ -2746,6 +2746,7 @@ export default function App() {
       const cap = wizSaveIdentityRef.current;
       if (!cap || epochNow() !== cap.epoch || currentToken() !== cap.token || currentUser() !== cap.user) return;
       if (wizCompletedRef.current.has(r.id)) return;
+      wizIdRef.current = r.id;
       setWizId(r.id);
       if (typeof r.version === "number") acceptWizVersion(r.id, r.version);
       { try { const u = cap.user || "anon"; localStorage.setItem("simceo-wizard:"+u, r.id); localStorage.removeItem("simceo-wizard"); } catch {} }
@@ -2919,14 +2920,20 @@ export default function App() {
     },
   });
   const createBoardFromWizard = useMutation({
-    mutationFn: () =>
-      post<{ board: Board; advisors: { advisor: string; role: string }[] }>(
-        `/api/wizard/${wizId}/create`,
-        { ...(wizVersion != null ? { version: wizVersion } : {}) },
-      ),
-    onMutate: () => ({ originWizId: wizId, origin: originIdentity(), originOwner: wizOwnerRef.current || currentUser() }),
+    mutationFn: async () => {
+      const origin = originIdentity();
+      // Accept always saves the current form before creating, including edits
+      // to an older draft. A failed save must never create a stale board.
+      const draft = await wizSave.mutateAsync(4);
+      if (originStale(origin) || wizCompletedRef.current.has(draft.id))
+        throw Object.assign(new Error("Board creation context changed"), { stale: true });
+      const result = await post<{ board: Board; advisors: { advisor: string; role: string }[] }>(
+        `/api/wizard/${draft.id}/create`, { version: draft.version });
+      return { ...result, draftId: draft.id };
+    },
+    onMutate: () => ({ origin: originIdentity(), originOwner: wizOwnerRef.current || currentUser() }),
     onSuccess: (r, _v, ctx) => {
-      const o = ctx as { originWizId?: string; origin?: { epoch: number; token: string; user: string }; originOwner?: string } | undefined;
+      const o = { ...ctx, originWizId: r.draftId };
       // Consume the completed wizard only under the originating identity:
       // a late completion after an account switch must not seed caches,
       // switch boards, or retire another account's draft pointer.
@@ -6916,350 +6923,52 @@ const testModel = useMutation({
             </section>
           )}{" "}
           {tab === "wizard" && (
-            <section aria-label="New-board wizard">
-              {" "}
-              <h2>Create a board</h2>{" "}
-              <ol className="steps" aria-label="Progress">
-                {" "}
-                {[{ label: "About", step: 1 }, { label: "Advisors", step: 2 }, { label: "Review", step: 4 }].map((item, i) => (
-                  <li
-                    key={item.label}
-                    aria-current={wizard.step === item.step ? "step" : undefined}
-                    className={
-                      wizard.step === item.step
-                        ? "now"
-                        : wizard.step > item.step
-                          ? "done"
-                          : ""
-                    }
-                  >
-                    {" "}
-                    {i + 1}. {item.label}{" "}
-                  </li>
-                ))}{" "}
-              </ol>{" "}
-              <p role="status">
-                {" "}
-                {wizId
-                  ? (wizVersion == null ? "Loading saved draft\u2026" : "Draft saved on this device.")
-                  : "Draft not saved yet on this device."}{" "}
-              </p>{" "}
-              {!!wizId && wizVersion == null && (
-                <p className="muted">
-                  {" "}
-                  Loading the saved draft before editing protects server data.{" "}
-                  <button type="button" className="btn ghost" onClick={() => hydrateWizard()}>{" "}Retry load{" "}</button>{" "}
+            <section aria-label="Create a board">
+              <h2>Create a board</h2>
+              {!!wizId && wizVersion == null && <p role="status">Loading your saved board draft… <button type="button" className="btn ghost" onClick={() => hydrateWizard()}>Retry load</button></p>}
+              <div className="card">
+                <h3>About</h3>
+                <label>Board name
+                  <input disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
+                    value={wizard.name} onChange={e => setWizard({ ...wizard, name: e.target.value })}
+                    placeholder="e.g. Pricing review" />
+                </label>
+                <label>Mission
+                  <GrowingTextarea rows={5} className="profile-area"
+                    disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
+                    value={wizard.mission} onChange={e => setWizard({ ...wizard, mission: e.target.value })}
+                    placeholder="What should the board help you decide? Include any useful background or goals." />
+                </label>
+                <label>Stage
+                  <input disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
+                    value={wizard.stage} onChange={e => setWizard({ ...wizard, stage: e.target.value })}
+                    placeholder="e.g. Early idea, deciding this month" />
+                </label>
+                <label>Starting shape
+                  <select disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
+                    value={presetKey} onChange={e => setPresetKey(e.target.value)}>
+                    {(presets.data ?? []).map(p => <option key={p.key} value={p.key}>{p.title}</option>)}
+                  </select>
+                </label>
+                <h3>Advisors ({selectedWizardSeats.length}/10)</h3>
+                <p>Choose up to ten advisors from your roster.</p>
+                {wizard.seats.some(s => !s.rosterEntryId) && <p role="status">Choose advisors below to replace this draft's older role suggestions.</p>}
+                <WizardRosterPicker rows={wizardRoster.data ?? []} selected={wizard.seats}
+                  disabled={createBoardFromWizard.isPending || (!!wizId && wizVersion == null)}
+                  loading={wizardRoster.isLoading} error={wizardRoster.isError}
+                  onRetry={() => { void wizardRoster.refetch(); }} onToggle={toggleWizardAdvisor} />
+                <p>{profile.isSuccess ? `Your saved profile (${profile.data.name}) will be used automatically.` : profile.isLoading ? "Loading your saved profile…" : "Save your profile before creating this board."}
+                  {!profile.isLoading && !profile.isSuccess && <button type="button" className="btn ghost" onClick={() => setTab("profile")}>Open Your Profile</button>}
                 </p>
-              )}{" "}
-              {wizard.step === 1 && (
-                <div className="card">
-                  {" "}
-                  <h3>What is this board about?</h3>{" "}
-                  <label>
-                    {" "}
-                    Board name{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.name}
-                      onChange={(e) =>
-                        setWizard({ ...wizard, name: e.target.value })
-                      }
-                      placeholder="e.g. Pricing review"
-                    />{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Mission{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.mission}
-                      onChange={(e) =>
-                        setWizard({ ...wizard, mission: e.target.value })
-                      }
-                      placeholder="What should the board help you decide?"
-                    />{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Stage{" "}
-                    <input
-                      disabled={!!wizId && wizVersion == null}
-                      value={wizard.stage}
-                      onChange={(e) =>
-                        setWizard({ ...wizard, stage: e.target.value })
-                      }
-                      placeholder="e.g. Early idea, deciding this month"
-                    />{" "}
-                  </label>{" "}
-                  <label>
-                    {" "}
-                    Starting shape{" "}
-                    <select
-                      disabled={!!wizId && wizVersion == null}
-                      value={presetKey}
-                      onChange={(e) => setPresetKey(e.target.value)}
-                    >
-                      {" "}
-                      {(presets.data ?? []).map((p) => (
-                        <option key={p.key} value={p.key}>
-                          {" "}
-                          {p.title}{" "}
-                        </option>
-                      ))}{" "}
-                    </select>{" "}
-                  </label>{" "}
-                  <div className="meetctl">
-                    {" "}
-                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
-                      {" "}
-                      Save draft{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={!wizard.name.trim() || wizSave.isPending || (!!wizId && wizVersion == null)}
-                      onClick={() => {
-                        wizSave.mutate(2);
-                        setWizard({ ...wizard, step: 2 });
-                      }}
-                    >
-                      {" "}
-                      Continue{" "}
-                    </button>{" "}
-                  </div>{" "}
+                <div className="meetctl">
+                  <button type="button" className="primary"
+                    disabled={!wizard.name.trim() || !wizard.mission.trim() || !wizardSelectionsValid ||
+                      !profile.isSuccess || createBoardFromWizard.isPending || wizSave.isPending || (!!wizId && wizVersion == null)}
+                    onClick={() => createBoardFromWizard.mutate()}>
+                    {createBoardFromWizard.isPending ? "Creating…" : "Create board"}
+                  </button>
                 </div>
-              )}{" "}
-              {wizard.step === 2 && (
-                <div className="card">
-                  {" "}
-                  <h3>
-                    {" "}
-                    Who should be on the board? ({selectedWizardSeats.length}/10){" "}
-                  </h3>{" "}
-                  <p>Choose up to ten advisors from your roster. Their existing profiles and portraits will be used.</p>
-                  {wizard.seats.some(s => !s.rosterEntryId) && <p role="status">Choose advisors below to replace this draft's older role suggestions.</p>}
-                  <WizardRosterPicker rows={wizardRoster.data ?? []} selected={wizard.seats}
-                    disabled={!!wizId && wizVersion == null} loading={wizardRoster.isLoading} error={wizardRoster.isError}
-                    onRetry={() => { void wizardRoster.refetch(); }} onToggle={toggleWizardAdvisor} />
-                  <div className="meetctl">
-                    {" "}
-                    <button type="button" disabled={wizSave.isPending || (!!wizId && wizVersion == null)} onClick={() => wizSave.mutate(undefined)}>
-                      {" "}
-                      Save draft{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      onClick={() => setWizard({ ...wizard, step: 1 })}
-                    >
-                      {" "}
-                      Back{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={!wizardSelectionsValid || wizSave.isPending || (!!wizId && wizVersion == null)}
-                      onClick={() => {
-                        wizSave.mutate(4);
-                        setWizard({ ...wizard, step: 4 });
-                      }}
-                    >
-                      {" "}
-                      Continue{" "}
-                    </button>{" "}
-                  </div>{" "}
-                </div>
-              )}{" "}
-              {wizard.step < 4 && wizard.step !== 2 && (
-                <div className="card" aria-label="Guided interview">{" "}
-                  <h3>Guided interview</h3>{" "}
-                  <p>Answer one question at a time. Answers save to the draft and fill fields.</p>{" "}
-                  {iturns.map((t, i) => (
-                    <div key={i} className="takenote">{" "}
-                      <div><b>Guide:</b> {t.question}</div>{" "}
-                      {t.answer && <div><b>You:</b> {t.answer}</div>}{" "}
-                      {t.analysis && <div className="muted">{t.analysis}</div>}{" "}
-                    </div>
-                  ))}{" "}
-                  {iquestion && <p><b>Next question:</b> {iquestion}</p>}{" "}
-                  <label>Your answer<input disabled={!!wizId && wizVersion == null} value={ianswer} onChange={(e) => setIanswer(e.target.value)} placeholder="Answer in your own words" /></label>{" "}
-                  <div className="meetctl">{" "}
-                    <button type="button" disabled={!wizId || wizVersion == null || askInterview.isPending} onClick={() => askInterview.mutate(ianswer)}>Send answer</button>{" "}
-                    <button type="button" className="btn ghost" disabled={!wizId || wizVersion == null} onClick={() => askInterview.mutate("")}>Start interview</button>{" "}
-                  </div>{" "}
-                  {ichecks.length > 0 && (<div><h4>Checkpoints</h4><ul>{ichecks.map((c, i) => <li key={i}>{c.text}</li>)}</ul></div>)}{" "}
-                  {(wizReview.data?.fields ?? []).length > 0 && (<div><h4>Setup fields</h4><ul>{(wizReview.data?.fields ?? []).map((f) => <li key={f.field}>Step {f.step} - {f.field}: {f.status}</li>)}</ul></div>)}{" "}
-                </div>
-              )}{" "}
-              {wizard.step < 4 && wizard.step !== 2 && (
-                <div className="card" aria-label="Board setup guide">
-                  {" "}
-                  <h3>Setup guide</h3>{" "}
-                  {!guide && (
-                    <p>
-                      {" "}
-                      Stuck? The guide asks one question at a time and suggests
-                      entries you can apply or ignore. Nothing is filled in
-                      without you saying so.{" "}
-                    </p>
-                  )}{" "}
-                  <div className="meetctl">
-                    {" "}
-                    <button
-                      type="button"
-                      onClick={() => suggest.mutate()}
-                      disabled={!wizId || wizVersion == null || suggest.isPending}
-                    >
-                      {" "}
-                      {suggest.isPending
-                        ? "Guide is thinking…"
-                        : guide
-                          ? "Ask again"
-                          : "Ask the guide"}{" "}
-                    </button>{" "}
-                    {guide && (
-                      <button
-                        type="button"
-                        className="btn ghost"
-                        onClick={() => setGuide(null)}
-                      >
-                        {" "}
-                        Dismiss{" "}
-                      </button>
-                    )}{" "}
-                  </div>{" "}
-                  {guide && (
-                    <>
-                      {" "}
-                      <p>{guide.suggestion}</p>{" "}
-                      <p>
-                        {" "}
-                        <b>Next question:</b> {guide.nextQuestion}{" "}
-                      </p>{" "}
-                      {guide.fields?.mission && (
-                        <div className="meetctl">
-                          {" "}
-                          <span className="muted">
-                            {" "}
-                            Suggested mission: {guide.fields.mission}{" "}
-                          </span>{" "}
-                          <button
-                            type="button"
-                            disabled={!!wizId && wizVersion == null}
-                            onClick={() => {
-                              setWizard({
-                                ...wizard,
-                                mission:
-                                  guide.fields?.mission ?? wizard.mission,
-                              });
-                              setGuide(null);
-                            }}
-                          >
-                            {" "}
-                            Apply mission{" "}
-                          </button>{" "}
-                        </div>
-                      )}{" "}
-                      {guide.fields?.stage && (
-                        <div className="meetctl">
-                          {" "}
-                          <span className="muted">
-                            {" "}
-                            Suggested stage: {guide.fields.stage}{" "}
-                          </span>{" "}
-                          <button
-                            type="button"
-                            disabled={!!wizId && wizVersion == null}
-                            onClick={() => {
-                              setWizard({
-                                ...wizard,
-                                stage: guide.fields?.stage ?? wizard.stage,
-                              });
-                              setGuide(null);
-                            }}
-                          >
-                            {" "}
-                            Apply stage{" "}
-                          </button>{" "}
-                        </div>
-                      )}{" "}
-                    </>
-                  )}{" "}
-                </div>
-              )}{" "}
-              {wizard.step >= 4 && (
-                <div className="card">
-                  {" "}
-                  <h3>Review and create</h3>{" "}
-                  <p>
-                    {" "}
-                    <b>{wizard.name || "Unnamed board"}</b> ·{" "}
-                    {wizard.mission || "No mission yet."}{" "}
-                    {wizard.stage && <span> · {wizard.stage}</span>}{" "}
-                  </p>{" "}
-                  <p>
-                    {" "}
-                    Advisors ({wizard.seats.length}):{" "}
-                    {wizard.seats.map((s) => s.role).join(", ") || "none"}{" "}
-                  </p>{" "}
-                  <p>
-                    {" "}
-                    {profile.isSuccess ? `Your saved profile (${profile.data.name}) will be used automatically.` : profile.isLoading ? "Loading your saved profile…" : "Save your profile before creating this board."}
-                    {!profile.isLoading && !profile.isSuccess && <button type="button" className="btn ghost" onClick={() => setTab("profile")}>Open Your Profile</button>}
-                  </p>{" "}
-                  <p role="status">
-                    {" "}
-                    {wizId
-                      ? (wizReview.data?.status ?? "Checking…")
-                      : "Save the draft first."}{" "}
-                  </p>{" "}
-                  {(wizReview.data?.blockers ?? []).length > 0 && (
-                    <ul>
-                      {" "}
-                      {(wizReview.data?.blockers ?? []).map((b) => (
-                        <li key={b.field}>
-                          {" "}
-                          Step {b.step}: {b.message}{" "}
-                        </li>
-                      ))}{" "}
-                    </ul>
-                  )}{" "}
-                  {(wizReview.data?.fields ?? []).length > 0 && (<div><h4>Setup fields</h4><ul>{(wizReview.data?.fields ?? []).map((f) => <li key={f.field}>Step {f.step} - {f.field}: {f.status}</li>)}</ul></div>)}{" "}
-                  {wizId && (wizReview.data?.blockers ?? []).length === 0 && (
-                    <p>
-                      {" "}
-                      Ready to create. Advisor profiles stay drafts until you
-                      approve each one.{" "}
-                    </p>
-                  )}{" "}
-                  <div className="meetctl">
-                    {" "}
-                    <button
-                      type="button"
-                      onClick={() => setWizard({ ...wizard, step: 2 })}
-                    >
-                      {" "}
-                      Back{" "}
-                    </button>{" "}
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={
-                        !wizId ||
-                        !wizardSelectionsValid ||
-                        !profile.isSuccess ||
-                        createBoardFromWizard.isPending ||
-                        (wizReview.data?.blockers ?? []).length > 0
-                      }
-                      onClick={() => createBoardFromWizard.mutate()}
-                    >
-                      {" "}
-                      {createBoardFromWizard.isPending
-                        ? "Creating…"
-                        : "Create board"}{" "}
-                    </button>{" "}
-                  </div>{" "}
-                </div>
-              )}{" "}
+              </div>
             </section>
           )}{" "}
           {tab === "profile" && (
