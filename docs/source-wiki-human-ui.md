@@ -48,7 +48,7 @@ QA
   fail-closed. Covers History/Sections expansion effects, recall effects,
   permission toggles, upload scope pinning, downloads, error recovery,
   sync/config copy differences, textareas, and computed accessible-name
-  uniqueness. No real app services, no real HTTP/PG/Docker/keys.
+  uniqueness. No real app services, no real HTTP/PG/Docker/keys. The mounted script runs under one overall deadline (build, launch, interactions, route cleanup) inside try/finally from startup: HTTP route cleanup plus bounded browser close plus awaited server close with listener-closed proof and failure exit; the route allowlist is exactly http://127.0.0.1:<own-port> (no localhost alias, no https, no arbitrary port).
 
 Verification by the authoring agent
 
