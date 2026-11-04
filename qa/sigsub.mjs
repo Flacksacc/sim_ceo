@@ -5,7 +5,7 @@
 // frame plus join/connect outcomes as JSON lines. Exits alone after durationMs.
 import { createRequire } from "node:module";
 import fs from "node:fs";
-const require = createRequire(process.cwd() + "/qa/.sigclient/");
+const require = createRequire(new URL("../web/package.json", import.meta.url));
 const { HubConnectionBuilder, LogLevel } = require("@microsoft/signalr");
 
 const [api, token, meetingsCsv, outfile, durationMs] = process.argv.slice(2);
