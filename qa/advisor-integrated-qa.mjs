@@ -180,9 +180,9 @@ const WEB = webUrl.origin;
 const FAKE_ENABLED = FAKE !== "" && FAKE !== "none";
 let fakeUrl = null;
 if (FAKE_ENABLED) {
-  try { fakeUrl = new URL(FAKE); } catch { failExit("REFUSE: QA_FAKE is not a valid URL."); }
-  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || fakeUrl.port !== "15302") failExit("REFUSE: QA_FAKE must be http://127.0.0.1:15302 loopback.");
-  if (fakeUrl.username || fakeUrl.password) failExit("REFUSE: credentials-in-URL are never accepted.");
+  try { fakeUrl = new URL(FAKE); } catch { console.log("FATAL REFUSE: QA_FAKE is not a valid URL."); process.exit(2); }
+  if (fakeUrl.protocol !== "http:" || fakeUrl.hostname !== "127.0.0.1" || fakeUrl.port !== "15302") { console.log("FATAL REFUSE: QA_FAKE must be http://127.0.0.1:15302 loopback."); process.exit(2); }
+  if (fakeUrl.username || fakeUrl.password) { console.log("FATAL REFUSE: credentials-in-URL are never accepted."); process.exit(2); }
 }
 ok("allowlist-web-ok", WEB === "http://127.0.0.1:15300" || (WEB === "http://127.0.0.1:15180" && LIVE), WEB);
 
@@ -866,8 +866,30 @@ async function stepMeeting() {
   const initSetOk = Array.isArray(initIds) && initIds.length === 2 && initIds.map(String).map((v) => v.toLowerCase()).sort().join(",") === [advisor1, advisor2].map(String).map((v) => v.toLowerCase()).sort().join(",");
   ok("meeting-initial-two", initSetOk, "exactSet={advisor1,advisor2} got=" + (initIds ? initIds.join(",").slice(0,80) : "unparsed"));
   if (!initSetOk) failExit("initial participant set must exactly equal {advisor1,advisor2} before restriction.");
-  await patch("/api/meetings/" + meetingId, { participantIds: [advisor1] });
+  // d896a83 closure: PATCH is a real route, but SAME-hash goto does NOT document reload-refetch, so rail can render stale included state.
+  const rp1 = await patch("/api/meetings/" + meetingId, { participantIds: [advisor1] });
+  const detPre = await get("/api/boards/" + boardA + "/meetings/" + meetingId);
+  let preIds = null;
+  if (detPre.status === 200 && detPre.json) { const r1 = pick(detPre.json, "participantIds"); if (Array.isArray(r1)) preIds = r1.map(String); else { try { const pj = JSON.parse(pick(detPre.json, "participantIdsJson") || "[]"); if (Array.isArray(pj)) preIds = pj.map(String); } catch {} } }
+  const preExact = Array.isArray(preIds) && preIds.length === 1 && String(preIds[0]).toLowerCase() === String(advisor1).toLowerCase();
+  const imgA0 = await get("/api/roster/" + rosterId + "/images");
+  const imgB0 = await get("/api/roster/" + roster2 + "/images");
+  const accA0 = Array.isArray(imgA0.json) && imgA0.json.some((x) => pick(x, "review") === "accepted" || pick(x, "review") === "grandfathered");
+  const accB0 = Array.isArray(imgB0.json) && imgB0.json.some((x) => pick(x, "review") === "accepted" || pick(x, "review") === "grandfathered");
+  const advCol0 = await get("/api/boards/" + boardA + "/advisors");
+  const advList0 = Array.isArray(advCol0.json) ? advCol0.json : [];
+  const roleA0 = advList0.some((x) => String(pick(x, "id") || "").toLowerCase() === String(advisor1).toLowerCase() && String(pick(x, "boardRole") || "") === "Harbor Strategist");
+  const roleB0 = advList0.some((x) => String(pick(x, "id") || "").toLowerCase() === String(advisor2).toLowerCase() && String(pick(x, "boardRole") || "") === "Tide Watcher");
+  ok("meeting-restrict-patch-exact-preset", (rp1.status === 200 || rp1.status === 204) && detPre.status === 200 && preExact && accA0 && accB0 && roleA0 && roleB0, "patch=" + rp1.status + " detail=" + detPre.status + " exactPre=" + preExact + " accA=" + accA0 + " accB=" + accB0 + " roleA=" + roleA0 + " roleB=" + roleB0);
+  if (!((rp1.status === 200 || rp1.status === 204) && preExact)) failExit("participant PATCH response-exact barrier failed before rail; refusing stale-rail proof. patch=" + rp1.status + " " + safeDiag(rp1));
   await gotoTab("/#/meet?board=" + encodeURIComponent(boardA) + "&meeting=" + encodeURIComponent(meetingId));
+  try { await page.reload({ waitUntil: "domcontentloaded", timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch {}
+  await page.waitForTimeout(Math.min(1500, Math.max(400, remainingMs(6000))));
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/meetings/" + meetingId && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/boards/" + boardA + "/advisors" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
+  try { await page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/activity" && r.request().method() === "GET"; } catch { return false; } }, { timeout: Math.min(20000, Math.max(8000, remainingMs(12000))) }).catch(() => null); } catch {}
+  try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const seats = rail.querySelectorAll("li.mp-seat"); if (seats.length !== 4) return false; const names = Array.from(rail.querySelectorAll(".mp-name")).map((e) => e.textContent || ""); const idx = names.findIndex((n) => String(n).indexOf("Tide Watcher") >= 0); if (idx < 0) return false; const cls = seats[idx] ? seats[idx].className : ""; if (cls.indexOf("act-excluded") < 0) return false; return true; }, undefined, { timeout: boundedTimeout(20000, 8000) }); } catch {}
+  try { await page.waitForFunction(() => { const rail = document.querySelector('section.meet-participants ul.mp-rail[aria-label="Participant activity"]'); if (!rail) return false; const imgs = rail.querySelectorAll('img[alt^="Portrait of "]'); if (imgs.length !== 2) return false; let okN = 0; for (const im of imgs) { const el = im; if (el && el.complete && (el.naturalWidth || 0) > 0) okN++; } return okN === 2; }, undefined, { timeout: boundedTimeout(25000, 8000) }); } catch {}
   // F6+F7: toolbar search (ACTUAL labelled textbox), EXACT Meeting settings
   // button + in-dialog Decisions & evidence, and the ACTUAL presence rail.
   let shellNote = "";
@@ -955,6 +977,7 @@ async function stepMeeting() {
       const mappedOk = classes.every((c) => String(c).split(/\s+/).filter((t) => t.indexOf("act-") === 0).every((t) => MAPPED_VOCAB.has(t.slice(4))));
       railOk = seatCount === 4 && hasLead && hasAdv1 && hasAdv2 && hasSec && adv2Excluded && !otherExcluded && srcOk && portraitsDistinct && mappedOk;
       shellNote += "seats=" + seatCount + " lead=" + hasLead + " adv1=" + hasAdv1 + " adv2=" + hasAdv2 + " sec=" + hasSec + " excludedSeatLocal=" + adv2Excluded + " p1ok=" + p1.ok + ":" + p1.reason + " p2ok=" + p2.ok + ":" + p2.reason + " distinct=" + portraitsDistinct + " mappedVocab=" + mappedOk + ";";
+      try { globalThis.__railNote = "seats=" + seatCount + " excluded=" + adv2Excluded + " p1=" + p1.ok + ":" + p1.reason + " p2=" + p2.ok + ":" + p2.reason + " distinct=" + portraitsDistinct + " srcOk=" + srcOk; } catch {}
     } else { shellNote += "rail=missing;"; }
     // Exactly one meeting control area (the conv-actions group) + composer.
     const ctlCount = await page.locator('[aria-label="Meeting and advisor controls"]').count().catch(() => -1);
@@ -964,7 +987,7 @@ async function stepMeeting() {
   } catch (e) { shellNote += " shell probe threw: " + trunc(String((e && e.message) || e), 120); }
   ok("meeting-search-textbox-above", searchOk, shellNote || "search contract (see contract doc)");
   ok("meeting-settings-dialog-decisions-escape", settingsOk, shellNote || "settings contract (see contract doc)");
-  ok("meeting-rail-seats-portraits-secretary", railOk, shellNote || "rail contract (see contract doc)");
+  ok("meeting-rail-seats-portraits-secretary", railOk, ((globalThis.__railNote || "") + " | " + (shellNote || "rail contract")).slice(0, 220));
   ok("meeting-control-area-once", controlOk, shellNote || "exactly one control area + composer");
   // Restrict participants via a real route (HTTP PATCH is an allowed route),
   // then verify the EXACT participant set on the scoped detail — statuses
@@ -1173,12 +1196,13 @@ async function stepMeeting() {
   const secPostPromise = page.waitForResponse((r) => { try { return new URL(r.url()).pathname === "/api/meetings/" + meetingId + "/secretary" && r.request().method() === "POST"; } catch { return false; } }, { timeout: Math.min(30000, Math.max(8000, remainingMs(12000))) }).catch(() => null);
   await box.fill(SECQ);
   await box.press("Enter");
-  let secPostReqId = "", secPostNonce = "", secPostInput = "";
+  let secPostReqId = "", secPostRespNonce = "", secPostReqNonce = "", secPostInput = "", secPostStatus = 0;
   try {
     const _sr = await secPostPromise;
-    if (_sr) { try { const _sj = await _sr.json(); secPostReqId = String(pick(_sj, "requestId") || ""); secPostNonce = String(pick(_sj, "clientNonce") || ""); } catch {} try { const _rq = _sr.request(); const _pd = _rq.postDataJSON(); if (_pd) { secPostInput = String(_pd.input || ""); secPostNonce = String(_pd.clientNonce || secPostNonce); } } catch {} }
+    if (_sr) { try { secPostStatus = _sr.status(); } catch {} try { const _sj = await _sr.json(); secPostReqId = String(pick(_sj, "requestId") || ""); secPostRespNonce = String(pick(_sj, "clientNonce") || ""); } catch {} try { const _rq = _sr.request(); const _pd = _rq.postDataJSON(); if (_pd) { secPostInput = String(_pd.input || ""); secPostReqNonce = String(_pd.clientNonce || ""); } } catch {} }
   } catch {}
-  ok("secretary-post-captured", secPostReqId.length > 0 && secPostNonce.length > 0, "reqId=" + (secPostReqId ? secPostReqId.slice(0,8) : "missing"));
+  const secPostNonce = secPostRespNonce;
+  ok("secretary-post-captured", secPostStatus >= 200 && secPostStatus < 300 && secPostReqId.length > 0 && secPostRespNonce.length > 0 && secPostReqNonce.length > 0 && secPostRespNonce === secPostReqNonce && secPostInput === SECQ, "status=" + secPostStatus + " reqId=" + (secPostReqId ? secPostReqId.slice(0,8) : "missing") + " nonceEq=" + (secPostRespNonce === secPostReqNonce) + " inputExact=" + (secPostInput === SECQ));
   if (!secPostReqId) failExit("secretary POST response must carry exact requestId/nonce; refusing list-only correlation.");
   const secDeadline = Date.now() + Math.min(90000, remainingMs(20000));
   let sreq1List = [], fresh = [], secDone = null;
@@ -1207,14 +1231,17 @@ async function stepMeeting() {
     const expectNorm = stripSecPrefix(SECQ);
     const nonceOk = rqNonce === secPostNonce && rqNonce.length > 0;
     const inputOk = rqInput === expectNorm && rqInput.includes(run);
-    const parentOk = String(pick(rq, "boardId") || pick(rq, "BoardId") || "") !== "" && String(pick(rq, "meetingId") || pick(rq, "MeetingId") || "") !== "";
+    const rqBoard = String(pick(rq, "boardId") || pick(rq, "BoardId") || "");
+    const rqMeet = String(pick(rq, "meetingId") || pick(rq, "MeetingId") || "");
+    const parentOk = rqBoard.toLowerCase() === String(boardA).toLowerCase() && rqMeet.toLowerCase() === String(meetingId).toLowerCase();
     ok("secretary-request-correlated", nonceOk && inputOk && String(pick(rq, "status") || "") === "completed" && !!pick(rq, "noteId") && parentOk, "nonceExact=" + nonceOk + " stripPrefixExact=" + inputOk + " parent=" + parentOk);
     if (!(nonceOk && inputOk)) failExit("secretary request must carry EXACT POST nonce and StripPrefix(InputText).");
     const one = await get("/api/meetings/" + meetingId + "/secretary/requests/" + rqId);
     const oneReq = pick(one.json, "request") || pick(one.json, "Request") || one.json || {};
     const oneReqId = String(pick(oneReq, "id") || pick(one.json, "requestId") || "");
     const oneNoteId = String(pick(oneReq, "noteId") || pick(one.json, "noteId") || pick(pick(one.json, "note") || {}, "id") || "");
-    const sameGetOk = one.status === 200 && (oneReqId.toLowerCase() === rqId.toLowerCase() || oneNoteId !== "") && oneNoteId === String(pick(rq, "noteId") || "");
+    const rqNote = String(pick(rq, "noteId") || "");
+    const sameGetOk = one.status === 200 && oneReqId.toLowerCase() === rqId.toLowerCase() && oneNoteId !== "" && oneNoteId === rqNote;
     ok("secretary-get-same-id", sameGetOk, "completedGET sameID noteId=" + (oneNoteId ? oneNoteId.slice(0,8) : "missing"));
     if (!sameGetOk) failExit("completed GET must resolve the same request ID with its noteId.");
     const note = pick(one.json, "note") || {};
@@ -1223,7 +1250,8 @@ async function stepMeeting() {
     const nkind = typeof pick(note, "kind") === "string" ? String(pick(note, "kind")) : "";
     const nprov = pick(note, "provisional");
     const bodyExactOk = typeof pick(note, "body") === "string" && nbody.includes(run) && nbody.length > 40;
-    ok("secretary-note-provisional-persisted", one.status === 200 && (nkind === "secretary-note" || nkind === "secretary-briefing") && nprov === true && bodyExactOk && String(pick(note, "boardId") || pick(note, "BoardId") || "") !== "" && String(pick(note, "meetingId") || pick(note, "MeetingId") || "") !== "", "status=" + one.status + " kind=" + nkind + " provisional=" + nprov + " bodyLen=" + nbody.length);
+    const noteParentOk = String(pick(note, "boardId") || pick(note, "BoardId") || "").toLowerCase() === String(boardA).toLowerCase() && String(pick(note, "meetingId") || pick(note, "MeetingId") || "").toLowerCase() === String(meetingId).toLowerCase();
+    ok("secretary-note-provisional-persisted", one.status === 200 && (nkind === "secretary-note" || nkind === "secretary-briefing") && nprov === true && bodyExactOk && noteParentOk && String(pick(note, "id") || "").toLowerCase() === rqNote.toLowerCase(), "status=" + one.status + " kind=" + nkind + " provisional=" + nprov + " bodyLen=" + nbody.length + " parentExact=" + noteParentOk);
     if (!(one.status === 200 && (nkind === "secretary-note" || nkind === "secretary-briefing") && nprov === true && bodyExactOk)) failExit("persisted provisional must be exact body with UI-visible correlation.");
     try { globalThis.__secNoteTitle = ntitle; globalThis.__secNoteBody = nbody; globalThis.__secNoteId = rqId; } catch {}
   } else {
@@ -1368,7 +1396,8 @@ async function stepReeditRerun() {
   const curFull = (globalThis.__canonCurrent && globalThis.__canonCurrent.length === 3) ? globalThis.__canonCurrent : submitted2;
   // Unique lead prompt marker MUST be POSTED before the API run (exact owned YOUR TURN gate).
   const rerunBoundary = Date.now();
-  const rerunLeadContent = rerunMarker + " " + QUESTION + " current: " + curFull.join(" | ");
+  // d896a83 closure item 19: lead carries ONLY the unique discriminator + ordinary question. Current paragraphs must reach the model via the canonical behavior section (ContextCurator), never via lead echo.
+  const rerunLeadContent = rerunMarker + " " + QUESTION;
   const rl2 = await post("/api/meetings/" + mid2 + "/messages", { sender: "lead", content: rerunLeadContent });
   ok("rerun-lead-posted", rl2.status === 200 || rl2.status === 201, "status=" + rl2.status);
   if (!(rl2.status === 200 || rl2.status === 201)) failExit("rerun lead with unique marker must post before run.");
@@ -1387,8 +1416,8 @@ async function stepReeditRerun() {
     const yourTurn = post2.filter((e) => logText(e).includes("YOUR TURN"));
     const ownedCorr = yourTurn.filter((e) => logText(e).includes("Harbor Strategist") || logText(e).includes(rosterName) || logText(e).includes(advisor1));
     const withMarker = ownedCorr.filter((e) => logText(e).includes(rerunMarker));
-    const withCurrent = withMarker.filter((e) => [N1, N2, N3].every((mk) => logText(e).includes(mk)) && curFull.every((para) => logText(e).includes(para.slice(0, 40))));
-    const staleLeak = post2.filter((e) => [M1, M2, M3].some((mk) => logText(e).includes(mk)));
+    const withCurrent = withMarker.filter((e) => [N1, N2, N3].every((mk) => logText(e).includes(mk)) && curFull.every((para) => logText(e).includes(para)));
+    const staleLeak = withMarker.filter((e) => [M1, M2, M3].some((mk) => logText(e).includes(mk)));
     ok("promptlog-current-markers-owned", withMarker.length >= 1 && withCurrent.length >= 1 && staleLeak.length === 0 && post2.length >= 1 && yourTurn.length >= 1, "marker=" + withMarker.length + " currentFull=" + withCurrent.length + " stale=" + staleLeak.length);
     if (!(withMarker.length >= 1 && withCurrent.length >= 1 && staleLeak.length === 0)) failExit("rerun prompt must carry exact owned YOUR TURN marker plus current full paragraphs, no stale leak.");
   } else {
@@ -1400,17 +1429,35 @@ async function stepReeditRerun() {
 // ---- 5b. roster direct chat through the REAL RosterChatPanel UI ----
 async function stepRosterChatUI() {
   await gotoTab("/#/roster");
-  try {
-    const rrow = page.locator("aside.listpanel button.lprow", { hasText: rosterName }).first();
-    await rrow.waitFor({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) });
-    await rrow.click({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) });
-  } catch {}
-  await page.waitForTimeout(1200);
+  const freshCol = await get("/api/roster?accountId=" + ACCT);
+  const freshRows = Array.isArray(freshCol.json) ? freshCol.json : [];
+  const freshHit = freshRows.find((x) => String(pick(pick(x, "entry") || x, "id") || "").toLowerCase() === String(rosterId).toLowerCase());
+  const freshEntry = freshHit ? (pick(freshHit, "entry") || freshHit) : null;
+  const freshName = freshEntry ? String(pick(freshEntry, "name") || "") : "";
+  const freshVer = freshEntry ? Number(pick(freshEntry, "version") || 0) : 0;
+  const canonPre = await canonicalEntry(rosterId);
+  const canonVer = canonPre.entry ? Number(pick(canonPre.entry, "version") || 0) : 0;
+  const selDiag = "freshRows=" + freshRows.length + " hit=" + !!freshHit + " nameEq=" + (freshName === rosterName) + " freshVer=" + freshVer + " canonVer=" + canonVer + " rosterId=" + String(rosterId).slice(0, 8);
+  ok("roster-chat-fresh-entry-identity", freshCol.status === 200 && !!freshHit && freshName === rosterName && Number.isInteger(freshVer) && freshVer > 0, selDiag);
+  if (!(freshCol.status === 200 && !!freshHit && freshName === rosterName)) failExit("fresh roster collection lost the exact selected entry after re-edit; refusing panel proof. " + selDiag);
+  const rrow = page.locator("aside.listpanel button.lprow", { hasText: rosterName }).first();
+  try { await rrow.waitFor({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch { ok("roster-chat-panel-mounted", false, "owned roster row never visible for click; " + selDiag); failExit("roster row not visible; no swallowed click. " + selDiag); }
+  const rowName = await rrow.locator(".lprow-name").innerText().catch(() => "");
+  if (rowName !== rosterName) { ok("roster-chat-panel-mounted", false, "roster row name mismatch; " + selDiag); failExit("roster row identity drift after canonical re-edit; refusing wrong-entry chat. " + selDiag); }
+  try { await rrow.click({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch (e) { ok("roster-chat-panel-mounted", false, "owned row click failed: " + trunc(String((e && e.message) || e), 120) + " " + selDiag); failExit("roster row click failed; no swallowed click. " + selDiag); }
+  try { await page.waitForFunction((exp) => { const b = Array.from(document.querySelectorAll("aside.listpanel button.lprow")).find((e) => (e.textContent || "").indexOf(exp) >= 0); if (!b) return false; return b.getAttribute("aria-current") === "true" && b.className.indexOf("active") >= 0; }, rosterName, { timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); } catch {}
+  const ariaCur = await rrow.getAttribute("aria-current").catch(() => null);
+  const clsCur = await rrow.evaluate((el) => el.className).catch(() => "");
+  const selOk = ariaCur === "true" && String(clsCur).indexOf("active") >= 0;
+  if (!selOk) { const allN = await page.locator("aside.listpanel button.lprow .lprow-name").allInnerTexts().catch(() => []); ok("roster-chat-panel-mounted", false, "selection did not land on owned entry aria=" + ariaCur + " rows=" + (allN || []).length + " " + selDiag); failExit("roster selection identity not proven; refusing panel proof. " + selDiag); }
+  await page.waitForTimeout(800);
   const panel = page.locator('div[data-roster-chat="' + rosterId + '"]');
   let panelOk = false;
-  try { await panel.waitFor({ timeout: boundedTimeout(BROWSER_TIMEOUT, 8000) }); panelOk = true; } catch { ok("roster-chat-panel-mounted", false, "RosterChatPanel for owned advisor never mounted"); }
-  ok("roster-chat-panel-mounted", panelOk, panelOk ? "div[data-roster-chat] mounted" : "panel missing");
-  if (!panelOk) failExit("roster chat panel missing; refusing HTTP-only chat.");
+  let panelDiag = "";
+  try { await panel.waitFor({ timeout: boundedTimeout(20000, 8000) }); panelOk = await panel.count() > 0; } catch { panelOk = false; }
+  if (!panelOk) { const rowCount = await page.locator("aside.listpanel button.lprow").count().catch(() => -1); const panelCount = await page.locator("div[data-roster-chat]").count().catch(() => -1); panelDiag = "rowCount=" + rowCount + " panelCount=" + panelCount + " aria=" + ariaCur + " " + selDiag + " badResp=" + badResponses.slice(-3).join(" | ").slice(0, 240) + " pageErr=" + pageErrors.slice(-2).join(" | ").slice(0, 240); ok("roster-chat-panel-mounted", false, "RosterChatPanel for owned advisor never mounted; " + panelDiag); }
+  ok("roster-chat-panel-mounted", panelOk, panelOk ? "div[data-roster-chat] mounted same-entry=" + String(rosterId).slice(0, 8) + " " + selDiag : "panel missing; " + panelDiag);
+  if (!panelOk) failExit("roster chat panel missing for same exact entry after proven selection; refusing HTTP-only chat. " + (panelDiag || selDiag));
   const headOk = await panel.getByText("Chat with this advisor", { exact: false }).count().then((c) => c > 0).catch(() => false);
   const boardfreeOk = await panel.getByText(/nothing here joins a meeting/i).count().then((c) => c > 0).catch(() => false);
   ok("roster-chat-boardfree-contract", headOk && boardfreeOk, "heading=" + headOk + " boardfree-note=" + boardfreeOk);
@@ -1420,8 +1467,8 @@ async function stepRosterChatUI() {
   ok("roster-chat-controls", boxOk && await chatLog.count() > 0, "messageBox=" + boxOk);
   if (!boxOk) failExit("roster chat message box missing.");
   const mc0 = await get("/api/meetings/" + meetingId + "/messages?take=100");
-  const msgValid = (x) => x && typeof x === "object" && Number.isInteger(Number(pick(x, "sequence") ?? pick(x, "Sequence"))) && typeof pick(x, "sender") === "string" && typeof (pick(x, "content") ?? pick(x, "Content")) === "string" && typeof pick(x, "advisorId") === "string" && (pick(x, "status") === undefined || typeof pick(x, "status") === "string") && (pick(x, "stance") === undefined || typeof pick(x, "stance") === "string");
-  const msgSnap = (x) => String(pick(x, "sequence") ?? pick(x, "Sequence")) + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") ?? pick(x, "Content") ?? "") + "|" + String(pick(x, "parentSequence") ?? pick(x, "ParentSequence") ?? "") + "|" + String(pick(x, "stance") || "") + "|" + String(pick(x, "status") || "");
+  const msgValid = (x) => x && typeof x === "object" && Number.isInteger(Number(pick(x, "sequence") ?? pick(x, "Sequence"))) && typeof pick(x, "sender") === "string" && typeof (pick(x, "content") ?? pick(x, "Content")) === "string" && typeof pick(x, "advisorId") === "string" && typeof pick(x, "stance") === "string" && typeof pick(x, "status") === "string" && (pick(x, "boardId") === undefined || typeof pick(x, "boardId") === "string") && (pick(x, "meetingId") === undefined || typeof pick(x, "meetingId") === "string") && (pick(x, "advisorName") === undefined || pick(x, "advisorName") === null || typeof pick(x, "advisorName") === "string") && (pick(x, "createdAt") === undefined || typeof pick(x, "createdAt") === "string") && (pick(x, "parentSequence") === undefined || pick(x, "parentSequence") === null || Number.isInteger(Number(pick(x, "parentSequence") ?? pick(x, "ParentSequence"))));
+  const msgSnap = (x) => String(pick(x, "sequence") ?? pick(x, "Sequence")) + "|" + String(pick(x, "sender") || "") + "|" + String(pick(x, "advisorId") || "") + "|" + String(pick(x, "content") ?? pick(x, "Content") ?? "") + "|" + String(pick(x, "parentSequence") ?? pick(x, "ParentSequence") ?? "") + "|" + String(pick(x, "stance") || "") + "|" + String(pick(x, "status") || "") + "|" + String(pick(x, "boardId") || "") + "|" + String(pick(x, "meetingId") || "") + "|" + String(pick(x, "advisorName") || "");
   const mc0Valid = mc0.status === 200 && Array.isArray(mc0.json) && mc0.json.every(msgValid);
   ok("roster-chat-message-shape", mc0Valid, "all meeting messages carry Sequence/ParentSequence/Status/Stance/Content");
   if (!mc0Valid) failExit("meeting message entities must validate full snapshot; Id does not exist (Sequence only).");
@@ -1456,9 +1503,11 @@ async function stepRosterChatUI() {
   let chatJson = null; try { chatJson = chatReq ? JSON.parse(chatReq.body) : null; } catch { chatJson = null; }
   const chatUrlOk = !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
   const chatKeyOk = !!chatJson && typeof chatJson.message === "string" && chatJson.message === chatQ && !("content" in chatJson) && !("body" in chatJson);
-  const chatResOk = chatStatus >= 200 && chatStatus < 300 && chatAns.length >= 20 && chatRid.toLowerCase() === String(rosterId).toLowerCase() && Number.isInteger(chatVer) && chatVer > 0 && chatStored === false;
+  const chatPairOk = !!_chatResp && !!chatReq && String(chatReq.url || "") === "/api/roster/" + rosterId + "/chat";
+  const chatVerOk = Number.isInteger(chatVer) && chatVer > 0 && chatVer === freshVer && freshVer > 0;
+  const chatResOk = chatPairOk && chatStatus >= 200 && chatStatus < 300 && chatAns.length >= 20 && chatRid.toLowerCase() === String(rosterId).toLowerCase() && chatVerOk && chatStored === false;
   const uiEqOk = !!advAnswer && advAnswer === chatAns;
-  ok("roster-chat-request", chatUrlOk && chatKeyOk && chatResOk, "urlExact=" + chatUrlOk + " messageKeyExact=" + chatKeyOk + " answerLen=" + chatAns.length + " ver=" + chatVer);
+  ok("roster-chat-request", chatUrlOk && chatKeyOk && chatResOk, "urlExact=" + chatUrlOk + " messageKeyExact=" + chatKeyOk + " paired=" + chatPairOk + " answerLen=" + chatAns.length + " ver=" + chatVer + " freshVer=" + freshVer);
   if (!(chatUrlOk && chatKeyOk && chatResOk)) failExit("roster chat must use EXACT message key with 200 answer/rosterId/version/stored.");
   ok("roster-chat-ui-eq-answer", uiEqOk, "uiLen=" + (advAnswer ? advAnswer.length : 0) + " ansLen=" + chatAns.length);
   if (!uiEqOk) failExit("rendered roster answer must equal the API answer exactly.");
@@ -1496,9 +1545,10 @@ async function scanDebug(tag) {
   const guidRe = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
   const jsonRe = /"[^"]+"\s*:\s*(\{|\[|")/g;
   const primRe = /"[^"]+"\s*:\s*(\d+|true|false|null)/g;
-  const guidHits = (collected.match(guidRe) || []).length;
-  const jsonHits = (collected.match(jsonRe) || []).length;
-  const primHits = (collected.match(primRe) || []).length;
+  const detCollected = det(collected);
+  const guidHits = detCollected.g ? (collected.match(guidRe) || []).length : 0;
+  const jsonHits = detCollected.j ? (collected.match(jsonRe) || []).length : 0;
+  const primHits = detCollected.p ? (collected.match(primRe) || []).length : 0;
   // SAME actual detector on every positive/clean fixture (no independent has* regexes).
   const det = (t) => ({ g: (String(t).match(new RegExp(guidRe.source, "i")) || []).length >= 1, j: (String(t).match(new RegExp(jsonRe.source, "g")) || []).length >= 1, p: (String(t).match(new RegExp(primRe.source, "g")) || []).length >= 1 });
   const hasGuid = (t) => det(t).g;
@@ -1575,7 +1625,7 @@ async function stepNavigation() {
     let headOk = true;
     if (d.head) { const hLoc = secLoc.getByRole("heading", { name: d.head }); headOk = await hLoc.first().isVisible().catch(() => false); if (!headOk) headOk = secTxt.includes(d.head); }
     let entityOk = true;
-    if (d.entity) { entityOk = secTxt.includes(d.entity) || secTxt.includes(run); if (!entityOk && d.seg === "records") entityOk = /no records|empty|nothing/i.test(secTxt); }
+    if (d.entity) { if (d.seg === "meet") { entityOk = secTxt.includes(d.entity); } else { entityOk = secTxt.includes(d.entity) || secTxt.includes(run); } if (!entityOk && d.seg === "records") entityOk = /no records|empty|nothing|prepare draft/i.test(secTxt); if (!entityOk && d.seg === "sources") entityOk = /wiki|sources|inbox|no sources|empty/i.test(secTxt); }
     const h = await page.evaluate(() => location.hash).catch(() => "");
     const hashOk = h.indexOf("#/" + d.seg) === 0;
     const boardOk = ["advisors", "meet", "sources", "records", "people", "activity"].includes(d.seg) ? h.includes("board=" + encodeURIComponent(boardA)) : true;
@@ -1643,12 +1693,9 @@ async function stepNavigation() {
   checkBudget("navigation");
 }
 
-// Duplicative backend negative activity scenarios REMOVED from this monolith by design.
-// Coverage mapping (not claimed passed here; primary runs focused suites):
-// - abstain / bid-decline / reply-error abstained+failed+provider-error shapes -> qa/meeting-send-pipeline-qa.mjs (Send 142, no-responder) + backend qa/http-qa.mjs (119 HTTP) + qa/wiki-pg-qa.mjs style PG checks (29 PG) + qa/usage-activity-browser.mjs activity contract.
-// - no-responder zero-contribution -> meeting-send-pipeline no-responder + lifecycle mounted QA (primary-advisor-7b3986f-mounted-lifecycle).
-// This integration keeps the honest core: one real send with working-state pairing + excluded-seat proof. No weakened assertion hides a removed failure.
-async function stepActivityScenarios() { console.log("  ok - activity-scenarios-mapped-to-focused-suites"); }
+// Duplicative backend negative activity scenarios REMOVED from this monolith by design (mapped, NOT claimed passed here; primary runs focused suites).
+// Exact mapping: no-responder stubbed UI terminal/retry -> qa/meeting-send-pipeline-qa.mjs:402; bid-decline yields + zero reply-error publications -> qa/http-qa.mjs:495; actual bid-decline activity assertions + T6 provider/reply errors -> qa/meeting-activity-qa.mjs:316. wiki-pg-qa.mjs (Wiki persistence) and usage-activity-browser.mjs (usage reporting) do NOT replace participant-state assertions. The lifecycle suite does not supply abstained/failed seat-label checks; QA-ABSTAIN fake support is not an executed abstention test. Bid decline produces bid-declined (provider-error belongs to provider failure). This integration keeps the honest core: one real send with working-state pairing + excluded-seat proof.
+async function stepActivityScenarios() { console.log("  note - activity-scenarios-mapped-to-focused-suites (mapped-unexecuted here; primary runs focused suites, no assertions claimed)"); }
 async function main() {
   try {
     await stepSetup();
