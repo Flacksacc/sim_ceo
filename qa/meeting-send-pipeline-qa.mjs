@@ -815,12 +815,15 @@ async function testHeldDetailAuthoritativeSendBlocked() {
   resetProbeState();
   capsOverride = { board: "contribute", meeting: null, meetings: ["m-one", "m-two", "m-empty"], guest: false, admin: false };
   await page.goto(webBase + "#/meet?board=b-alpha&meeting=m-one");
+  await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector("textarea[aria-label=\"" + COMPOSER_LABEL + "\"]", { timeout: 20000 });
   await page.getByRole("heading", { name: "Pricing move QA session", exact: true }).first().waitFor({ timeout: 20000 });
   const mark = reqLog.length;
   gates.detail = deferred();
   await page.evaluate((h) => { window.location.hash = h; }, "#/meet?board=b-alpha&meeting=m-empty");
   await page.waitForSelector("textarea[aria-label=\"" + COMPOSER_LABEL + "\"]", { timeout: 20000 });
+  for (let i = 0; i < 40 && countFrom(mark, "GET", "/api/boards/b-alpha/meetings/m-empty") === 0; i++) await page.waitForTimeout(50);
+  ok("helddetail-authoritative-request-held", countFrom(mark, "GET", "/api/boards/b-alpha/meetings/m-empty") > 0, "cold detail GET dispatched behind the unreleased gate");
   await sleep(700);
   const box = composer();
   const btn = sendButton();
@@ -841,7 +844,9 @@ async function testHeldDetailAuthoritativeSendBlocked() {
   await page.waitForFunction(() => { const b = document.querySelector(".composer-bar button.primary"); return b && !b.disabled; }, null, { timeout: 20000 });
   ok("helddetail-send-enabled-after-load", await btn.isEnabled(), "draft plus valid numeric detail enables Send");
   ok("helddetail-draft-survives-load", (await box.inputValue()) === "Held detail lead must not send early", "early draft survives detail release");
+  const heldRunResponse = page.waitForResponse((r) => r.request().method()==="POST" && new URL(r.url()).pathname==="/api/meetings/m-empty/run", {timeout:30000});
   await box.press("Enter");
+  const heldDone=await heldRunResponse; const heldJson=await heldDone.json(); ok("helddetail-current-run-completed",heldDone.status()===200 && Array.isArray(heldJson.published) && heldJson.published.length>0,"current run response completed with a contribution");
   await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Responses complete.", { timeout: 30000 });
   ok("helddetail-lead-once", countFrom(mark, "POST", "/api/meetings/m-empty/messages") === 1, "messages=" + countFrom(mark, "POST", "/api/meetings/m-empty/messages"));
   ok("helddetail-patch-once", countFrom(mark, "PATCH", "/api/meetings/m-empty") === 1, "patch=" + countFrom(mark, "PATCH", "/api/meetings/m-empty"));
