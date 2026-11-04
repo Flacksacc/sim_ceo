@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import "./advisor-creation.css";
 import { FriendlyError } from "./human-disclosure";
-import { friendlyError } from "./human-format";
 
 export function extractCharacterServerText(raw: string): { status: number; serverError: string } {
   const input = String(raw ?? "");
@@ -81,19 +80,51 @@ export async function fetchFreshCanonicalEntry(deps: FreshCanonicalDeps, id: str
   return null;
 }
 
-const CLIENT_VALIDATION_ALLOWLIST: readonly string[] = [
-  "name is required",
-  "description is required",
-  "name must be",
-  "description must be",
-  "links must be urls",
-  "must be a non-empty paragraph",
-  "is over the",
-  "character limit",
-  "profile is over",
-  "no changes to save",
-  "creation failed before anything was saved",
+// Exact known client-validation copy. Entries are full normalized sentences,
+// never substrings: a longer technical string that merely CONTAINS one of
+// these (e.g. "Name is required; SQLSTATE 23505 at /srv/db/roster.sql") must
+// NOT pass. Dynamic shapes (link URLs, counts) match anchored patterns and
+// always resolve to fixed copy without echoing the raw input.
+const EXACT_CLIENT_VALIDATION: readonly string[] = [
+  "name is required.",
+  "name must be 120 chars or fewer.",
+  "description is required (a sentence or more).",
+  "this draft already exists \u2014 continue below.",
+  "when to contribute must be a non-empty paragraph when saving character behavior.",
+  "how to reason must be a non-empty paragraph when saving character behavior.",
+  "how to respond must be a non-empty paragraph when saving character behavior.",
+  "links must be urls (http(s):// or www.).",
+  "no changes to save \u2014 the stored draft is current.",
 ];
+
+export function exactClientValidationCopy(text: string): string | null {
+  try {
+    const t = String(text ?? "").trim();
+    if (!t || t.length >= 300) return null;
+    if (looksTechnicalOrId(t)) return null;
+    const l = t.toLowerCase();
+    for (const exact of EXACT_CLIENT_VALIDATION) {
+      if (l === exact) {
+        if (exact === "name is required.") return "Name is required.";
+        if (exact === "name must be 120 chars or fewer.") return "Name must be 120 chars or fewer.";
+        if (exact === "description is required (a sentence or more).") return "Description is required (a sentence or more).";
+        if (exact.indexOf("already exists") >= 0) return "This draft already exists \u2014 continue below.";
+        if (exact.indexOf("when to contribute must be") >= 0) return "When to contribute must be a non-empty paragraph when saving character behavior.";
+        if (exact.indexOf("how to reason must be") >= 0) return "How to reason must be a non-empty paragraph when saving character behavior.";
+        if (exact.indexOf("how to respond must be") >= 0) return "How to respond must be a non-empty paragraph when saving character behavior.";
+        if (exact.indexOf("links must be urls") >= 0) return "Links must be URLs (http(s):// or www.).";
+        if (exact.indexOf("no changes to save") >= 0) return "No changes to save \u2014 the stored draft is current.";
+      }
+    }
+    if (/^links must be urls \(http\(s\):\/\/ or www\.\)\. got: .+$/i.test(l)) return "Links must be URLs (http(s):// or www.).";
+    if (/^(when to contribute|how to reason|how to respond) is over the \d+-character limit\. shorten it before saving \u2014 nothing is cut automatically\.$/i.test(l)) {
+      const label = l.indexOf("when to contribute") === 0 ? "When to contribute" : (l.indexOf("how to reason") === 0 ? "How to reason" : "How to respond");
+      return label + " is over the character limit. Shorten it before saving \u2014 nothing is cut automatically.";
+    }
+    if (/^profile is over the \d+-character limit \(got \d+\)\. shorten paragraphs or links \u2014 nothing is cut automatically\.$/i.test(l)) return "The profile is over the character limit. Shorten paragraphs or links \u2014 nothing is cut automatically.";
+    return null;
+  } catch { return null; }
+}
 
 export function looksTechnicalOrId(text: string): boolean {
   try {
@@ -110,14 +141,7 @@ export function looksTechnicalOrId(text: string): boolean {
 
 export function isAllowlistedClientValidation(text: string): boolean {
   try {
-    const s = String(text ?? "");
-    if (!s || s.length >= 300) return false;
-    if (looksTechnicalOrId(s)) return false;
-    const l = s.toLowerCase();
-    for (const phrase of CLIENT_VALIDATION_ALLOWLIST) {
-      if (l.indexOf(phrase) >= 0) return true;
-    }
-    return false;
+    return exactClientValidationCopy(text) !== null;
   } catch { return false; }
 }
 
@@ -131,10 +155,11 @@ export function characterFriendlyError(raw: string): string {
   if (status === 401 || hay.indexOf("authentication required") >= 0 || hay.indexOf("session changed") >= 0 || hay.indexOf("signed in") >= 0) return "Your session changed. Sign in again, then retry. Your draft above is unchanged.";
   if (status === 403 || hay.indexOf("not granted") >= 0 || hay.indexOf("access revoked") >= 0 || hay.indexOf("denied") >= 0 || hay.indexOf("not authorized") >= 0) return "You do not have access to change this. Ask a board manager to invite you or adjust your access. Your draft is unchanged.";
   if (status === 404 || hay.indexOf("not found") >= 0 || hay.indexOf("archived") >= 0) return "That draft could not be found. It may have been archived - reload the roster. Your text above is unchanged.";
-  try {
-    const shared = friendlyError(input) || friendlyError(serverError);
-    if (shared) return shared;
-  } catch {}
+  // Research conflicts are handled here, before any generic mapping (the
+  // generic record/discussion mapper is intentionally NOT consulted from
+  // this translator, so a superseded-research 409 can never surface
+  // record-history copy and "already in progress" can never surface
+  // meeting-discussion copy).
   if (status === 409 || hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) {
     if (hay.indexOf("already running") >= 0 || hay.indexOf("already in progress") >= 0 || hay.indexOf("run in progress") >= 0) return "Research is already running for this draft on the server. Wait, then use Check again - do not start a second run.";
     if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer") >= 0 || hay.indexOf("changed") >= 0 || hay.indexOf("profile") >= 0 || hay.indexOf("version") >= 0 || hay.indexOf("conflict") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
@@ -142,8 +167,12 @@ export function characterFriendlyError(raw: string): string {
   }
   if (hay.indexOf("superseded") >= 0 || hay.indexOf("newer research") >= 0 || hay.indexOf("changed during research") >= 0 || hay.indexOf("advisor profile changed") >= 0) return "A newer version won on the server. Your text is kept - use Reload or Check again to review it, then retry.";
   if (status === 502 || status === 503 || status === 504 || status === 499 || hay.indexOf("provider") >= 0 || hay.indexOf("model") >= 0 || hay.indexOf("deadline") >= 0 || hay.indexOf("time bound") >= 0 || hay.indexOf("research failed") >= 0 || hay.indexOf("research start failed") >= 0) return "Research could not complete because the text service had a problem. Your draft and brief are unchanged - retry, or edit the paragraphs directly.";
+  // Exact known client validation only: the candidate must equal a known
+  // safe sentence (anchored), and the fixed copy is returned here \u2014 never
+  // the raw matched substring, so a technical suffix cannot leak.
   const candidate = status === 400 && serverError ? serverError : (status === 0 ? input : "");
-  if (candidate && candidate.length < 300 && isAllowlistedClientValidation(candidate)) return candidate;
+  const exact = exactClientValidationCopy(candidate);
+  if (exact) return exact;
   return "That request did not complete. Your draft and text are unchanged - retry, or edit directly.";
 }
 
@@ -1577,6 +1606,9 @@ export function CharacterEditor(props: CharacterEditorProps) {
   async function saveEdits() {
     const opId = entry.id;
     const myOp = nextOp();
+    // Captured at click: invalidation refreshes caches only and must not
+    // select roster rows or close modals (App handlers only refresh).
+    const capturedInvalidated = props.onInvalidated;
     setBusy(true);
     setError(null);
     try {
@@ -1616,6 +1648,18 @@ export function CharacterEditor(props: CharacterEditorProps) {
       observeCanon(opId, entry.version);
       const normCleanPre = normLinks(clean);
       const updated = await put<RosterEntryDto>("/api/roster/" + entry.id, { profileJson: nextProfile, sourceUrls: normCleanPre });
+      // Immediate canonical invalidation on the confirmed PUT: refresh
+      // caches now when the captured auth origin is still valid, BEFORE the
+      // held verification GET and before op-ownership/unmount checks. A held
+      // verify, a superseding edit, or an unmount can therefore never delay
+      // or drop the invalidation for a write the server confirmed; adoption
+      // of text below stays independently ownership-gated.
+      try {
+        const originAtSave = opOrigins.current.get(myOp) ?? null;
+        if (!originDead(props, originAtSave)) {
+          try { capturedInvalidated?.(); } catch {}
+        }
+      } catch {}
       if (staleKind(myOp, opId) !== "ok") return;
       observeCanon(opId, updated.version);
       const myOriginSave = opOrigins.current.get(myOp) ?? null;

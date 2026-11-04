@@ -346,7 +346,9 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
   check("avail: stale origin unusable", resolveActivityAvailability({ reqStale: true, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false }) === "unavailable");
   check("avail: initial loading checking", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: false, isPaused: false, liveOff: false, isLoading: true }) === "loading");
   check("avail: polling paused retained hidden", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: true, liveOff: false, isLoading: false }) === "paused");
-  check("avail: live off retained hidden", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: true, isLoading: false }) === "paused");
+  check("avail: hub stopped never gates healthy HTTP", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: true, isLoading: false }) === "available");
+  check("avail: hidden tab pauses retained snapshot", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: true, isLoading: false, pagePaused: true }) === "paused");
+  check("avail: post-resume waits for fresh HTTP", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false, awaitingFresh: true }) === "paused");
   check("avail: healthy available", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: true, hasData: true, isPaused: false, liveOff: false, isLoading: false }) === "available");
   check("avail: disabled no data unavailable", resolveActivityAvailability({ reqStale: false, fetchFailed: false, queryEnabled: false, hasData: false, isPaused: false, liveOff: false, isLoading: false }) === "unavailable");
 }
@@ -392,7 +394,7 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
   const liveSeats = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a1", "responding"]]), availability: "available", secretaryActivity: "responding" });
   check("rail: live snapshot applies", liveSeats[1].activity === "responding" && liveSeats[2].activity === "responding");
   const exclLive = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a9", boardRole: "Guest", approved: true, portraitUrl: null }], includedIds: [], snapshot: new Map([["a9", "responding"]]), availability: "available" });
-  check("rail: unselected never responding without inclusion", exclLive[1].activity !== "responding" || true);
+  check("rail: unrestricted allowlist passes snapshot responding through", exclLive[1].activity === "responding");
   const exclSel = buildPresence({ leadName: "Ava Lead", leadRoleLabel: "Owner", advisors: [{ id: "a1", boardRole: "Strategist", approved: true, portraitUrl: null }, { id: "a2", boardRole: "Skeptic", approved: true, portraitUrl: null }], includedIds: ["a1"], snapshot: new Map([["a1", "responding"], ["a2", "responding"]]), availability: "available" });
   check("rail: unselected seat never inferred responding", exclSel[1].activity === "responding" && exclSel[2].activity === "excluded");
   const pausedHtml = renderToString(<MeetingParticipants participants={pausedSeats} live={true} availability="paused" />);

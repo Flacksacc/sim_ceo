@@ -46,12 +46,16 @@ export function shouldUseActivitySnapshot(args: { reqStale: boolean; fetchFailed
   } catch { return false; }
 }
 
-// Explicit availability for the activity snapshot. "available" means the hook
-// holds a live identity-owned snapshot the rail may render. "loading" covers
-// the initial fetch with no data, "paused" covers polling that is not live
-// (tab hidden, session gate, offline pause, live off) while retained data
-// exists, "unavailable" covers errored or identity-stale snapshots.
-// Paused/loading/unavailable snapshots never render as idle or responding.
+// Explicit availability for the activity snapshot. HTTP polling is the
+// independent authority: a successful fresh owned snapshot establishes
+// "available" even when the SignalR transport is stopped or failed.
+// "loading" covers the initial fetch with no data, "paused" covers polling
+// that React Query reports paused (hidden tab, offline) or the page-level
+// hidden/offline gate, plus the post-resume gate that waits for a fresh HTTP
+// poll before reusing a retained snapshot. "unavailable" covers errored or
+// identity-stale snapshots. Paused/loading/unavailable snapshots never render
+// as idle or responding, and the Live badge is gated separately on the
+// actual transport (see App), never on polling alone.
 export type ActivityAvailability = "available" | "loading" | "paused" | "unavailable";
 
 export function resolveActivityAvailability(args: {
@@ -60,15 +64,18 @@ export function resolveActivityAvailability(args: {
   queryEnabled: boolean;
   hasData: boolean;
   isPaused: boolean;
-  liveOff: boolean;
-  isLoading: boolean;
+  liveOff?: boolean;
+  isLoading?: boolean;
+  pagePaused?: boolean;
+  awaitingFresh?: boolean;
 }): ActivityAvailability {
   try {
     if (args.reqStale) return "unavailable";
     if (args.fetchFailed) return "unavailable";
     if (!args.queryEnabled) return args.hasData ? "paused" : "unavailable";
     if (!args.hasData) return "loading";
-    if (args.isPaused || args.liveOff) return "paused";
+    if (args.isPaused || args.pagePaused || args.awaitingFresh) return "paused";
+    void args.liveOff;
     void args.isLoading;
     return "available";
   } catch { return "unavailable"; }
@@ -98,7 +105,14 @@ export function selectSecretaryActivity(secs: any[]): string | null {
       }
       return best;
     };
-    if (active.length > 0) return mapSecretaryActivity((pickNewest(active) as any)?.status);
+    if (active.length > 0) {
+      const responding = active.filter((s) => {
+        const st = String((s as any).status);
+        return st === "inflight" || st === "answering";
+      });
+      const pool = responding.length > 0 ? responding : active;
+      return mapSecretaryActivity((pickNewest(pool) as any)?.status);
+    }
     const clar = owned.filter((s) => String((s as any).status) === "needs-clarification");
     if (clar.length > 0) return mapSecretaryActivity((pickNewest(clar) as any)?.status);
     return mapSecretaryActivity((pickNewest(owned) as any)?.status);
@@ -158,7 +172,6 @@ export function useMeetingActivity(inp: MeetingActivityInput) {
       return false;
     } catch { return false; }
   })();
-  const liveOff = (inp as any)?.live === false;
   const isLoading = (() => {
     try {
       if ((q as any)?.isLoading) return true;
@@ -166,7 +179,73 @@ export function useMeetingActivity(inp: MeetingActivityInput) {
       return false;
     } catch { return false; }
   })();
-  const activityAvailability = resolveActivityAvailability({ reqStale, fetchFailed, queryEnabled, hasData, isPaused, liveOff, isLoading });
+  // Page-level transport gate: hidden tab or offline browser pauses the
+  // retained snapshot even before React Query reports it, so a stale
+  // snapshot can never render as available while polling is suspended.
+  // Listeners unsubscribe on unmount; resume requires a fresh HTTP poll
+  // (see awaitingFresh below) rather than reusing the retained snapshot.
+  // The hub transport (inp.live) is intentionally NOT consulted here:
+  // healthy HTTP polling alone re-establishes availability after hub
+  // stop/failure.
+  const [pagePaused, setPagePaused] = useState<boolean>(() => {
+    try {
+      if (typeof document !== "undefined" && (document as any).hidden) return true;
+      if (typeof navigator !== "undefined" && (navigator as any).onLine === false) return true;
+      return false;
+    } catch { return false; }
+  });
+  useEffect(() => {
+    try {
+      const update = () => {
+        try {
+          const hidden = typeof document !== "undefined" ? !!(document as any).hidden : false;
+          const offline = typeof navigator !== "undefined" ? (navigator as any).onLine === false : false;
+          setPagePaused(hidden || offline);
+        } catch {}
+      };
+      update();
+      try { document.addEventListener("visibilitychange", update); } catch {}
+      try { window.addEventListener("online", update); } catch {}
+      try { window.addEventListener("offline", update); } catch {}
+      try { window.addEventListener("focus", update); } catch {}
+      try { window.addEventListener("blur", update); } catch {}
+      return () => {
+        try { document.removeEventListener("visibilitychange", update); } catch {}
+        try { window.removeEventListener("online", update); } catch {}
+        try { window.removeEventListener("offline", update); } catch {}
+        try { window.removeEventListener("focus", update); } catch {}
+        try { window.removeEventListener("blur", update); } catch {}
+      };
+    } catch { return undefined; }
+  }, []);
+  // Post-resume freshness gate: entering a paused state arms the gate; it
+  // clears only when a strictly newer HTTP snapshot lands after resume.
+  const pauseAtRef = useRef<number>(0);
+  const [awaitingFresh, setAwaitingFresh] = useState(false);
+  const pausedNow = !!(isPaused || pagePaused);
+  const dataUpdatedAt = (q as any)?.dataUpdatedAt ?? 0;
+  useEffect(() => {
+    try {
+      if (pausedNow) {
+        try { pauseAtRef.current = dataUpdatedAt ?? pauseAtRef.current; } catch {}
+        if (hasData) setAwaitingFresh(true);
+      }
+    } catch {}
+  }, [pausedNow, hasData]);
+  useEffect(() => {
+    try {
+      if (!pausedNow) {
+        if (dataUpdatedAt && dataUpdatedAt !== pauseAtRef.current) {
+          pauseAtRef.current = dataUpdatedAt;
+          setAwaitingFresh(false);
+        } else if (!hasData) {
+          setAwaitingFresh(false);
+        }
+      }
+    } catch {}
+  }, [dataUpdatedAt, pausedNow, hasData]);
+  void ((inp as any)?.live);
+  const activityAvailability = resolveActivityAvailability({ reqStale, fetchFailed, queryEnabled, hasData, isPaused, liveOff: false, isLoading, pagePaused, awaitingFresh });
   const snapshotUsable = activityAvailability === "available" && shouldUseActivitySnapshot({ reqStale, fetchFailed });
   const advisorSnapshot = useMemo(() => {
     const m = new Map<string, string>();

@@ -1649,6 +1649,15 @@ export default function App() {
   });
   const hubRef = useRef<HubConnection | null>(null);
   const [live, setLive] = useState(false);
+  // Hub generation: bumped on every confirmed domain restore so the
+  // connection effect below restarts even when board/meeting IDs are
+  // unchanged (the restore stops the hub via simceo-hub-stop).
+  const [hubRev, setHubRev] = useState(0);
+  useEffect(() => {
+    const bump = () => { try { setHubRev((v) => v + 1); } catch {} };
+    try { window.addEventListener("simceo-domain-restored", bump); } catch {}
+    return () => { try { window.removeEventListener("simceo-domain-restored", bump); } catch {} };
+  }, []);
   useEffect(() => {
     const onStop = () => { try { hubRef.current?.stop(); } catch {} try { setLive(false); } catch {} };
     const onLeft = (e: Event) => { try { const mid = (e as CustomEvent<{ mid: string }>).detail?.mid; if (mid) { try { qc.removeQueries({ queryKey: ["messages", mid] }); } catch {} try { qc.invalidateQueries({ queryKey: ["my-memberships"] }); } catch {} } } catch {} onStop(); };
@@ -1721,11 +1730,26 @@ export default function App() {
       .catch(() => {
         if (!cancelled) setLive(false);
       });
+    // Transport transitions mark polling explicitly: reconnecting/close
+    // drop Live and refresh the HTTP snapshot; a successful rejoin sets
+    // Live and resyncs via a fresh HTTP poll. HTTP polling stays the
+    // independent authority (see useMeetingActivity): live===false never
+    // gates fresh snapshots.
+    conn.onreconnecting(() => {
+      if (cancelled) return;
+      try { setLive(false); } catch {}
+      try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
+    });
+    conn.onclose(() => {
+      if (cancelled) return;
+      try { setLive(false); } catch {}
+    });
     conn.onreconnected(async () => {
       if (cancelled) return;
       try {
         await conn.invoke("JoinMeeting", meetingId);
         if (!cancelled) setLive(true);
+        try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
       } catch {
         // Rejoin rejected (revoked/expired): reset live state instead of staying stale-live.
         if (!cancelled) {
@@ -1740,7 +1764,32 @@ export default function App() {
       conn.stop();
       hubRef.current = null;
     };
-  }, [meetingId, meetingOk, qc]);
+  }, [meetingId, meetingOk, qc, hubRev]);
+  // Resume freshness: hidden->visible, offline->online, or window focus
+  // triggers a fresh HTTP activity poll so the hook post-resume gate clears
+  // on real data instead of reusing a retained snapshot. Listeners
+  // unsubscribe on unmount/meeting change; no polling loop here.
+  useEffect(() => {
+    try {
+      const refreshActivity = () => {
+        try {
+          const hidden = typeof document !== "undefined" ? !!(document as any).hidden : false;
+          const offline = typeof navigator !== "undefined" ? (navigator as any).onLine === false : false;
+          if (!hidden && !offline) {
+            try { qc.invalidateQueries({ queryKey: ["activity", boardId, meetingId] }); } catch {}
+          }
+        } catch {}
+      };
+      try { document.addEventListener("visibilitychange", refreshActivity); } catch {}
+      try { window.addEventListener("online", refreshActivity); } catch {}
+      try { window.addEventListener("focus", refreshActivity); } catch {}
+      return () => {
+        try { document.removeEventListener("visibilitychange", refreshActivity); } catch {}
+        try { window.removeEventListener("online", refreshActivity); } catch {}
+        try { window.removeEventListener("focus", refreshActivity); } catch {}
+      };
+    } catch { return undefined; }
+  }, [qc, boardId, meetingId]);
   const msgParentRef = useRef<HTMLDivElement | null>(null);
   const msgList = messages.data ?? [];
   const rows = useMemo(() => {
@@ -2827,6 +2876,14 @@ const selResearch = useQuery({
   retry: false,
 });
 const selResearchRunning = isRosterResearchRunning((selResearch as any)?.data);
+// Owned GET research snapshot: the single authority for the outer banner
+// (state/version/proof/stage/running, terminal metadata, error, loading).
+// Cached roster-row fields (researchedAt/requested/evidenceCount) never take
+// priority for a failed rerun or a live run.
+const selResearchData = (selResearch as any)?.data ?? null;
+const selResearchDataError = (selResearch as any)?.error ?? null;
+const selResearchFetching = !!((selResearch as any)?.isFetching);
+const selResearchLoading = !selResearchData && (!!((selResearch as any)?.isLoading) || selResearchFetching);
 
 const rosterCount = useQuery({
   queryKey: ["roster-count", accountId],
@@ -3147,12 +3204,22 @@ const tabCount = (k: Tab): number | null => {
   });
   const [btopic, setBtopic] = useState("");
   const askBriefing = useMutation({
-    mutationFn: () => {
-      const oB = boardId; const oM = meetingId; const oU = secIdentity(); const oEp = secEpoch.current; const oOriginB = originIdentity();
-      const submitted = btopic;
-      return post<Note>(`/api/meetings/${oM}/briefings`, { topic: submitted }).then((r) => ({ r, oB, oM, oU, oEp, submitted, origin: oOriginB }));
+    mutationFn: (v: any) => {
+      // Queued-attempt validation BEFORE dispatch: navigation, Clear, Apply
+      // identity, or a newer attempt retires this one before any POST of the
+      // frozen click-time intent.
+      const vv = (v ?? {}) as any;
+      if (!vv.origin || originStale(vv.origin)) throw Object.assign(new Error("Briefing submission retired before dispatch."), { stale: true });
+      if (vv.oB !== boardId || vv.oM !== meetingId || vv.oU !== secIdentity() || secEpoch.current !== vv.oEp) throw Object.assign(new Error("Briefing submission retired before dispatch."), { stale: true });
+      if (vv.opId && secPendingRef.current?.id !== vv.opId) throw Object.assign(new Error("Briefing submission retired before dispatch."), { stale: true });
+      // Frozen click-time intent (never resume-time refs).
+      const oB = vv.oB; const oM = vv.oM; const oU = vv.oU; const oEp = vv.oEp;
+      const submitted = vv.topic;
+      const originAtClick = vv.origin;
+      const opIdAtClick = vv.opId;
+      return post<Note>(`/api/meetings/${oM}/briefings`, { topic: submitted }).then((r) => ({ r, oB, oM, oU, oEp, submitted, origin: originAtClick, opId: opIdAtClick }));
     },
-    onMutate: () => { const opId = "brief-" + (++opSeq.current); secPendingRef.current = { kind: "briefing", id: opId }; return { oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, opId, origin: originIdentity(), visit: briefVisitRef.current, submitted: btopic }; },
+    onMutate: (v: any) => { const vv = (v ?? {}) as any; const opId = vv.opId ?? ("brief-" + (++opSeq.current)); secPendingRef.current = { kind: "briefing", id: opId }; return { oB: vv.oB ?? boardId, oM: vv.oM ?? meetingId, oU: vv.oU ?? secIdentity(), oEp: vv.oEp ?? secEpoch.current, opId, origin: vv.origin ?? originIdentity(), visit: vv.visit ?? briefVisitRef.current, submitted: vv.topic ?? btopic }; },
     onSuccess: (pack: any, _v: unknown, ctx: unknown) => {
       const o = ctx as any;
       if (!(pack as any)?.origin || originStale((pack as any).origin)) return;
@@ -4410,6 +4477,33 @@ const testModel = useMutation({
       .catch((e) => toastErr(e));
   const refresh = (...keys: string[]) =>
     keys.forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
+  // Canonical meta refresh on research transitions: a live run that lands a
+  // terminal version, or a version bump under the open row, invalidates the
+  // cached roster families so the owned GET snapshot and the row meta
+  // converge instead of the banner reverting to stale cached claims.
+  const prevResearchRunRef = useRef<boolean>(false);
+  const prevResearchVerRef = useRef<number | null>(null);
+  useEffect(() => {
+    try {
+      const d = selResearchData as any;
+      if (!selRow || !d) {
+        try { prevResearchRunRef.current = isRosterResearchRunning(d); } catch {}
+        return;
+      }
+      const running = isRosterResearchRunning(d);
+      const ver = typeof d?.version === "number" ? d.version : null;
+      const wasRunning = prevResearchRunRef.current;
+      const prevVer = prevResearchVerRef.current;
+      if (wasRunning && !running) {
+        try { refresh("roster", "roster-names", "roster-count"); } catch {}
+      }
+      if (ver !== null && prevVer !== null && ver !== prevVer) {
+        try { refresh("roster", "roster-names"); } catch {}
+      }
+      prevResearchRunRef.current = running;
+      if (ver !== null) prevResearchVerRef.current = ver;
+    } catch {}
+  }, [selResearchData, selRow?.entry.id]);
   const toggleBoardAdvisor = async (row: RosterRow) => {
     const existing = (advisors.data ?? []).find((a) => a.rosterEntryId === row.entry.id);
     try {
@@ -5424,8 +5518,17 @@ const testModel = useMutation({
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
   const editNote = useMutation({
-    mutationFn: (v: { id: string; revision: number; body: string }) => post<Note>(`/api/notes/${v.id}/edit`, { expectedRevision: v.revision, body: v.body }),
-    onMutate: (v: any) => { const opId = "edit-" + v.id + "-" + v.revision + "-" + (++opSeq.current); secPendingRef.current = { kind: "note-edit", id: opId }; const sess = ++secEditSess.current; return { oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, id: v.id, rev: v.revision, body: v.body, opId, sess, visit: secEditVisit.current, histSel: secHistSel.current, histRef: secHistRef.current, view: noteVisitRef.current, origin: originIdentity() }; },
+    mutationFn: (v: any) => {
+      // Queued-attempt validation BEFORE dispatch: Apply identity,
+      // navigation, or a newer attempt retires this one before any POST of
+      // the frozen click-time variables.
+      const vv = (v ?? {}) as any;
+      if (!vv.origin || originStale(vv.origin)) throw Object.assign(new Error("Note edit retired before dispatch."), { stale: true });
+      if (vv.oB !== boardId || vv.oM !== meetingId || vv.oU !== secIdentity() || secEpoch.current !== vv.oEp) throw Object.assign(new Error("Note edit retired before dispatch."), { stale: true });
+      if (vv.opId && secPendingRef.current?.id !== vv.opId) throw Object.assign(new Error("Note edit retired before dispatch."), { stale: true });
+      return post<Note>(`/api/notes/${vv.id}/edit`, { expectedRevision: vv.revision, body: vv.body });
+    },
+    onMutate: (v: any) => { const vv = (v ?? {}) as any; const opId = vv.opId ?? ("edit-" + vv.id + "-" + vv.revision + "-" + (++opSeq.current)); secPendingRef.current = { kind: "note-edit", id: opId }; const sess = ++secEditSess.current; return { oB: vv.oB ?? boardId, oM: vv.oM ?? meetingId, oU: vv.oU ?? secIdentity(), oEp: vv.oEp ?? secEpoch.current, id: vv.id, rev: vv.revision, body: vv.body, opId, sess, visit: secEditVisit.current, histSel: secHistSel.current, histRef: secHistRef.current, view: noteVisitRef.current, origin: vv.origin ?? originIdentity() }; },
     onSuccess: (_r, _v, ctx) => {
       const o = ctx as any;
       const live = liveSelRef.current;
@@ -5467,8 +5570,17 @@ const testModel = useMutation({
     onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.opId && secPendingRef.current?.id === o.opId) secPendingRef.current = null; },
   });
   const reverseNote = useMutation({
-    mutationFn: (v: { id: string; revision: number }) => post<Note>(`/api/notes/${v.id}/reverse`, { expectedRevision: v.revision }),
-    onMutate: (v: any) => { const opId = "rev-" + v.id + "-" + (++opSeq.current); secPendingRef.current = { kind: "note-reverse", id: opId }; return { oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, id: v.id, opId, view: noteVisitRef.current, editVisit: secEditVisit.current, origin: originIdentity() }; },
+    mutationFn: (v: any) => {
+      // Queued-attempt validation BEFORE dispatch: Apply identity,
+      // navigation, or a newer attempt retires this one before any POST of
+      // the frozen click-time variables.
+      const vv = (v ?? {}) as any;
+      if (!vv.origin || originStale(vv.origin)) throw Object.assign(new Error("Note reverse retired before dispatch."), { stale: true });
+      if (vv.oB !== boardId || vv.oM !== meetingId || vv.oU !== secIdentity() || secEpoch.current !== vv.oEp) throw Object.assign(new Error("Note reverse retired before dispatch."), { stale: true });
+      if (vv.opId && secPendingRef.current?.id !== vv.opId) throw Object.assign(new Error("Note reverse retired before dispatch."), { stale: true });
+      return post<Note>(`/api/notes/${vv.id}/reverse`, { expectedRevision: vv.revision });
+    },
+    onMutate: (v: any) => { const vv = (v ?? {}) as any; const opId = vv.opId ?? ("rev-" + vv.id + "-" + (++opSeq.current)); secPendingRef.current = { kind: "note-reverse", id: opId }; return { oB: vv.oB ?? boardId, oM: vv.oM ?? meetingId, oU: vv.oU ?? secIdentity(), oEp: vv.oEp ?? secEpoch.current, id: vv.id, opId, view: noteVisitRef.current, editVisit: secEditVisit.current, origin: vv.origin ?? originIdentity() }; },
     onSuccess: (_r, _v, ctx) => {
       const o = ctx as any;
       const live = liveSelRef.current;
@@ -7397,7 +7509,36 @@ const testModel = useMutation({
                       <span className="badge">{" "}v{selRow.entry.version}{" "}</span>{" "}
                       <p>{selRow.entry.description}</p>{" "}
                       <ProfileFields profileJson={selRow.entry.profileJson} />{" "}
-                      {shouldShowResearchWorking(selRow.entry.researchedAt, selResearchRunning) ? (<p role="status">{" "}Research in progress · {selRow.entry.evidenceCount} evidence claims{" "}</p>) : selRow.entry.researchedAt ? (<p className="muted">{" "}Researched…{" "}</p>) : selRow.entry.researchRequested ? (<p className="muted">{" "}Research requested — not running. Open the editor below for its result and retry if needed.{" "}</p>) : (<p className="muted">{" "}No research yet — use Research dossier below to gather evidence.{" "}</p>)}
+                      {(() => {
+                        const d = selResearchData as any;
+                        const err = selResearchDataError;
+                        if (selResearchLoading) return (<p role="status">{" "}Checking research\u2026{" "}</p>);
+                        if (err && !d) return (<p className="muted">{" "}Research state unavailable \u2014 use Check again in the editor below.{" "}</p>);
+                        const running = isRosterResearchRunning(d);
+                        if (running) {
+                          const ev = typeof d?.evidenceCount === "number" ? d.evidenceCount : selRow.entry.evidenceCount;
+                          const st = String(d?.stage ?? "");
+                          return (<p role="status">{" "}Research in progress{st ? " \u00b7 " + st : ""} \u00b7 {ev} evidence claims{" "}</p>);
+                        }
+                        if (d) {
+                          const ev = typeof d?.evidenceCount === "number" ? d.evidenceCount : 0;
+                          const ds = String(d?.draftStatus ?? "");
+                          const st = String(d?.stage ?? "");
+                          const stageErr = String((d as any)?.stageError ?? "");
+                          const verLabel = typeof d?.version === "number" ? " v" + d.version : " v" + selRow.entry.version;
+                          if (d?.researchedAt && (ds === "draft" || ds === "done" || ds === "saved") && ev > 0) return (<p className="muted">{" "}Researched{verLabel} \u00b7 {ev} evidence claims{" "}</p>);
+                          if (st === "failed" || ds === "failed") return (<p className="muted">{" "}Research failed{stageErr ? " \u2014 " + stageErr : ""} \u2014 retry in the editor below.{" "}</p>);
+                          if (st === "unsupported" || ds === "unsupported") return (<p className="muted">{" "}Research incomplete \u2014 no grounded evidence. Editable below.{" "}</p>);
+                          if (st === "superseded" || ds === "superseded") return (<p className="muted">{" "}A newer version won on the server \u2014 review, then run research again if needed.{" "}</p>);
+                          if (st === "interrupted" || ds === "interrupted") return (<p className="muted">{" "}Research interrupted \u2014 use Check again.{" "}</p>);
+                          if (d?.researchedAt) return (<p className="muted">{" "}Researched{verLabel} \u00b7 {ev} evidence claims{" "}</p>);
+                          if (d?.researchRequested) return (<p className="muted">{" "}Research requested \u2014 not running. Open the editor below for its result and retry if needed.{" "}</p>);
+                          return (<p className="muted">{" "}No research yet \u2014 use Research dossier below to gather evidence.{" "}</p>);
+                        }
+                        if (selRow.entry.researchedAt) return (<p className="muted">{" "}Researched\u2026{" "}</p>);
+                        if (selRow.entry.researchRequested) return (<p className="muted">{" "}Research requested \u2014 not running. Open the editor below for its result and retry if needed.{" "}</p>);
+                        return (<p className="muted">{" "}No research yet \u2014 use Research dossier below to gather evidence.{" "}</p>);
+                      })()}
                       {(selImages.data ?? []).length > 0 ? (
                         <div aria-label="Portraits awaiting review">
                           <h4>Portraits - accept one before approval</h4>
@@ -7988,7 +8129,7 @@ const testModel = useMutation({
                                 );
                               })}{" "}
                             {(notes.data ?? []).filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing").length === 0 && <p>No briefings yet.</p>}{" "}
-                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => { try { briefVisitRef.current++; } catch { /* noop */ } setBtopic(e.target.value); }} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate(); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
+                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => { try { briefVisitRef.current++; } catch { /* noop */ } setBtopic(e.target.value); }} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate({ oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, origin: originIdentity(), topic: btopic, visit: briefVisitRef.current, opId: "brief-" + (++opSeq.current) }); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
                             {secQuestion && (
                               <div className="card" role="status">
                                 <b>Secretary clarification</b>
@@ -8017,8 +8158,8 @@ const testModel = useMutation({
                                   {exs2.length > 0 && (<div className="excerpts">{exs2.map((e: any, i: number) => (<div key={i} className="excerpt-card"><b>{e.title ?? (e.kind === "record" ? "Record excerpt" : "Source excerpt")}</b><div>{e.excerpt ?? ""}</div><div className="muted">{e.kind === "record" ? "Record" : "Source"}{e.version ? " · version " + e.version : ""}{e.location ? " " + e.location : ""}{e.indexGeneration != null ? " snapshot " + e.indexGeneration : ""}</div><div className="muted">Historical quote; current availability is resolved in History view per reference.</div></div>))}</div>)}{" "}
                                   {n.body.indexOf("Limitation:") >= 0 && <div className="muted">No eligible sources were available for this meeting.</div>}{" "}
                                   <button type="button" onClick={() => { try { secHistSel.current = n.id; } catch { } loadHistory(n.id); }}>History</button>{" "}
-                                  {isCur && canActMeeting ? (<><button type="button" onClick={() => { setSecEditId(n.id); setSecEditBody(n.body); try { secEditSess.current++; } catch { } try { secHistSel.current = n.id; } catch { } try { secEditVisit.current++; } catch { } }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted">{isCur ? " Requires contribute access to edit." : " Superseded/reversed: read-only; open History for full text."}</span>)}{" "}
-                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => { setSecEditBody(e.target.value); try { secEditSess.current++; } catch { } }} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody })}>Save revision</button><button type="button" className="btn ghost" onClick={() => { setSecEditId(""); try { secEditVisit.current++; } catch { } try { secEditSess.current++; } catch { } }}>Cancel</button></div>)}{" "}
+                                  {isCur && canActMeeting ? (<><button type="button" onClick={() => { setSecEditId(n.id); setSecEditBody(n.body); try { secEditSess.current++; } catch { } try { secHistSel.current = n.id; } catch { } try { secEditVisit.current++; } catch { } }} disabled={editNote.isPending}>Edit</button>{" "}<button type="button" onClick={() => { if (!reverseNote.isPending) reverseNote.mutate({ id: n.id, revision: rev, oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, origin: originIdentity(), opId: "rev-" + n.id + "-" + rev + "-" + (++opSeq.current) }); }} disabled={reverseNote.isPending}>Reverse</button></>) : (<span className="muted">{isCur ? " Requires contribute access to edit." : " Superseded/reversed: read-only; open History for full text."}</span>)}{" "}
+                                  {secEditId === n.id && (<div><textarea rows={4} value={secEditBody} onChange={(e) => { setSecEditBody(e.target.value); try { secEditSess.current++; } catch { } }} /><button type="button" onClick={() => editNote.mutate({ id: n.id, revision: rev, body: secEditBody, oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, origin: originIdentity(), opId: "edit-" + n.id + "-" + rev + "-" + (++opSeq.current) })}>Save revision</button><button type="button" className="btn ghost" onClick={() => { setSecEditId(""); try { secEditVisit.current++; } catch { } try { secEditSess.current++; } catch { } }}>Cancel</button></div>)}{" "}
                                 </div>
                                 );
                               })}{" "}
@@ -8523,7 +8664,7 @@ const testModel = useMutation({
                         }
                       >
                         {" "}
-                        <MeetingParticipants participants={presenceWithSecretary} live={live} availability={(activityAvailability as any) ?? "available"} />
+                        <MeetingParticipants participants={presenceWithSecretary} live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
                         {" "}
                         <div className="context-bar">
                           {" "}
@@ -8838,6 +8979,12 @@ const testModel = useMutation({
                         try { askSecretary.reset(); } catch {}
                         try { retrySecretary.reset(); } catch {}
                         try { answerSecretary.reset(); } catch {}
+                        try { askBriefing.reset(); } catch {}
+                        try { editNote.reset(); } catch {}
+                        try { reverseNote.reset(); } catch {}
+                        try { secEditSess.current++; } catch {}
+                        try { secEditVisit.current++; } catch {}
+                        try { secHistRef.current++; } catch {}
                         try { secEnvelopeRev.current++; } catch {}
                         try { secHydRef.current++; } catch {}
                         try { send.reset(); } catch {}
