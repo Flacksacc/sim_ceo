@@ -30,7 +30,8 @@ const PROJECT_DEFAULT = "simceo-advisor-real-15190";
 const PROJECT_V2 = "simceo-advisor-real-15190-v2";
 const PROJECT_V3 = "simceo-advisor-real-15190-v3";
 const PROJECT_V4 = "simceo-advisor-real-15190-v4";
-const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2, PROJECT_V3, PROJECT_V4];
+const PROJECT_V5 = "simceo-advisor-real-15190-v5";
+const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2, PROJECT_V3, PROJECT_V4, PROJECT_V5];
 const SOURCE_COMMIT_DEFAULT = "509e6a6ea4a9c9078774f8963eca446760878cdc";
 function expectedProject() {
   const v = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;

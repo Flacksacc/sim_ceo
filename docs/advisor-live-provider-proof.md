@@ -113,3 +113,6 @@ the provider path is qualitatively good. semanticGate PENDING in the artifact re
 ## Direct v4 verification
 The allowlist additionally accepts exactly simceo-advisor-real-15190-v4 with an explicit full source commit. V3 is retained as failed evidence: the provider accepted the request but exhausted its 2048-token output allowance and returned incomplete research. The application now reserves 4096 research output tokens and requests at most eight concise claims, preserving the two-call and whole-run deadlines. V4 is one new fresh attempt in new volumes, with no resume or hidden retry. Artifacts retain full container/image IDs and mark index agreement only after the freshness check passes.
 
+
+V5 additionally permits exactly simceo-advisor-real-15190-v5, with the same full-source proof and one-fresh-attempt limits. V4 completed both model calls but honestly returned unsupported: paragraph extraction had clipped narrative quotes behind an infobox. The candidate now retains visible block boundaries; 108 security checks, 33 provenance checks, and a direct two-page public fetch passed before this new attempt. Earlier results and volumes remain retained.
+
