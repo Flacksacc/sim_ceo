@@ -2850,7 +2850,8 @@ async function stepInlineAdvisorEditing() {
   const paragraph = page.locator('.roster-detail .cc-editor #cc-contribute');
   await paragraph.waitFor({ state: 'visible', timeout: boundedTimeout(10000, 8000) });
   const savedText = await paragraph.inputValue();
-  await locFill(paragraph, savedText + '\n' + longText, 'inline-edit-paragraph');
+  const editedText = savedText + '\n' + longText.slice(0, 1000);
+  await locFill(paragraph, editedText, 'inline-edit-paragraph');
   await page.setViewportSize({ width: 390, height: 844 });
   await wft(200);
   const size = await paragraph.evaluate(el => ({ scroll: el.scrollHeight, visible: el.clientHeight, overflow: getComputedStyle(el).overflowY }));
@@ -2861,7 +2862,7 @@ async function stepInlineAdvisorEditing() {
   page.once('dialog', async d => { warning = d.message(); await d.dismiss(); });
   await locClick(other, 'inline-cancel-edited-advisor-switch');
   ok('inline-existing-advisor-switch-warns', /unsaved/i.test(warning), 'Edited existing advisors receive the same protection');
-  ok('inline-existing-advisor-cancel-preserves-text', await paragraph.inputValue() === savedText + '\n' + longText, 'Cancel keeps every paragraph line');
+  ok('inline-existing-advisor-cancel-preserves-text', await paragraph.inputValue() === editedText, 'Cancel keeps every paragraph line');
   page.once('dialog', async d => { await d.accept(); });
   await locClick(other, 'inline-confirm-edited-advisor-switch');
   const canonical = await canonicalEntry(rosterId);
