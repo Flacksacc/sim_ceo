@@ -37,7 +37,7 @@ async function api(method, p, body, token) {
   try {
     const headers = { "content-type": "application/json" };
     if (token) headers.authorization = "Bearer " + token;
-    const r = await fetch(API + p, { method, signal: ctl.signal, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const r = await fetch(API + p, { method, signal: ctl.signal, headers, body: (method === "GET" || method === "HEAD") ? undefined : (body === undefined ? undefined : JSON.stringify(body)) });
     const text = await r.text();
     let json = null; try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     return { status: r.status, json, text };

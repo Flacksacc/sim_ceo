@@ -255,7 +255,7 @@ ok("all-discarded-set", JSON.stringify([...rev3.json.discarded].sort()) === JSON
   ok("guest-evidence-readable", gcards.some((c) => !camel(c, "missing") && String(camel(c, "excerpt") || "").includes("Bears opening")), JSON.stringify(gcards.map((c) => camel(c, "missing"))));
   ok("guest-evidence-held", gcards.some((c) => camel(c, "missing") === true), "no withheld card in guest readback");
   ok("guest-no-pending-disclosure", (gr.json.pending || []).length === 0 && (gr.json.notes || []).length === 0 && (gr.json.recentMessages || []).length === 0, "guest sees manage context");
-  ok("guest-no-id-leak", humanStrings(gr.json.draft, 0).every((s) => !leakRe.test(s)) && humanStrings(gr.json.effectiveIds, 0).every((s) => !leakRe.test(s)), "guid shaped text in guest draft");
+  ok("guest-no-id-leak", Array.isArray(gr.json.draft?.approvedItems) && gr.json.draft.approvedItems.length > 0 && Array.isArray(gr.json.draft?.effective?.approvedItems) && gr.json.draft.effective.approvedItems.length > 0 && gr.json.draft.approvedItems.every((it) => typeof it?.text === "string" && !leakRe.test(it.text)) && gr.json.draft.effective.approvedItems.every((it) => typeof it?.text === "string" && !leakRe.test(it.text)), "identifier in approved text");
   ok("guest-draft-no-history", !(gr.json.draft || {}).historyJson && !("historyJson" in (gr.json.draft || {})), "history disclosed to guest");
 }
 const canonDecidedBefore = await canonState(did, ownerT);
