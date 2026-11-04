@@ -77,7 +77,7 @@ let cleanupPromise = null;
 function runBounded(cmd, args, opts, timeoutMs) {
   const r = spawnSync(cmd, args, { ...(opts || {}), timeout: Math.min(timeoutMs, Math.max(1000, TOTAL_BUDGET_MS - (Date.now() - TOTAL_START) - RECORDS_QA_PARENT_RESERVE_MS)) });
   if (r.error && String((r.error && r.error.code) || "") === "ETIMEDOUT") throw new Error("BUILD TIMEOUT " + cmd + " " + (args || []).join(" "));
-  if (r.status !== 0) throw new Error("BUILD FAIL " + cmd + " " + (args || []).join(" ") + " status=" + r.status + " " + String(r.stderr || "").slice(0, 300));
+  if (r.status !== 0) throw new Error("BUILD FAIL " + cmd + " " + (args || []).join(" ") + " status=" + r.status + " " + String(r.stdout || "").replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*(\S+)/gi, "$1=***").slice(-2000) + " err=" + String(r.stderr || "").replace(/(api[_-]?key|secret|token|password)\s*[:=]\s*(\S+)/gi, "$1=***").slice(-1000)); // dotnet reports errors on stdout: retain redacted stdout, not stderr-only
   return r;
 }
 async function boundedWait(child, ms) {
@@ -86,7 +86,7 @@ async function boundedWait(child, ms) {
   return !!done;
 }
 function childEnv() {
-  const allowExact = new Set(["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "COMSPEC", "ComSpec", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "OS", "WINDIR", "PROGRAMFILES", "PROGRAMDATA", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "DOTNET_NOLOGO"]);
+  const allowExact = new Set(["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "COMSPEC", "ComSpec", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "OS", "WINDIR", "PROGRAMFILES", "PROGRAMDATA", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "DOTNET_CLI_TELEMETRY_OPTOUT", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "DOTNET_NOLOGO", "APPDATA", "ProgramFiles", "ProgramFiles(x86)"]); // APPDATA + ProgramFiles required by .NET SDK NuGet restore (GetRestoreSettingsTask path1-null without them); non-secret Windows shell paths, isolation unchanged
   const allowPrefix = ["NUGET_", "NPM_", "PROGRAM"]; // NODE_ deliberately excluded: NODE_OPTIONS/--require/--import hooks
   const denyRe = /API_KEY|SECRET|TOKEN|PASSWORD|OPENAI|ANTHROPIC|AZURE|GITHUB|META_|GOOGLE|AWS_|ASPNETCORE_|KESTREL_|DOTNET_URLS|PORT|URLS/i;
   const out = {};

@@ -67,3 +67,23 @@
 - Cooperative deadline is half of the contract; browser-side enforcement is
   the parallel author's work and is not verified here.
 - No independent-review pass claimed.
+## Fresh-17 build failure: actual diagnosis + minimal fix (Muse isolated)
+### Actual failure, reproduced (not guessed)
+- Primary fresh `17eb4ac` run failed BEFORE services at `dotnet publish status=1` with blank stderr.
+- Blank stderr root cause: `dotnet` reports restore/build errors on stdout; old `runBounded` discarded stdout and kept only a 300-char stderr slice.
+- Reproduced with EXACT child env (parent env untouched, redacted): `NuGet.targets(782,5): error : Value cannot be null. (Parameter path1)` in `_GetRestoreSettings` / `_GenerateRestoreGraphProjectEntry`. Full inherited env publishes clean (STATUS=0).
+- Bisection (exact child env + candidate additions): `[]` fail; `APPDATA` alone fail; `APPDATA+LOCALAPPDATA` fail; shell set alone fail; program set alone fail; shell+program pass; `A+ProgramFiles` pass; `ProgramFiles+APPDATA` pass; `ProgramFiles(x86)+APPDATA` pass; `CommonProgramFiles+APPDATA` fail; `ProgramFiles+LOCALAPPDATA` (no APPDATA) fail.
+- Minimal required: APPDATA + ProgramFiles (x86 accepted as alternate; both added for 32/64-bit layout robustness). Standard non-secret Windows shell paths; denyRe unaffected; NODE_/DOTNET_/PG/secrets/ports exclusions unchanged; DOTNET_CONTENTROOT still pinned to fresh PUB.
+### Fix in this commit (launcher only, 2 lines)
+- `allowExact` += `APPDATA`, `ProgramFiles`, `ProgramFiles(x86)` with inline comment (verified minimal by bisection above).
+- `runBounded` now retains redacted build output: `out=` stdout tail (2000 chars; dotnet failures surface at the end) + `err=` stderr tail (1000 chars); light redactor masks api-key/secret/token/password assignments. No isolation weakening: no NODE_OPTIONS/global DOTNET_CONTENTROOT/PG/env secrets admitted, no fake PASS.
+- Dedicated independent review `records-24f-51b-independent-review.txt` (frozen 17eb4ac): launcher findings 1-3 STATIC PASS; remaining P2 findings 4/5/7 are browser-side and NOT edited here (any actual browser failures reported back to primary).
+### Own complete combined 17 run (instance muse-r597-mw21cp70-9f3f, 2026-11-04 ~06:31-06:34 ET)
+- Build with fixed sanitized child env: PASS. Artifact 1833984 bytes (identical size to c971b55 author evidence), wwwroot staged from dist.
+- Owned services only: fake + api on 127.0.0.1:15320/15322, unique instance/keyring, provenance proven (boot-bound, chatBefore=0); sanitized-host proof shows no DOTNET_/NODE_ leaks; headless owned browser only. No PG/Docker, no human/shared ports, no other worktrees, no app-source changes.
+- HTTP suite: 226 pass / 0 fail (matches primary c971b55 226/0).
+- Browser suite (browser file NOT edited here; failures reported back, not fixed): 4 FAILs + 1 FATAL, browser exit status=2, launcher exit=1, cleanup verified (ports closed).
+  - FAIL reload-403-preserve-peritem-R1/R2 (per-item child lost on App 403) and FAIL reload-abort-preserve-peritem-R1/R2 (per-item child lost on App abort).
+  - FATAL locator.click timeout 20000ms at browser:787 waiting for Reload-editor-from-current-review button that never renders after the failed review query (cf. App isError gate). Confirms independent-review Finding 5 both parts; Finding 7 unreached in this run.
+- First attempt (instance mw21b9az-8225): transient MSBuild-node crash status=3762504530 (0xE0434352) after a non-fatal NU1900 warning; the old head-slice truncated the true error tail, which motivated the tail-slice fix in this commit. Clean retry passed build + HTTP.
+- No secrets persisted: dummy per-run QA keys only; all run redirect logs and owned .qa publish/keyring dirs removed after the run.
