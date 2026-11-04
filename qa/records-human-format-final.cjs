@@ -1,5 +1,5 @@
 // qa/records-human-format-final.cjs — focused formatter regression for
-// parent review records-181140d finding 4 (sole Muse scope).
+// parent reviews records-181140d finding 4 and records-916c063 follow-up (sole Muse scope).
 // Scope: web/src/human-format.ts + this file (+ distinct doc only).
 // No services, network, browser, PG, Docker, .env, keys, or process kills.
 // Compiles the ACTUAL TypeScript source via the repo esbuild approach and
@@ -203,6 +203,132 @@ async function main() {
     assert.ok(out === NEUTRAL_BODY, JSON.stringify(out));
   });
 
+  // ---- Bare escaped structural JSON (review 916c063 P2 group 1): neutral, no leak.
+  check("bare unicode-escaped object body -> neutral, no leak", () => {
+    const out = m.humanNoteBody("{\\u0022reviewToken\\u0022:\\u0022internal");
+    assert.ok(out === NEUTRAL_BODY, JSON.stringify(out));
+    assertNoLeak(out, "bare-u-body");
+    assertNoRawJson(out, "bare-u-body");
+  });
+  check("bare unicode-escaped object title/excerpt/evidenceTitle -> neutral", () => {
+    const raw = "{\\u0022reviewToken\\u0022:\\u0022internal";
+    assert.ok(m.humanNoteTitle(raw) === "(untitled note)", JSON.stringify(m.humanNoteTitle(raw)));
+    assert.ok(m.humanEvidenceExcerpt(raw, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(raw, "note")));
+    assert.ok(m.humanEvidenceTitle(raw, "note", null) === "Supporting excerpt", JSON.stringify(m.humanEvidenceTitle(raw, "note", null)));
+    assertNoLeak(m.humanNoteTitle(raw), "bare-u-title");
+    assertNoLeak(m.humanEvidenceExcerpt(raw, "note"), "bare-u-excerpt");
+  });
+  check("bare unicode-brace body/title/excerpt -> neutral, no leak", () => {
+    const raw = "\\u007B\\u0022reviewToken\\u0022:\\u0022internal";
+    assert.ok(m.humanNoteBody(raw) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(raw)));
+    assert.ok(m.humanNoteTitle(raw) === "(untitled note)", JSON.stringify(m.humanNoteTitle(raw)));
+    assert.ok(m.humanEvidenceExcerpt(raw, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(raw, "note")));
+    assertNoLeak(m.humanNoteBody(raw), "bare-brace");
+  });
+  check("bare backslash-escaped object body/title/excerpt -> neutral, no leak", () => {
+    const raw = "{\\\"reviewToken\\\":\\\"internal";
+    assert.ok(m.humanNoteBody(raw) === NEUTRAL_BODY, JSON.stringify(raw) + " got " + JSON.stringify(m.humanNoteBody(raw)));
+    assert.ok(m.humanNoteTitle(raw) === "(untitled note)", JSON.stringify(m.humanNoteTitle(raw)));
+    assert.ok(m.humanEvidenceExcerpt(raw, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(raw, "note")));
+    assertNoLeak(m.humanNoteBody(raw), "bare-bs");
+    assertNoRawJson(m.humanNoteBody(raw), "bare-bs");
+  });
+  check("stringified bare unicode-escaped body/title/excerpt -> neutral", () => {
+    const raw = JSON.stringify("{\\u0022reviewToken\\u0022:\\u0022internal");
+    assert.ok(m.humanNoteBody(raw) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(raw)));
+    assert.ok(m.humanNoteTitle(raw) === "(untitled note)", JSON.stringify(m.humanNoteTitle(raw)));
+    assert.ok(m.humanEvidenceExcerpt(raw, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(raw, "note")));
+    assertNoLeak(m.humanNoteBody(raw), "bare-u-stringify");
+  });
+  check("stringified bare backslash-escaped body -> neutral", () => {
+    const raw = JSON.stringify("{\\\"reviewToken\\\":\\\"internal");
+    assert.ok(m.humanNoteBody(raw) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(raw)));
+    assertNoLeak(m.humanNoteBody(raw), "bare-bs-stringify");
+  });
+  // ---- Overdepth encoding (review 916c063 P2 group 2): 6/7/12 layers fail neutral.
+  check("six-encoded object body/title/excerpt/evidenceTitle -> neutral", () => {
+    let s = JSON.stringify({ reviewToken: "internal" });
+    for (let i = 0; i < 5; i++) s = JSON.stringify(s);
+    assert.ok(m.humanNoteBody(s) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(s)).slice(0, 200));
+    assert.ok(m.humanNoteTitle(s) === "(untitled note)", JSON.stringify(m.humanNoteTitle(s)).slice(0, 200));
+    assert.ok(m.humanEvidenceExcerpt(s, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(s, "note")).slice(0, 200));
+    assert.ok(m.humanEvidenceTitle(s, "note", null) === "Supporting excerpt", JSON.stringify(m.humanEvidenceTitle(s, "note", null)).slice(0, 200));
+    assertNoLeak(m.humanNoteBody(s), "depth6-body");
+    assertNoLeak(m.humanNoteTitle(s), "depth6-title");
+  });
+  check("seven-encoded object body/excerpt -> neutral", () => {
+    let s = JSON.stringify({ reviewToken: "internal" });
+    for (let i = 0; i < 6; i++) s = JSON.stringify(s);
+    assert.ok(m.humanNoteBody(s) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(s)).slice(0, 200));
+    assert.ok(m.humanEvidenceExcerpt(s, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(s, "note")).slice(0, 200));
+    assertNoLeak(m.humanNoteBody(s), "depth7");
+  });
+  check("twelve-encoded object body/title/excerpt -> neutral", () => {
+    let s = JSON.stringify({ reviewToken: "internal" });
+    for (let i = 0; i < 11; i++) s = JSON.stringify(s);
+    assert.ok(m.humanNoteBody(s) === NEUTRAL_BODY, JSON.stringify(m.humanNoteBody(s)).slice(0, 200));
+    assert.ok(m.humanNoteTitle(s) === "(untitled note)", JSON.stringify(m.humanNoteTitle(s)).slice(0, 200));
+    assert.ok(m.humanEvidenceExcerpt(s, "note").includes("Supporting detail is available in context."), JSON.stringify(m.humanEvidenceExcerpt(s, "note")).slice(0, 200));
+    assertNoLeak(m.humanNoteBody(s), "depth12");
+  });
+  // ---- Ordinary prose preservation (review 916c063 P2 group 3).
+  check("numeric bracket prose body/title/excerpt/evidenceTitle preserved", () => {
+    const prose = "[2026] Budget review tomorrow.";
+    const b = m.humanNoteBody(prose);
+    assert.ok(b.includes("[2026]") && b.includes("Budget review tomorrow."), JSON.stringify(b));
+    assert.ok(!b.includes("available in context"), JSON.stringify(b));
+    const ti = m.humanNoteTitle(prose);
+    assert.ok(ti.includes("[2026]") && ti.includes("Budget review"), JSON.stringify(ti));
+    const ex = m.humanEvidenceExcerpt(prose, "note");
+    assert.ok(ex.includes("[2026]") && ex.includes("Budget review"), JSON.stringify(ex));
+    const et = m.humanEvidenceTitle(prose, "note", null);
+    assert.ok(et.includes("[2026]") && et.includes("Budget review"), JSON.stringify(et));
+    assertNoLeak(b, "numeric-bracket");
+  });
+  check("stringified numeric bracket prose preserved", () => {
+    const out = m.humanNoteBody(JSON.stringify("[2026] Budget review tomorrow."));
+    assert.ok(out.includes("[2026]") && out.includes("Budget review tomorrow."), JSON.stringify(out));
+    assert.ok(!out.includes("available in context"), JSON.stringify(out));
+  });
+  check("nested [note] text preserved in all four exports", () => {
+    const raw = JSON.stringify({ text: "[note] remember to call finance" });
+    const b = m.humanNoteBody(raw);
+    assert.ok(b.includes("[note]") && b.includes("remember to call finance"), JSON.stringify(b));
+    assert.ok(!b.includes("available in context"), JSON.stringify(b));
+    const ti = m.humanNoteTitle(raw);
+    assert.ok(ti.includes("[note]") && ti.includes("remember to call finance"), JSON.stringify(ti));
+    const ex = m.humanEvidenceExcerpt(raw, "note");
+    assert.ok(ex.includes("[note]") && ex.includes("remember to call finance"), JSON.stringify(ex));
+    const et = m.humanEvidenceTitle(raw, "note", null);
+    assert.ok(et.includes("[note]") && et.includes("remember to call finance"), JSON.stringify(et));
+    assertNoLeak(b, "nested-note");
+  });
+  check("nested numeric bracket text preserved", () => {
+    const raw = JSON.stringify({ text: "[2026] Budget review tomorrow." });
+    const b = m.humanNoteBody(raw);
+    assert.ok(b.includes("[2026]") && b.includes("Budget review tomorrow."), JSON.stringify(b));
+    assert.ok(!b.includes("available in context"), JSON.stringify(b));
+    const ti = m.humanNoteTitle(raw);
+    assert.ok(ti.includes("[2026]"), JSON.stringify(ti));
+  });
+  check("quoted-label prose preserved in evidence exports", () => {
+    const prose = JSON.stringify("\"Approved\": use this label after review.");
+    const ex = m.humanEvidenceExcerpt(prose, "note");
+    assert.ok(ex.includes("Approved") && ex.includes("use this label"), JSON.stringify(ex));
+    const et = m.humanEvidenceTitle(prose, "note", null);
+    assert.ok(et.includes("Approved") && et.includes("use this label"), JSON.stringify(et));
+  });
+  check("valid numeric array still projects (no overcorrection)", () => {
+    const out = m.humanNoteBody(JSON.stringify([2026]));
+    assert.ok(out.includes("2026"), JSON.stringify(out));
+    assert.ok(!out.includes("available in context"), JSON.stringify(out));
+  });
+  check("symmetric body/title/evidence for truncated known-field prose", () => {
+    const raw = JSON.stringify({ title: "Budget review", text: "[note] remember to call finance" });
+    const b = m.humanNoteBody(raw);
+    assert.ok(b.includes("Budget review") && b.includes("remember to call finance"), JSON.stringify(b));
+    assertNoLeak(b, "symmetric-known");
+  });
   // ---- Existing accepted JSON projections (no regression).
   check("question+text projection intact", () => {
     const out = m.humanNoteBody(JSON.stringify({ question: "Should we expand?", text: "Yes, open a second site." }));
