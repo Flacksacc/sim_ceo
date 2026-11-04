@@ -2730,9 +2730,8 @@ async function stepNavigation() {
       await wft(900);
       clicked = true;
     } else if (["advisors", "sources", "records", "people", "activity"].includes(d.seg)) {
-      if (!await page.locator('.board-tools').isVisible()) await locClick(page.locator('nav.rail').getByRole('button', { name: 'Boards', exact: true }), 'nav-board-tools-return');
-      await locClick(page.locator('.board-tools summary'), 'nav-open-board-tools');
-      await locClick(page.getByRole('navigation', { name: 'Board tools', exact: true }).getByRole('button', { name: d.label, exact: true }), 'nav-board-tool-' + d.seg);
+      if (!await page.locator('aside[aria-label="Board meetings"]').isVisible()) await locClick(page.locator('nav.rail').getByRole('button', { name: 'Boards', exact: true }), 'nav-board-pages-return');
+      await locClick(page.locator('aside[aria-label="Board meetings"] .board-pages').getByRole('button', { name: d.label, exact: true }), 'nav-board-page-' + d.seg);
       clicked = true;
     } else if (d.seg === 'meet') {
       await locClick(page.locator('aside[aria-label="Board meetings"]').getByRole('listitem').filter({ hasText: run + ' harbor call' }), 'nav-select-meeting');

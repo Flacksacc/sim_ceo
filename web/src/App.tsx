@@ -6286,22 +6286,11 @@ const testModel = useMutation({
             </div>{" "}
             <div className="listpanel-sub">
               {showBoardMeetings
-                ? `${sidebarMeetings.length} meetings`
+                ? `${sidebarMeetings.length} ${sidebarMeetings.length === 1 ? "meeting" : "meetings"}`
                 : tab === "roster" ? `${(rosterNames.data ?? []).length} people`
                 : boards.isLoading || boards.data === undefined ? "Loading boards…" : `${scopeRows.length} boards`}
             </div>{" "}
           </div>{" "}
-          {showBoardMeetings && boardOk && !boardDenied && !isGuest && (
-            <div className="listpanel-filters">
-              <input aria-label="Search meetings" placeholder="Search meetings" value={mq} onChange={e => setMq(e.target.value)} />
-              <select aria-label="Meeting state filter" value={mstate} onChange={e => setMstate(e.target.value)}>
-                <option value="">All states</option>
-                <option value="AwaitingBrief">Awaiting brief</option><option value="Active">Active</option>
-                <option value="Paused">Paused</option><option value="WrappingUp">Wrapping up</option>
-                <option value="ClosedWithRecord">Closed with record</option><option value="ClosedWithoutPublication">Closed without publication</option>
-              </select>
-            </div>
-          )}
           {tab === "roster" && (
             <div className="listpanel-filters">
               {" "}
@@ -6316,7 +6305,7 @@ const testModel = useMutation({
               <input aria-label="Tag filter" placeholder="tag" value={rtag} onChange={(e) => setRtag(e.target.value)} />{" "}
             </div>
           )}{" "}
-          <div className="listpanel-rows" role="list" ref={listpanelRowsRef} onScroll={(e) => { listpanelScroll.current[tab === "roster" ? "roster" : boardId || "boards"] = e.currentTarget.scrollTop; }}>
+          <div className="listpanel-rows" role={showBoardMeetings ? undefined : "list"} ref={listpanelRowsRef} onScroll={(e) => { listpanelScroll.current[tab === "roster" ? "roster" : boardId || "boards"] = e.currentTarget.scrollTop; }}>
             {" "}
             {tab === "boards" && !showBoardMeetings &&
               scopeRows.map((b) => (
@@ -6338,13 +6327,26 @@ const testModel = useMutation({
               <div className="sub-empty">{boardScope === "archived" ? "No archived boards." : boardScope === "all" ? "No boards in this view." : "No boards yet"}</div>
             )}{" "}
             {showBoardMeetings && boardOk && !boardDenied && <>
+              <section className="board-list-section" aria-labelledby="sidebar-meetings-heading">
+                <h2 className="listpanel-section-title" id="sidebar-meetings-heading">Meetings</h2>
+                {!isGuest && <div className="listpanel-filters">
+                  <input aria-label="Search meetings" placeholder="Search meetings" value={mq} onChange={e => setMq(e.target.value)} />
+                  <select aria-label="Meeting state filter" value={mstate} onChange={e => setMstate(e.target.value)}>
+                    <option value="">All states</option>
+                    <option value="AwaitingBrief">Awaiting brief</option><option value="Active">Active</option>
+                    <option value="Paused">Paused</option><option value="WrappingUp">Wrapping up</option>
+                    <option value="ClosedWithRecord">Closed with record</option><option value="ClosedWithoutPublication">Closed without publication</option>
+                  </select>
+                </div>}
+                <div className="board-section-items" role="list" aria-label="Meetings">
               {sidebarMeetings.map(m => <button key={m.id} type="button" role="listitem"
-                className={m.id === meetingId ? "lprow active" : "lprow"}
-                aria-current={m.id === meetingId ? "true" : undefined}
+                className={tab === "meet" && m.id === meetingId ? "lprow active" : "lprow"}
+                aria-current={tab === "meet" && m.id === meetingId ? "true" : undefined}
                 onClick={() => { setMeetingId(m.id); setTab("meet"); setNavOpen(false); }}>
                 <span className="lprow-name">{m.title}</span>
                 <span className="lprow-sub">{meetingStateLabel(m.state)}</span>
               </button>)}
+                </div>
               {!isGuest && meetings.isLoading && <p className="sub-empty" role="status">Loading meetings…</p>}
               {!isGuest && meetings.isError && <div className="sub-empty" role="alert">Could not load meetings. <button type="button" onClick={() => meetings.refetch()}>Try again</button></div>}
               {!meetings.isLoading && !meetings.isError && sidebarMeetings.length === 0 && <p className="sub-empty">{mq || mstate ? "No meetings match these filters." : "No meetings yet."}</p>}
@@ -6352,6 +6354,18 @@ const testModel = useMutation({
                 onClick={() => { setMq(""); setMstate(""); setTab("meet"); createMeeting.mutate(); }}>
                 <span className="lprow-name">{createMeeting.isPending ? "Creating…" : "+ New meeting"}</span>
               </button>}
+              </section>
+              {([
+                { title: "Resources", items: [["sources", "Sources"], ["records", "Records"]] },
+                { title: "Board", items: [["boards", "Board overview"], ["advisors", "Board Advisors"], ["people", "People"], ["activity", "Activity"]] },
+              ] as { title: string; items: [Tab, string][] }[]).map(group => <section key={group.title} className="board-list-section board-pages" aria-label={group.title}>
+                <h2 className="listpanel-section-title">{group.title}</h2>
+                <nav className="board-section-items" aria-label={group.title + " pages"}>
+                  {group.items.filter(([key]) => SHOW_ACCOUNT_UI || key !== "people").map(([key, label]) => <button key={key} type="button"
+                    className={tab === key ? "lprow active" : "lprow"} aria-current={tab === key ? "page" : undefined}
+                    onClick={() => { setTab(key); setNavOpen(false); }}><span className="lprow-name">{label}</span></button>)}
+                </nav>
+              </section>)}
             </>}
             {tab === "roster" &&
               (rosterNames.data ?? []).map((r) => (
@@ -6468,15 +6482,6 @@ const testModel = useMutation({
               <p role="status">{SHOW_ACCOUNT_UI ? "Session verification pending — private content is hidden until the current session is verified. Unsent per-account drafts are preserved for re-authentication." : "Checking the demo session…"}</p>
             </section>
           ) : (<>
-          {showBoardMeetings && boardOk && !boardDenied && (
-            <details className="board-tools">
-              <summary>Board settings</summary>
-              <nav aria-label="Board tools">
-                {([["boards", "Board overview"], ["advisors", "Board Advisors"], ["sources", "Sources"], ["records", "Records"], ["people", "People"], ["activity", "Activity"]] as [Tab, string][]).filter(([key]) => SHOW_ACCOUNT_UI || key !== "people").map(([key, label]) =>
-                  <button key={key} type="button" className={tab === key ? "btn primary" : "btn ghost"} aria-current={tab === key ? "page" : undefined} onClick={e => { setTab(key); e.currentTarget.closest("details")?.removeAttribute("open"); }}>{label}</button>)}
-              </nav>
-            </details>
-          )}
           {tab === "boards" && (
             <section aria-label="Boards">
               {SHOW_ACCOUNT_UI && <AuthPanel />}
