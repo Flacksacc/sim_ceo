@@ -1309,6 +1309,7 @@ export default function App() {
     // origin identity no longer holds. Per-user drafts in localStorage are
     // preserved for re-authentication under the same identity key.
     try { secEpoch.current++; } catch {}
+    try { retirePipeline(submitOpRef.current); } catch {}
     try { secPendingRef.current = null; } catch {}
     try { secHydRef.current++; } catch {}
     try { secEnvelopeRev.current++; } catch {}
@@ -4313,6 +4314,110 @@ const testModel = useMutation({
   });
   const submitBusyRef = useRef(false);
   const submitOpRef = useRef<string | null>(null);
+  const [sendPhase, setSendPhase] = useState("idle");
+  const [sendStatus, setSendStatus] = useState("");
+  const [sendRetryCtx, setSendRetryCtx] = useState<any>(null);
+  const [sendConflict, setSendConflict] = useState<null | { kind: string }>(null);
+  const phaseOpRef = useRef<string | null>(null);
+  const chainedOpRef = useRef<string | null>(null);
+  useEffect(() => { setSendPhase("idle"); setSendStatus(""); setSendRetryCtx(null); setSendConflict(null); submitBusyRef.current = false; submitOpRef.current = null; phaseOpRef.current = null; chainedOpRef.current = null; }, [boardId, meetingId]);
+  const pipelineOwns = (op: unknown, pack: { origin?: any; originBoardId?: string; originMeetingId?: string; originUser?: string; originEpoch?: number }): boolean => {
+    if (typeof op !== "string" || !op || submitOpRef.current !== op) return false;
+    if (!pack || !pack.origin || originStale(pack.origin)) return false;
+    const live = liveSelRef.current;
+    if (live.boardId !== pack.originBoardId || live.meetingId !== pack.originMeetingId) return false;
+    if (secIdentity() !== pack.originUser || pack.originEpoch !== secEpoch.current) return false;
+    return true;
+  };
+  const showPhase = (op: string, phase: "sending" | "working" | "complete" | "no-contributions" | "error", status: string): void => {
+    phaseOpRef.current = op;
+    setSendPhase(phase);
+    setSendStatus(status);
+  };
+  const takePipeline = (op: string, phase: "sending" | "working", status: string): void => {
+    submitBusyRef.current = true;
+    submitOpRef.current = op;
+    phaseOpRef.current = op;
+    setSendPhase(phase);
+    setSendStatus(status);
+  };
+  const settlePipeline = (op: unknown, phase: "complete" | "no-contributions" | "error", status: string, retryCtx: any): boolean => {
+    if (typeof op !== "string" || !op || submitOpRef.current !== op) return false;
+    submitBusyRef.current = false;
+    submitOpRef.current = null;
+    phaseOpRef.current = null;
+    if (chainedOpRef.current === op) chainedOpRef.current = null;
+    setSendPhase(phase);
+    setSendStatus(status);
+    setSendRetryCtx(retryCtx);
+    return true;
+  };
+  const retirePipeline = (op: unknown): void => {
+    if (typeof op !== "string" || !op) return;
+    if (submitOpRef.current === op) { submitBusyRef.current = false; submitOpRef.current = null; }
+    if (chainedOpRef.current === op) { chainedOpRef.current = null; }
+    if (phaseOpRef.current === op) { phaseOpRef.current = null; setSendPhase("idle"); setSendStatus(""); setSendRetryCtx(null); setSendConflict(null); }
+  };
+  const parseRunError = (e: unknown): { status: number; serverError: string; serverFixes: string[]; hay: string } => {
+    const raw = String((e as any)?.message ?? e);
+    const m = /^(\d{3})\s([\s\S]*)$/.exec(raw);
+    const status = m ? parseInt(m[1], 10) : 0;
+    const bodyText = m ? m[2] : raw;
+    let serverError = "";
+    let serverFixes: string[] = [];
+    try {
+      const parsed = JSON.parse(bodyText);
+      if (parsed && typeof parsed.error === "string") serverError = parsed.error;
+      if (Array.isArray(parsed?.fixes)) serverFixes = parsed.fixes.filter((x: unknown) => typeof x === "string");
+    } catch { /* body is not JSON: match on text */ }
+    return { status, serverError, serverFixes, hay: (serverError + " " + bodyText).toLowerCase() };
+  };
+  const runErrorKind = (e: unknown): string | null => {
+    const p = parseRunError(e);
+    if (p.hay.includes("lead profile changed")) return "lead-version";
+    return null;
+  };
+  const runErrorMessage = (e: unknown, leadSaved: boolean): string => {
+    const p = parseRunError(e);
+    const status = p.status;
+    const hay = p.hay;
+    if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")) return "Access changed for this meeting. Reopen it from Boards, then retry.";
+    if (status === 404 || hay.includes("meeting is gone")) return "This meeting is gone. Reopen it from Boards.";
+    if (hay.includes("lead profile changed")) return "Lead profile changed since you sent. Review the current lead profile, then retry with the current version.";
+    if (hay.includes("already in progress")) return "A response run is already in progress for this meeting. Wait for it to finish.";
+    if (hay.includes("no advisors available")) {
+      if (p.serverFixes.some((x) => x.toLowerCase().includes("re-pick"))) return "No selected participants can respond. Re-pick participants from this board\u2019s current advisors, then retry.";
+      return "No approved advisors yet. Approve at least one advisor on this board, then retry.";
+    }
+    if (hay.includes("paused")) return "Meeting is paused. Resume it, then retry responses.";
+    if (hay.includes("interrupted")) return "The run was interrupted by a meeting change or a new message. Review the latest messages, then retry responses.";
+    if (status === 402 || hay.includes("usage cap") || hay.includes("cap exceeded")) return "Advisor usage cap reached. Check spending, then retry later.";
+    if (status === 502 || status === 503 || hay.includes("provider") || hay.includes("model service") || hay.includes("unavailable")) return leadSaved ? "Advisor service is unavailable right now. The lead message is saved; retry responses shortly." : "Advisor service is unavailable right now. Retry responses shortly.";
+    return leadSaved ? "Could not get advisor responses. The lead message is saved; retry responses." : "Could not get advisor responses. Retry responses shortly.";
+  };
+  const sendErrorMessage = (e: unknown): string => {
+    const raw = String((e as any)?.message ?? e);
+    const m = /^(\d{3})\s([\s\S]*)$/.exec(raw);
+    if (m) {
+      const status = parseInt(m[1], 10);
+      const hay = m[2].toLowerCase();
+      if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then resend your message.";
+      if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied")) return "Access changed for this meeting. Reopen it from Boards, then resend.";
+      if (status === 404 || hay.includes("meeting is gone")) return "This meeting is gone. Reopen it from Boards.";
+      return "Could not confirm your message was saved. The server response was unclear: check the conversation and resend only if it does not appear.";
+    }
+    return "Could not confirm your message was saved. Check the conversation: if it appears, do not resend; otherwise resend.";
+  };
+  const briefErrorMessage = (e: unknown): string => {
+    const raw = String((e as any)?.message ?? e);
+    const m = /^(\d{3})\s([\s\S]*)$/.exec(raw);
+    const hay = (m ? m[2] : raw).toLowerCase();
+    const status = m ? parseInt(m[1], 10) : 0;
+    if (status === 401 || hay.includes("authentication required")) return "Your session changed. Sign in again, then retry responses.";
+    if (status === 403 || hay.includes("not granted") || hay.includes("access revoked") || hay.includes("denied") || hay.includes("contribute")) return "Only contributors can save the brief. Ask a contributor to add a brief, then retry responses.";
+    return "Your message was saved but the brief could not be updated. Retry responses.";
+  };
   const send = useMutation({
     mutationFn: (v: any) => {
       // Queued-attempt validation: a paused (offline) dispatch posts exactly the click-time snapshot, never resume-time composer or selection refs.
@@ -4327,12 +4432,17 @@ const testModel = useMutation({
       const submitVer = v.submitVer;
       const originCap = v.origin;
       const replySeq = v.replySeq ?? null;
+      const leadVersionAtClick = (v.leadVersion !== undefined && v.leadVersion !== null) ? v.leadVersion : null;
+      const policyAtClick = v.policy ? v.policy : policy;
+      const briefAtClick = v.briefAtClick ? v.briefAtClick : "";
+      const meetingStateAtClick = v.meetingStateAtClick;
+      const canContributeAtClick = !!v.canContributeAtClick;
       if (!submittedDraft.trim()) throw Object.assign(new Error('Message send retired before dispatch.'), { stale: true });
       return post<Msg>(`/api/meetings/${originMeetingId}/messages`, {
         sender: "lead",
         content: submittedDraft,
         parentSequence: replySeq,
-      }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, submittedDraft, submitVer, origin: originCap, submitOp: v.submitOp }));
+      }).then((r) => ({ r, originBoardId, originMeetingId, originUser, originEpoch, submittedDraft, submitVer, origin: originCap, submitOp: v.submitOp, leadVersion: leadVersionAtClick, policy: policyAtClick, briefAtClick: briefAtClick, meetingStateAtClick: meetingStateAtClick, canContributeAtClick: canContributeAtClick }));
     },
     onMutate: (v: any) => ({ originBoardId: v.boardId, originMeetingId: v.meetingId, originUser: v.user, originEpoch: v.epoch, origin: v.origin, submitOp: v.submitOp, retired: !v || v.boardId !== boardId || v.meetingId !== meetingId || v.user !== secIdentity() || v.epoch !== secEpoch.current || originStale(v.origin) }),
     onSuccess: (pack: any, _v: unknown, ctx: unknown) => {
@@ -4343,16 +4453,44 @@ const testModel = useMutation({
       if (live.boardId !== (pack as any)?.originBoardId || live.meetingId !== (pack as any)?.originMeetingId || liveUser !== (pack as any)?.originUser || (pack as any)?.originEpoch !== secEpoch.current) return;
       if (draft === (pack as any)?.submittedDraft && secDraftVer.current === (pack as any)?.submitVer) { setDraft(""); setReplyTo(null); }
       refresh("messages");
+      if (!pipelineOwns((pack as any)?.submitOp, pack as any)) return;
+      const st = (pack as any)?.meetingStateAtClick;
+      const op = (pack as any)?.submitOp;
+      if (st !== 0 && st !== 1) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
+      const frozenPrompt = (pack as any)?.submittedDraft ?? "";
+      const frozenLeadVersion = (pack as any)?.leadVersion ?? null;
+      const frozenPolicy = (pack as any)?.policy ?? policy;
+      const frozenBrief = (pack as any)?.briefAtClick ?? "";
+      const frozenCanContribute = !!(pack as any)?.canContributeAtClick;
+      const oB = (pack as any)?.originBoardId; const oM = (pack as any)?.originMeetingId; const oU = (pack as any)?.originUser; const oE = (pack as any)?.originEpoch; const oOrigin = (pack as any)?.origin;
+      const leadCtx = { boardId: oB, meetingId: oM, user: oU, epoch: oE, prompt: frozenPrompt, leadVersion: frozenLeadVersion, policy: frozenPolicy, origin: oOrigin, submitOp: op, saveConfirmed: true };
+      if (!String(frozenBrief ?? "").trim()) {
+        if (!frozenCanContribute) { settlePipeline(op, "error", "Add a brief before requesting advisor responses.", leadCtx); setSendConflict(null); return; }
+        showPhase(op, "working", "Requesting advisor responses...");
+        chainedOpRef.current = op;
+        patch("/api/meetings/" + oM, { brief: String(frozenPrompt).slice(0, 800) }).then(() => {
+          if (!pipelineOwns(op, pack as any)) { retirePipeline(op); return; }
+          refresh("meetings", "meeting-detail");
+          showPhase(op, "working", "Requesting advisor responses...");
+          chainedOpRef.current = op; runDiscussion.mutate({ meetingId: oM, prompt: frozenPrompt, policy: frozenPolicy, leadVersion: frozenLeadVersion, origin: oOrigin, submitOp: op, boardId: oB, user: oU, epoch: oE, leadCtx: leadCtx });
+        }).catch((pe: any) => {
+          if ((pe as any)?.stale) { retirePipeline(op); return; }
+          if (!pipelineOwns(op, pack as any)) { retirePipeline(op); return; }
+          settlePipeline(op, "error", briefErrorMessage(pe), leadCtx);
+        });
+        return;
+      }
+      showPhase(op, "working", "Requesting advisor responses...");
+      chainedOpRef.current = op; runDiscussion.mutate({ meetingId: oM, prompt: frozenPrompt, policy: frozenPolicy, leadVersion: frozenLeadVersion, origin: oOrigin, submitOp: op, boardId: oB, user: oU, epoch: oE, leadCtx: leadCtx });
     },
-    onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (o && o.submitOp && submitOpRef.current === o.submitOp) { try { submitBusyRef.current = false; } catch { /* noop */ } try { submitOpRef.current = null; } catch { /* noop */ } } },
+    onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (!o || !o.submitOp) return; if (chainedOpRef.current === o.submitOp) return; retirePipeline(o.submitOp); },
     onError: (e, _v, ctx) => {
       const o = ctx as any;
-      if (!o || !(o as any).origin || originStale((o as any).origin)) return;
-      const live = liveSelRef.current;
-      let liveUser = secIdentity();
-      { if ((ctx as any)?.retired) return; }
-      if (live.boardId !== o.originBoardId || live.meetingId !== o.originMeetingId || liveUser !== o.originUser || o.originEpoch !== secEpoch.current) return;
-      alert(String(e));
+      if ((e as any)?.stale) { retirePipeline((o as any)?.submitOp); return; }
+      if (!o || !(o as any).origin || originStale((o as any).origin)) { retirePipeline((o as any)?.submitOp); return; }
+      if ((ctx as any)?.retired) { retirePipeline((o as any)?.submitOp); return; }
+      if (!pipelineOwns(o.submitOp, o)) { retirePipeline(o.submitOp); return; }
+      settlePipeline(o.submitOp, "error", sendErrorMessage(e), null); setSendConflict(null);
     },
   });
   const [secQuestion, setSecQuestion] = useState("");
@@ -4710,7 +4848,8 @@ const testModel = useMutation({
     // Synchronous pending guard: React pending flags flip a render later, so
     // rapid double-Enter (or Enter+click) must also hit this same-tick ref.
     if (submitBusyRef.current) return;
-    if (secPendingRef.current || askSecretary.isPending || send.isPending) return;
+    if (secPendingRef.current || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending) return;
+    if (sendPhase === "sending" || sendPhase === "working") return;
     const submitOp = "submit-" + (++opSeq.current);
     submitBusyRef.current = true;
     submitOpRef.current = submitOp;
@@ -4731,7 +4870,10 @@ const testModel = useMutation({
         nonce: (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : String(Date.now()) + "-" + String(Math.floor(Math.random() * 1000000)),
       });
     }
-    else send.mutate({ boardId, meetingId, user: secIdentity(), epoch: secEpoch.current, origin: originIdentity(), draft, submitVer: secDraftVer.current, replySeq: replyTo ? replyTo.seq : null, submitOp });
+    else {
+      takePipeline(submitOp, "sending", "Sending message..."); setSendRetryCtx(null); setSendConflict(null);
+      send.mutate({ boardId, meetingId, user: secIdentity(), epoch: secEpoch.current, origin: originIdentity(), draft, submitVer: secDraftVer.current, replySeq: replyTo ? replyTo.seq : null, submitOp, leadVersion: lead.data ? lead.data.version : null, policy: policy, briefAtClick: briefText, meetingStateAtClick: curMeeting ? (curMeeting as any).state : null, canContributeAtClick: canActMeeting });
+    }
   };
   const runSummary = (r: { published: Msg[]; yielded: { advisor: string; reason: string }[]; overflow: { omitted: string[]; cap: number; policy: string } | null }) => {
     const oc = r.overflow && r.overflow.omitted ? r.overflow.omitted.join(", ") : "";
@@ -4740,6 +4882,7 @@ const testModel = useMutation({
   const runDiscussion = useMutation({
     mutationFn: (v: any) => {
       // Queued-attempt validation: a paused dispatch posts exactly the click-time snapshot, never a newer meeting, prompt, or identity.
+      if (!v || !v.submitOp || submitOpRef.current !== v.submitOp) throw Object.assign(new Error("Discussion run retired before dispatch."), { stale: true });
       if (!v || v.meetingId !== meetingId || originStale(v.origin)) throw Object.assign(new Error("Discussion run retired before dispatch."), { stale: true });
       return post<{ published: Msg[]; yielded: { advisor: string; reason: string }[]; abstained: string[]; overflow: { omitted: string[]; cap: number; policy: string } | null }>(`/api/meetings/${v.meetingId}/run`, {
         policy: v.policy,
@@ -4748,20 +4891,75 @@ const testModel = useMutation({
         ...(v.leadVersion != null ? { leadVersion: v.leadVersion } : {}),
       });
     },
-    onMutate: (v: any) => ({ meetingId: v.meetingId, origin: v.origin }),
+    onMutate: (v: any) => ({ submitOp: v?.submitOp, origin: v?.origin, originBoardId: v?.boardId, originMeetingId: v?.meetingId, originUser: v?.user, originEpoch: v?.epoch, meetingId: v?.meetingId, leadCtx: (v as any)?.leadCtx ?? null, retired: !v || !v.submitOp || submitOpRef.current !== v.submitOp || v.meetingId !== meetingId || originStale(v.origin) }),
     onSuccess: (r, _v, ctx) => {
-      // Retire held completions after a view/identity change: never refresh or notify a stale meeting context.
       const o = ctx as any;
-      if (!o || o.meetingId !== meetingId || originStale(o.origin)) return;
+      if ((o as any)?.retired) { retirePipeline((o as any)?.submitOp); return; }
+      if (!pipelineOwns(o.submitOp, o)) { retirePipeline(o.submitOp); return; }
       refresh("messages");
-      notify(runSummary(r));
+      const pubs = (r as any)?.published ?? [];
+      if (!pubs || pubs.length === 0) { if (chainedOpRef.current === o.submitOp) chainedOpRef.current = null; settlePipeline(o.submitOp, "no-contributions", "No advisors contributed. Adjust participants or the brief, then retry responses.", (o as any)?.leadCtx ?? null); }
+      else { if (chainedOpRef.current === o.submitOp) chainedOpRef.current = null; settlePipeline(o.submitOp, "complete", "Responses complete.", null); setSendConflict(null); }
+      notify(runSummary(r as { published: Msg[]; yielded: { advisor: string; reason: string }[]; overflow: { omitted: string[]; cap: number; policy: string } | null }));
     },
     onError: (e, _v, ctx) => {
       const o = ctx as any;
-      if (!o || o.meetingId !== meetingId || originStale(o.origin)) return;
-      alert(String(e));
+      if ((e as any)?.stale) { retirePipeline((o as any)?.submitOp); return; }
+      if (!o || (o as any).retired) { retirePipeline((o as any)?.submitOp); return; }
+      if (!pipelineOwns(o.submitOp, o)) { retirePipeline(o.submitOp); return; }
+      const frozen = (o as any)?.leadCtx ?? null;
+      const kind = runErrorKind(e);
+      if (kind === "lead-version" && frozen) { try { refresh("lead"); } catch {} }
+      if (chainedOpRef.current === o.submitOp) chainedOpRef.current = null;
+      settlePipeline(o.submitOp, "error", runErrorMessage(e, !!(frozen && (frozen as any).saveConfirmed)), frozen);
+      setSendConflict(kind === "lead-version" && frozen ? { kind } : null);
     },
+    onSettled: (_r: unknown, _e: unknown, _v: unknown, ctx: unknown) => { const o = ctx as any; if (!o || !o.submitOp) return; if ((o as any).retired) retirePipeline(o.submitOp); },
   });
+  const retryResponses = (rc: any): void => {
+    if (!rc || rc.meetingId !== meetingId || !rc.origin || originStale(rc.origin)) return;
+    if (submitBusyRef.current || runDiscussion.isPending || send.isPending) return;
+    const op = "submit-" + (++opSeq.current);
+    submitBusyRef.current = true;
+    submitOpRef.current = op;
+    const leadCtx = { boardId: rc.boardId, meetingId: rc.meetingId, user: rc.user, epoch: rc.epoch, prompt: rc.prompt, leadVersion: rc.leadVersion, policy: rc.policy, origin: rc.origin, submitOp: op, saveConfirmed: !!(rc as any).saveConfirmed };
+    const needBrief = !String(briefText ?? "").trim();
+    if (needBrief && !canActMeeting) { settlePipeline(op, "error", "Add a brief before requesting advisor responses.", leadCtx); setSendConflict(null); return; }
+    showPhase(op, "working", "Requesting advisor responses...");
+    if (needBrief) {
+      chainedOpRef.current = op; patch("/api/meetings/" + rc.meetingId, { brief: String(rc.prompt).slice(0, 800) }).then(() => {
+        if (submitOpRef.current !== op || !rc.origin || originStale(rc.origin)) { retirePipeline(op); return; }
+        const live = liveSelRef.current;
+        if (live.boardId !== rc.boardId || live.meetingId !== rc.meetingId) { retirePipeline(op); return; }
+        refresh("meetings", "meeting-detail");
+        showPhase(op, "working", "Requesting advisor responses...");
+        runDiscussion.mutate({ meetingId: rc.meetingId, prompt: rc.prompt, policy: rc.policy, leadVersion: rc.leadVersion, origin: rc.origin, submitOp: op, boardId: rc.boardId, user: rc.user, epoch: rc.epoch, leadCtx: leadCtx });
+      }).catch((pe: any) => {
+        if ((pe as any)?.stale) { retirePipeline(op); return; }
+        if (submitOpRef.current !== op || !rc.origin || originStale(rc.origin)) { retirePipeline(op); return; }
+        const live = liveSelRef.current;
+        if (live.boardId !== rc.boardId || live.meetingId !== rc.meetingId) { retirePipeline(op); return; }
+        settlePipeline(op, "error", briefErrorMessage(pe), leadCtx);
+      });
+      return;
+    }
+    runDiscussion.mutate({ meetingId: rc.meetingId, prompt: rc.prompt, policy: rc.policy, leadVersion: rc.leadVersion, origin: rc.origin, submitOp: op, boardId: rc.boardId, user: rc.user, epoch: rc.epoch, leadCtx: leadCtx });
+  };
+  const requestFreshResponses = (): void => {
+    if (submitBusyRef.current || runDiscussion.isPending || send.isPending) return;
+    if (!canDiscussMeeting || !briefText.trim()) return;
+    if (curMeeting != null && !meetingIsOpen((curMeeting as any).state)) return;
+    const op = "submit-" + (++opSeq.current);
+    submitBusyRef.current = true;
+    submitOpRef.current = op;
+    const origin = originIdentity();
+    const st = curMeeting != null ? (curMeeting as any).state : 1;
+    if (st !== 0 && st !== 1) { settlePipeline(op, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; }
+    const prompt = draft || "Continue the discussion.";
+    const leadCtx = { boardId: boardId, meetingId: meetingId, user: secIdentity(), epoch: secEpoch.current, prompt: prompt, leadVersion: lead.data ? lead.data.version : null, policy: policy, origin: origin, submitOp: op, saveConfirmed: false };
+    showPhase(op, "working", "Requesting advisor responses...");
+    runDiscussion.mutate({ meetingId: meetingId, prompt: prompt, policy: policy, leadVersion: lead.data ? lead.data.version : null, origin: origin, submitOp: op, boardId: boardId, user: secIdentity(), epoch: secEpoch.current, leadCtx: leadCtx });
+  };
   const askSecretary = useMutation({
     mutationFn: (v: any) => {
       // Queued-attempt validation (offline pause, held dispatch): navigation, Clear, or a newer attempt retires this one BEFORE any storage write or POST.
@@ -7447,9 +7645,12 @@ const testModel = useMutation({
                             (<button
                               type="button"
                               className="primary"
-                              onClick={() => runDiscussion.mutate({ meetingId, prompt: draft || "Continue the discussion.", policy, leadVersion: lead.data ? lead.data.version : null, origin: originIdentity() })}
+                              onClick={() => { const rc = sendRetryCtx; if (rc && rc.meetingId === meetingId) { retryResponses(rc); return; } requestFreshResponses(); }}
                               disabled={
                                 runDiscussion.isPending ||
+                                send.isPending ||
+                                sendPhase === "sending" ||
+                                sendPhase === "working" ||
                                 !canDiscussMeeting ||
                                 !briefText.trim() ||
                                 (curMeeting != null &&
@@ -7463,8 +7664,8 @@ const testModel = useMutation({
                             >
                               {" "}
                               {runDiscussion.isPending
-                                ? "Advisors drafting…"
-                                : "Request advisor responses"}{" "}
+                                ? "Requesting advisor responses..."
+                                : ((sendRetryCtx && sendRetryCtx.meetingId === meetingId) ? "Retry advisor responses (same lead)" : "Request advisor responses")}{" "}
                             </button>{" "}
                             <div className="muted">Asks the advisors in the current meeting to respond.</div>{" "}
                           </div>{" "}
@@ -7835,7 +8036,7 @@ const testModel = useMutation({
                                   ✦
                                 </span>
                                 <span>
-                                  Advisors are drafting
+                                  Requesting advisor responses
                                   <span
                                     className="thinking-dots"
                                     aria-hidden="true"
@@ -7843,6 +8044,9 @@ const testModel = useMutation({
                                 </span>
                               </div>
                             )}{" "}
+                            {sendPhase !== "idle" && (<div role="status" className="status-line"><span className="badge live">{sendPhase === "sending" ? "Sending" : sendPhase === "working" ? "Working" : sendPhase === "complete" ? "Complete" : sendPhase === "no-contributions" ? "No contributions" : "Error"}</span><span>{sendStatus || sendPhase}</span></div>)}{" "}
+                            {(sendPhase === "error" || sendPhase === "no-contributions") && sendRetryCtx && sendRetryCtx.meetingId === meetingId && (<div className="card" role="alert"><b>{sendPhase === "error" ? "Advisor responses failed" : "No advisor responses"}</b><div>{sendStatus}</div><div className="muted">{sendRetryCtx.saveConfirmed ? "Retry sends only the responses step for the same lead message." : "Retry sends only the advisor-responses step again."}</div><button type="button" onClick={() => retryResponses(sendRetryCtx)} disabled={runDiscussion.isPending || send.isPending}>Retry responses (same lead)</button>{" "}{sendConflict && sendConflict.kind === "lead-version" && (<span><button type="button" onClick={() => { const rc = sendRetryCtx; if (!rc || rc.meetingId !== meetingId) return; const v = lead.data ? lead.data.version : null; if (v == null) return; retryResponses({ ...rc, leadVersion: v }); }} disabled={runDiscussion.isPending || send.isPending}>Retry with current lead profile{typeof (lead.data ? lead.data.version : null) === "number" ? " (v" + String(lead.data ? lead.data.version : null) + ")" : ""}</button>{" "}</span>)}{" "}<button type="button" className="btn ghost" onClick={() => { setSendPhase("idle"); setSendStatus(""); setSendRetryCtx(null); setSendConflict(null); phaseOpRef.current = null; }}>Dismiss</button></div>)}{" "}
+                            {(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) && (<div role="status" className="status-line"><span className="badge live">Secretary</span><span>Secretary working...</span></div>)}{" "}
                             <div className="composer-bar">
                               {" "}
                               <div className="topline">
@@ -7967,10 +8171,10 @@ const testModel = useMutation({
                                   type="button"
                                   className="primary"
                                   onClick={() => submitDraft()}
-                                  disabled={!canDiscussMeeting || !draft.trim() || askSecretary.isPending || send.isPending}
+                                  disabled={!canDiscussMeeting || !draft.trim() || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending || submitBusyRef.current || sendPhase === "sending" || sendPhase === "working"}
                                 >
                                   {" "}
-                                  {askSecretary.isPending ? "Sending secretary..." : "Send"}{" "}
+                                  {(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) ? "Sending secretary..." : sendPhase === "sending" ? "Sending..." : sendPhase === "working" ? "Requesting responses..." : "Send"}{" "}
                                 </button>{" "}
                               </div>{" "}
                               <div
@@ -8063,7 +8267,7 @@ const testModel = useMutation({
                                 <button type="button" onClick={() => { if (!answerSecretary.isPending) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>{answerSecretary.isPending ? "Sending..." : "Send answer"}</button>{" "}
                               </div>
                             )}{" "}
-                            {secError && (<div className="card" role="alert"><b>Secretary error</b><div>{secError}</div>{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) { const uRet = secIdentity(); try { secEnvelopeRev.current++; } catch { } try { secHydRef.current++; } catch { } retrySecretary.mutate({ opId: "retry-" + (++opSeq.current), boardId, meetingId, user: uRet, epoch: secEpoch.current, origin: originIdentity(), envRevCap: secEnvelopeRev.current, hydRevCap: secHydRef.current, env: readEnvelope(secEnvelopeKey(uRet, boardId, meetingId)) }); } }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
+                            {secError && (<div className="card" role="alert">{(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) && (<div role="status" className="status-line"><span className="badge live">Secretary</span><span>Secretary working...</span></div>)}{" "}<b>Secretary error</b><div>{secError}</div>{secRequestId && secQuestion ? (<button type="button" onClick={() => { if (!answerSecretary.isPending && !secPendingRef.current) answerSecretary.mutate(buildAnswerVars()); }} disabled={!secAnswer.trim() || answerSecretary.isPending}>Retry answer (same request)</button>) : (<button type="button" onClick={() => { if (!retrySecretary.isPending && !secPendingRef.current) { const uRet = secIdentity(); try { secEnvelopeRev.current++; } catch { } try { secHydRef.current++; } catch { } retrySecretary.mutate({ opId: "retry-" + (++opSeq.current), boardId, meetingId, user: uRet, epoch: secEpoch.current, origin: originIdentity(), envRevCap: secEnvelopeRev.current, hydRevCap: secHydRef.current, env: readEnvelope(secEnvelopeKey(uRet, boardId, meetingId)) }); } }} disabled={retrySecretary.isPending}>Retry secretary (same envelope)</button>)}<button type="button" onClick={() => { try { secHydRef.current++; } catch { } try { secEnvelopeRev.current++; } catch { } const u = secIdentity(); try { localStorage.removeItem(secEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secAnsEnvelopeKey(u, boardId, meetingId)); localStorage.removeItem(secPendingKey(u, boardId, meetingId)); localStorage.removeItem(secSubmitKey(u, boardId, meetingId)); } catch { } try { secHistRef.current++; } catch { /* noop */ } try { secEditSess.current++; } catch { /* noop */ } try { secEditVisit.current++; } catch { /* noop */ } try { secHistSel.current = ""; } catch { /* noop */ } setSecError(""); setSecQuestion(""); setSecRequestId(""); setSecAnswer(""); try { secAnsOwnerReq.current = ""; } catch { } try { secAnsOwnerHyd.current = false; } catch { } setSecOmitted([]); try { secOmittedReq.current = ""; } catch { } setSecEditId(""); setSecEditBody(""); setSecHistory(null); }}>Clear saved retry</button></div>)}{" "}
                             {secOmitted.length > 0 && (<div className="muted">Omitted from packet (not cited): {secOmitted.join("; ")}</div>)}
                             <h3>Secretary provisional notes</h3>{" "}
                             {(notes.data ?? [])
@@ -8749,6 +8953,7 @@ const testModel = useMutation({
                         try { setProfileReloading(false); } catch {}
                         try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
                         try { secEpoch.current++; } catch {}
+                        try { retirePipeline(submitOpRef.current); } catch {}
                         try { qc.clear(); } catch {}
                         qc.invalidateQueries();
                       }}
