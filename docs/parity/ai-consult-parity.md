@@ -840,3 +840,21 @@ Healthy deployment on localhost:5173:
 Backup `.tmp/update-20261104-190212-UTC-869a6ee8`; original database and volumes
 retained. Owned QA services and browsers stopped; no background coding agents.
 `tmp.txt` unchanged; broader parity goal remains paused.
+
+### 2026-11-04 — Profile paragraph fields expand to fit
+
+Implemented `ff38212`: all four Your Profile paragraph fields use the existing
+GrowingTextarea control. Removed the 320px height cap and internal overflow;
+width stays fixed to the form while height follows saved values, edits and
+viewport wrapping. Automatic sizing prevents manual shrinking from hiding text.
+Frontend build passed. Browser checks against both the built assets and deployed
+app passed for long saved values, edits, deletion, unbroken words, desktop/mobile
+wrapping, light/dark themes and all four fields having no internal overflow.
+Evidence: `.tmp/profile-growing-{preview,live}-check.log` and screenshots.
+Browser-only fixture values; zero actual profile writes or page errors.
+
+Healthy localhost:5173 image:
+`sha256:e29fa1a359c8df5fcaabc68c6f87bceb25334d0971b980128cbc2f6ed257368a`.
+Backup `.tmp/update-20261104-190545-UTC-6aa83615`; original database and volumes
+preserved. Browser contexts closed, no coding agents used, `tmp.txt` untouched.
+Broader parity goal remains paused.
