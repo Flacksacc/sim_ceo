@@ -72,10 +72,51 @@ async function desktopSuite(browser) {
     await check(page, "desktop boards has no horizontal overflow", () => noOverflow(page));
     await page.screenshot({ path: path.join(SHOTDIR, "shot-desktop-boards.png") });
 
-    // select Alpha board from the sidebar list
-    await page.locator(".listpanel-rows button", { hasText: "Alpha Board" }).click();
+    // select Alpha board from the sidebar list (the boards query is gated on
+    // the auth-status contract, so wait for the real row, not a fixed delay)
+    const alphaBtn = page.locator(".listpanel-rows button", { hasText: "Alpha Board" });
+    await alphaBtn.waitFor({ timeout: 15000 });
+    await alphaBtn.click();
     await check(page, "sidebar board select writes hash board", async () => (await hashOf(page)).includes("board=b-alpha"));
     await check(page, "main shows open Alpha board", () => page.locator("main").getByText("Open board: Alpha Board").isVisible());
+
+    // Backend-truth contracts the whole suite depends on (unsecured fixture:
+    // authRequired false; board capabilities manage/guest false; meeting scope
+    // manage; unknown scope stays 404; activity idle DTO shape).
+    const contracts = await page.evaluate(async () => {
+      const j = async (url, opts) => {
+        const r = await fetch(url, opts);
+        let b = null;
+        try { b = await r.json(); } catch { b = null; }
+        return { status: r.status, body: b };
+      };
+      const out = {};
+      const st = await j("/api/auth/status");
+      out.statusOk = st.status === 200 && !!st.body;
+      out.unsecured = !!st.body && st.body.authRequired === false;
+      out.statusShape = !!st.body && st.body.hasAccounts === false && st.body.accountCount === 0 && st.body.admin === "";
+      const cb = await j("/api/boards/b-alpha/capabilities");
+      out.capsBoard = cb.status === 200 && !!cb.body && cb.body.board === "manage" && cb.body.guest === false && cb.body.admin === false;
+      const cm = await j("/api/boards/b-alpha/capabilities?meetingId=m-one");
+      out.capsMeeting = cm.status === 200 && !!cm.body && cm.body.meeting === "manage";
+      const unk = await j("/api/boards/NOPE/capabilities");
+      out.capsUnknown404 = unk.status === 404;
+      const mm = await j("/api/boards/b-beta/capabilities?meetingId=m-one");
+      out.capsMismatch404 = mm.status === 404;
+      const act = await j("/api/meetings/m-one/activity");
+      out.activityShape = act.status === 200 && !!act.body && !!act.body.discussion && Array.isArray(act.body.discussion.advisors) && Array.isArray(act.body.secretary);
+      const actUnk = await j("/api/meetings/NOPE-MEET/activity");
+      out.activityUnknown404 = actUnk.status === 404;
+      return out;
+    });
+    await check(page, "auth status honest unsecured", async () => contracts.statusOk && contracts.unsecured);
+    await check(page, "auth status shape matches backend", async () => contracts.statusShape);
+    await check(page, "capabilities board manage, guest false", async () => contracts.capsBoard);
+    await check(page, "capabilities meeting manage for member meeting", async () => contracts.capsMeeting);
+    await check(page, "capabilities unknown board stays 404", async () => contracts.capsUnknown404);
+    await check(page, "capabilities mismatched meeting stays 404", async () => contracts.capsMismatch404);
+    await check(page, "meeting activity idle DTO shape", async () => contracts.activityShape);
+    await check(page, "meeting activity unknown stays 404", async () => contracts.activityUnknown404);
 
     // all 12 destinations reachable from the rail
     await rail("Meetings").click();

@@ -130,6 +130,17 @@ function fixtureHandler(reqLog, unhandled) {
       if (!b) return V("unknown board");
       return J(m[2] === "setup" ? setupFor(b) : statusFor(b));
     }
+    if ((m = p.match(/^\/api\/boards\/([^/]+)\/capabilities$/))) {
+      const b = boardById(m[1]);
+      if (!b) return V("unknown board");
+      const mid = u.searchParams.get("meetingId");
+      if (mid) {
+        const mf = meetingById(mid);
+        if (!mf || mf.boardId !== m[1]) return V("unknown meeting");
+        return J({ board: "manage", meeting: "manage", meetings: [], guest: false, admin: false });
+      }
+      return J({ board: "manage", meeting: null, meetings: [], guest: false, admin: false });
+    }
     if ((m = p.match(/^\/api\/boards\/([^/]+)\/(advisors|sources|directions|invites|grants)$/))) {
       if (!boardById(m[1])) return V("unknown board");
       if (m[2] === "advisors" && req.method() === "GET") return J(store.advisors[m[1]] || []);
@@ -151,6 +162,16 @@ function fixtureHandler(reqLog, unhandled) {
     if ((m = p.match(/^\/api\/boards\/([^/]+)\/recall$/))) {
       if (!boardById(m[1])) return V("unknown board");
       return J([]);
+    }
+    if ((m = p.match(/^\/api\/meetings\/([^/]+)\/activity$/))) {
+      const found = meetingById(m[1]);
+      if (!found && !String(m[1]).startsWith("m-new-")) return V("unknown meeting");
+      return J({ discussion: { status: "idle", advisors: [] }, secretary: [] });
+    }
+    if ((m = p.match(/^\/api\/roster\/([^/]+)\/research$/)) && req.method() === "GET") {
+      // Fixture roster is empty: any id is unknown (truthful 404 that stays in
+      // reqLog as a validation lookup, never an unhandled gap or allow-all).
+      return V("unknown roster entry");
     }
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/(pause|resume|end|reopen)$/)) && req.method() === "POST") {const mm=meetingById(m[1]);if(!mm)return V("unknown meeting");const op=m[2];if(op==="pause")mm.state=3;else if(op==="resume")mm.state=1;else if(op==="end")mm.state=4;else if(op==="reopen")mm.state=1;return J(mm);}
     if ((m = p.match(/^\/api\/meetings\/([^/]+)\/close$/)) && req.method() === "POST") {const mm=meetingById(m[1]);if(!mm)return V("unknown meeting");let bb={};try{bb=req.postDataJSON()||{};}catch{}mm.state=bb.withRecord?6:7;return J(mm);}
@@ -304,6 +325,10 @@ function fixtureHandler(reqLog, unhandled) {
     if (p === "/api/spending") return J({ month: "2026-11", monthlyCapUsd: null, mode: "warn", knownSpendUsd: 0, unknownCostCalls: 0, overCap: false, enforced: false, note: "fixture" });
     if (p === "/api/commands") return J([{ command: "meetings", view: "Meetings", action: "Open a meeting" }]);
     if (p === "/api/auth/me") return J({ user: "qa-fixture", authenticated: false });
+    // Honest unsecured fixture (mirrors AuthEndpoints /api/auth/status with no
+    // accounts): authRequired false unblocks anonymous private reads; staying
+    // truthful here is what lets the boards query enable without a fake login.
+    if (p === "/api/auth/status" && req.method() === "GET") return J({ authRequired: false, hasAccounts: false, accountCount: 0, admin: "" });
     return N("no fixture");
   };
 }

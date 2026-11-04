@@ -175,6 +175,7 @@ async function apiStub(route) {
   if (p.indexOf("/api/boards/") === 0 && p.indexOf("/recall") > 0) return J([]);
   if (p.indexOf("/api/meetings/") === 0 && (p.endsWith("/notes") || p.endsWith("/records") || p.indexOf("/notes/history") > 0 || p.indexOf("/secretary/requests/") > 0 || p.endsWith("/voice"))) return J([]);
   if ((m = p.match(/^\/api\/meetings\/([^/]+)\/messages\/search$/))) return J([]);
+  if ((m = p.match(/^\/api\/meetings\/([^/]+)\/activity$/)) && method === "GET") return J({ discussion: { status: "idle", advisors: [] }, secretary: [] });
   if (p === "/api/profile" && method === "GET") return J({ error: "no saved profile" }, 404);
   return fixtureFallback(route);
 }
@@ -507,7 +508,10 @@ async function testSecretaryRetryVisible() {
   const box = composer();
   await box.fill("Secretary: retry visibility note");
   await sendButton().click();
-  await gotoHash("#/meet?board=b-alpha&meeting=m-one&mtab=takeaways");
+  // Secretary error/retry lives in Meeting Settings (not the takeaways tab):
+  // open the actual settings dialog, then retry from the same envelope.
+  await page.getByRole("button", { name: "Meeting settings" }).click();
+  await page.locator('section[aria-label="Meeting settings"]').waitFor({ timeout: 15000 });
   await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Secretary error", { timeout: 30000 });
   const retryBtn = page.getByRole("button", { name: "Retry secretary (same envelope)" }).first();
   await retryBtn.waitFor({ timeout: 15000 });
@@ -557,7 +561,7 @@ async function testApplyIdentityRetirement() {
   await box.press("Enter");
   await page.waitForFunction((t) => document.body.innerText.indexOf(t) >= 0, "Requesting advisor responses...", { timeout: 30000 });
   await page.goto(webBase + "#/people?board=b-alpha");
-  await page.getByRole("heading", { name: "Act as (demo identity for grant checks)", exact: true }).waitFor({ timeout: 15000 });
+  await page.getByRole("heading", { name: "Preview access as", exact: true }).waitFor({ timeout: 15000 });
   await page.getByLabel("Act as user").fill("owner");
   await page.getByRole("button", { name: "Apply identity" }).click();
   await sleep(800);
@@ -688,7 +692,7 @@ async function testHeldPatchOverlapNewSurvives() {
   await sleep(400);
   ok("overlap-no-run-yet", countFrom(mark, "POST", "/api/meetings/m-empty/run") === 0, "run=" + countFrom(mark, "POST", "/api/meetings/m-empty/run"));
   await page.evaluate((h) => { window.location.hash = h; }, "#/people?board=b-alpha&meeting=m-empty");
-  await page.getByRole("heading", { name: "Act as (demo identity for grant checks)", exact: true }).waitFor({ timeout: 15000 });
+  await page.getByRole("heading", { name: "Preview access as", exact: true }).waitFor({ timeout: 15000 });
   await page.getByLabel("Act as user").fill("owner");
   await page.getByRole("button", { name: "Apply identity" }).click();
   await sleep(800);
