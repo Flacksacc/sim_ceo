@@ -17,7 +17,7 @@ import "./roster-chat.css";
 import { BoardAdvisorLinkPanel, RosterLinkBadge } from "./roster-integrity";
 import { MeetingParticipants } from "./meeting-participants";
 import "./meeting-participants.css";
-import { buildPresence, provenanceParts, resolveProvenanceImage } from "./meeting-presence";
+import { buildPresence, normalizeDisplayImageId } from "./meeting-presence";
 import "./roster-integrity.css";
 import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
 import { RecordComparison, RecordItemEditor, RecordItemList, RecordVersionRow } from "./human-record-items";
@@ -183,6 +183,7 @@ type AdvisorFull = Advisor & {
   rosterEntryId: string;
   rosterVersion: number;
   imageProvenance: string;
+  displayPortraitImageId?: string | null;
 };
 type MeetingFull = Meeting & { brief: string; boardId: string; participantIdsJson?: string };
 const DEFAULT_COMM_PREFS = "Be clear and direct. Explain unfamiliar terms, use practical examples, and finish with actionable next steps.";
@@ -1096,7 +1097,29 @@ function AuthedImg({ id, alt, className }: { id: string; alt: string; className?
 // unchanged) still re-resolves. Legacy 8-char selections resolve only on a
 // single same-entry prefix match, never by guessing. Images from any other
 // roster entry are never used (no wrong identity).
-function usePresencePortraits(entries: { key: string; rosterEntryId: string; provenance: string | null | undefined }[], rev: number, queryTick: number = 0): Map<string, string> {
+// Presence portraits via authorized advisors DTO displayPortraitImageId
+// (server RosterDisplayOps.ResolveDisplayPortrait, same authority as reviewed identity).
+// Loads exact bytes through the existing authorized image path (authed blob URLs),
+// identity-scoped with unmount cleanup. Reject or revoke (even with an unchanged
+// selection id) clears the blob and falls back to initials: the caller bumps
+// rev on every review or selection change and rev is part of the resolution key,
+// and the auth epoch is in the key so a demo Apply-identity still re-resolves.
+// Invalid ids never load; wrong-identity bytes are impossible because the server
+// already scoped the id to the advisor roster entry.
+// Presence portraits via authorized advisors DTO displayPortraitImageId
+// (server RosterDisplayOps.ResolveDisplayPortrait, same authority as reviewed identity).
+// Loads exact bytes through the existing authorized image path (authed blob URLs),
+// identity-scoped with unmount cleanup. Reject or revoke (even with an unchanged
+// selection id) clears the blob and falls back to initials: the caller bumps
+// rev on every review or selection change and rev is part of the resolution key,
+// and the auth epoch is in the key so a demo Apply-identity still re-resolves.
+// Invalid ids never load; wrong-identity bytes are impossible because the server
+// already scoped the id to the advisor roster entry.
+// Freshness: focus, visibility, and advisor refresh re-query the authoritative
+// advisors DTO for the computed display id before loading bytes. Bytes alone
+// cannot prove freshness because an owner-readable image endpoint may still
+// serve a rejected image; the DTO review gate is the authority.
+function useDisplayPortraits(boardId: string, entries: { key: string; displayImageId: string | null | undefined }[], rev: number, queryTick: number = 0): Map<string, string> {
   const [urls, setUrls] = useState<Map<string, string>>(() => new Map());
   const ownedRef = useRef<string[]>([]);
   const [focusTick, setFocusTick] = useState(0);
@@ -1112,7 +1135,7 @@ function usePresencePortraits(entries: { key: string; rosterEntryId: string; pro
       try { document.removeEventListener("visibilitychange", onVis); } catch {}
     };
   }, []);
-  const key = currentToken() + "\n" + currentUser() + "\n" + String(epochNow()) + "\n" + String(rev) + "\n" + String(queryTick) + "\n" + String(focusTick) + "\n" + entries.map((e) => e.key + "=" + e.rosterEntryId + "=" + (e.provenance ?? "")).join("|");
+  const key = currentToken() + "\n" + currentUser() + "\n" + String(epochNow()) + "\n" + String(boardId ?? "") + "\n" + String(rev) + "\n" + String(queryTick) + "\n" + String(focusTick) + "\n" + entries.map((e) => e.key + "=" + (normalizeDisplayImageId(e.displayImageId) ?? "")).join("|");
   useEffect(() => {
     let live = true;
     const myEpoch = epochNow();
@@ -1127,17 +1150,30 @@ function usePresencePortraits(entries: { key: string; rosterEntryId: string; pro
     const made: string[] = [];
     (async () => {
       const next = new Map<string, string>();
+      // Fresh authoritative display ids first: a same-ID reject/revoke changes
+      // the DTO gate but leaves cached props and raw bytes readable for owners,
+      // so bytes alone cannot prove freshness.
+      const freshByKey = new Map<string, string | null>();
+      try {
+        if (boardId) {
+          const fresh = await get<any[]>(`/api/boards/${boardId}/advisors`);
+          if (!live || retired()) return;
+          for (const a of fresh ?? []) {
+            const fid = String((a as any)?.id ?? (a as any)?.Id ?? "");
+            if (!fid) continue;
+            const dispRaw = (a as any)?.displayPortraitImageId ?? (a as any)?.DisplayPortraitImageId ?? null;
+            freshByKey.set(fid, dispRaw ? String(dispRaw) : null);
+          }
+        }
+      } catch { /* fallback to cached entries when the fresh DTO read fails */ }
+      if (!live || retired()) return;
       for (const e of entries) {
         if (!live) return;
         try {
-          const parts = provenanceParts(e.provenance);
-          if (!parts.guid && !parts.legacy8) continue;
-          if (!e.rosterEntryId) continue;
-          const list = await get<{ id: string; review?: string }[]>(`/api/roster/${e.rosterEntryId}/images`);
-          if (!live) return;
-          if (retired()) return;
-          const id = resolveProvenanceImage(parts, list ?? []);
+          const raw = freshByKey.has(e.key) ? freshByKey.get(e.key) : e.displayImageId;
+          const id = normalizeDisplayImageId(raw ?? null);
           if (!id) continue;
+          if (retired()) return;
           const b = await authedBlobUrl("/api/images/" + id);
           if (!live || blobStale(b)) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } continue; }
           if (retired()) { try { URL.revokeObjectURL(b.url); } catch { /* noop */ } return; }
@@ -1149,9 +1185,9 @@ function usePresencePortraits(entries: { key: string; rosterEntryId: string; pro
       ownedRef.current = made.slice();
       setUrls(next);
     })();
-    // Intentionally keyed on the derived string: identity, epoch, review
-    // generation, entry, and provenance changes all re-resolve from accepted
-    // metadata.
+    // Intentionally keyed on the derived string: identity, epoch, board,
+    // review generation, advisor refresh, focus, and display id changes all
+    // re-resolve from authorized DTO metadata.
     return () => { live = false; };
   }, [key]);
   useEffect(() => () => { for (const u of ownedRef.current) { try { URL.revokeObjectURL(u); } catch { /* noop */ } } ownedRef.current = []; }, []);
@@ -4606,9 +4642,9 @@ const testModel = useMutation({
   // the secretary seat, from data App already owns. Per-seat activity is
   // idle/excluded until the backend activity snapshot/events land; approval
   // is never shown as responding and no global pending flag is consulted.
-  const presenceEntries = useMemo(() => tab === "meet" ? (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ key: a.id, rosterEntryId: a.rosterEntryId, provenance: (a.imageProvenance ?? null) as string | null }))) : [], [tab, advisors.data]);
+  const presenceEntries = useMemo(() => tab === "meet" ? (((advisors.data as AdvisorFull[] | undefined) ?? []).filter((a) => !a.removed).map((a) => ({ key: a.id, displayImageId: ((a as AdvisorFull).displayPortraitImageId ?? null) as string | null }))) : [], [tab, advisors.data]);
   const advisorsTick = (advisors as unknown as { dataUpdatedAt?: number })?.dataUpdatedAt ?? 0;
-  const presenceUrls = usePresencePortraits(presenceEntries, portraitRev, advisorsTick);
+  const presenceUrls = useDisplayPortraits(boardId, presenceEntries, portraitRev, advisorsTick);
   const presence = useMemo(() => buildPresence({
     leadName: lead.data?.name ?? "",
     leadRoleLabel: lead.data ? lead.data.roleLabel + " \u00B7 You" : "Board lead",

@@ -1396,6 +1396,7 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
     return Results.Ok(s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed).Select(a =>
     {
       var view = SimCEO.Api.Work.RosterIntegrity.ResolveCanonicalView(s, a);
+      var displayId = RosterDisplayOps.ResolveDisplayPortrait(s, a)?.Id;
       return new
       {
         a.Id, a.BoardId, a.RosterEntryId, a.RosterVersion, a.BoardRole, a.Approved, a.Removed, a.ImageProvenance, a.CreatedAt,
@@ -1404,6 +1405,7 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
         stale = view is null || view.Stale,
         unlinked = view is null,
         behaviorFingerprint = view is null ? ("missing:" + a.RosterEntryId) : view.BehaviorFingerprint,
+        displayPortraitImageId = (Guid?)displayId,
       };
     }).ToList());
   var user = PeopleOps.UserOf(s, req);
@@ -1415,7 +1417,7 @@ app.MapGet("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest 
       try { using var d = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(mm.ParticipantIdsJson) ? "[]" : mm.ParticipantIdsJson); foreach (var e in d.RootElement.EnumerateArray()) if (e.ValueKind == System.Text.Json.JsonValueKind.String && Guid.TryParse(e.GetString(), out var g)) parts.Add(g); } catch { }
   var list = s.Advisors.Values.Where(a => a.BoardId == boardId && !a.Removed && a.Approved);
   if (parts.Count > 0) list = list.Where(a => parts.Contains(a.Id));
-  return Results.Ok(list.Select(a => new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId }).ToList());
+  return Results.Ok(list.Select(a => new { id = a.Id, boardId = a.BoardId, boardRole = a.BoardRole, approved = a.Approved, rosterEntryId = a.RosterEntryId, displayPortraitImageId = RosterDisplayOps.ResolveDisplayPortrait(s, a) == null ? (Guid?)null : RosterDisplayOps.ResolveDisplayPortrait(s, a)!.Id }).ToList());
 });
 
 app.MapPost("/api/boards/{boardId:guid}/advisors", (InMemoryStore s, HttpRequest req, Guid boardId, JsonElement body) =>

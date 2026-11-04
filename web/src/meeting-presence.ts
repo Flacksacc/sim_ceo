@@ -71,6 +71,15 @@ export function isPortraitAccepted(review: string | null | undefined): boolean {
   return review === "accepted" || review === "grandfathered";
 }
 
+// Display portrait id supplied by the authorized advisors DTO
+// (server ResolveDisplayPortrait, same authority as reviewed identity).
+// Only exact GUIDs load bytes; anything else renders the initials fallback.
+export function normalizeDisplayImageId(id: string | null | undefined): string | null {
+  if (!id) return null;
+  const trimmed = id.trim();
+  if (/^[0-9a-fA-F-]{36}$/.test(trimmed)) return trimmed;
+  return null;
+}
 export interface PortraitImage { id: string; review?: string | null }
 
 // Resolve a provenance selection against the advisor OWN roster-entry
