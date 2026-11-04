@@ -1020,9 +1020,11 @@ function AuthPanel() {
   const [password, setPassword] = useState("");
   const [msg, setMsg] = useState("");
   const status = useQuery({ queryKey: ["auth-status"], queryFn: () => getPublic<{ authRequired: boolean; hasAccounts: boolean; accountCount: number; admin: string }>("/api/auth/status") });
-  const meQ = useQuery({ queryKey: ["me"], queryFn: () => get<{ user: string; authenticated: boolean }>("/api/auth/me") });
+  // CURRENT identity/epoch ownership: keys carry live token/user/epoch so retained data from a prior identity/epoch is never reused.
+  const __apToken = currentToken(); const __apUser = currentUser(); const __apEpoch = epochNow();
+  const meQ = useQuery({ queryKey: ["me", __apToken, __apUser, __apEpoch], queryFn: () => get<{ user: string; authenticated: boolean }>("/api/auth/me") });
   type MineRow = { id: string; boardId: string; meetingId: string; userKey: string; active?: boolean; canRejoin?: boolean; meetingTitle?: string; boardName?: string; inviteId?: string };
-  const mine = useQuery({ queryKey: ["my-memberships"], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!meQ.data?.authenticated });
+  const mine = useQuery({ queryKey: ["my-memberships", __apToken, __apUser, __apEpoch], queryFn: () => get<MineRow[]>("/api/me/memberships"), enabled: !!__apToken && !!meQ.data?.authenticated });
   const [rejoinBusy, setRejoinBusy] = useState("");
   const rejoinOpRef = useRef(0);
   const rejoin = async (m: MineRow) => {
@@ -1142,7 +1144,7 @@ function AuthPanel() {
         <button type="button" onClick={doLogout}>Sign out</button>
       </div>
       {msg && <p role="status">{msg}</p>}
-      {(mine.data ?? []).length > 0 && (
+      {!!__apToken && !!meQ.data?.authenticated && (mine.data ?? []).length > 0 && (
         <div>
           <h4>My meetings</h4>
           {(mine.data ?? []).map((m) => {
@@ -1585,7 +1587,8 @@ export default function App() {
         "modelcalls", "status", "model-status", "caps", "voice", "wizreview", "meeting-views", "briefings", "briefing", "me"]) {
         try { qc.removeQueries({ queryKey: [k] }); } catch {}
       }
-      qc.invalidateQueries({ queryKey: ["my-memberships"] });
+      try { qc.cancelQueries({ queryKey: ["my-memberships"] }); } catch {}
+      try { qc.removeQueries({ queryKey: ["my-memberships"] }); } catch {}
       qc.invalidateQueries({ queryKey: ["sess"] });
     } catch {}
     // Secretary continuations join the central transition: bump the epoch so
@@ -7676,8 +7679,8 @@ const testModel = useMutation({
               <h2>{selRow ? selRow.entry.name : "My Advisor Roster (unlimited)"}{" "}</h2>{" "}
               <p>
                 {" "}
-                Roster entries are reusable profile templates. Board copies are
-                independent; no messages or sources travel with a copy.{" "}
+                Roster entries are reusable profile templates. Profile changes apply across boards;
+                messages and sources stay scoped to their board.{" "}
               </p>{" "}
                 <div className="roster-detail" aria-label="Selected advisor">
                   {" "}
