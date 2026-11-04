@@ -817,3 +817,26 @@ Image: `sha256:79457422429507f2908a147006deb0c72858629773e486de5bd9596d82805f2b`
 Backup: `.tmp/update-20261104-184659-UTC-c81861e8`.
 Owned QA services/browser contexts stopped; no background coding agents used;
 `tmp.txt` untouched. The broader parity goal remains paused.
+
+### 2026-11-04 — Automatic saved profile in board creation
+
+Implemented `e16fc81`: board creation now has About, Advisors and Review only.
+The leader form and suggested leader details are removed. Review identifies the
+saved default profile, and new boards inherit it rather than saving board-specific
+leader copies. Legacy draft leader fields are ignored; a draft on the removed
+leader step resumes at Review. Missing defaults link to Your Profile.
+
+Frontend/backend/release builds passed. Extended `qa/wizard-roster-qa.mjs` passed
+with 211 entries, three-step navigation, inherited profile identity, subsequent
+profile updates, legacy override rejection, old-step resume and missing-profile
+checks (`.tmp/automatic-leader-qa.log`). Live light/dark desktop and 390px mobile
+checks passed without page errors or actual wizard writes
+(`.tmp/automatic-leader-live-check.log`). The existing default was available at
+verification; no automatic profile copy was needed or performed. Existing board
+and seven roster entries/profiles were retained.
+
+Healthy deployment on localhost:5173:
+`sha256:64dc4835a8c18e4689d1c133c612cf803056cc626390f5abd92f0f5d9f09d7d8`.
+Backup `.tmp/update-20261104-190212-UTC-869a6ee8`; original database and volumes
+retained. Owned QA services and browsers stopped; no background coding agents.
+`tmp.txt` unchanged; broader parity goal remains paused.
