@@ -8,6 +8,7 @@ const PORT = Number(argIdx >= 0 ? process.argv[argIdx + 1] : 5199);
 let seq = 0;
 const counts = { chat: 0, responses: 0, transcribe: 0, images: 0 };
 const promptLog = [];
+let nextTranscribeFailure = null;
 const DRAFT_SLEEP_ONLY = process.env.QA_DRAFT_SLEEP_ONLY === "1";
 function isBidPrompt(p) { return /Reply with exactly YES or NO/.test(p || ""); }
 function gateWait(text, kind) { const w = sleepMsOf(text, kind); return (DRAFT_SLEEP_ONLY && isBidPrompt(text)) ? 0 : w; }
@@ -191,6 +192,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const rawBuf = await readRaw(req);
+  if (req.method === "POST" && url.pathname === "/__fail-next-transcribe") {
+    let body = {};
+    try { body = JSON.parse(rawBuf.toString("utf8")); } catch {}
+    nextTranscribeFailure = { status: Number(body.status) === 502 ? 502 : 500, body: String(body.body || "qa controlled failure") };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ armed: true }));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/chat/completions") {
     counts.chat++;
     let body = {};
@@ -257,6 +266,13 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/asr/transcribe") {
     counts.transcribe++;
+    if (nextTranscribeFailure) {
+      const failure = nextTranscribeFailure;
+      nextTranscribeFailure = null;
+      res.writeHead(failure.status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: failure.body }));
+      return;
+    }
     try {
       const ctype = String(req.headers["content-type"] || "");
       const mp = parseMultipart(rawBuf, ctype);

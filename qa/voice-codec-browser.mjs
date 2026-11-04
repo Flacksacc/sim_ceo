@@ -462,7 +462,7 @@ try {
     await box.fill("typed hello DURINGREC", { timeout: 15000 });
     const recState = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
     ok("recording-state", recState.pressed === true, JSON.stringify(recState));
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     // Correlated entered gates: blob -> decode -> render, each explicitly
@@ -579,7 +579,7 @@ try {
     await page.waitForTimeout(2000);
     const st = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
     ok("overlap-single-recording", st.pressed === true, JSON.stringify(st));
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(c0.transcribe, "overlap", 30000);
     ok("overlap-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
@@ -625,7 +625,7 @@ try {
     await page.waitForTimeout(2000);
     const st = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
     ok("stale-new-op-unaffected", st.pressed === true, JSON.stringify(st));
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(c0.transcribe, "stale", 30000);
     ok("stale-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
@@ -654,7 +654,7 @@ try {
     await page.waitForTimeout(1500);
     const st = await page.evaluate(() => ({ pressed: document.querySelector("[aria-pressed=true]") !== null }));
     ok("failwait-new-op-unaffected", st.pressed === true, JSON.stringify(st));
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(c0.transcribe, "failwait", 30000);
     ok("failwait-single-hit", c1.transcribe === c0.transcribe + 1, c0.transcribe + "->" + c1.transcribe);
@@ -729,7 +729,7 @@ try {
     await (await requireBox()).fill("conv-blob-origin", { timeout: 15000 });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     const blobId = await waitGateEntered("blob", baselineBlob);
@@ -768,7 +768,7 @@ try {
     await box4.fill("conv-origin", { timeout: 15000 });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     // Decode entered and HELD: cancel by navigation BEFORE release, then
@@ -805,7 +805,7 @@ try {
     await (await requireBox()).fill("conv-render-origin", { timeout: 15000 });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     const rBlob = await waitGateEntered("blob", baselineRen);
@@ -847,7 +847,7 @@ try {
     await (await requireBox()).fill("conv-key-origin", { timeout: 15000 });
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     const kBlob = await waitGateEntered("blob", baselineKey);
@@ -896,7 +896,7 @@ try {
     const holdA = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     // A upstream completes and the proxy holds A downstream body: +1
@@ -919,7 +919,7 @@ try {
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await waitRecording();
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     const bBlob = await waitGateEntered("blob", baselineB);
@@ -1010,7 +1010,7 @@ try {
     transcribeMode = "delay:4000";
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
@@ -1039,7 +1039,7 @@ try {
     const holdE = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     const heldE = await waitHold(holdE, "epoch-provider");
@@ -1074,7 +1074,7 @@ try {
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await waitRecording();
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c2 = await waitForCount(c1.transcribe, "epoch2", 30000);
     await waitTranscribed();
@@ -1114,7 +1114,7 @@ try {
     const errHold = proxy.holdNext("/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     // Failure completion held: the App waits for the ACTUAL API 502 body.
@@ -1175,7 +1175,7 @@ try {
     await waitRecording();
     ok("aborted-body-retry-released", true);
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(cFail.transcribe, "aborted-retry", 30000);
     ok("aborted-body-retry-hit", c1.transcribe === cFail.transcribe + 1, cFail.transcribe + "->" + c1.transcribe);
@@ -1226,7 +1226,7 @@ try {
     const sHold = proxy.errorNext(502, "provider request aborted", "/api/meetings/" + mid + "/transcribe");
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     await page.waitForTimeout(1500);
@@ -1260,7 +1260,7 @@ try {
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await waitRecording();
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     await waitTranscribing();
     // Decode entered and HELD: the error only materializes after release,
@@ -1289,7 +1289,7 @@ try {
     await page.getByRole("button", { name: /Dictate/i }).first().click({ timeout: 15000 });
     await waitRecording();
     await page.waitForTimeout(1800);
-    await page.getByRole("button", { name: /Stop dictation/i }).first().click({ timeout: 15000 });
+    await page.getByRole("button", { name: "Stop and transcribe into draft", exact: true }).first().click({ timeout: 15000 });
     await waitStopped();
     const c1 = await waitForCount(cFail.transcribe, "decode-retry", 30000);
     ok("decode-retry-fresh-hit", c1.transcribe === cFail.transcribe + 1, cFail.transcribe + "->" + c1.transcribe);
