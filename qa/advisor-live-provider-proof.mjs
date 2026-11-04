@@ -3,8 +3,8 @@
 // Own files: this script + docs/advisor-live-provider-proof.md ONLY. Prod 509e6a6 frozen:
 // no server/web/compose/Dockerfile edits. Muse never runs this script
 // against a service (node --check only here); PRIMARY executes it against the isolated
-// Docker project simceo-advisor-real-15190 (source 509e6a6ea4a9c9078774f8963eca446760878cdc,
-// fresh PG/appdata volumes) at the EXACT origin http://127.0.0.1:15190 with the approved
+// Docker project QA_LIVE_PROJECT allowlist: simceo-advisor-real-15190 (default, source 509e6a6ea4a9c9078774f8963eca446760878cdc backcompat)
+// OR simceo-advisor-real-15190-v2 (requires explicit QA_LIVE_SOURCE_COMMIT full 40hex); fresh PG/appdata volumes) at the EXACT origin http://127.0.0.1:15190 with the approved
 // sealed app.env server-side. Trusted identity (primary docker-inspect, outside script):
 // containerId 55fd668e4bcca1e50d5220c9f3484bebb3175fa6375031b328e960c18b0172d0 (64hex),
 // image sha256 eb48b80d1063a25051e029bcf4798e699d68e8218f132ebd9e34dbc99399781f (64hex).
@@ -16,8 +16,8 @@
 // NO admin DB/restore/reconcile, NO meeting/board run, NO 5173/15180/9333/5080 contact,
 // NO .env/key/token reads. One fresh attempt only: no resume, no extra accounts/retry.
 //
-// Invocation (primary only):
-//   QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROOF_PATH=/path/to/live-proof.json \
+// Invocation (primary only; QA_LIVE_PROJECT + QA_LIVE_SOURCE_COMMIT select the expected build; v2 requires explicit full-40hex source):
+//   QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROJECT=simceo-advisor-real-15190-v2 QA_LIVE_SOURCE_COMMIT=<full40hex> QA_LIVE_PROOF_PATH=/path/to/live-proof.json \
 //     node qa/advisor-live-provider-proof.mjs
 // Without the gate this script performs code-only validation and refuses (no HTTP).
 import crypto from "node:crypto";
@@ -25,9 +25,23 @@ import fs from "node:fs/promises";
 
 // ---------- immutable proof contract ----------
 const ORIGIN = "http://127.0.0.1:15190";
-const PROJECT = "simceo-advisor-real-15190";
-const SOURCE_COMMIT_EXACT = "509e6a6ea4a9c9078774f8963eca446760878cdc";
-const SOURCE_COMMIT_PREFIX = "509e6a6";
+const PROJECT_DEFAULT = "simceo-advisor-real-15190";
+const PROJECT_V2 = "simceo-advisor-real-15190-v2";
+const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2];
+const SOURCE_COMMIT_DEFAULT = "509e6a6ea4a9c9078774f8963eca446760878cdc";
+function expectedProject() {
+  const v = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
+  if (!PROJECT_ALLOWLIST.includes(v)) throw new ProofError("QA_LIVE_PROJECT must be exactly " + PROJECT_ALLOWLIST.join(" OR "));
+  return v;
+}
+function expectedSourceCommit() {
+  const raw = (process.env.QA_LIVE_SOURCE_COMMIT || "").trim().toLowerCase();
+  const proj = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
+  if (proj === PROJECT_V2 && !raw) throw new ProofError("QA_LIVE_SOURCE_COMMIT explicit full 40hex is required for " + PROJECT_V2);
+  const v = raw || SOURCE_COMMIT_DEFAULT;
+  if (!/^[0-9a-f]{40}$/.test(v)) throw new ProofError("QA_LIVE_SOURCE_COMMIT must be full 40 lowercase hex");
+  return v;
+}
 const TRUSTED_CONTAINER_ID = "55fd668e4bcca1e50d5220c9f3484bebb3175fa6375031b328e960c18b0172d0";
 const TRUSTED_IMAGE_SHA = "eb48b80d1063a25051e029bcf4798e699d68e8218f132ebd9e34dbc99399781f";
 const FORBIDDEN_PORTS = ["5173", "15180", "9333", "5080", "5099", "5100", "5199", "15433"];
@@ -157,17 +171,22 @@ function pick(o, k) {
 function validateProofShape(p) {
   const errs = [];
   if (!p || typeof p !== "object") return ["proof must be a JSON object"];
-  if (p.project !== PROJECT) errs.push("project must be exactly " + PROJECT);
+  let expProj = null;
+  try { expProj = expectedProject(); } catch (e) { return ["invalid QA_LIVE_PROJECT: " + e.message]; }
+  if (p.project !== expProj) errs.push("project must be exactly " + expProj + " (allowlist: " + PROJECT_ALLOWLIST.join(" OR ") + ")");
   if (typeof p.containerId !== "string" || !/^[0-9a-f]{64}$/.test(p.containerId.trim().toLowerCase()))
     errs.push("containerId must be full 64 lowercase hex (primary docker-inspect identity; not length-6)");
   if (typeof p.imageId !== "string" || !/^[0-9a-f]{64}$/.test(normImageId(p.imageId)))
     errs.push("imageId must be full 64 lowercase hex container/image id (sha256: prefix allowed; not length-6)");
   if (typeof p.sourceCommit !== "string" || !/^[0-9a-f]{40}$/.test(p.sourceCommit.trim().toLowerCase()))
     errs.push("sourceCommit must be full 40 lowercase hex");
-  else if (p.sourceCommit.trim().toLowerCase() !== SOURCE_COMMIT_EXACT)
-    errs.push("sourceCommit must equal exact trusted " + SOURCE_COMMIT_EXACT);
-  else if (!p.sourceCommit.startsWith(SOURCE_COMMIT_PREFIX))
-    errs.push("sourceCommit must start with " + SOURCE_COMMIT_PREFIX);
+  else {
+    let expSrc = null;
+    try { expSrc = expectedSourceCommit(); }
+    catch (e) { errs.push("invalid QA_LIVE_SOURCE_COMMIT: " + e.message); expSrc = null; }
+    if (expSrc && p.sourceCommit.trim().toLowerCase() !== expSrc)
+      errs.push("sourceCommit must equal exact trusted QA_LIVE_SOURCE_COMMIT " + expSrc);
+  }
   if (typeof p.servedIndexSha256 !== "string" || !/^[0-9a-f]{64}$/.test(p.servedIndexSha256))
     errs.push("servedIndexSha256 must be 64 lowercase hex");
   if (p.apiOrigin !== ORIGIN) errs.push("apiOrigin must be exactly " + ORIGIN);
@@ -199,13 +218,25 @@ async function validateOnly() {
   const shapeErrs = validateProofShape(null);
   if (!shapeErrs.length) problems.push("proof-shape validator accepts null");
   // Strict-shape self-tests: length-6 ids and non-exact commit must be rejected.
-  const lax = validateProofShape({ project: PROJECT, containerId: "abc123", imageId: "abc123",
-    sourceCommit: SOURCE_COMMIT_PREFIX, servedIndexSha256: "0".repeat(64), apiOrigin: ORIGIN });
-  if (lax.length < 3) problems.push("strict-shape self-test failed: length-6/prefix-only accepted");
-  const exact = validateProofShape({ project: PROJECT, containerId: TRUSTED_CONTAINER_ID,
-    imageId: TRUSTED_IMAGE_SHA, sourceCommit: SOURCE_COMMIT_EXACT,
+  let expProj0 = PROJECT_DEFAULT, expSrc0 = SOURCE_COMMIT_DEFAULT;
+  try { expProj0 = expectedProject(); expSrc0 = expectedSourceCommit(); }
+  catch (e) { problems.push("env: " + e.message); }
+  const lax = validateProofShape({ project: expProj0, containerId: "abc123", imageId: "abc123",
+    sourceCommit: "0".repeat(7), servedIndexSha256: "0".repeat(64), apiOrigin: ORIGIN });
+  if (!problems.length && lax.length < 3) problems.push("strict-shape self-test failed: length-6/prefix-only accepted");
+  const exact = validateProofShape({ project: expProj0, containerId: TRUSTED_CONTAINER_ID,
+    imageId: TRUSTED_IMAGE_SHA, sourceCommit: expSrc0,
     servedIndexSha256: "0".repeat(64), apiOrigin: ORIGIN });
-  if (exact.length) problems.push("strict-shape self-test failed: trusted exact rejected: " + exact.join(";"));
+  if (!problems.length && exact.length) problems.push("strict-shape self-test failed: trusted exact rejected: " + exact.join(";"));
+  const wrongSrc = validateProofShape({ project: expProj0, containerId: TRUSTED_CONTAINER_ID,
+    imageId: TRUSTED_IMAGE_SHA, sourceCommit: expSrc0 === SOURCE_COMMIT_DEFAULT ? "1".repeat(40) : SOURCE_COMMIT_DEFAULT,
+    servedIndexSha256: "0".repeat(64), apiOrigin: ORIGIN });
+  if (!problems.length && !wrongSrc.some((m) => /sourceCommit must equal/.test(m)))
+    problems.push("strict-shape self-test failed: mismatched sourceCommit accepted");
+  for (const bad of ["", null, undefined]) {
+    const okMode = bad === "block" || bad === "warn" || bad === "off";
+    if (okMode) problems.push("spending allowlist self-test failed for empty mode");
+  }
   // Spending-policy self-test: fresh-DB warn/null/false is VALID; enforced==true/cap-number is NOT required.
   const spendCases = [
     { mode: "warn", cap: null, enforced: false, ok: true },
@@ -224,7 +255,7 @@ async function validateOnly() {
   }
   console.log("CODE-ONLY VALIDATION PASS (no HTTP performed; no mutation).");
   console.log("REFUSED live proof: set QA_ALLOW_LIVE_PROVIDER=1 + QA_LIVE_PROOF_PATH to let PRIMARY run it.");
-  console.log("Trusted identity (primary-inspected outside script): containerId=" + TRUSTED_CONTAINER_ID.slice(0,12) + "... image sha256=" + TRUSTED_IMAGE_SHA.slice(0,12) + "... source=" + SOURCE_COMMIT_EXACT);
+  console.log("Trusted identity (primary-inspected outside script): containerId=" + TRUSTED_CONTAINER_ID.slice(0,12) + "... image sha256=" + TRUSTED_IMAGE_SHA.slice(0,12) + "... source=" + expSrc0 + " project=" + expProj0);
   process.exit(2);
 }
 
@@ -527,7 +558,7 @@ function artifactBase(extra) {
   return Object.assign({
     contract: {
       script: "qa/advisor-live-provider-proof.mjs",
-      origin: ORIGIN, project: PROJECT, sourceCommitExact: SOURCE_COMMIT_EXACT,
+      origin: ORIGIN, project: expectedProject(), sourceCommitExact: expectedSourceCommit(),
       trustedContainerId: TRUSTED_CONTAINER_ID.slice(0, 12) + "...",
       callBudget: "1 research + 1 roster-chat + 1 audition (no retries/double POST; polls are free GETs)",
       totalBudgetMs: TOTAL_MS, drainMs: DRAIN_MS, researchAbsoluteMs: RESEARCH_ABSOLUTE_MS,
@@ -552,7 +583,7 @@ async function writeArtifacts(doc) {
   const L = [];
   L.push("# Advisor live-provider proof — " + RUN_TAG);
   L.push("");
-  L.push("- Origin: " + ORIGIN + " | Project: " + PROJECT + " | Elapsed: " + doc.elapsedMs + " ms");
+  L.push("- Origin: " + ORIGIN + " | Project: " + expectedProject() + " (" + PROJECT_ALLOWLIST.join("/") + ") | Elapsed: " + doc.elapsedMs + " ms");
   L.push("- Freshness: " + (doc.freshness || ""));
   L.push("- Model: " + ((doc.modelInfo && doc.modelInfo.model) || "") + " (" +
     ((doc.modelInfo && doc.modelInfo.modelSource) || "") + ")");

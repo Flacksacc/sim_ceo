@@ -9,15 +9,14 @@ control — code-only check + refusal gate.
 ## What it proves (bounded, actual provider)
 
 One fictional public-domain advisor (**Sherlock Holmes**) through the REAL routes against the
-isolated Docker project `simceo-advisor-real-15190`
-(source exact `509e6a6ea4a9c9078774f8963eca446760878cdc`, fresh PG/appdata volumes)
+isolated Docker project selected by `QA_LIVE_PROJECT` (allowlist exactly `simceo-advisor-real-15190` OR `simceo-advisor-real-15190-v2`)
+(expected source pinned by `QA_LIVE_SOURCE_COMMIT` full 40hex, mandatory match against trusted proof `sourceCommit`; default `509e6a6ea4a9c9078774f8963eca446760878cdc` backcompat for the old project, explicit full-40hex required for `-v2`; fresh PG/appdata volumes)
 at the EXACT origin `http://127.0.0.1:15190`:
 
 1. Trusted primary proof JSON (`QA_LIVE_PROOF_PATH`) pins `project`, `containerId` (full 64hex),
-   `imageId` (full 64hex, `sha256:` prefix allowed), `sourceCommit` (full 40hex, exact
-   `509e6a6ea4a9c9078774f8963eca446760878cdc`), `servedIndexSha256` (64hex),
+   `imageId` (full 64hex, `sha256:` prefix allowed), `sourceCommit` (full 40hex, exact match to `QA_LIVE_SOURCE_COMMIT` (default `509e6a6ea4a9c9078774f8963eca446760878cdc`), `servedIndexSha256` (64hex),
    `apiOrigin` (exactly `http://127.0.0.1:15190`). Actual trusted identity (primary
-   docker-inspect OUTSIDE the script, currently pristine no accounts):
+   docker-inspect OUTSIDE the script; the fresh project under test must be pristine no accounts):
    containerId `55fd668e4bcca1e50d5220c9f3484bebb3175fa6375031b328e960c18b0172d0`,
    image sha256 `eb48b80d1063a25051e029bcf4798e699d68e8218f132ebd9e34dbc99399781f`.
    The script only validates the fields (length-6 ids and prefix-only commits rejected).
@@ -34,7 +33,7 @@ at the EXACT origin `http://127.0.0.1:15190`:
 4. Real configured model status + admin spending in its ACTUAL allowed mode. Fresh-DB
    default `warn` / cap `null` / `enforced=false` is a VALID policy — the script does NOT
    invent a mandatory enforced-cap=true/number requirement (primary never requested force-cap).
-   Read: mode `warn`/`block`/`off`, cap number OR null, `enforced === (mode==block && cap!=null)`,
+   Read: mode `warn`/`block`/`off` ONLY (empty mode fails closed: the first actual run stopped here with zero paid calls on the real fresh-product empty-Mode default bug; the fixed source must present a real mode, `warn` goal legitimate), cap number OR null, `enforced === (mode==block && cap!=null)`,
    effective `overCap` (`cap!=null && known>=cap`) in `block` mode stops paid calls.
    Policy is observed, never changed (no settings/spending PUTs). Bounded to
    1 research + 1 chat + 1 audition (+1 addl ready authorized).
@@ -76,13 +75,15 @@ the doc. No unhandled-rejection swallows (first unhandled turns the run FAIL).
 
 ## Invocation (primary only)
 
-Set QA_ALLOW_LIVE_PROVIDER=1 and QA_LIVE_PROOF_PATH to the trusted live-proof JSON, then run:
-node qa/advisor-live-provider-proof.mjs
+Set QA_ALLOW_LIVE_PROVIDER=1, QA_LIVE_PROJECT, QA_LIVE_SOURCE_COMMIT, and QA_LIVE_PROOF_PATH to the trusted live-proof JSON, then run:
+QA_LIVE_PROJECT=simceo-advisor-real-15190-v2 QA_LIVE_SOURCE_COMMIT=<fixed-source-full-40hex> QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROOF_PATH=/path/to/live-proof.json node qa/advisor-live-provider-proof.mjs
 
-Proof JSON contract (all required): project must be simceo-advisor-real-15190, containerId full
+Proof JSON contract (all required): project must equal QA_LIVE_PROJECT (allowlist exactly simceo-advisor-real-15190 OR simceo-advisor-real-15190-v2), containerId full
 64 lowercase hex (primary docker-inspect identity), imageId full 64 hex (`sha256:` prefix
-allowed), sourceCommit full 40 hex equal to 509e6a6ea4a9c9078774f8963eca446760878cdc,
+allowed), sourceCommit full 40 hex exactly equal to QA_LIVE_SOURCE_COMMIT (default 509e6a6ea4a9c9078774f8963eca446760878cdc backcompat; explicit full-40hex mandatory for -v2),
 servedIndexSha256 64 lowercase hex, apiOrigin exactly http://127.0.0.1:15190.
+
+First actual run (old project `simceo-advisor-real-15190`) stopped fail-closed at the spending gate with `Mode` empty before research/chat/audition (zero paid calls), confirming the real fresh-product default bug (separate fix underway); its stack data stays preserved untouched (no resume/accounts/deletes by this script). The `-v2` rerun is a NEW fresh Docker project reusing origin 15190 with the fixed source: one fresh attempt only, no paid retries. Strict `fetched===true` evidence and the ONE absolute 15s cleanup allowance are unchanged. Same-API-origin 15190, full container/image 64hex, and served-index proof requirements are unchanged.
 
 No resume envs. Optional override QA_LIVE_RESULT_PATH for the owned result artifact location
 (default qa/proof/advisor-live-provider-proof-<runTag>.json, plus a .md twin).
