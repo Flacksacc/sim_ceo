@@ -78,11 +78,14 @@ for(const role of ['Operator Fast','Finance Slow']) {
   const first = log.find(p=>p.full.includes('YOUR TURN')&&!p.full.includes('PEER-REVIEW TURN:')&&p.full.includes('BOARD ROLE (board-specific, not canonical): '+role));
   assert.ok(first.full.includes('CEO-BACKGROUND-ONLY')&&first.full.includes('BACKSTORY '+role));
   assert.ok(first.full.includes('Never invent')&&first.full.includes('primary lens'));
+  for(const instruction of ['subject-matter expert','concise and accurate','FamiliarTopics','SimplerTopics','never talk down']) assert.ok(first.full.includes(instruction), 'Delivered expert/knowledge-adaptation instruction: '+instruction);
+  assert.ok(first.full.includes('Sales')&&first.full.includes('Cash flow'));
 }
 const firstDispatches = log.filter(p=>p.full.includes('YOUR TURN')&&!p.full.includes('PEER-REVIEW TURN:'));
 assert.equal(firstDispatches.length,2); assert.ok(Math.abs(firstDispatches[0].t-firstDispatches[1].t)<500,'Workers dispatch in parallel');
 const reviews = log.filter(p=>p.full.includes('PEER-REVIEW TURN:'));
 assert.equal(reviews.length,2);
+assert.ok(reviews.every(p=>p.full.includes('subject-matter expert')&&p.full.includes('FamiliarTopics')&&p.full.includes('SimplerTopics')));
 assert.ok(reviews.every(p=>p.full.includes('QA first reply from Operator Fast')&&p.full.includes('QA first reply from Finance Slow')));
 await ok('POST',`/api/meetings/${m.id}/run`,{prompt:question});
 assert.equal((await replies(m)).length,4,'Retry never exceeds two posts per advisor per CEO turn');
@@ -113,6 +116,7 @@ const chat = await ok('POST',`/api/roster/${advisors[0].rosterId}/chat`,{message
 assert.ok(chat.answer);
 const chatLog=(await(await fetch(fake+'/__log')).json()).findLast(p=>p.full.includes('CEO-CHAT-ONLY'));
 assert.ok(chatLog.full.includes('CEO-BACKGROUND-UPDATED')&&chatLog.full.includes('BACKSTORY Operator Fast'));
+assert.ok(chatLog.full.includes('subject-matter expert')&&chatLog.full.includes('FamiliarTopics')&&chatLog.full.includes('SimplerTopics'));
 assert.ok(chatLog.full.includes('HISTORY-ITEM-11-END')&&!chatLog.full.includes('HISTORY-ITEM-0-END'));
 const bad = await meeting('Bad selector result'); await lead(bad,'QA-SELECT-BAD');
 assert.equal((await call('POST',`/api/meetings/${bad.id}/run`,{prompt:'QA-SELECT-BAD'})).status,502);
