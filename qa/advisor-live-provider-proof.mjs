@@ -4,7 +4,8 @@
 // no server/web/compose/Dockerfile edits. Muse never runs this script
 // against a service (node --check only here); PRIMARY executes it against the isolated
 // Docker project QA_LIVE_PROJECT allowlist: simceo-advisor-real-15190 (default, source 509e6a6ea4a9c9078774f8963eca446760878cdc backcompat)
-// OR simceo-advisor-real-15190-v2 (requires explicit QA_LIVE_SOURCE_COMMIT full 40hex); fresh PG/appdata volumes) at the EXACT origin http://127.0.0.1:15190 with the approved
+// OR simceo-advisor-real-15190-v2 (requires explicit QA_LIVE_SOURCE_COMMIT full 40hex)
+// OR simceo-advisor-real-15190-v3 (forthcoming fresh stack; requires explicit QA_LIVE_SOURCE_COMMIT full 40hex = actual primary integrated HEAD at proof time, never a hardcoded older SHA); fresh PG/appdata volumes) at the EXACT origin http://127.0.0.1:15190 with the approved
 // sealed app.env server-side. Trusted identity (primary docker-inspect, outside script):
 // containerId 55fd668e4bcca1e50d5220c9f3484bebb3175fa6375031b328e960c18b0172d0 (64hex),
 // image sha256 eb48b80d1063a25051e029bcf4798e699d68e8218f132ebd9e34dbc99399781f (64hex).
@@ -16,7 +17,7 @@
 // NO admin DB/restore/reconcile, NO meeting/board run, NO 5173/15180/9333/5080 contact,
 // NO .env/key/token reads. One fresh attempt only: no resume, no extra accounts/retry.
 //
-// Invocation (primary only; QA_LIVE_PROJECT + QA_LIVE_SOURCE_COMMIT select the expected build; v2 requires explicit full-40hex source):
+// Invocation (primary only; QA_LIVE_PROJECT + QA_LIVE_SOURCE_COMMIT select the expected build; v2/v3 require explicit full-40hex source):
 //   QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROJECT=simceo-advisor-real-15190-v2 QA_LIVE_SOURCE_COMMIT=<full40hex> QA_LIVE_PROOF_PATH=/path/to/live-proof.json \
 //     node qa/advisor-live-provider-proof.mjs
 // Without the gate this script performs code-only validation and refuses (no HTTP).
@@ -27,7 +28,8 @@ import fs from "node:fs/promises";
 const ORIGIN = "http://127.0.0.1:15190";
 const PROJECT_DEFAULT = "simceo-advisor-real-15190";
 const PROJECT_V2 = "simceo-advisor-real-15190-v2";
-const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2];
+const PROJECT_V3 = "simceo-advisor-real-15190-v3";
+const PROJECT_ALLOWLIST = [PROJECT_DEFAULT, PROJECT_V2, PROJECT_V3];
 const SOURCE_COMMIT_DEFAULT = "509e6a6ea4a9c9078774f8963eca446760878cdc";
 function expectedProject() {
   const v = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
@@ -37,7 +39,7 @@ function expectedProject() {
 function expectedSourceCommit() {
   const raw = (process.env.QA_LIVE_SOURCE_COMMIT || "").trim().toLowerCase();
   const proj = (process.env.QA_LIVE_PROJECT || "").trim() || PROJECT_DEFAULT;
-  if (proj === PROJECT_V2 && !raw) throw new ProofError("QA_LIVE_SOURCE_COMMIT explicit full 40hex is required for " + PROJECT_V2);
+  if ((proj === PROJECT_V2 || proj === PROJECT_V3) && !raw) throw new ProofError("QA_LIVE_SOURCE_COMMIT explicit full 40hex is required for " + proj);
   const v = raw || SOURCE_COMMIT_DEFAULT;
   if (!/^[0-9a-f]{40}$/.test(v)) throw new ProofError("QA_LIVE_SOURCE_COMMIT must be full 40 lowercase hex");
   return v;
@@ -458,6 +460,22 @@ async function runResearch(token, id) {
     check("research-inputs-urls", Array.isArray(inputs.sourceUrls) && SOURCE_URLS.every((u) => inputs.sourceUrls.includes(u)),
       "urls=" + JSON.stringify((inputs && inputs.sourceUrls) || []));
   }
+  // Full returned research claims retained (bounded) for dedicated semantic review.
+  // Retention is not grounding: excerpts/quotes alone do not prove claim truth.
+  const rawClaims = Array.isArray(pick(cur, "claims")) ? pick(cur, "claims") : [];
+  const retainedClaims = rawClaims.slice(0, 30).map((c) => ({
+    angle: String((c && c.angle) || ""),
+    text: String((c && c.text) || "").slice(0, 4000),
+    sources: Array.isArray(c && c.sources) ? c.sources.slice(0, 5).map((x) => ({
+      url: String((x && x.url) || ""), title: String((x && x.title) || "").slice(0, 200),
+    })) : [],
+    refs: Array.isArray(c && c.refs) ? c.refs.slice(0, 5).map((x) => ({
+      kind: String((x && x.kind) || ""), ref: String((x && x.ref) || "").slice(0, 500),
+      url: String((x && x.url) || ""), title: String((x && x.title) || "").slice(0, 200),
+      excerpt: String((x && x.excerpt) || "").slice(0, 1000),
+      fetched: (x && Object.prototype.hasOwnProperty.call(x, "fetched")) ? (x.fetched === true) : null,
+    })) : [],
+  }));
   return {
     elapsedMs: Date.now() - researchStart, stages, stage, draftStatus,
     inputs,
@@ -466,6 +484,7 @@ async function runResearch(token, id) {
       excerpt: String(s.excerpt || "").slice(0, 500), fetched: s.fetched === true,
     })),
     draftParas: paras, researchBaseVersion: pick(cur, "version"),
+    claims: retainedClaims, claimsTotalN: rawClaims.length,
   };
 }
 async function canonicalEntry(token, id) {
@@ -571,7 +590,8 @@ function artifactBase(extra) {
     structuralChecks: structural,
     meetingIntegration: "NOT CLAIMED: no board created/joined/run; boards count asserted unchanged.",
     semanticGate: "PENDING: dedicated AI semantic review of paragraphs/chat/audition still required; " +
-      "structural checks above are not model self-rating or claim-tone proof.",
+      "structural checks above are not model self-rating or claim-tone proof. " +
+      "Full returned research claims are retained in research.claims for that review; structural counts and semantics are separate.",
   }, extra || {});
 }
 async function writeArtifacts(doc) {
@@ -599,6 +619,7 @@ async function writeArtifacts(doc) {
   L.push("## Evidence-backed URLs");
   for (const e of ((doc.research && doc.research.evidence) || []))
     L.push("- [" + (e.title || e.url) + "](" + e.url + ") fetched=" + e.fetched);
+  L.push("- Full returned research claims retained: " + (((doc.research && doc.research.claims) || []).length) + " of " + ((doc.research && doc.research.claimsTotalN) ?? "?") + " (retention is not grounding; dedicated semantic review still required).");
   L.push("");
   for (const k of PARA_KEYS) {
     L.push("## " + k);

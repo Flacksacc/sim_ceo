@@ -9,8 +9,8 @@ control — code-only check + refusal gate.
 ## What it proves (bounded, actual provider)
 
 One fictional public-domain advisor (**Sherlock Holmes**) through the REAL routes against the
-isolated Docker project selected by `QA_LIVE_PROJECT` (allowlist exactly `simceo-advisor-real-15190` OR `simceo-advisor-real-15190-v2`)
-(expected source pinned by `QA_LIVE_SOURCE_COMMIT` full 40hex, mandatory match against trusted proof `sourceCommit`; default `509e6a6ea4a9c9078774f8963eca446760878cdc` backcompat for the old project, explicit full-40hex required for `-v2`; fresh PG/appdata volumes)
+isolated Docker project selected by `QA_LIVE_PROJECT` (allowlist exactly `simceo-advisor-real-15190` OR `simceo-advisor-real-15190-v2` OR `simceo-advisor-real-15190-v3`)
+(expected source pinned by `QA_LIVE_SOURCE_COMMIT` full 40hex, mandatory match against trusted proof `sourceCommit`; default `509e6a6ea4a9c9078774f8963eca446760878cdc` backcompat for the old project, explicit full-40hex required for `-v2`/`-v3`; fresh PG/appdata volumes)
 at the EXACT origin `http://127.0.0.1:15190`:
 
 1. Trusted primary proof JSON (`QA_LIVE_PROOF_PATH`) pins `project`, `containerId` (full 64hex),
@@ -76,14 +76,20 @@ the doc. No unhandled-rejection swallows (first unhandled turns the run FAIL).
 ## Invocation (primary only)
 
 Set QA_ALLOW_LIVE_PROVIDER=1, QA_LIVE_PROJECT, QA_LIVE_SOURCE_COMMIT, and QA_LIVE_PROOF_PATH to the trusted live-proof JSON, then run:
-QA_LIVE_PROJECT=simceo-advisor-real-15190-v2 QA_LIVE_SOURCE_COMMIT=<fixed-source-full-40hex> QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROOF_PATH=/path/to/live-proof.json node qa/advisor-live-provider-proof.mjs
+QA_LIVE_PROJECT=simceo-advisor-real-15190-v3 QA_LIVE_SOURCE_COMMIT=<actual-primary-integrated-HEAD-full-40hex> QA_ALLOW_LIVE_PROVIDER=1 QA_LIVE_PROOF_PATH=/path/to/live-proof.json node qa/advisor-live-provider-proof.mjs
 
-Proof JSON contract (all required): project must equal QA_LIVE_PROJECT (allowlist exactly simceo-advisor-real-15190 OR simceo-advisor-real-15190-v2), containerId full
+Proof JSON contract (all required): project must equal QA_LIVE_PROJECT (allowlist exactly simceo-advisor-real-15190 OR simceo-advisor-real-15190-v2 OR simceo-advisor-real-15190-v3), containerId full
 64 lowercase hex (primary docker-inspect identity), imageId full 64 hex (`sha256:` prefix
-allowed), sourceCommit full 40 hex exactly equal to QA_LIVE_SOURCE_COMMIT (default 509e6a6ea4a9c9078774f8963eca446760878cdc backcompat; explicit full-40hex mandatory for -v2),
+allowed), sourceCommit full 40 hex exactly equal to QA_LIVE_SOURCE_COMMIT (default 509e6a6ea4a9c9078774f8963eca446760878cdc backcompat; explicit full-40hex mandatory for -v2/-v3),
 servedIndexSha256 64 lowercase hex, apiOrigin exactly http://127.0.0.1:15190.
 
 First actual run (old project `simceo-advisor-real-15190`) stopped fail-closed at the spending gate with `Mode` empty before research/chat/audition (zero paid calls), confirming the real fresh-product default bug (separate fix underway); its stack data stays preserved untouched (no resume/accounts/deletes by this script). The `-v2` rerun is a NEW fresh Docker project reusing origin 15190 with the fixed source: one fresh attempt only, no paid retries. Strict `fetched===true` evidence and the ONE absolute 15s cleanup allowance are unchanged. Same-API-origin 15190, full container/image 64hex, and served-index proof requirements are unchanged.
+
+## v2 outcome record (not overwritten) + forthcoming v3
+
+- v2 run (`simceo-advisor-real-15190-v2`): structural checks 62/62 PASS. Structural only — counts are not semantic ratings.
+- Dedicated semantic review of the v2 artifact: character behavior PASS for the sampled Holmes scenario (cautious reasoning, no overclaim on uncertain testimony), but stored claim attribution FAIL — every dossier claim carries the same three citations, one with an empty excerpt, whose retained excerpts do not substantiate the twelve distinct publication/method/forensic/cipher claims (product provenance defect). This does NOT support an unqualified semantic-and-evidence release PASS. The v2 record stands as-is; nothing here overwrites it.
+- New production pipeline `cbc8086` is under review. The eventual v3 proof (`simceo-advisor-real-15190-v3`, forthcoming fresh stack at the same exact origin `http://127.0.0.1:15190`) uses the actual primary integrated HEAD at proof time as `QA_LIVE_SOURCE_COMMIT` (explicit full 40hex) — never a hardcoded older SHA. All other proof requirements (fresh volumes, pristine accountCount=0, strict `fetched===true` evidence, one fresh attempt, call budget, 480s TOTAL + one 15s cleanup allowance, full 64hex container/image + served-index proof) are unchanged.
 
 No resume envs. Optional override QA_LIVE_RESULT_PATH for the owned result artifact location
 (default qa/proof/advisor-live-provider-proof-<runTag>.json, plus a .md twin).
@@ -91,7 +97,7 @@ No resume envs. Optional override QA_LIVE_RESULT_PATH for the owned result artif
 ## Outputs
 
 - qa/proof/advisor-live-provider-proof-<runTag>.json — full structural record (provenance,
-  freshness, model/spending, research stages + elapsed + evidence snippets, 3 paragraphs,
+  freshness, model/spending, research stages + elapsed + evidence snippets, full returned research claims (`research.claims`, bounded) + 3 paragraphs,
   chat/audition answers, structural checks).
 - .md twin — human-readable paragraphs, evidence-backed URLs, elapsed/research stages,
   answers, and check list, for primary + dedicated AI review.
@@ -99,7 +105,7 @@ No resume envs. Optional override QA_LIVE_RESULT_PATH for the owned result artif
 ## Remaining semantic gate (NOT closed by this script)
 
 Automatic checks are structural only (status codes, shapes, version pins, byte equality).
-They are not model self-rating or claim-tone proof. The paragraphs, chat answer, and audition
+They are not model self-rating or claim-tone proof. Structural counts (e.g. 62/62) and semantics are separate: retaining claims/excerpts alongside the compiled paragraphs does not prove claim truth — that is the job of the dedicated semantic review. The paragraphs, chat answer, and audition
 answer still require dedicated AI semantic review (grounding fidelity to the two upstream
 URLs, no overclaiming on uncertain testimony, in-character consistency) before any claim that
 the provider path is qualitatively good. semanticGate PENDING in the artifact records this.
