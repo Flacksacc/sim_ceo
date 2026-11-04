@@ -16,6 +16,7 @@ for (const pair of [[ "QA_API", API, 15320 ], [ "QA_WEB", WEB, 15321 ], [ "QA_FA
   if (nm === "QA_WEB" && v === API) { /* WEB same API origin allowed */ }
   else if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
   if (/:5080|:5173|:9333/.test(v)) { console.error("REFUSE reserved port " + nm); process.exit(2); }
+  try { const uu = new URL(v); if (uu.search || uu.hash || uu.username || uu.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo"); process.exit(2); } } catch { console.error("REFUSE bad " + nm); process.exit(2); }
 }
 const PROV = process.env.SIMCEO_INSTANCE || process.env.QA_PROVENANCE || "";
 if (!PROV) { console.error("REFUSE missing provenance: primary must launch the owned API with SIMCEO_INSTANCE set"); process.exit(2); }
@@ -28,6 +29,9 @@ if (!EDGE) { console.error("REFUSE no Edge binary"); process.exit(2); }
 let pass = 0, fail = 0;
 const failures = [];
 const consoleErrors = [];
+function preflight(name, cond, extra) {
+  if (cond) { pass++; } else { console.log("  FAIL " + name + (extra ? " :: " + extra : "")); console.error("PREFLIGHT FAIL " + name); process.exit(2); }
+}
 function ok(name, cond, extra) {
   if (cond) { pass++; } else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
 }
@@ -61,7 +65,8 @@ async function safeErrors() { return consoleErrors.slice(0, 5).join(" | ").slice
 async function canonState(did, tok) {
   const d = await api("GET", "/api/records/" + did, undefined, tok);
   const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
-  return JSON.stringify({ items: d.json && d.json.itemsJson, ap: d.json && d.json.approvedJson, dc: d.json && d.json.discardedJson, hist: d.json && d.json.historyJson, v: d.json && d.json.version, h: d.json && d.json.hash, tok: d.json && d.json.reviewToken, wm: d.json && d.json.watermark, pend: r.json && r.json.pending, appr: r.json && r.json.approved, hc: r.json && r.json.historyCount });
+  if (d.status !== 200 || r.status !== 200) throw new Error("canonState requires 200 got " + d.status + "/" + r.status);
+  return JSON.stringify({ items: d.json && d.json.itemsJson, ap: d.json && d.json.approvedJson, dc: d.json && d.json.discardedJson, hist: d.json && d.json.historyJson, v: d.json && d.json.version, h: d.json && d.json.hash, tok: d.json && d.json.reviewToken, wm: d.json && d.json.watermark, rev: d.json && d.json.reviewRevision, st: d.json && d.json.status, dec: d.json && d.json.decided, sup: d.json && d.json.supersedesJson, pend: r.json && r.json.pending, appr: r.json && r.json.approved, disc: r.json && r.json.discarded, hc: r.json && r.json.historyCount, eff: r.json && r.json.effectiveHeadId });
 }
 async function pendingOrdinals(did, tok) {
   const r = await api("GET", "/api/records/" + did + "/review", undefined, tok);
@@ -85,9 +90,10 @@ async function uploadPortrait(rid, tok) {
 }
 let watchdog;
 let timedOut = false;
+let cleanupFailed = false;
 async function boundedClose(p, ms, label) {
   try { await Promise.race([p(), new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timeout")), ms))]); }
-  catch (e) { console.log("CLEANUP " + label + ": " + String((e && e.message) || e).slice(0, 200)); }
+  catch (e) { cleanupFailed = true; console.log("CLEANUP " + label + ": " + String((e && e.message) || e).slice(0, 200)); }
 }
 async function cleanup() {
   if (watchdog) clearTimeout(watchdog);
@@ -123,11 +129,11 @@ async function main() {
   ok("app-loads", true);
   {
     const h = await api("GET", "/health", null, null);
-    ok("preflight-health", h.status === 200 && h.json && h.json.ok === true, String(h.status));
-    ok("preflight-health-instance", h.json && String(h.json.instance || h.json.Instance) === PROV, "instance=" + String(h.json && (h.json.instance || h.json.Instance)));
+    preflight("preflight-health", h.status === 200 && h.json && h.json.ok === true, String(h.status));
+    preflight("preflight-health-instance", h.json && String(h.json.instance || h.json.Instance) === PROV, "instance=" + String(h.json && (h.json.instance || h.json.Instance)));
     const be = await api("GET", "/api/backend", null, null);
     const mode = String((be.json && (be.json.mode || be.json.Mode)) || "").toLowerCase();
-    ok("preflight-backend-memory", mode === "memory", "mode=" + mode);
+    preflight("preflight-backend-memory", mode === "memory", "mode=" + mode);
     const fh = await (async () => {
       const ctl = new AbortController();
       const tm = setTimeout(() => ctl.abort(), 30000);
@@ -138,7 +144,7 @@ async function main() {
         return { status: r.status, json };
       } finally { clearTimeout(tm); }
     })();
-    ok("preflight-fake-scoped", fh.status === 200 && fh.json && fh.json.fake === "records5-scoped", String(fh.status));
+    preflight("preflight-fake-scoped", fh.status === 200 && fh.json && fh.json.fake === "records5-scoped", String(fh.status));
   }
   const ownerEmail = run + "-owner@qa.invalid";
   const strangerEmail = run + "-stranger@qa.invalid";
@@ -153,6 +159,14 @@ async function main() {
   ok("seed-reader", regR.status === 201 && regR.json && regR.json.token, String(regR.status));
   const reader = regR.json.token;
   await ctx.addInitScript((tok) => window.localStorage.setItem("simceo-token", tok), owner);
+  await page.reload({ waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction(() => { const r = document.querySelector("#root"); return !!(r && r.innerText && r.innerText.trim().length > 0); }, null, { timeout: T.goto });
+  {
+    const stored = await page.evaluate(() => window.localStorage.getItem("simceo-token"));
+    ok("browser-token-bootstrapped", stored === owner, "browser storage missing owner token");
+    const me = await api("GET", "/api/auth/me", undefined, owner);
+    ok("browser-auth-me-owned", me.status === 200 && (me.json.authenticated === true || me.json.Authenticated === true), String(me.status));
+  }
   const board = await api("POST", "/api/boards", { name: run + "-board", mission: run + " mission", stage: "qa" }, owner);
   ok("seed-board", board.status === 201 && board.json.id, String(board.status));
   const bid = board.json.id;
@@ -208,7 +222,7 @@ async function main() {
   ok("one-doc-no-guid-leak", !(await bodyHas(gidA)) && !(await bodyHas(gidB)) && !(await bodyHas(gidC)), "guid leak");
   await page.getByLabel("Revised text for decision " + ordB).first().fill("Bears UI revised beta", { timeout: T.step });
   await page.getByRole("button", { name: "Revise decision " + ordB }).first().click({ timeout: T.step });
-  await page.waitForFunction(() => document.body.innerText.includes("Bears UI revised beta"), null, { timeout: T.poll }).catch(() => null);
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears UI revised beta", { timeout: T.poll });
   await page.waitForTimeout(1200);
   ok("ui-revise-QB", await bodyHas("Bears UI revised beta"), "revised text missing");
   {
@@ -227,8 +241,13 @@ async function main() {
   await page.waitForTimeout(1500);
   const rev2 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-discard-QC", (rev2.json.discarded || []).includes(gidC), "discard wrong");
-  await page.getByRole("button", { name: "Approve decision " + ordA }).first().click({ timeout: T.step });
-  await page.waitForFunction(() => document.body.innerText.includes("Approved decision " + ordA), null, { timeout: T.poll }).catch(() => null);
+  {
+    const ordRemap = await pendingOrdinals(did, owner);
+    const ordA2 = ordRemap[gidA];
+    ok("ordinals-remapped-after-discard", ordA2 > 0 && !(gidC in ordRemap), JSON.stringify(ordRemap));
+    await page.getByRole("button", { name: "Approve decision " + ordA2 }).first().click({ timeout: T.step });
+    await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decision " + ordA2, { timeout: T.poll });
+  }
   await page.waitForTimeout(1200);
   const rev3 = await api("GET", "/api/records/" + did + "/review", undefined, owner);
   ok("api-approve-QA", (rev3.json.approved || []).includes(gidA), "approve wrong");
@@ -263,20 +282,22 @@ async function main() {
   const canonHeldBefore = await canonState(sid, owner);
   const ordS = await pendingOrdinals(sid, owner);
   await page.getByRole("button", { name: "Approve decision " + ordS["S2"] }).first().click({ timeout: T.step }).catch(() => null);
-  await page.waitForFunction(() => document.body.innerText.includes("No automatic retry"), null, { timeout: T.poll }).catch(() => null);
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "No automatic retry", { timeout: T.poll });
   await page.waitForTimeout(1200);
   ok("ui-409-guided", await bodyHas("Refresh review") && await bodyHas("No automatic retry"), "guided 409 missing");
   ok("held-no-state-write", (await canonState(sid, owner)) === canonHeldBefore, "held approve mutated canonical state");
   await shot("onedoc-409");
   await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears fresh input" }, owner);
-  const itemsBeforeRefresh = (await api("GET", "/api/records/" + sid, undefined, owner)).json.itemsJson;
+  const preRefreshRec = await api("GET", "/api/records/" + sid, undefined, owner);
+  const itemsBeforeRefresh = preRefreshRec.json.itemsJson;
+  const tokenBeforeRefresh = preRefreshRec.json.reviewToken;
   await page.getByRole("button", { name: "Refresh review" }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
   ok("ui-refresh-reloads", await bodyHas("Bears other-client revision"), "fresh authority missing");
   {
     const after = await api("GET", "/api/records/" + sid, undefined, owner);
     ok("refresh-preserves-items", after.json.itemsJson === itemsBeforeRefresh, "refresh rewrote items");
-    ok("refresh-rotates-token-ui", after.json.reviewToken !== g0g.reviewToken, "token unchanged after refresh");
+    ok("refresh-rotates-token-ui", after.json.reviewToken !== tokenBeforeRefresh, "token unchanged after refresh");
   }
   const ordS2 = await pendingOrdinals(sid, owner);
   await page.getByRole("button", { name: "Approve decision " + ordS2["S2"] }).first().click({ timeout: T.step });
@@ -288,6 +309,29 @@ async function main() {
   const br = await api("POST", "/api/records/" + sid + "/revise", { version: sg.json.version, hash: sg.json.hash, reviewToken: sg.json.reviewToken, watermark: sg.json.watermark, items: [{ id: "S1", text: "x" }] }, owner);
   ok("whole-revise-after-decisions-409", br.status === 409, String(br.status));
   ok("whole-revise-no-state-write", (await canonState(sid, owner)) === canonWholeBefore, "decided whole-revise mutated state");
+  // Explicit reload editor stale ALL-fields race: type text+detail, stale via per-item revise, reload recovers.
+  const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one" }, { id: "R2", text: "Bears reload two" }], owner);
+  const rid = rr1.json.id;
+  ok("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload two", { timeout: T.poll });
+  const editorBoxes = page.locator(".human-editor-text");
+  ok("reload-editor-fields", (await editorBoxes.count()) >= 4, "whole editor text+detail fields missing " + String(await editorBoxes.count()));
+  await editorBoxes.nth(0).fill("Bears reload one STALE", { timeout: T.step });
+  await editorBoxes.nth(1).fill("Bears stale detail", { timeout: T.step });
+  const rg = await api("GET", "/api/records/" + rid, undefined, owner);
+  await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
+  await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1200);
+  ok("reload-stale-race-guided", await bodyHas("Reload editor from current review"), "reload recovery hidden after reviewError");
+  const canonReloadBefore = await canonState(rid, owner);
+  await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step });
+  await page.waitForTimeout(800);
+  const afterReloadText = await editorBoxes.nth(0).inputValue();
+  const afterReloadDetail = await editorBoxes.nth(1).inputValue();
+  ok("reload-stale-race-reset-text", afterReloadText === "Bears reload one", "stale text survived reload: " + afterReloadText.slice(0, 80));
+  ok("reload-stale-race-reset-detail", afterReloadDetail === "", "stale detail survived reload: " + afterReloadDetail.slice(0, 80));
+  ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated canonical state");
   const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
   ok("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
@@ -321,28 +365,61 @@ async function main() {
   await page.getByRole("button", { name: "Open version 1" }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
   ok("ui-v1-shows-successor", await bodyHas("Open version 2") || await bodyHas("A newer version exists"), "successor missing");
-  ok("ui-v1-historical", await bodyHas("Historical") || await bodyHas("historical"), "historical section missing on superseded v1");
+  ok("ui-v1-no-false-historical", !(await bodyHas("Historical approved")), "undecided branch must not claim historical approvals with no approvals");
   ok("ui-v1-no-approve", (await allApproveControls()) === 0 && (await reviseCount()) === 0 && (await setAsideCount()) === 0, "superseded controls present");
   {
     const urlV1 = page.url() || "";
-    const bodyV1 = await page.locator("body").innerText().catch(() => "");
-    await page.goBack({ timeout: T.step }).catch(() => null);
+    const bodyV1 = await page.locator("body").innerText();
+    ok("ui-v1-url", urlV1.includes(buid), "v1 hash missing " + urlV1);
+    ok("ui-v1-content", bodyV1.includes("Bears branch one"), "v1 content missing");
+    const backOk = await page.goBack({ timeout: T.step }).then(() => true).catch(() => false);
+    ok("ui-back-navigated", backOk, "goBack failed");
     await page.waitForTimeout(800);
-    await page.goForward({ timeout: T.step }).catch(() => null);
+    const urlV2 = page.url() || "";
+    const bodyV2 = await page.locator("body").innerText();
+    ok("ui-back-v2-url", urlV2.includes(nid), "back did not reach v2 " + urlV2.slice(-36));
+    ok("ui-back-v2-content", bodyV2.includes("Bears stale two v2"), "v2 content missing after back");
+    const fwdOk = await page.goForward({ timeout: T.step }).then(() => true).catch(() => false);
+    ok("ui-forward-navigated", fwdOk, "goForward failed");
     await page.waitForTimeout(800);
-    const urlBack = page.url() || "";
-    const bodyBack = await page.locator("body").innerText().catch(() => "");
-    ok("ui-back-forward-hash", urlBack === urlV1 && urlBack.includes(buid), "hash changed v1=" + urlV1.slice(-12) + " back=" + urlBack.slice(-12));
-    ok("ui-back-forward-entity", bodyBack.includes("Bears branch one") && bodyV1.includes("Bears branch one"), "entity text lost across nav");
-    ok("ui-back-forward-human", bodyBack.includes("Historical") && !bodyBack.includes("U1"), "history section or id leak across nav");
+    const urlFwd = page.url() || "";
+    const bodyFwd = await page.locator("body").innerText();
+    ok("ui-forward-v1-url", urlFwd === urlV1 && urlFwd.includes(buid), "forward hash changed v1=" + urlV1.slice(-12) + " fwd=" + urlFwd.slice(-12));
+    ok("ui-forward-v1-content", bodyFwd.includes("Bears branch one") && bodyV1.includes("Bears branch one"), "entity text lost across nav");
+    ok("ui-forward-no-id-leak", !bodyFwd.includes("U1") && !bodyFwd.includes(nid.slice(0, 8)), "id leak across nav");
   }
+  // Approved amendment inheritance (separate from undecided branch): v1 approved A/B, amend replace A, approve v2.
+  const amA = crypto.randomUUID();
+  const amB = crypto.randomUUID();
+  const amBase = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: amA, text: "Bears inherit alpha" }, { id: amB, text: "Bears inherit beta" }], owner);
+  const amBaseId = amBase.json.id;
+  ok("amend-inherit-ui-base", amBase.status === 201 && amBaseId, String(amBase.status));
+  const amApAll = await api("POST", "/api/records/" + amBaseId + "/approve-all", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
+  ok("amend-inherit-ui-approve-base", amApAll.status === 200, String(amApAll.status));
+  const amAmend = await api("POST", "/api/records/" + amBaseId + "/amend", await (async () => { const g = await api("GET", "/api/records/" + amBaseId, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, items: [{ id: amA, text: "Bears inherit alpha replaced" }, { id: amB, text: "Bears inherit beta" }] }; })(), owner);
+  const amV2 = amAmend.json.id;
+  ok("amend-inherit-ui-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
+  const amApV2 = await api("POST", "/api/records/" + amV2 + "/approve-all", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })(), owner);
+  ok("amend-inherit-ui-approve-v2", amApV2.status === 200, String(amApV2.status));
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amBaseId, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Historical", { timeout: T.poll });
+  ok("ui-amend-v1-historical", await bodyHas("Historical") && await bodyHas("Bears inherit alpha"), "amended v1 missing historical");
+  ok("ui-amend-v1-effective", await bodyHas("Current effective record") && await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta"), "amended v1 missing current effective");
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amV2, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decisions (current record)", { timeout: T.poll });
+  ok("ui-amend-v2-current", await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta") && await bodyHas("approved in version 2"), "amended v2 missing inherited+replaced with versions");
   const ctx2 = await browser.newContext();
   await ctx2.addInitScript((tok) => window.localStorage.setItem("simceo-token", tok), stranger);
   const p2 = await ctx2.newPage();
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(2000);
-  const sBody = await p2.locator("body").innerText().catch(() => "");
+  const sBody = await p2.locator("body").innerText();
   ok("stranger-no-approve-buttons", !sBody.includes("Approve decision"), "stranger sees approve");
+  ok("stranger-no-selected-all", !sBody.includes("Approve selected") && !sBody.includes("Approve all"), "stranger sees selected/all");
+  ok("stranger-no-checkbox", (await p2.locator('input[aria-label^="Select decision"]').count()) === 0, "stranger sees checkbox");
+  ok("stranger-no-revise", !sBody.includes("Revise decision") && !sBody.includes("Revised text for decision"), "stranger sees revise");
+  ok("stranger-no-setaside", !sBody.includes("Set aside decision"), "stranger sees set-aside");
+  ok("stranger-no-protocol", !sBody.includes("reviewToken") && !sBody.includes("evidenceSnapshot") && !sBody.includes("reviewRevision"), "stranger sees protocol");
   await ctx2.close().catch(() => null);
   {
     const ctx3 = await browser.newContext();
@@ -352,10 +429,37 @@ async function main() {
     await p3.waitForTimeout(2000);
     const gBody = await p3.locator("body").innerText().catch(() => "");
     ok("guest-approved-positive", gBody.includes("Bears UI approve alpha"), "guest misses approved text");
+    ok("guest-approved-evidence", gBody.includes("Bears opening drive memo") || gBody.includes("Supporting excerpt") || gBody.includes("Approved record"), "guest misses approved evidence");
     ok("guest-no-pending-claim", !gBody.includes("No pending decisions remain"), "false no-pending claim shown to guest");
     ok("guest-no-approve-buttons", !gBody.includes("Approve decision"), "guest sees approve controls");
+    ok("guest-no-selected-all", !gBody.includes("Approve selected") && !gBody.includes("Approve all"), "guest sees selected/all");
+    ok("guest-no-checkbox", (await p3.locator('input[aria-label^="Select decision"]').count()) === 0, "guest sees checkbox");
+    ok("guest-no-revise", !gBody.includes("Revise decision") && !gBody.includes("Revised text for decision"), "guest sees revise");
+    ok("guest-no-setaside", !gBody.includes("Set aside decision"), "guest sees set-aside");
+    ok("guest-no-protocol", !gBody.includes("reviewToken") && !gBody.includes("evidenceSnapshot") && !gBody.includes("reviewRevision"), "guest sees protocol");
     await ctx3.close().catch(() => null);
   }
+  // Beyond-50 chain with singular navigation (owned disposable chain).
+  const ch0 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "CH0", text: "Bears chain base" }], owner);
+  let chid = ch0.json.id;
+  ok("chain-ui-base", ch0.status === 201 && chid, String(ch0.status));
+  for (let v = 0; v < 55; v++) {
+    const gg = await api("GET", "/api/records/" + chid, undefined, owner);
+    if (gg.status !== 200) { ok("chain-ui-step-" + v, false, String(gg.status)); break; }
+    const nb = await api("POST", "/api/records/" + chid + "/revise", { version: gg.json.version, hash: gg.json.hash, reviewToken: gg.json.reviewToken, watermark: gg.json.watermark, items: [{ id: "CH0", text: "Bears chain base rev" + v }] }, owner);
+    if (nb.status !== 201 && nb.status !== 200) { ok("chain-ui-step-" + v, false, String(nb.status)); break; }
+    chid = nb.json.id;
+  }
+  const chRev = await api("GET", "/api/records/" + chid + "/review", undefined, owner);
+  ok("chain-over-50-ui", (chRev.json.predecessors || []).length > 50, String((chRev.json.predecessors || []).length));
+  const chList = await api("GET", "/api/meetings/" + mid + "/records", undefined, owner);
+  ok("chain-list-capped-50-ui", chList.status === 200 && Array.isArray(chList.json) && chList.json.length <= 50, String(chList.status));
+  const chOldestId = (chRev.json.predecessors || [])[0];
+  const chOldest = await api("GET", "/api/records/" + chOldestId, undefined, owner);
+  ok("chain-singular-oldest-ui", chOldest.status === 200 && chOldest.json.version === 1, String(chOldest.status));
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + chOldestId, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears chain base", { timeout: T.poll });
+  ok("chain-singular-nav-ui", (page.url() || "").includes(chOldestId) && await bodyHas("Bears chain base"), "singular nav failed");
   const de = await api("POST", "/api/meetings/" + mid + "/record/draft", [], owner);
   const eid = de.json.id;
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + eid, { waitUntil: "domcontentloaded", timeout: T.goto });
@@ -373,6 +477,20 @@ async function main() {
   const okPosts = postLog.filter((e) => e.status >= 200 && e.status < 300);
   ok("postlog-no-500", badPosts.length === 0, JSON.stringify(badPosts.slice(0, 3)));
   ok("postlog-has-record-posts", okPosts.length >= 4, String(okPosts.length));
-  console.log("[records5-onedoc-ui] pass=" + pass + " fail=" + fail);
 }
-main().then(async () => { if (timedOut) return; await cleanup(); if (fail > 0) { console.log("FAILURES:"); for (const f of failures) console.log(" - " + f); process.exit(1); } }).catch(async (e) => { if (timedOut) return; console.log("FATAL " + String(e && e.stack || e).slice(0, 500) + " consoleErrors=" + consoleErrors.slice(0, 5).join(" | ").slice(0, 600)); try { await cleanup(); } catch {} process.exit(2); });
+main().then(async () => {
+  if (timedOut) return;
+  const finalExit = setTimeout(() => { console.error("FINAL EXIT TIMEOUT"); process.exit(3); }, 15000);
+  try { await cleanup(); } finally { /* bounded */ }
+  if (cleanupFailed) { console.log("CLEANUP FAILED"); clearTimeout(finalExit); process.exit(1); }
+  if (fail > 0) { console.log("[records5-onedoc-ui] fail=" + fail + " pass=" + pass); console.log("FAILURES:"); for (const f of failures) console.log(" - " + f); clearTimeout(finalExit); process.exit(1); }
+  console.log("[records5-onedoc-ui] pass=" + pass + " fail=" + fail);
+  clearTimeout(finalExit); process.exit(0);
+}).catch(async (e) => {
+  if (timedOut) return;
+  console.log("FATAL " + String(e && e.stack || e).slice(0, 500) + " consoleErrors=" + consoleErrors.slice(0, 5).join(" | ").slice(0, 600));
+  const finalExit2 = setTimeout(() => { console.error("FINAL EXIT TIMEOUT"); process.exit(3); }, 15000);
+  try { await cleanup(); } catch {}
+  clearTimeout(finalExit2);
+  process.exit(2);
+});

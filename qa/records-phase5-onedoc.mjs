@@ -12,6 +12,7 @@ for (const pair of [["QA_API", API, 15320], ["QA_FAKE", FAKE, 15322]]) {
   let u; try { u = new URL(v); } catch { console.error("REFUSE bad " + nm + " " + v); process.exit(2); }
   if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") { console.error("REFUSE non loopback " + nm); process.exit(2); }
   if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
+  if (u.search || u.hash || u.username || u.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo got " + v); process.exit(2); }
 }
 if (/:5080|:5173|:9333/.test(API) || /:5080|:5173|:9333/.test(FAKE)) { console.error("REFUSE human port"); process.exit(2); }
 const PROV = process.env.SIMCEO_INSTANCE || process.env.QA_PROVENANCE || "";
@@ -20,6 +21,9 @@ const TAG = "records5-onedoc";
 const run = "bears5-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex");
 let pass = 0, fail = 0;
 const failures = [];
+function preflight(name, cond, extra) {
+  if (cond) { pass++; } else { console.error("PREFLIGHT FAIL " + name + (extra ? " :: " + extra : "")); process.exit(2); }
+}
 function ok(name, cond, extra) {
   if (cond) { pass++; } else { fail++; failures.push(name + (extra ? " :: " + extra : "")); console.log("  FAIL " + name + (extra ? " :: " + extra : "")); }
 }
@@ -51,9 +55,11 @@ async function fakeFetch(path, opts) {
 async function canonState(did, tok) {
   const d = await get("/api/records/" + did, tok);
   const r = await get("/api/records/" + did + "/review", tok);
+  if (d.status !== 200 || r.status !== 200) throw new Error("canonState requires 200 got " + d.status + "/" + r.status + " for " + did);
   return JSON.stringify({
     items: camel(d.json, "itemsJson"), ap: camel(d.json, "approvedJson"), dc: camel(d.json, "discardedJson"),
     hist: camel(d.json, "historyJson"), v: camel(d.json, "version"), h: camel(d.json, "hash"),
+    rev: camel(d.json, "reviewRevision"), st: camel(d.json, "status"), dec: camel(d.json, "decided"), sup: camel(d.json, "supersedesJson"),
     tok: camel(d.json, "reviewToken"), wm: camel(d.json, "watermark"),
     pend: r.json ? r.json.pending : null, appr: r.json ? r.json.approved : null,
     disc: r.json ? r.json.discarded : null, hc: r.json ? r.json.historyCount : null,
@@ -109,18 +115,18 @@ async function register(email) {
 console.log("[" + TAG + "] api=" + API + " run=" + run);
 {
   const h = await req("GET", "/health", undefined, null);
-  ok("preflight-health", h.status === 200 && h.json && h.json.ok === true, String(h.status));
-  ok("preflight-health-instance", h.json && String(camel(h.json, "instance")) === PROV, "instance=" + String(h.json && camel(h.json, "instance")) + " prov=" + PROV);
+  preflight("preflight-health", h.status === 200 && h.json && h.json.ok === true, String(h.status));
+  preflight("preflight-health-instance", h.json && String(camel(h.json, "instance")) === PROV, "instance=" + String(h.json && camel(h.json, "instance")) + " prov=" + PROV);
   const be = await req("GET", "/api/backend", undefined, null);
   const mode = String((be.json && (camel(be.json, "mode"))) || "").toLowerCase();
-  ok("preflight-backend", be.status === 200 && !!be.json, String(be.status));
-  ok("preflight-backend-memory", mode === "memory", "mode=" + mode);
+  preflight("preflight-backend", be.status === 200 && !!be.json, String(be.status));
+  preflight("preflight-backend-memory", mode === "memory", "mode=" + mode);
   const fh = await fakeFetch("/__health");
-  ok("preflight-fake-health", fh.status === 200 && fh.json && fh.json.fake === "records5-scoped", String(fh.status));
-  ok("preflight-fake-boot", !!(fh.json && fh.json.boot), "no boot nonce");
+  preflight("preflight-fake-health", fh.status === 200 && fh.json && fh.json.fake === "records5-scoped", String(fh.status));
+  preflight("preflight-fake-boot", !!(fh.json && fh.json.boot), "no boot nonce");
   globalThis.__fakeBoot = fh.json && fh.json.boot;
   const fc = await fakeFetch("/__counts");
-  ok("preflight-fake-counts", fc.status === 200 && fc.json && typeof fc.json.chat === "number", String(fc.status));
+  preflight("preflight-fake-counts", fc.status === 200 && fc.json && typeof fc.json.chat === "number", String(fc.status));
   globalThis.__fakeChatBefore = (fc.json && fc.json.chat) || 0;
 }
 const ownerT = await register(run + "-owner@qa.invalid");
@@ -276,10 +282,11 @@ ok("conflict-no-history-write", histOf((await get("/api/records/" + sid, ownerT)
 ok("conflict-no-state-write", (await canonState(sid, ownerT)) === canonStaleBefore, "failed approve mutated canonical state");
 await post("/api/meetings/" + mid + "/messages", { sender: "lead", content: "Bears fresh input moves watermark" }, ownerT);
 const g1 = await guards(sid, ownerT);
+const itemsBeforeRefresh = camel((await get("/api/records/" + sid, ownerT)).json, "itemsJson");
+const tokenBeforeRefresh = g1.reviewToken;
 const rf = await post("/api/records/" + sid + "/refresh", g1, ownerT);
 ok("explicit-refresh-200", rf.status === 200, String(rf.status));
-ok("refresh-rotates-token", camel(rf.json.draft || rf.json, "reviewToken") !== g1.reviewToken, "token unchanged");
-const itemsBeforeRefresh = camel((await get("/api/records/" + sid, ownerT)).json, "itemsJson");
+ok("refresh-rotates-token", camel(rf.json.draft || rf.json, "reviewToken") !== tokenBeforeRefresh, "token unchanged");
 const revS = await get("/api/records/" + sid + "/review", ownerT);
 ok("refresh-no-auto-approve", JSON.stringify([...revS.json.pending].sort()) === JSON.stringify(["S1", "S2"]), JSON.stringify(revS.json.pending));
 ok("refresh-history-entry", histOf((await get("/api/records/" + sid, ownerT)).json).some((e) => e.action === "refresh"), "no refresh history");
@@ -308,6 +315,35 @@ const apNew = await post("/api/records/" + nid + "/items/approve", { ...(await g
 ok("successor-approve-200", apNew.status === 200, String(apNew.status));
 const eff = await get("/api/records/" + nid + "/effective", ownerT);
 ok("effective-head", camel(eff.json, "head") === nid, JSON.stringify(eff.json).slice(0, 200));
+
+const amA = crypto.randomUUID();
+const amB = crypto.randomUUID();
+const amBase = await post("/api/meetings/" + mid + "/record/draft", [{ id: amA, text: "Bears inherit alpha" }, { id: amB, text: "Bears inherit beta" }], ownerT);
+const amBaseId = camel(amBase.json, "id");
+ok("amend-inherit-base", amBase.status === 201 && amBaseId, String(amBase.status));
+const amAp = await post("/api/records/" + amBaseId + "/approve-all", await guards(amBaseId, ownerT), ownerT);
+ok("amend-inherit-approve-base", amAp.status === 200, String(amAp.status));
+const amHeadBefore = await get("/api/records/" + amBaseId + "/effective", ownerT);
+ok("amend-inherit-head-is-base", amHeadBefore.status === 200 && camel(amHeadBefore.json, "head") === amBaseId, JSON.stringify(amHeadBefore.json).slice(0, 200));
+const amAmend = await post("/api/records/" + amBaseId + "/amend", { ...(await guards(amBaseId, ownerT)), items: [{ id: amA, text: "Bears inherit alpha replaced" }, { id: amB, text: "Bears inherit beta" }] }, ownerT);
+const amV2 = camel(amAmend.json, "id");
+ok("amend-inherit-v2", (amAmend.status === 201 || amAmend.status === 200) && amV2, String(amAmend.status));
+const amMgrV1 = await get("/api/records/" + amBaseId + "/review", ownerT);
+ok("amend-inherit-v1-still-head-with-pending-child", amMgrV1.json.effectiveHeadId === amBaseId, JSON.stringify(amMgrV1.json.effectiveHeadId));
+const amAp2 = await post("/api/records/" + amV2 + "/approve-all", await guards(amV2, ownerT), ownerT);
+ok("amend-inherit-approve-v2", amAp2.status === 200, String(amAp2.status));
+const amMgrV2 = await get("/api/records/" + amV2 + "/review", ownerT);
+const amEff = (amMgrV2.json.lineageEffects || []);
+ok("amend-inherit-replaced-A", amEff.some((e) => e.id === amA && e.status === "replaced" && String(e.text).includes("replaced") && e.fromVersion === 1 && e.toVersion === 2), JSON.stringify(amEff).slice(0, 400));
+ok("amend-inherit-kept-B", amEff.some((e) => e.id === amB), JSON.stringify(amEff).slice(0, 400));
+ok("amend-inherit-head-is-v2", amMgrV2.json.effectiveHeadId === amV2 && amMgrV2.json.effectiveHeadVersion === 2, JSON.stringify({ h: amMgrV2.json.effectiveHeadId, v: amMgrV2.json.effectiveHeadVersion }));
+const amMgrV1After = await get("/api/records/" + amBaseId + "/review", ownerT);
+ok("amend-inherit-v1-historical-after-approval", amMgrV1After.json.effectiveHeadId === amV2, JSON.stringify(amMgrV1After.json.effectiveHeadId));
+const amGuestV1 = await get("/api/records/" + amBaseId + "/review", readerT);
+ok("amend-inherit-guest-v1-historical", amGuestV1.status === 200 && String(amGuestV1.json.draft?.effective?.headId) === amV2 && String(amGuestV1.json.draft?.effective?.headVersion) === "2", JSON.stringify(amGuestV1.json.draft?.effective).slice(0, 300));
+const amGuestV2 = await get("/api/records/" + amV2 + "/review", readerT);
+const amGItems = ((amGuestV2.json.draft?.effective?.approvedItems) || []);
+ok("amend-inherit-guest-v2-current", amGuestV2.status === 200 && amGItems.some((e) => e.text === "Bears inherit alpha replaced" && e.approvedBy?.version === 2) && amGItems.some((e) => e.text === "Bears inherit beta"), JSON.stringify(amGItems).slice(0, 400));
 const c0 = await post("/api/meetings/" + mid + "/record/draft", [{ id: "C0", text: "Bears chain base" }], ownerT);
 let cid = camel(c0.json, "id");
 ok("chain-base", c0.status === 201 && cid, String(c0.status));

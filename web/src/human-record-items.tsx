@@ -133,7 +133,7 @@ export function emitEditorRows(rows: EditorRow[]): string {
   );
 }
 
-// Structured revision editor: one textarea per decision. Multiline text
+// Structured revision editor: one textarea per decision plus supporting detail per row. Multiline text
 // remains a single decision. Unknown and server-managed properties ride
 // along untouched. Nothing is emitted on mount or on hydration — onChange
 // fires only for genuine user edits (typing, add, remove), so host
@@ -143,12 +143,14 @@ export function emitEditorRows(rows: EditorRow[]): string {
 export function RecordItemEditor(props: {
   draftKey: string;
   initialJson: string;
+  resetGen?: number;
   onChange: (itemsJson: string, meta: EditorRowMeta) => void;
 }) {
 
   const [baseKeys, setBaseKeys] = useState<string[]>(() => parseEditorRows(props.initialJson).map((r) => r.key));
   const [rows, setRows] = useState<EditorRow[]>(() => parseEditorRows(props.initialJson));
   const keyRef = useRef(props.draftKey);
+  const genRef = useRef(props.resetGen ?? 0);
   const baseJsonRef = useRef(props.initialJson);
   const dirtyRef = useRef(false);
   const onChangeRef = useRef(props.onChange);
@@ -173,17 +175,25 @@ export function RecordItemEditor(props: {
     });
   };
 
-  // New draft context (different draft id/version): full reset.
+  // Explicit reset contract: a new draftKey OR a bumped resetGen performs a
+  // full in-place reset of ALL child state - rows, base keys, base JSON,
+  // dirty flag, and detail/metadata refs - to exactly the current review.
+  // The host bumps resetGen (and remounts via key) ONLY on explicit user
+  // Reload; automatic refetches never bump it so unsaved typing is preserved
+  // unless the user reloads. No onChange is emitted on reset/remount, so old
+  // typed rows are never reposted against fresh guards.
   useEffect(() => {
-    if (keyRef.current === props.draftKey) return;
+    const wantGen = props.resetGen ?? 0;
+    if (keyRef.current === props.draftKey && genRef.current === wantGen) return;
     keyRef.current = props.draftKey;
+    genRef.current = wantGen;
     baseJsonRef.current = props.initialJson;
     const fresh = parseEditorRows(props.initialJson);
 
     setBaseKeys(fresh.map((r) => r.key));
     setRows(fresh);
     dirtyRef.current = false;
-  }, [props.draftKey, props.initialJson]);
+  }, [props.draftKey, props.resetGen, props.initialJson]);
 
   // Same draft, newer content (e.g. refetch after save): accept while
   // pristine so the editor never shows stale text; preserve typing.

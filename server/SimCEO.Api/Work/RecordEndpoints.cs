@@ -1880,6 +1880,8 @@ public static partial class RecordsOps
       ["legacyReview"] = d.LegacyReview,
       ["effectiveIds"] = mine is null ? new List<string>() : mine.EffectiveIds,
       ["effectiveExport"] = mine is null ? "" : mine.ConciseExport,
+      ["effectiveHeadId"] = mine is null ? "" : mine.Head.Id.ToString(),
+      ["effectiveHeadVersion"] = mine is null ? 0 : mine.Head.Version,
       ["lineageEffects"] = AmendmentEffects(s, d),
     };
   }
@@ -1939,6 +1941,8 @@ public static partial class RecordsOps
       ["legacyReview"] = d.LegacyReview,
       ["effectiveIds"] = mine is null ? new List<string>() : mine.EffectiveIds,
       ["effectiveExport"] = mine is null ? "" : mine.ConciseExport,
+      ["effectiveHeadId"] = mine is null ? "" : mine.Head.Id.ToString(),
+      ["effectiveHeadVersion"] = mine is null ? 0 : mine.Head.Version,
       ["lineageEffects"] = AmendmentEffects(s, d),
     };
   }

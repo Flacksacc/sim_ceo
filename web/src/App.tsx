@@ -3430,6 +3430,7 @@ const tabCount = (k: Tab): number | null => {
   const revTextRev = useRef(0);
   const revTextOwner = useRef("");
   const revBaseRef = useRef<{ id: string; version: number; hash: string; reviewToken: string; watermark: number; revision: number } | null>(null);
+  const [editorGen, setEditorGen] = useState(0);
   // Whole-draft ownership AND typed revision retire together with their
   // context: any board/meeting/record switch clears owner, typed revision,
   // and base authority so the next hydration starts pristine from the new
@@ -3505,6 +3506,7 @@ const tabCount = (k: Tab): number | null => {
     if (revTextRev.current === 0) return false;
     return b.version !== d.version || (b.hash ?? "") !== (d.hash ?? "") || (b.reviewToken ?? "") !== (d.reviewToken ?? "") || (b.watermark ?? 0) !== (d.watermark ?? 0) || (b.revision ?? 0) !== (d.reviewRevision ?? 0);
   })();
+  const canReloadEditor = recOk && !!recReview.data && !recReview.isError && canActMeeting && revEditorStale;
   const ordinalOf = (itemId: string): number => reviewPending.indexOf(itemId) + 1;
   const ordinalLabel = (itemId: string): string => { const n = ordinalOf(itemId); return n > 0 ? "decision " + String(n) : "decision"; };
   useEffect(() => {
@@ -8916,7 +8918,7 @@ const testModel = useMutation({
                           <h4>Version history</h4>{" "}
                           <p>
                             {" "}
-                            Version {(authDraft as RecordDraft).version} · reviewed input {(authDraft as RecordDraft).watermark} · current input {recReview.data.meetingWatermark} ·{" "}
+                            Version {(authDraft as RecordDraft).version} · reviewed input {typeof (authDraft as unknown as { watermark?: unknown }).watermark === "number" ? (authDraft as unknown as { watermark: number }).watermark : "unknown (read-only review)"} · current input {recReview.data.meetingWatermark} ·{" "}
                             {recReview.data.historyCount} recorded decisions.{" "}
                           </p>{" "}
                           {(recReview.data.predecessors ?? []).length > 0 && (
@@ -9024,8 +9026,10 @@ const testModel = useMutation({
                             hist = src.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
                           } catch { hist = []; }
                         }
-                        const succ = ((recReview.data?.successors ?? []) as string[]);
-                        const isHead = succ.length === 0 && !reviewSuperseded;
+                        const effHeadId = (() => { try { const rr = recReview.data as unknown as { draft?: { effective?: { headId?: unknown; headVersion?: unknown } }; effectiveHeadId?: unknown; effectiveHeadVersion?: unknown }; const g = rr?.draft as unknown as { effective?: { headId?: unknown } } | undefined; const gh = (g && (g as { effective?: { headId?: unknown } }).effective?.headId) ?? (rr as { effectiveHeadId?: unknown }).effectiveHeadId; return typeof gh === "string" ? gh : (gh != null ? String(gh) : ""); } catch { return ""; } })();
+                        const effHeadVersion = (() => { try { const rr = recReview.data as unknown as { draft?: { effective?: { headVersion?: unknown } }; effectiveHeadVersion?: unknown }; const g = rr?.draft as unknown as { effective?: { headVersion?: unknown } } | undefined; const gv = (g && (g as { effective?: { headVersion?: unknown } }).effective?.headVersion) ?? (rr as { effectiveHeadVersion?: unknown }).effectiveHeadVersion; return typeof gv === "number" ? gv : 0; } catch { return 0; } })();
+                        void effHeadVersion;
+                        const isHead = effHeadId !== "" && String(ad.id) === effHeadId && !reviewSuperseded;
                         const effects = ((recReview.data?.lineageEffects ?? []) as { id: string; text: string; status: string; fromVersion: number; toVersion: number }[]);
                         let effGuest: { text: string; version: number }[] = [];
                         try {
@@ -9037,7 +9041,8 @@ const testModel = useMutation({
                         } catch { effGuest = []; }
                         if (hist.length === 0 && effects.length === 0 && effGuest.length === 0) return null;
                         if (isHead && reviewDecided) {
-                          const all = hist.length > 0 ? hist : (isGuest ? effGuest.map((e) => e.text) : effects.map((e) => e.text));
+                          const effAllText = isGuest ? effGuest.map((e) => e.text) : effects.map((e) => e.text);
+                          const all = effAllText.length > 0 ? effAllText : hist;
                           if (all.length === 0) return null;
                           return (
                             <div className="card">
@@ -9045,10 +9050,11 @@ const testModel = useMutation({
                               <h4>Approved decisions (current record)</h4>{" "}
                               <p>This version is the authoritative head. The text below is the current record.</p>{" "}
                               <ol className="human-item-list">
-                                {all.map((tx, k) => (
+                                {(effAllText.length > 0 ? (isGuest ? effGuest.map((e) => ({ text: e.text, sub: e.version > 0 ? "approved in version " + String(e.version) + "." : "" })) : effects.map((e) => ({ text: e.text, sub: e.status + ", versions " + String(e.fromVersion) + " to " + String(e.toVersion) + "." }))) : all.map((tx) => ({ text: tx, sub: "" }))).map((row, k) => (
                                   <li key={"ap-" + String(k)} className="human-item">
                                     <div className="human-item-body">
-                                      <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
+                                      <span className="human-item-text">{row.text === "" ? "(approved decision)" : row.text}</span>{" "}
+                                      {row.sub !== "" && (<span className="muted">{row.sub}</span>)}{" "}
                                     </div>
                                   </li>
                                 ))}
@@ -9171,7 +9177,9 @@ const testModel = useMutation({
                         </button>)}{" "}
                       </div>{" "}
                       <RecordItemEditor
+                        key={(authDraft as RecordDraft).id + "-v" + (authDraft as RecordDraft).version + "#g" + String(editorGen)}
                         draftKey={(authDraft as RecordDraft).id + "-v" + (authDraft as RecordDraft).version}
+                        resetGen={editorGen}
                         initialJson={revText}
                         onChange={(json) => { try { revTextRev.current++; } catch { /* noop */ } setRevText(json); }}
                       />{" "}
@@ -9183,12 +9191,13 @@ const testModel = useMutation({
                         {" "}
                         Amend approved record{" "}
                       </button>)}{" "}
-                      {revEditorStale && canContributeReview && (<button type="button" onClick={() => {
+                      {canReloadEditor && (<button type="button" onClick={() => {
                         const d = reviewDraft as RecordDraft | undefined;
                         if (!d) return;
                         setRevText(d.itemsJson ?? "");
                         revTextRev.current = 0;
                         revBaseRef.current = { id: d.id, version: d.version, hash: d.hash ?? "", reviewToken: d.reviewToken ?? "", watermark: d.watermark ?? 0, revision: d.reviewRevision ?? 0 };
+                        setEditorGen((g) => g + 1);
                         setReviewError(null);
                       }}>
                         {" "}

@@ -273,26 +273,46 @@ function shortJoin(parts: string[], cap: number): string {
   return (sp > 40 ? slice.slice(0, sp) : slice) + " ...";
 }
 function valueToText(v: unknown): string {
-  if (typeof v === "string") return scrubIds(v.trim());
+  if (typeof v === "string") {
+    const s = (v as string).trim();
+    if (s.startsWith("{") || s.startsWith("[")) return projectNestedString(s, 220);
+    return scrubIds(s);
+  }
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   if (Array.isArray(v)) {
     const bits = v.map((e) => valueToText(e)).filter((s) => s !== "");
     return shortJoin(bits, 220);
   }
+  if (v !== null && typeof v === "object") return projectObject(v as Record<string, unknown>, 160);
   return "";
+}
+function humanKeyLabel(k: string): string {
+  const spaced = k.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[-_]+/g, " ").trim().toLowerCase();
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+function projectNestedString(s: string, cap: number): string {
+  const tt = (s ?? "").trim();
+  if (!(tt.startsWith("{") || tt.startsWith("["))) return scrubIds(tt).slice(0, cap);
+  try {
+    const v: unknown = JSON.parse(tt);
+    const hit = projectJson(v, cap, "");
+    return hit !== "" ? hit : scrubIds(tt).slice(0, cap);
+  } catch { return scrubIds(tt).slice(0, cap); }
 }
 function projectObject(o: Record<string, unknown>, cap: number): string {
   const bits: string[] = [];
   if (typeof o.question === "string" && o.question.trim() !== "") bits.push("Question: " + scrubIds(o.question.trim()));
+  if (typeof o.title === "string" && (o.title as string).trim() !== "") bits.push(scrubIds((o.title as string).trim()));
   for (const k of TEXT_FIELDS) {
     if (k === "question" || k === "title") continue;
     const v = o[k];
     if (typeof v === "string" && v.trim() !== "") {
-      const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : k + ": ";
-      bits.push(label + scrubIds(v.trim()));
+      const vv = (v.trim().startsWith("{") || v.trim().startsWith("[")) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
+      const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : humanKeyLabel(k) + ": ";
+      bits.push(label + vv);
     } else if (Array.isArray(v) && v.length > 0) {
       const inner = v.map((e) => valueToText(e)).filter((s) => s !== "");
-      if (inner.length > 0) bits.push((k === "text" ? "" : k + ": ") + shortJoin(inner, 160));
+      if (inner.length > 0) bits.push((k === "text" ? "" : humanKeyLabel(k) + ": ") + shortJoin(inner, 160));
     }
   }
   if (bits.length > 0) return shortJoin(bits, cap);
@@ -320,6 +340,26 @@ function projectJson(raw: unknown, cap: number, fallback: string): string {
   }
   return fallback;
 }
+function extractTruncatedFields(s: string, cap: number): string {
+  const bits: string[] = [];
+  const re = /"(title|question|text|body|content|excerpt|background|description|summary|detail|strengths|methods|evidenceNeeded|limits|collaboration|name)"\s*:\s*"((?:[^"\\]|\\.){1,600})/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s ?? "")) !== null && bits.length < 6) {
+    try {
+      const raw = m[2].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+      const label = m[1] === "text" || m[1] === "body" || m[1] === "content" || m[1] === "excerpt" ? "" : humanKeyLabel(m[1]) + ": ";
+      const clean = scrubIds(raw.trim());
+      if (clean !== "") bits.push(label + clean.slice(0, 160));
+    } catch { /* keep scanning */ }
+  }
+  if (bits.length > 0) return shortJoin(bits, cap);
+  return "";
+}
+function projectTruncated(s: string, cap: number, fallback: string): string {
+  const hit = extractTruncatedFields(s, cap);
+  if (hit !== "") return hit;
+  return fallback;
+}
 function tryParseJson(s: string): { ok: boolean; value: unknown } {
   const t = (s ?? "").trim();
   if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null };
@@ -331,6 +371,11 @@ export function humanNoteTitle(title: string): string {
   const parsed = tryParseJson(t);
   if (parsed.ok) {
     const hit = projectJson(parsed.value, 160, "");
+    if (hit !== "") return hit;
+    return "(untitled note)";
+  }
+  if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
+    const hit = projectTruncated(t, 160, "");
     if (hit !== "") return hit;
     return "(untitled note)";
   }
@@ -346,6 +391,10 @@ export function humanNoteBody(body: string): string {
     const hit = projectJson(parsed.value, 600, "");
     const out = (hit === "" ? "Note detail is available in context." : hit) + warn;
     return out.trim();
+  }
+  if (base.trim().startsWith("{") || base.trim().startsWith("[")) {
+    const out = (projectTruncated(base, 600, "Note detail is available in context.") + warn).trim();
+    return out;
   }
   return (scrubIds(base) + warn).trim();
 }
@@ -363,6 +412,11 @@ export function humanEvidenceTitle(title: string, kind: string, version: number 
     const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
     return v !== "" ? "Approved record, version " + v : "Approved record";
   }
+  if (t.trim().startsWith("{") || t.trim().startsWith("[")) {
+    const hit = projectTruncated(t, 160, "");
+    if (hit !== "") return hit;
+    return "Supporting excerpt";
+  }
   return scrubIds(t).slice(0, 160);
 }
 export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
@@ -379,6 +433,11 @@ export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
     const hit = projectJson(parsed.value, 600, "");
     const out = (hit === "" ? fallback : hit) + warn;
     return out.trim();
+  }
+  if (candidate.trim().startsWith("{") || candidate.trim().startsWith("[")) {
+    const fallback = kind === "dossier" ? "Advisor profile detail is available on the roster." : "Supporting detail is available in context.";
+    const out = (projectTruncated(candidate, 600, fallback) + warn).trim();
+    return out;
   }
   return (scrubIds(candidate) + warn).trim();
 }
