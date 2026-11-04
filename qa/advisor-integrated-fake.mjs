@@ -301,14 +301,14 @@ const server = http.createServer(async (req, res) => {
     seq++;
     const noSearch = input.includes("QA-NOSEARCH");
     const output = [
-      { type: "message", content: [{ type: "output_text", text: "FACT | QA grounded claim line one about port risk || EVIDENCE: https://qa.example/s1 :: \"QA excerpt one.\"\nINTERPRETATION | QA grounded interpretation line two about crew || EVIDENCE: https://qa.example/s2 :: \"QA excerpt two.\"" }] },
+      { type: "message", content: [{ type: "output_text", text: "FACT | QA grounded claim line one about port risk || EVIDENCE: https://qa.example/s1 :: \"QA excerpt one.\"\nINTERPRETATION | QA grounded interpretation line two about crew || EVIDENCE: https://qa.example/s2 :: \"QA excerpt two.\"\nUNSUPPORTED | QA_UNVERIFIED_ONLY_SENTINEL has no evidence." }] },
     ];
     if (!noSearch) {
       output.unshift({
         type: "web_search_call",
         results: [
-          { url: "https://qa.example/s1", title: "QA source one", snippet: "QA excerpt one." },
-          { url: "https://qa.example/s2", title: "QA source two", snippet: "QA excerpt two." },
+          { url: "https://qa.example/s1", title: "QA source one", snippet: "QA excerpt one. QA_CITATION_ONLY_SENTINEL unrelated context." },
+          { url: "https://qa.example/s2", title: "QA source two", snippet: "QA excerpt two. QA_CITATION_ONLY_SECOND unrelated context." },
         ],
       });
     }

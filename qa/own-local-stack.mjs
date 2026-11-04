@@ -60,7 +60,7 @@ const STOP_BUDGET_MS = 25000;
 const BUILD_BUDGET_MS = 600000;
 const FRESH_CLEANUP_MS = 15000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
-function tcpOk(port, timeoutMs) { return new Promise((resolve) => { const s = net.connect({ host: "127.0.0.1", port: port }); let done = false; const fin = (v) => { if (done) return; done = true; try { s.destroy(); } catch (e) {} resolve(v); }; s.on("connect", () => fin(true)); s.on("error", () => fin(false)); s.setTimeout(timeoutMs || 2000, () => fin(false)); }); }
+function tcpOk(port, timeoutMs = 2000) { if (!(timeoutMs > 0)) throw new Error("TCP check deadline expired"); return new Promise((resolve) => { const s = net.connect({ host: "127.0.0.1", port: port }); let done = false; const fin = (v) => { if (done) return; done = true; try { s.destroy(); } catch (e) {} resolve(v); }; s.on("connect", () => fin(true)); s.on("error", () => fin(false)); s.setTimeout(timeoutMs, () => fin(false)); }); }
 function exactOrigin(u) { try { const x = new URL(u); if (x.username || x.password) return null; if (x.protocol !== "http:") return null; if (x.hostname !== "127.0.0.1") return null; return x.origin; } catch { return null; } }
 async function getJson(url, ms, deadlineMs) {
   const o = exactOrigin(url);
@@ -509,7 +509,8 @@ async function cleanupFresh(reason, contextPids) {
     const rem = deadline - Date.now();
     if (rem > 0) {
       const a = await tcpOk(API_PORT, Math.min(1500, rem));
-      const f = await tcpOk(FAKE_PORT, Math.min(1500, deadline - Date.now()));
+      const remFake = deadline - Date.now();
+      const f = remFake > 0 ? await tcpOk(FAKE_PORT, Math.min(1500, remFake)) : true;
       details.apiOpen = a; details.fakeOpen = f;
       if (a || f) verified = false;
     } else { details.apiOpen = true; details.fakeOpen = true; verified = false; }
@@ -630,7 +631,9 @@ async function cmdStart() {
   const remPorts = startDeadline - Date.now();
   if (remPorts <= 0) { console.log("FATAL start deadline exceeded before port check"); process.exit(2); }
   const aOpen = await tcpOk(API_PORT, Math.min(2000, remPorts));
-  const fOpen = await tcpOk(FAKE_PORT, Math.min(2000, startDeadline - Date.now()));
+  const remFakePort = startDeadline - Date.now();
+  if (remFakePort <= 0) throw new Error("start deadline expired before fake port check");
+  const fOpen = await tcpOk(FAKE_PORT, Math.min(2000, remFakePort));
   if (aOpen || fOpen) { console.log("FATAL refuse: occupied ports"); process.exit(2); }
   const env = apiEnv();
   assertControlledEnv(env);
@@ -757,13 +760,15 @@ async function cmdStop() {
     const rem = stopDeadline - Date.now();
     if (rem <= 0) break;
     const a = await tcpOk(API_PORT, Math.min(1500, rem));
-    const f = await tcpOk(FAKE_PORT, Math.min(1500, stopDeadline - Date.now()));
+    const remFake = stopDeadline - Date.now();
+    const f = remFake > 0 ? await tcpOk(FAKE_PORT, Math.min(1500, remFake)) : true;
     if (!a && !f) break;
     await sleep(Math.min(1000, stopDeadline - Date.now()));
   }
   const remFinal = stopDeadline - Date.now();
   const a2 = remFinal > 0 ? await tcpOk(API_PORT, Math.min(1500, remFinal)) : true;
-  const f2 = (stopDeadline - Date.now()) > 0 ? await tcpOk(FAKE_PORT, Math.min(1500, stopDeadline - Date.now())) : true;
+  const remFakeFinal = stopDeadline - Date.now();
+  const f2 = remFakeFinal > 0 ? await tcpOk(FAKE_PORT, Math.min(1500, remFakeFinal)) : true;
   console.log("after-stop apiOpen=" + a2 + " fakeOpen=" + f2 + (refusedReuse ? " refusedReuse=true" : "") + (unavailableSeen ? " unavailable=true" : ""));
   if (a2 || f2) {
     console.log("FATAL ports still open after bounded stop");
@@ -787,6 +792,7 @@ async function cmdStop() {
 }
 async function cmdStatus() {
   const deadline = Date.now() + 15000;
+  let identitiesVerified = false;
   let rec = null;
   try { rec = JSON.parse(fs.readFileSync(PIDFILE, "utf8")); } catch (e) { rec = null; }
   if (!rec) { try { rec = JSON.parse(fs.readFileSync(MANIFESTFILE, "utf8")); } catch (e) { rec = null; } }
@@ -800,10 +806,12 @@ async function cmdStatus() {
     if (cCur.status === "unavailable" || aCur.status === "unavailable" || fCur.status === "unavailable") { console.log("status REFUSED identity UNAVAILABLE controller=" + cCur.status + " api=" + aCur.status + " fake=" + fCur.status + " (cannot prove liveness; retaining)"); process.exit(2); }
     if (!cOk || !aOk || !fOk) { console.log("status REFUSED identity mismatch controller=" + String(!!cOk) + " api=" + String(!!aOk) + " fake=" + String(!!fOk) + " (PID reuse or restart; not accepted)"); process.exit(2); }
     console.log("status identity verified controller=" + cCur.pid + " api=" + aCur.pid + " fake=" + fCur.pid);
+    identitiesVerified = true;
   } else {
     console.log("status no recorded identities (stack down or never started)");
   }
   const h = await getJson(WEB + "/health", 5000, deadline); const r = await getJson(WEB + "/ready", 5000, deadline); const f = await getJson(FAKE + "/__log", 5000, deadline); console.log("health=" + h.status + " instance=" + ((h.json && h.json.instance) || "?") + " ready=" + r.status + " store=" + ((r.json && r.json.store) || "?") + " fake=" + f.status);
+  if (!identitiesVerified && (h.status || r.status || f.status)) throw new Error("status refused: responding endpoints without verified process identities");
 }
 const cmd = String(process.argv[2] || "");
 if (cmd === "start") { cmdStart().catch((e) => { console.log("FATAL " + String((e && e.message) || e).slice(0, 200)); process.exit(2); }); }

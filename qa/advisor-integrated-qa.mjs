@@ -1188,7 +1188,16 @@ async function stepCreateAdvisor() {
     // lines in order (whole-line+tail), and must EXCLUDE every unverified/citation line whole.
     const dossierSingleInput = dossierContentOk ? compileTexts.find((c) => dossierOrderInCompile(dossierLines, c)) : null;
     const dossierKindsOk = dossierContentOk && dossierLines.length >= 2;
-    const citationExcludedOk = !dossierSingleInput || citationLines.every((cl) => !String(dossierSingleInput).includes(String(cl)));
+    // Supporting quotes belong in verified claims. Only the distinct raw
+    // citation context and unsupported note must be absent from compilation.
+    const citationExcludedOk = !!dossierSingleInput
+      && citationLines.some((cl) => cl.includes("QA_CITATION_ONLY_SENTINEL"))
+      && citationLines.some((cl) => cl.includes("QA_UNVERIFIED_ONLY_SENTINEL"))
+      && !dossierSingleInput.includes("QA_CITATION_ONLY_SENTINEL")
+      && !dossierSingleInput.includes("QA_CITATION_ONLY_SECOND")
+      && !dossierSingleInput.includes("QA_UNVERIFIED_ONLY_SENTINEL")
+      && dossierSingleInput.includes("QA excerpt one.")
+      && dossierSingleInput.includes("QA excerpt two.");
     const compileHeadingOnly = compileTexts.some((c) => c.includes("Dossier (grounded evidence"));
     ok("research-dossier-content-full-in-compile", dossierContentOk && dossierInCompileFull && dossierTailOk && dossierKindsOk && citationExcludedOk && compileTexts.length >= 1 && !!dossierSingleInput, "dossierLines=" + dossierLines.length + " (FACT+INTERPRETATION both, CBC interpretation included) allVerbatimOrderTail=" + (dossierInCompileFull && dossierTailOk) + " singleInput=" + (!!dossierSingleInput) + " citationExcluded=" + citationExcludedOk + " compileN=" + compileTexts.length + " headingAlsoPresent=" + compileHeadingOnly + " (whole verified FACT+INTERPRETATION text/tail/order in ONE compile input; unverified/citation excluded)");
     ok("research-citation-snippets-not-required", dossierContentOk && dossierInCompileFull && citationExcludedOk, "citationLines=" + citationLines.length + " separatelyStored=" + (citationLines.length >= 0) + " excludedFromSingle=" + citationExcludedOk + " (production BuildCompileInput passes only verified g.Text FACT+INTERPRETATION dossier=" + dossierLines.length + " lines; unverified/citation angles stored separately and never required, never counted as dossier)");

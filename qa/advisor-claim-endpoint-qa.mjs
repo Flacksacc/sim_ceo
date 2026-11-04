@@ -186,19 +186,17 @@ async function boot() {
   throw new Error("boot failed within 90s");
 }
 async function cleanupAndVerify() {
-  for (const c of [apiProc, fakeProc]) { try { if (c && c.exitCode === null && !c.killed) c.kill(); } catch {} }
+  const exited = (c) => !!c && (c.exitCode !== null || c.signalCode !== null);
   const end = Date.now() + 20000;
+  for (const c of [apiProc, fakeProc]) { try { if (c && c.exitCode === null && !c.killed) c.kill(); } catch {} }
+  let apiOpen = true, fakeOpen = true;
   while (Date.now() < end) {
-    let alive = false;
-    for (const c of [apiProc, fakeProc]) { try { if (c && c.exitCode === null) { process.kill(c.pid, 0); alive = true; } } catch {} }
-    if (!alive) break;
-    await new Promise((r) => setTimeout(r, 400));
+    apiOpen = await tcpOk(API_PORT, Math.min(800, Math.max(1, end - Date.now())));
+    fakeOpen = await tcpOk(FAKE_PORT, Math.min(800, Math.max(1, end - Date.now())));
+    if (exited(apiProc) && exited(fakeProc) && !apiOpen && !fakeOpen) break;
+    await new Promise((r) => setTimeout(r, Math.min(100, Math.max(0, end - Date.now()))));
   }
-  let apiExited = false, fakeExited = false;
-  try { apiExited = !!apiProc && apiProc.exitCode !== null; } catch { apiExited = false; }
-  try { fakeExited = !!fakeProc && fakeProc.exitCode !== null; } catch { fakeExited = false; }
-  const apiOpen = await tcpOk(API_PORT, 800);
-  const fakeOpen = await tcpOk(FAKE_PORT, 800);
+  const apiExited = exited(apiProc), fakeExited = exited(fakeProc);
   const clean = apiExited && fakeExited && !apiOpen && !fakeOpen;
   if (clean) { try { fs.unlinkSync(PIDFILE); } catch {} }
   return { apiExited, fakeExited, apiPortClosed: !apiOpen, fakePortClosed: !fakeOpen, clean, pidRetained: fs.existsSync(PIDFILE) };
@@ -212,6 +210,9 @@ function parseResearchJson(v) {
 }
 function claimByText(claims, needle) {
   return (claims || []).find((c) => String(pick(c, "text") || "").toLowerCase().includes(String(needle).toLowerCase()));
+}
+function rosterEntries(response) {
+  return (Array.isArray(response.json) ? response.json : []).map((row) => pick(row, "entry") || row);
 }
 function refUrl(r) { return String(pick(r, "url") || pick(r, "ref") || ""); }
 function refQuote(r) { return String(pick(r, "excerpt") || pick(r, "quote") || ""); }
@@ -272,7 +273,7 @@ async function main() {
   const uUn = claimByText(uClaims, "unsupported speculation");
   ok("unsupported-claim-unverified-empty-refs", !!uUn && pick(uUn, "verified") === false && Array.isArray(pick(uUn, "refs")) && pick(uUn, "refs").length === 0, truncJson(uUn, 300));
   const canon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const rows = Array.isArray(canon.json) ? canon.json : [];
+  const rows = rosterEntries(canon);
   const found = rows.find((x) => String(pick(x, "id") || "").toLowerCase() === uId.toLowerCase());
   ok("unsupported-canonical", !!found, "rows=" + rows.length);
   const uVer0 = Number(pick(found, "version") || 0);
@@ -281,7 +282,7 @@ async function main() {
   const uEdit = await aput(WEB + "/api/roster/" + uId, { profileJson: behaviorU }, 15000);
   ok("unsupported-behavior-save-200", uEdit.status === 200, "status=" + uEdit.status);
   const uCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const uFound2 = (Array.isArray(uCanon2.json) ? uCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === uId.toLowerCase());
+  const uFound2 = rosterEntries(uCanon2).find((x) => String(pick(x, "id") || "").toLowerCase() === uId.toLowerCase());
   const uRj2 = parseResearchJson(pick(uFound2, "researchJson"));
   ok("unsupported-behavior-preserved", uRj2.json && String(pick(uRj2.json, "draftStatus") || "").toLowerCase() === "unsupported", truncJson(uRj2.json, 300));
   ok("unsupported-version-bumped", Number(pick(uFound2, "version") || 0) === uVer0 + 1, "v0=" + uVer0);
@@ -348,14 +349,14 @@ async function main() {
   const sRefs = Array.isArray(pick(sRes.json, "sources")) ? pick(sRes.json, "sources") : [];
   ok("supported-refs-provider-unfetched", sRefs.length >= 5 && sRefs.every((x) => pick(x, "fetched") === false && String(pick(x, "origin") || "") === "provider-search"), truncJson(sRefs, 400));
   const sCanon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const sFound = (Array.isArray(sCanon.json) ? sCanon.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
+  const sFound = rosterEntries(sCanon).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
   const sVer0 = Number(pick(sFound, "version") || 0);
   const sInputs0 = String(pick(sFound, "researchInputsJson") || "");
   const behaviorS = JSON.stringify({ contributionCriteria: "QA S contribution for " + MARK_S + ": harbor risk surfacing.", reasoningApproach: "QA S reasoning for " + MARK_S + ": options against port evidence.", responseStyle: "QA S style for " + MARK_S + ": blunt about port risk, diplomatic." });
   const sEdit = await aput(WEB + "/api/roster/" + sId, { profileJson: behaviorS }, 15000);
   ok("supported-behavior-save-200", sEdit.status === 200, "status=" + sEdit.status);
   const sCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const sFound2 = (Array.isArray(sCanon2.json) ? sCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
+  const sFound2 = rosterEntries(sCanon2).find((x) => String(pick(x, "id") || "").toLowerCase() === sId.toLowerCase());
   const sRj2 = parseResearchJson(pick(sFound2, "researchJson"));
   ok("supported-behavior-saved", sRj2.json && String(pick(sRj2.json, "draftStatus") || "").toLowerCase() === "saved", truncJson(sRj2.json, 300));
   ok("supported-version-bumped", Number(pick(sFound2, "version") || 0) === sVer0 + 1, "v0=" + sVer0);
@@ -410,14 +411,14 @@ async function main() {
   const cUn = claimByText(cClaims, "unsupported speculation");
   ok("character-unverified-empty-refs", !!cUn && pick(cUn, "verified") === false && Array.isArray(pick(cUn, "refs")) && pick(cUn, "refs").length === 0, truncJson(cUn, 300));
   const cCanon = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const cFound = (Array.isArray(cCanon.json) ? cCanon.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
+  const cFound = rosterEntries(cCanon).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
   const cVer0 = Number(pick(cFound, "version") || 0);
   const cInputs0 = String(pick(cFound, "researchInputsJson") || "");
   const behaviorC = JSON.stringify({ contributionCriteria: "QA C contribution for " + MARK_C + ": harbor risk; abstains without data.", reasoningApproach: "QA C reasoning for " + MARK_C + ": compares options; challenges unsupported.", responseStyle: "QA C style for " + MARK_C + ": blunt about risk, diplomatic." });
   const cEdit = await aput(WEB + "/api/roster/" + cId, { profileJson: behaviorC }, 15000);
   ok("character-save-200", cEdit.status === 200, "status=" + cEdit.status);
   const cCanon2 = await aget(WEB + "/api/roster?accountId=" + encodeURIComponent(ACCT), 15000);
-  const cFound2 = (Array.isArray(cCanon2.json) ? cCanon2.json : []).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
+  const cFound2 = rosterEntries(cCanon2).find((x) => String(pick(x, "id") || "").toLowerCase() === cId.toLowerCase());
   const cRj2 = parseResearchJson(pick(cFound2, "researchJson"));
   ok("character-behavior-saved-pinned", cRj2.json && ["saved", "done"].includes(String(pick(cRj2.json, "draftStatus") || "").toLowerCase()), truncJson(cRj2.json, 300));
   ok("character-version-bumped", Number(pick(cFound2, "version") || 0) === cVer0 + 1, "v0=" + cVer0);

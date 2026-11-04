@@ -707,7 +707,11 @@ public static class RosterEndpoints
       if (name.Trim().Length > 120) return Results.BadRequest("Name must be 120 chars or fewer.");
       if (role.Trim().Length > 500) return Results.BadRequest("Role must be 500 chars or fewer.");
       if (problem.Trim().Length > 4000) return Results.BadRequest("Problem must be 4000 chars or fewer.");
-      var descText = body.TryGetProperty("description", out var dd) && !string.IsNullOrWhiteSpace(dd.GetString()) ? dd.GetString()! : role + " helping with: " + problem;
+      var hasDescription = body.TryGetProperty("description", out var dd) && !string.IsNullOrWhiteSpace(dd.GetString());
+      // The full role/problem remain in CharacterJson; keep the generated
+      // summary within its own limit when both seed fields are at capacity.
+      var descText = hasDescription ? dd.GetString()! : role + " helping with: " + problem;
+      if (!hasDescription && descText.Length > 4000) descText = descText[..4000];
       if (descText.Trim().Length > 4000) return Results.BadRequest("Description must be 4000 chars or fewer.");
       string suppliedProfile = "";
       if (body.TryGetProperty("profileJson", out var pj))
