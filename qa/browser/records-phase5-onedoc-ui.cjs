@@ -92,7 +92,10 @@ function consumeExpectedConsole(combined, txt, label) {
     const e = expectedConsole[i];
     if (e.label !== label) continue;
     if (now - (e.at || 0) > 30000) continue;
-    if (!String(combined).includes(e.path)) continue;
+    const resourceUrl = (String(combined).match(/https?:\/\/[^\s"']+/) || [])[0];
+    let resourcePath = '';
+    try { const u = new URL(resourceUrl); resourcePath = u.pathname + u.search; } catch {}
+    if (resourcePath !== e.path) continue;
     if (String(e.status) === 'ERR') {
       if (!/ERR_|Failed to load resource|net::ERR|aborted|abort/i.test(String(txt))) continue;
       let stubIdx = -1;
@@ -277,8 +280,8 @@ async function main() {
         const q = r.request();
         const pathname = new URL(q.url()).pathname;
         const method = q.method();
-        if (/\/api\/records\//.test(q.url())) {
-          netLog.push({ method: method, path: pathname, status: r.status(), label: label, at: Date.now() });
+        if (/\/api\/records\//.test(q.url()) || (label === 'stranger' && pathname.startsWith('/api/boards/'))) {
+          netLog.push({ method: method, path: pathname + new URL(q.url()).search, status: r.status(), label: label, at: Date.now() });
         }
         if (method === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: pathname, status: r.status(), method: method, label: label, at: Date.now() });
         const u = new URL(q.url());
@@ -294,6 +297,7 @@ async function main() {
     const combined = tt + " " + lu;
     if (tt.includes("Failed to load resource")) {
       if ((tt.includes("409") || tt.includes("403")) && combined.includes("/api/records/") && consumeExpectedConsole(combined, tt, label)) return true;
+      if (label === 'stranger' && tt.includes('403') && combined.includes('/api/boards/') && consumeExpectedConsole(combined, tt, label)) return true;
       if (tt.includes("404") && !combined.includes("/api/")) return true;
       if (tt.includes("net::ERR_")) {
         if (/fonts\.gstatic|fonts\.googleapis/.test(combined)) return true;
@@ -1093,6 +1097,11 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
   p2 = await ctx2.newPage();
   attachCollectors(p2, "stranger");
+  const deniedBoardPaths = ['/api/boards/' + bid, '/api/boards/' + bid + '/capabilities?meetingId=' + mid];
+  for (const p of deniedBoardPaths) {
+    preflight('stranger-private-board-denied:' + p.split('/').at(-1).split('?')[0], (await api('GET', p, undefined, stranger)).status === 403, 'private board must reject unrelated account');
+    expectConsoleError('GET', p, 403, 'stranger');
+  }
   expectConsoleError('GET', '/api/records/' + nid + '/review', 403, 'stranger');
   expectConsoleError('GET', '/api/records/' + nid, 403, 'stranger');
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
