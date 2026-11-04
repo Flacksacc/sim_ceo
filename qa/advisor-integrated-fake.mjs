@@ -1,4 +1,5 @@
-// qa/advisor-integrated-fake.mjs - integrated fake for advisor-integrated QA ONLY (never shipped). Combines deterministic research compile (COMPILE-CHARACTER-PARAGRAPHS echoing name), YOUR TURN/bid pacing, and structured secretary JSON echoing the owned run marker. Reuses research 3-paragraph outputs + chat logs + QA-SLEEP pacing from qa/fake-provider and structured secretary schema from qa/secretary-fake. Primary starts it on 15302; this file never runs services itself.`r`nimport http from "node:http";
+// qa/advisor-integrated-fake.mjs - integrated fake for advisor-integrated QA ONLY (never shipped). Combines deterministic research compile (COMPILE-CHARACTER-PARAGRAPHS echoing name), YOUR TURN/bid pacing, and structured secretary JSON echoing the owned run marker. Reuses research 3-paragraph outputs + chat logs + QA-SLEEP pacing from qa/fake-provider and structured secretary schema from qa/secretary-fake. Primary starts it on 15302; this file never runs services itself.
+import http from "node:http";
 import { findDelimiters } from "./voice-multipart.mjs";
 import fs from "node:fs";
 import crypto from "node:crypto";
