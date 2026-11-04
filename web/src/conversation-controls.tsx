@@ -1,5 +1,5 @@
 import { AdvisorSummary } from "./advisor-summary";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 // Unified conversation controls for the Sim CEO meeting room.
@@ -58,6 +58,10 @@ export interface LifecycleProps {
   onResume: () => void;
   onEnd: () => void;
   onRequestResponses: () => void;
+  secretaryAvailable?: boolean;
+  secretaryPending?: boolean;
+  onSecretaryCommand?: (input: string) => boolean;
+  onPrepareBriefing?: (topic: string) => boolean;
 }
 
 // Single conversation header: lifecycle + the ONE advisor-request action.
@@ -81,6 +85,50 @@ export function ConversationHeader(p: LifecycleProps) {
     catch { setRenameError("Could not save the meeting name. Your changes are still here; try again."); }
     finally { setSaving(false); }
   };
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [promptKind, setPromptKind] = useState<"secretary" | "briefing" | null>(null);
+  const [commandText, setCommandText] = useState("");
+  const menuId = useId();
+  const menuRoot = useRef<HTMLDivElement>(null);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const positionMenu = () => {
+      const button = menuButton.current;
+      const menu = menuRoot.current?.querySelector<HTMLElement>('[role="menu"]');
+      if (!button || !menu) return;
+      const anchor = button.getBoundingClientRect();
+      const below = window.innerHeight - anchor.bottom - 12;
+      const above = anchor.top - 12;
+      const upwards = below < 360 && above > below;
+      menu.style.left = Math.max(12, Math.min(anchor.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 12)) + "px";
+      menu.style.right = "auto";
+      menu.style.maxHeight = Math.max(60, Math.min(600, (upwards ? above : below) - 6)) + "px";
+      menu.style.top = upwards ? "auto" : (anchor.bottom + 6) + "px";
+      menu.style.bottom = upwards ? (window.innerHeight - anchor.top + 6) + "px" : "auto";
+    };
+    positionMenu();
+    menuRoot.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus({ preventScroll: true });
+    window.addEventListener("resize", positionMenu);
+    window.addEventListener("scroll", positionMenu, true);
+    const outside = (event: PointerEvent) => { if (!menuRoot.current?.contains(event.target as Node)) setMenuOpen(false); };
+    document.addEventListener("pointerdown", outside);
+    return () => { document.removeEventListener("pointerdown", outside); window.removeEventListener("resize", positionMenu); window.removeEventListener("scroll", positionMenu, true); };
+  }, [menuOpen]);
+  const closeMenu = () => { setMenuOpen(false); menuButton.current?.focus(); };
+  const runMenu = (action: () => void) => { closeMenu(); action(); };
+  const openPrompt = (kind: "secretary" | "briefing") => { closeMenu(); setCommandText(""); setPromptKind(kind); };
+  const cancelPrompt = () => { setPromptKind(null); menuButton.current?.focus(); };
+  const menuKeys = (event: React.KeyboardEvent) => {
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeMenu(); return; }
+    if (event.key === "Tab") { setMenuOpen(false); return; }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(menuRoot.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? []);
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+    items[next]?.focus();
+  };
   return (
     <div className="conv-head">
       <div className="conv-title">
@@ -100,30 +148,39 @@ export function ConversationHeader(p: LifecycleProps) {
           {p.messageCount != null && <span>{p.messageCount} messages</span>}
           {p.live && <span className="badge live">live</span>}
           {p.requestPending && <span className="badge live">Advisors drafting...</span>}
+          {p.secretaryPending && <span className="badge live">Secretary working…</span>}
         </p>
       </div>
       <div className="conv-actions" role="group" aria-label="Meeting and advisor controls">
-        <div className="conv-group" role="group" aria-label="Meeting lifecycle">
-          <button type="button" className="btn ghost" onClick={p.onOpenSettings}>Meeting settings</button>
-          {p.canManageMeeting && (
-            <>
-              <button type="button" onClick={p.onPause} disabled={!p.pauseAvailable}
-                title={p.pauseAvailable ? undefined : "Pause is available while the meeting is Active"}>Pause meeting</button>
-              <button type="button" onClick={p.onResume} disabled={!p.resumeAvailable}
-                title={p.resumeAvailable ? undefined : "Resume is available while the meeting is Paused"}>Resume meeting</button>
-              <button type="button" onClick={p.onEnd} disabled={!p.endAvailable}>End discussion</button>
-            </>
-          )}
+        <div className="meeting-command-root" ref={menuRoot}>
+          <button type="button" className="btn ghost" ref={menuButton} aria-label="Meeting settings"
+            aria-haspopup="menu" aria-expanded={menuOpen} aria-controls={menuOpen ? menuId : undefined}
+            onClick={() => setMenuOpen(open => !open)} onKeyDown={event => { if (event.key === "ArrowDown") { event.preventDefault(); setMenuOpen(true); } }}>Meeting settings <span aria-hidden="true">▾</span></button>
+          {menuOpen && <div id={menuId} className="meeting-command-menu" role="menu" aria-label="Meeting commands" onKeyDown={menuKeys}>
+            <div role="group" aria-label="Orchestrator commands">
+              <div className="meeting-command-heading" aria-hidden="true">Orchestrator</div>
+              <button role="menuitem" type="button" disabled={requestDisabled} onClick={() => runMenu(p.onRequestResponses)}>{p.requestPending ? "Advisors drafting…" : "Request advisor responses"}</button>
+              {p.canManageMeeting && <>
+                <button role="menuitem" type="button" disabled={!p.pauseAvailable} onClick={() => runMenu(p.onPause)}>Pause meeting</button>
+                <button role="menuitem" type="button" disabled={!p.resumeAvailable} onClick={() => runMenu(p.onResume)}>Resume meeting</button>
+                <button role="menuitem" type="button" disabled={!p.endAvailable} onClick={() => runMenu(p.onEnd)}>End discussion</button>
+              </>}
+            </div>
+            <div role="group" aria-label="Secretary commands">
+              <div className="meeting-command-heading" aria-hidden="true">Secretary</div>
+              <button role="menuitem" type="button" disabled={!p.secretaryAvailable || !p.onSecretaryCommand} onClick={() => openPrompt("secretary")}>Ask the Secretary…</button>
+              <button role="menuitem" type="button" disabled={!p.secretaryAvailable || !p.onSecretaryCommand} onClick={() => runMenu(() => { p.onSecretaryCommand?.("Summarize this meeting so far: key points, decisions, unresolved questions, and next steps. Use only the conversation and available evidence."); })}>Summarize meeting</button>
+              <button role="menuitem" type="button" disabled={!p.secretaryAvailable || !p.onPrepareBriefing} onClick={() => openPrompt("briefing")}>Prepare briefing…</button>
+            </div>
+            <div className="meeting-command-general"><button role="menuitem" type="button" onClick={() => runMenu(p.onOpenSettings)}>General settings</button></div>
+          </div>}
         </div>
-        <div className="conv-group conv-request" role="group" aria-label="Advisor responses">
-          <button type="button" className="primary" onClick={p.onRequestResponses}
-            disabled={requestDisabled}
-            title={!p.briefReady ? "Add a brief before requesting advisor responses" : (!p.canDiscussMeeting ? "Discuss access is required" : undefined)}>
-            {p.requestPending ? "Advisors drafting..." : "Request advisor responses"}
-          </button>
-          {!p.briefReady && <span className="muted conv-hint">A brief is required before advisors respond.</span>}
-          <span className="muted conv-hint">Asks the advisors in the current meeting to respond. Nothing runs until you press this.</span>
-        </div>
+        {promptKind && <form className="conv-command-prompt" onSubmit={event => { event.preventDefault(); if (!commandText.trim() || !p.secretaryAvailable) return; const accepted = promptKind === "briefing" ? p.onPrepareBriefing?.(commandText.trim()) : p.onSecretaryCommand?.(commandText.trim()); if (accepted) cancelPrompt(); }}>
+          <h3>{promptKind === "briefing" ? "Prepare briefing" : "Ask the Secretary"}</h3>
+          <label>{promptKind === "briefing" ? "Briefing topic" : "Secretary request"}<textarea autoFocus rows={3} maxLength={4000} value={commandText} onChange={event => setCommandText(event.target.value)}
+            onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); cancelPrompt(); } }} /></label>
+          <div className="meetctl"><button type="submit" disabled={!commandText.trim() || !p.secretaryAvailable}>{promptKind === "briefing" ? "Prepare briefing" : "Send to Secretary"}</button><button type="button" className="btn ghost" onClick={cancelPrompt}>Cancel</button></div>
+        </form>}
       </div>
     </div>
   );

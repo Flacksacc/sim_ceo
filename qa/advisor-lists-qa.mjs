@@ -42,7 +42,7 @@ try{
  await page.goto(`${base}/#/meet?board=${board.id}&meeting=${meeting.id}`);await page.locator('.composer-bar .mp-seat').first().waitFor();
  assert.equal(await page.locator('.composer-bar .mp-seat').count(),12);
  assert.equal(await page.locator('.composer-bar .mp-role').filter({hasText:'An existing fictional specialist.'}).count(),10);
- await page.getByRole('button',{name:'Meeting settings',exact:true}).click();
+ await page.getByRole('button',{name:'Meeting settings',exact:true}).click();await page.getByRole('menuitem',{name:'General settings',exact:true}).click();
  const dialog=page.locator('.conv-settings');await dialog.waitFor();assert.equal(await dialog.locator('.conv-picks .advisor-summary-description').count(),10);await dialog.locator('.conv-picks img').first().waitFor();
  await page.screenshot({path:'.tmp/advisor-lists-settings.png',fullPage:true,animations:'disabled'});
  await ctx.close();

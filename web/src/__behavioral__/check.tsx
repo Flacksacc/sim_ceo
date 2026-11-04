@@ -80,18 +80,18 @@ const api = { get: noopAsync, post: noopAsync, put: noopAsync, originIdentity: (
     onResume: () => undefined, onEnd: () => undefined, onRequestResponses: () => undefined,
   };
   const html = renderToString(<ConversationHeader {...base} />);
-  check("conv: one Request advisor responses", (html.match(/Request advisor responses/g) ?? []).length === 1);
+  check("conv: settings opens commands menu", html.includes('aria-haspopup="menu"') && html.includes("Meeting settings"));
   check("conv: no New meeting in header", !html.includes("New meeting"));
   check("conv: rename meeting available", html.includes("Rename meeting"));
   check("conv: no New meeting helper copy", !html.includes("New meeting starts a separate conversation"));
-  check("conv: advisor helper copy", html.includes("Asks the advisors in the current meeting to respond"));
+  check("conv: command buttons hidden until menu opens", !html.includes("Pause meeting") && !html.includes("Request advisor responses"));
   check("conv: no legacy Run discussion", !html.includes("Run discussion"));
   check("conv: no legacy Start meeting", !html.includes("Start meeting"));
   check("conv: drafting state shown", renderToString(<ConversationHeader {...base} requestPending />).includes("Advisors drafting"));
   const gated = renderToString(<ConversationHeader {...base} briefReady={false} requestAvailable={false} />);
-  check("conv: request disabled without brief", gated.includes("disabled"));
+  check("conv: settings available without brief", gated.includes("Meeting settings"));
   const decoupled = renderToString(<ConversationHeader {...base} endAvailable requestAvailable={false} />);
-  check("conv: request gated apart from End", decoupled.includes("disabled"));
+  check("conv: settings available independently of commands", decoupled.includes("Meeting settings"));
   const search = renderToString(<ConversationSearchField value="" onChange={() => undefined} onSearch={() => undefined} resultCount={2} />);
   check("conv: search above messages", search.includes("Search this conversation") && search.includes("matches"));
   const dlgProps = {

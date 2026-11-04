@@ -5512,17 +5512,19 @@ const testModel = useMutation({
       } catch { }
     }).catch(() => {});
   }, [boardId, meetingId, appliedActAs, meetingOk]);
-  const submitDraft = () => {
-    if (!draft.trim()) return;
+  const submitDraft = (commandText?: string) => {
+    const submittedText = commandText ?? draft;
+    if (commandText !== undefined && (!canActMeeting || !curMeeting || ![0, 1].includes(curMeeting.state))) return false;
+    if (!submittedText.trim()) return false;
     // Synchronous pending guard: React pending flags flip a render later, so
     // rapid double-Enter (or Enter+click) must also hit this same-tick ref.
-    if (submitBusyRef.current) return;
-    if (secPendingRef.current || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending) return;
-    if (sendPhase === "sending" || sendPhase === "working") return;
+    if (submitBusyRef.current) return false;
+    if (secPendingRef.current || askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || send.isPending || runDiscussion.isPending) return false;
+    if (sendPhase === "sending" || sendPhase === "working") return false;
     const submitOp = "submit-" + (++opSeq.current);
     submitBusyRef.current = true;
     submitOpRef.current = submitOp;
-    const direct = audience === "secretary" || secHasPrefix(draft);
+    const direct = commandText !== undefined || audience === "secretary" || secHasPrefix(draft);
     if (direct) {
       // Genuine new attempt: advance exactly once BEFORE capturing caps so
       // older held hydration/callback intents retire; onMutate/mutationFn/
@@ -5534,15 +5536,18 @@ const testModel = useMutation({
       askSecretary.mutate({
         opId: "init-" + (++opSeq.current),
         boardId, meetingId, user: uAsk, epoch: secEpoch.current, origin: originIdentity(),
-        draft, submitVer: secDraftVer.current, prevReq: secRequestId, submitOp,
+        // Menu commands do not own a composer edit revision, so completion
+        // and retries must never clear the user's unrelated unsent text.
+        draft: submittedText, submitVer: commandText !== undefined ? -1 : secDraftVer.current, prevReq: secRequestId, submitOp,
         envRevCap: secEnvelopeRev.current, hydRevCap: secHydRef.current,
         nonce: (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : String(Date.now()) + "-" + String(Math.floor(Math.random() * 1000000)),
       });
     }
     else {
-      if (!meetingValid || curMeeting == null) { settlePipeline(submitOp, "error", "Meeting is still loading. Wait for the meeting to load, then retry.", null); setSendConflict(null); return; } if (!meetingSendOpen((curMeeting as any).state)) { settlePipeline(submitOp, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return; } takePipeline(submitOp, "sending", "Sending message..."); setSendRetryCtx(null); setSendConflict(null);
+      if (!meetingValid || curMeeting == null) { settlePipeline(submitOp, "error", "Meeting is still loading. Wait for the meeting to load, then retry.", null); setSendConflict(null); return false; } if (!meetingSendOpen((curMeeting as any).state)) { settlePipeline(submitOp, "error", "Meeting is not open for advisor responses.", null); setSendConflict(null); return false; } takePipeline(submitOp, "sending", "Sending message..."); setSendRetryCtx(null); setSendConflict(null);
       send.mutate({ boardId, meetingId, user: secIdentity(), epoch: secEpoch.current, origin: originIdentity(), draft, submitVer: secDraftVer.current, replySeq: replyTo ? replyTo.seq : null, submitOp, leadVersion: lead.data ? lead.data.version : null, policy: policy, briefAtClick: briefText, meetingStateAtClick: curMeeting ? (curMeeting as any).state : null, canContributeAtClick: canActMeeting });
     }
+    return true;
   };
   const runSummary = (r: { published: Msg[]; yielded: { advisor: string; reason: string }[]; overflow: { omitted: string[]; cap: number; policy: string } | null }) => {
     const oc = r.overflow && r.overflow.omitted ? r.overflow.omitted.join(", ") : "";
@@ -7561,8 +7566,17 @@ const testModel = useMutation({
                           endAvailable={curMeeting != null && meetingIsOpen(curMeeting.state)}
                           briefReady={!!briefText.trim()}
                           requestPending={runDiscussion.isPending}
-                          requestAvailable={canDiscussMeeting && !!briefText.trim() && curMeeting != null && (curMeeting.state === 0 || curMeeting.state === 1)}
+                          requestAvailable={canDiscussMeeting && !send.isPending && !askSecretary.isPending && !retrySecretary.isPending && !answerSecretary.isPending && !askBriefing.isPending && !!briefText.trim() && curMeeting != null && (curMeeting.state === 0 || curMeeting.state === 1)}
                           onRename={title => renameMeeting.mutateAsync({ boardId, meetingId, title }).then(() => undefined)}
+                          secretaryPending={askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending || askBriefing.isPending}
+                          secretaryAvailable={canActMeeting && curMeeting != null && [0, 1].includes(curMeeting.state) && !send.isPending && !runDiscussion.isPending && !askSecretary.isPending && !retrySecretary.isPending && !answerSecretary.isPending && !askBriefing.isPending && !secPendingRef.current}
+                          onSecretaryCommand={input => submitDraft(input)}
+                          onPrepareBriefing={topic => {
+                            if (!canActMeeting || !curMeeting || ![0, 1].includes(curMeeting.state) || secPendingRef.current || submitBusyRef.current || askBriefing.isPending || send.isPending || runDiscussion.isPending) return false;
+                            setBtopic(topic); briefVisitRef.current++;
+                            askBriefing.mutate({ oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, origin: originIdentity(), topic, visit: briefVisitRef.current, opId: "brief-" + (++opSeq.current) });
+                            return true;
+                          }}
                           onOpenSettings={openSettings}
                           onPause={() => meetingCtl("pause")}
                           onResume={() => meetingCtl("resume")}
@@ -7745,7 +7759,6 @@ const testModel = useMutation({
                                 );
                               })}{" "}
                             {(notes.data ?? []).filter((n) => n.kind === "briefing" || n.kind === "secretary-briefing").length === 0 && <p>No briefings yet.</p>}{" "}
-                            {canActMeeting && (<div className="card"><b>Prepare briefing</b><div className="muted">Grounded in approved sources, adopted directions, and approved records for this meeting.</div><label>Briefing topic<input value={btopic} onChange={(e) => { try { briefVisitRef.current++; } catch { /* noop */ } setBtopic(e.target.value); }} placeholder="e.g. pricing risks" /></label>{" "}<button type="button" onClick={() => { if (!askBriefing.isPending && btopic.trim()) askBriefing.mutate({ oB: boardId, oM: meetingId, oU: secIdentity(), oEp: secEpoch.current, origin: originIdentity(), topic: btopic, visit: briefVisitRef.current, opId: "brief-" + (++opSeq.current) }); }} disabled={!canActMeeting || !btopic.trim() || askBriefing.isPending}>{askBriefing.isPending ? "Preparing..." : "Prepare briefing"}</button></div>)}{" "}
                             {secQuestion && (
                               <div className="card" role="status">
                                 <b>Secretary clarification</b>
