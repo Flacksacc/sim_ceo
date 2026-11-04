@@ -52,7 +52,7 @@ try{
  const ctx=await browser.newContext({viewport:{width:1440,height:1000}});await ctx.grantPermissions(['local-network-access'],{origin:base});const page=await ctx.newPage();const errors=[];page.on('pageerror',e=>errors.push(String(e)));
  await page.goto(`${base}/#/meet?board=${board.id}&meeting=${meeting.id}`);const area=page.getByRole('region',{name:'Meeting attachments'});await area.waitFor();
  await area.getByText('budget.txt',{exact:false}).waitFor();
- for(const role of ['orchestrator','secretary'])assert.equal(await page.locator(`.mp-seat img[src="/portraits/${role}-v1.webp"]`).evaluate(i=>i.complete&&i.naturalWidth>0),true);
+ for(const role of ['orchestrator','secretary'])assert.equal(await page.locator(`.mp-seat img[src="/portraits/${role}-v2.webp"]`).evaluate(i=>i.complete&&i.naturalWidth>0),true);
  const composer=page.getByRole('textbox',{name:'Message. Press Enter to send, Shift and Enter for a new line.',exact:true});await composer.fill('Preserve this unsent draft.');
  await page.route('**/sources/upload',async route=>{await new Promise(resolve=>setTimeout(resolve,350));await route.continue();},{times:1});
  await area.locator('input[type=file]').setInputFiles({name:'browser.txt',mimeType:'text/plain',buffer:Buffer.from('BROWSER-ATTACHMENT-CONTEXT: visible progress.')});

@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { AdvisorSummary } from "./advisor-summary";
 import { useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -39,6 +40,7 @@ export function meetingStateLabel(state: MeetingLifecycleState | number): string
 export interface ParticipantPick { id: string; role: string; description?: string; portraitUrl?: string | null; included: boolean; locked?: boolean; }
 
 export interface LifecycleProps {
+  controlsTarget?: HTMLElement | null;
   meetingTitle: string;
   meetingBrief: string;
   stateLabel: string;
@@ -129,28 +131,7 @@ export function ConversationHeader(p: LifecycleProps) {
     const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
     items[next]?.focus();
   };
-  return (
-    <div className="conv-head">
-      <div className="conv-title">
-        <div className="eyebrow">Discussion</div>
-        {editing ? <form className="conv-title-editor" onSubmit={e => { e.preventDefault(); void rename(); }}>
-          <label>Meeting name<input autoFocus value={title} disabled={saving} onChange={e => setTitle(e.target.value)}
-            onKeyDown={e => { if (e.key === "Escape" && !saving) { e.preventDefault(); cancelRename(); } }} /></label>
-          <div className="meetctl"><button type="submit" disabled={!title.trim() || saving}>{saving ? "Saving…" : "Save name"}</button>
-            <button type="button" className="btn ghost" disabled={saving} onClick={cancelRename}>Cancel</button></div>
-          {renameError && <p role="alert">{renameError}</p>}
-        </form> : <div className="conv-title-row"><h2>{p.meetingTitle || "Meeting"}</h2>
-          {p.canManageMeeting && p.onRename && <button type="button" className="btn ghost" onClick={() => { setTitle(p.meetingTitle); setRenameError(""); setEditing(true); }}>Rename meeting</button>}
-        </div>}
-        {p.meetingBrief && <p className="muted conv-brief">{p.meetingBrief}</p>}
-        <p role="status" className="status-line conv-status">
-          <span className="badge">{p.stateLabel}</span>
-          {p.messageCount != null && <span>{p.messageCount} messages</span>}
-          {p.live && <span className="badge live">live</span>}
-          {p.requestPending && <span className="badge live">Advisors drafting...</span>}
-          {p.secretaryPending && <span className="badge live">Secretary working…</span>}
-        </p>
-      </div>
+  const controls = (
       <div className="conv-actions" role="group" aria-label="Meeting and advisor controls">
         <div className="meeting-command-root" ref={menuRoot}>
           <button type="button" className="btn ghost" ref={menuButton} aria-label="Meeting settings"
@@ -182,6 +163,30 @@ export function ConversationHeader(p: LifecycleProps) {
           <div className="meetctl"><button type="submit" disabled={!commandText.trim() || !p.secretaryAvailable}>{promptKind === "briefing" ? "Prepare briefing" : "Send to Secretary"}</button><button type="button" className="btn ghost" onClick={cancelPrompt}>Cancel</button></div>
         </form>}
       </div>
+  );
+  return (
+    <div className="conv-head">
+      <div className="conv-title">
+        <div className="eyebrow">Discussion</div>
+        {editing ? <form className="conv-title-editor" onSubmit={e => { e.preventDefault(); void rename(); }}>
+          <label>Meeting name<input autoFocus value={title} disabled={saving} onChange={e => setTitle(e.target.value)}
+            onKeyDown={e => { if (e.key === "Escape" && !saving) { e.preventDefault(); cancelRename(); } }} /></label>
+          <div className="meetctl"><button type="submit" disabled={!title.trim() || saving}>{saving ? "Saving…" : "Save name"}</button>
+            <button type="button" className="btn ghost" disabled={saving} onClick={cancelRename}>Cancel</button></div>
+          {renameError && <p role="alert">{renameError}</p>}
+        </form> : <div className="conv-title-row"><h2>{p.meetingTitle || "Meeting"}</h2>
+          {p.canManageMeeting && p.onRename && <button type="button" className="btn ghost" onClick={() => { setTitle(p.meetingTitle); setRenameError(""); setEditing(true); }}>Rename meeting</button>}
+        </div>}
+        {p.meetingBrief && <p className="muted conv-brief">{p.meetingBrief}</p>}
+        <p role="status" className="status-line conv-status">
+          <span className="badge">{p.stateLabel}</span>
+          {p.messageCount != null && <span>{p.messageCount} messages</span>}
+          {p.live && <span className="badge live">live</span>}
+          {p.requestPending && <span className="badge live">Advisors drafting...</span>}
+          {p.secretaryPending && <span className="badge live">Secretary working…</span>}
+        </p>
+      </div>
+      {p.controlsTarget ? createPortal(controls, p.controlsTarget) : p.controlsTarget === undefined ? controls : null}
     </div>
   );
 }

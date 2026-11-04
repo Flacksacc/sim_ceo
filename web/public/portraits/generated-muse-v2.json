@@ -1,0 +1,17 @@
+{
+  "provider": "Muse",
+  "model": "muse-image-1.0",
+  "generatedAt": "2026-11-04T20:49:02.740Z",
+  "images": [
+    {
+      "role": "orchestrator",
+      "file": "web/public/portraits/orchestrator-v2.webp",
+      "prompt": "Create a polished 3D cartoon avatar for the Sim CEO app, matching its logo style: a charming toy-like Meta-avatar person with an oversized rounded head, simplified sculpted face, smooth clay/plastic materials, chunky hair, warm skin tone, tiny friendly smile, tailored navy clothing, soft studio lighting, vibrant blue-to-violet circular backdrop, square composition, centered head and upper torso with generous space for circular cropping. Clearly stylized computer animation, NOT a photograph, NOT a realistic human portrait. No text, letters, logos or watermark. Distinctive and readable at 44 pixels. Meeting orchestrator: a male cartoon avatar with neatly swept dark brown hair, thick dark glasses with clear lenses, blue suit, white shirt and teal tie. Thoughtful friendly expression, arms casually folded, calm confident leader. The overall look resembles a premium social-platform avatar or playful business mascot."
+    },
+    {
+      "role": "secretary",
+      "file": "web/public/portraits/secretary-v2.webp",
+      "prompt": "Create a polished 3D cartoon avatar for the Sim CEO app, matching its logo style: a charming toy-like Meta-avatar person with an oversized rounded head, simplified sculpted face, smooth clay/plastic materials, chunky hair, warm skin tone, tiny friendly smile, tailored navy clothing, soft studio lighting, vibrant blue-to-violet circular backdrop, square composition, centered head and upper torso with generous space for circular cropping. Clearly stylized computer animation, NOT a photograph, NOT a realistic human portrait. No text, letters, logos or watermark. Distinctive and readable at 44 pixels. Meeting secretary: a female cartoon avatar with a neatly sculpted chestnut bob, expressive large eyes and subtle round glasses with clear lenses, navy blazer over a lavender blouse. Friendly organized expression, holding a small simple teal notebook against her chest below her face. The overall look resembles a premium social-platform avatar or playful business mascot."
+    }
+  ]
+}

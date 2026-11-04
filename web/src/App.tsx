@@ -2254,6 +2254,7 @@ export default function App() {
     "members" | "context" | "decisions"
   >(route0.ctab);
   const [contextCollapsed, setContextCollapsed] = useState(false);
+  const [meetingControlsHost, setMeetingControlsHost] = useState<HTMLDivElement | null>(null);
   const [recordFlash, setRecordFlash] = useState(false);
   const prevRecordKey = useRef("");
   const prevLatest = useRef(0);
@@ -7557,6 +7558,7 @@ const testModel = useMutation({
                         <div className="meet-center">
                         {" "}
                         <ConversationHeader key={meetingId + ":" + canonicalUser()}
+                          controlsTarget={meetingControlsHost}
                           meetingTitle={curMeeting?.title ?? "Meeting"}
                           meetingBrief={curMeeting?.brief ?? ""}
                           stateLabel={curMeeting ? meetingStateLabel(curMeeting.state) : "No meeting"}
@@ -8128,8 +8130,6 @@ const testModel = useMutation({
                             {(sendPhase === "error" || sendPhase === "no-contributions") && sendRetryCtx && sendRetryCtx.meetingId === meetingId && (<div className="card" role="alert"><b>{sendPhase === "error" ? "Advisor responses failed" : "No advisor responses"}</b><div>{sendStatus}</div><div className="muted">{sendRetryCtx.saveConfirmed ? "Retry sends only the responses step for the same lead message." : "Retry sends only the advisor-responses step again."}</div><button type="button" onClick={() => retryResponses(sendRetryCtx)} disabled={runDiscussion.isPending || send.isPending}>Retry responses (same lead)</button>{" "}{sendConflict && sendConflict.kind === "lead-version" && (<span><button type="button" onClick={() => { const rc = sendRetryCtx; if (!rc || rc.meetingId !== meetingId) return; const v = lead.data ? lead.data.version : null; if (v == null) return; retryResponses({ ...rc, leadVersion: v }); }} disabled={runDiscussion.isPending || send.isPending}>Retry with current lead profile{typeof (lead.data ? lead.data.version : null) === "number" ? " (v" + String(lead.data ? lead.data.version : null) + ")" : ""}</button>{" "}</span>)}{" "}<button type="button" className="btn ghost" onClick={() => { setSendPhase("idle"); setSendStatus(""); setSendRetryCtx(null); setSendConflict(null); phaseOpRef.current = null; }}>Dismiss</button></div>)}{" "}
                             {(askSecretary.isPending || retrySecretary.isPending || answerSecretary.isPending) && (<div role="status" className="status-line"><span className="badge live">Secretary</span><span>Secretary working...</span></div>)}{" "}
                             <div className="composer-bar">
-                              <MeetingAttachments key={boardId + meetingId + originRevision()} boardId={boardId} meetingId={meetingId} canUpload={canActMeeting} transport={{ get, upload }} />
-                              <MeetingParticipants participants={meetingTeam} variant="composer" heading="Meeting team" live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
                               {" "}
                               <div className="topline">
                                 {" "}
@@ -8239,6 +8239,7 @@ const testModel = useMutation({
                                     <path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2" />{" "}
                                   </svg>{" "}
                                 </button>{" "}
+                                <div className="composer-meeting-controls" ref={setMeetingControlsHost} />
                                 {(voiceStarting || recording || transcribing) && (
                                   <button
                                     type="button"
@@ -8283,26 +8284,22 @@ const testModel = useMutation({
                             </div>{" "}
 
                       </div>{" "}
-                      <div
-                        className={
-                          contextCollapsed
-                            ? "meet-right collapsed"
-                            : "meet-right"
-                        }
-                      >
-                        {" "}
-                        {" "}
+                      <aside className="meet-right meeting-tools" aria-label="Meeting tools">
+                              <MeetingAttachments key={boardId + meetingId + originRevision()} boardId={boardId} meetingId={meetingId} canUpload={canActMeeting} transport={{ get, upload }} />
+                        <div className="meeting-rail-team">
+                              <MeetingParticipants participants={meetingTeam} variant="rail" heading="Meeting team" live={live && activityAvailability === "available"} availability={(activityAvailability as any) ?? "available"} />
+                        </div>
                         <div className="context-bar">
                           {" "}
                           <span className="muted">Meeting context</span>{" "}
                           <button
                             type="button"
                             className="btn ghost icon"
-                            onClick={() => setContextCollapsed(true)}
-                            aria-label="Hide meeting context"
+                            onClick={() => setContextCollapsed(value => !value)}
+                            aria-label={contextCollapsed ? "Show meeting context" : "Hide meeting context"}
                           >
                             {" "}
-                            Hide{" "}
+                            {contextCollapsed ? "Show" : "Hide"}{" "}
                           </button>{" "}
                         </div>{" "}
                         {!contextCollapsed && (
@@ -8321,17 +8318,7 @@ const testModel = useMutation({
                                 </div>{" "}
                           </div>
                         )}{" "}
-                      </div>{" "}
-                      {contextCollapsed && (
-                        <button
-                          type="button"
-                          className="context-fab"
-                          onClick={() => setContextCollapsed(false)}
-                        >
-                          {" "}
-                          Show context{" "}
-                        </button>
-                      )}{" "}
+                      </aside>{" "}
                     </>
                     ) : (
                       <div className="meet-center">
