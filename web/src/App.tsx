@@ -20,8 +20,8 @@ import "./meeting-participants.css";
 import { buildPresence, normalizeDisplayImageId } from "./meeting-presence";
 import "./roster-integrity.css";
 import { HumanDisclosure, FriendlyError, StatusChip } from "./human-disclosure";
-import { RecordComparison, RecordItemEditor, RecordItemList, RecordVersionRow } from "./human-record-items";
-import { friendlyError, friendlyRecordStatus, humanizeOmission, parseRecordItems } from "./human-format";
+import { RecordComparison, RecordItemEditor, RecordVersionRow } from "./human-record-items";
+import { describeHistoryEntry, friendlyError, friendlyRecordStatus, humanEvidenceExcerpt, humanEvidenceTitle, humanizeOmission, humanNoteBody, humanNoteTitle, parseRecordItems } from "./human-format";
 import "./human-feedback.css";
 import { convertRecordedBlobToWav } from "./voiceCodec";
 import WikiResources from "./wiki-resources";
@@ -309,6 +309,8 @@ type RecordReview = {
   predecessors: string[];
   successors: string[];
   evidence: RecordEvidence[];
+  effectiveIds: string[];
+  effectiveExport: string;
   lineageEffects?: LineageEffect[];
   historyCount: number;
   meetingWatermark: number;
@@ -3499,7 +3501,7 @@ const tabCount = (k: Tab): number | null => {
       setRecId(r.id);
       setTab("records");
       refresh("records", "record");
-      notify("Direction staged for review as draft " + r.id + ".");
+      notify("Direction staged for review.");
     },
     onError: (e, _v, ctx) => {
       const origin = ctx as { originBoardId?: string; originMeetingId?: string; originRecId?: string; recVisit?: number; origin?: { epoch: number; token: string; user: string } } | undefined;
@@ -3602,8 +3604,8 @@ const tabCount = (k: Tab): number | null => {
   const recVisitRef = useRef(0);
   // Record view visits: leaving or (re)entering the Records tab retires held record callbacks even when the record ID is unchanged (A-away-A). Operation-owned settlement still protects newer operations.
   useEffect(() => { recVisitRef.current++; }, [recId, tab]);
-  const liveSelRef = useRef({ boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") });
-  liveSelRef.current = { boardId, meetingId, recId, user: currentToken() ? currentUser() : (actAs || "owner") };
+  const liveSelRef = useRef({ boardId, meetingId, recId, user: canonicalUser() });
+  liveSelRef.current = { boardId, meetingId, recId, user: canonicalUser() };
   // Immutable origin identity for async callbacks: the effective session
   // identity when a session exists, else the demo act-as label. Epoch and
   // token are captured so a later account switch or re-login invalidates
@@ -3686,25 +3688,29 @@ const tabCount = (k: Tab): number | null => {
   const [revText, setRevText] = useState("");
   const revTextRev = useRef(0);
   const revTextOwner = useRef("");
-  // Whole-draft ownership retires with its context: board and meeting switches
-  // and record deselect clear the owner so a deliberate same-ID reselect
-  // rehydrates. Same-draft refetches keep the owner and preserve newer typing.
-  useEffect(() => { try { revTextOwner.current = ""; } catch { /* noop */ } }, [boardId, meetingId]);
-  useEffect(() => { if (!recId) { try { revTextOwner.current = ""; } catch { /* noop */ } } }, [recId]);
+  const revBaseRef = useRef<{ id: string; version: number; hash: string; reviewToken: string; watermark: number; revision: number } | null>(null);
+  const [editorGen, setEditorGen] = useState(0);
+  // Whole-draft ownership AND typed revision retire together with their
+  // context: any board/meeting/record switch clears owner, typed revision,
+  // and base authority so the next hydration starts pristine from the new
+  // authoritative snapshot. Same-draft refetches keep all three and preserve
+  // newer typing.
+  useEffect(() => {
+    try { revTextOwner.current = ""; } catch { /* noop */ }
+    try { revTextRev.current = 0; } catch { /* noop */ }
+    try { revBaseRef.current = null; } catch { /* noop */ }
+    setRevText("");
+  }, [boardId, meetingId, recId]);
   useEffect(() => {
     if (recDetail.data) {
       const nid = (recDetail.data as RecordDraft).id;
-      // Whole-draft editor ownership: only a deliberate record selection
-      // (new draft id, first load, or board/meeting switch) replaces newer
-      // typing. Same-draft detail refreshes preserve in-progress edits.
+      // Selection defaults: seed the checkbox set on first load of a draft.
+      // The whole-document text hydrates from the authoritative review
+      // snapshot below (same bytes as the submitted guards), never from this
+      // detail row, so manager and guest views cannot diverge.
       if (revTextOwner.current !== nid) {
-        // Draft item text is redacted server-side for read-only roles: coerce
-        // to empty string so the editor stays controlled and the list below
-        // renders the restricted notice instead of crashing on undefined.
-        setRevText(recDetail.data.itemsJson ?? "");
-        revTextOwner.current = nid;
         try {
-          const ids = (JSON.parse(recDetail.data.itemsJson) as { id?: string }[])
+          const ids = (JSON.parse(recDetail.data.itemsJson ?? "[]") as { id?: string }[])
             .map((i) => i.id ?? "")
             .filter(Boolean);
           setSelItems(ids);
@@ -3732,9 +3738,94 @@ const tabCount = (k: Tab): number | null => {
   // flag, a failed/empty review, or a non-manage grant hides EVERY approval
   // control, including the selection checkboxes. An empty draft (no pending
   // items) likewise shows no approval controls.
-  const reviewPendingCount = (recReview.data?.pending ?? []).length;
+  const reviewDraft = (recReview.data?.draft as RecordDraft | undefined) ?? undefined;
+  const authDraft = reviewDraft ?? recDetail.data;
+  const reviewPending = ((recReview.data?.pending ?? []) as string[]);
+  const reviewPendingCount = reviewPending.length;
+  const reviewStatus = ((reviewDraft as unknown as { status?: unknown } | undefined)?.status as string | undefined) ?? recDetail.data?.status ?? "";
+  const reviewDecided = !!((reviewDraft as unknown as { decided?: unknown } | undefined)?.decided ?? recDetail.data?.decided);
+  const reviewSuperseded = reviewStatus.toLowerCase() === "superseded";
   const stateValid = recOk && !!recReview.data && !recReview.isError && !showReviewError && reviewPendingCount > 0 && recReview.data.stateValid === true;
-  const canApproveRecord = canManageMeeting && stateValid === true;
+  const isActionableReview = recOk && !!recReview.data && !recReview.isError && !showReviewError && recReview.data.stateValid === true && reviewPendingCount > 0 && !reviewDecided && !reviewSuperseded;
+  const canApproveRecord = canManageMeeting && isActionableReview === true;
+  const canContributeReview = canActMeeting && isActionableReview === true;
+  // Amendment has its own eligibility, separate from the pending-review
+  // predicate: only a final approved record (decided + approved status, not
+  // superseded) can amend under its own CAS guards. A partially decided or
+  // open draft can never amend; it must revise the open version instead.
+  const isFinalApproved = recOk && !!recReview.data && !recReview.isError && !showReviewError && !!reviewDraft && reviewDecided && reviewStatus.toLowerCase() === "approved" && !reviewSuperseded;
+  const canAmendRecord = canManageMeeting && isFinalApproved === true;
+  // A typed whole-document editor that predates newer per-item authority is
+  // stale: submitting it with fresh guards would overwrite the item revision
+  // disguised as current. Surface it so the owner reconciles explicitly.
+  const revEditorStale = (() => {
+    const b = revBaseRef.current;
+    const d = reviewDraft as RecordDraft | undefined;
+    if (!b || !d || b.id !== d.id) return false;
+    if (revTextRev.current === 0) return false;
+    return b.version !== d.version || (b.hash ?? "") !== (d.hash ?? "") || (b.reviewToken ?? "") !== (d.reviewToken ?? "") || (b.watermark ?? 0) !== (d.watermark ?? 0) || (b.revision ?? 0) !== (d.reviewRevision ?? 0);
+  })();
+  const canReloadEditor = recOk && !!recReview.data && !recReview.isError && canActMeeting && (revEditorStale || (showReviewError && revTextRev.current !== 0));
+  const ordinalOf = (itemId: string): number => reviewPending.indexOf(itemId) + 1;
+  const ordinalLabel = (itemId: string): string => { const n = ordinalOf(itemId); return n > 0 ? "decision " + String(n) : "decision"; };
+  useEffect(() => {
+    const pend = new Set(reviewPending);
+    setSelItems((old) => {
+      const kept = old.filter((x) => pend.has(x));
+      if (kept.length === 0 && pend.size > 0 && old.length === 0) return [...pend];
+      return kept;
+    });
+  }, [reviewPending.join(",")]);
+  const reviewPredIds = ((recReview.data?.predecessors ?? []) as string[]);
+  const reviewSuccIds = ((recReview.data?.successors ?? []) as string[]);
+  const [linkedVersions, setLinkedVersions] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const want = [...reviewPredIds, ...reviewSuccIds].filter((x) => linkedVersions[x] === undefined);
+    if (want.length === 0) return;
+    let live = true;
+    (async () => {
+      for (const rid of want) {
+        try {
+          const dd = await get<RecordDraft>("/api/records/" + rid);
+          if (!live) return;
+          if (dd && dd.boardId === boardId && dd.meetingId === meetingId) {
+            setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: dd.version } : old));
+          } else {
+            setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: -1 } : old));
+          }
+        } catch {
+          if (!live) return;
+          setLinkedVersions((old) => (old[rid] === undefined ? { ...old, [rid]: -1 } : old));
+        }
+      }
+    })();
+    return () => { live = false; };
+  }, [reviewPredIds.join(","), reviewSuccIds.join(","), boardId, meetingId]);
+  useEffect(() => {
+    // Pristine hydration from the authoritative review snapshot: the displayed
+    // text and the submitted guards always come from the same reviewDraft
+    // bytes. Typed editors keep owner text AND their base authority; a newer
+    // per-item authority never silently rewrites older typing.
+    const ad = reviewDraft as RecordDraft | undefined;
+    if (!ad) return;
+    const nid = ad.id;
+    const snap = { id: nid, version: ad.version, hash: ad.hash ?? "", reviewToken: ad.reviewToken ?? "", watermark: ad.watermark ?? 0, revision: ad.reviewRevision ?? 0 };
+    if (revTextOwner.current !== nid) {
+      // Draft item text is redacted server-side for read-only roles: coerce
+      // to empty string so the editor stays controlled and the list below
+      // renders the restricted notice instead of crashing on undefined.
+      setRevText(ad.itemsJson ?? "");
+      revTextOwner.current = nid;
+      revTextRev.current = 0;
+      revBaseRef.current = snap;
+      return;
+    }
+    if (revTextRev.current === 0) {
+      const fresh = ad.itemsJson ?? "";
+      setRevText((cur) => (cur === fresh ? cur : fresh));
+      revBaseRef.current = snap;
+    }
+  }, [reviewDraft && (reviewDraft as RecordDraft).id, reviewDraft && (reviewDraft as RecordDraft).itemsJson, reviewDraft && (reviewDraft as RecordDraft).version, reviewDraft && (reviewDraft as RecordDraft).hash, reviewDraft && (reviewDraft as RecordDraft).reviewToken, reviewDraft && (reviewDraft as RecordDraft).watermark]);
   const [itemTexts, setItemTexts] = useState<Record<string, string>>({});
   const itemTextRev = useRef<Record<string, number>>({});
   const editKey = (draftId: string, itemId: string) => `${draftId}:${itemId}`;
@@ -3846,8 +3937,8 @@ const tabCount = (k: Tab): number | null => {
     setReviewError({ key: `${origin.boardId}:${origin.meetingId}:${origin.recId}:${origin.user}:${origin.token !== undefined ? origin.token : fullIdentityToken()}`, message });
   };
   const itemApprove = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3857,7 +3948,7 @@ const tabCount = (k: Tab): number | null => {
         if (!recOriginLive(origin)) return;
         applyDraft(r);
         const st = (r as unknown as RecordDraft)?.status;
-        notify(st === "approved" ? `Approved ${itemId}; review complete.` : `Approved ${itemId}.`);
+        notify(st === "approved" ? "Approved " + ordinalLabel(itemId) + "; review complete." : "Approved " + ordinalLabel(itemId) + ".");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3866,8 +3957,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemRevise = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const reviseKey = editKey(d.id, itemId);
@@ -3894,7 +3985,7 @@ const tabCount = (k: Tab): number | null => {
           return next;
         });
         delete itemTextRev.current[reviseKey];
-        notify(`Revised ${itemId}; approved text untouched.`);
+        notify("Revised " + ordinalLabel(itemId) + "; approved text untouched.");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3903,8 +3994,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const itemDiscard = (itemId: string) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3913,7 +4004,7 @@ const tabCount = (k: Tab): number | null => {
         const live = liveSelRef.current;
         if (!recOriginLive(origin)) return;
         applyDraft(r);
-        notify(`Discarded ${itemId}; approved items preserved.`);
+        notify("Discarded " + ordinalLabel(itemId) + "; approved items preserved.");
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3922,8 +4013,8 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const approveAllFresh = () => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
     const origin = captureRecOrigin();
@@ -3941,20 +4032,14 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const approveRec = (all: boolean) => {
-    if (!recOk || !canManageMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canApproveRecord) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
-    let ids = selItems;
-    if (all) {
-      try {
-        ids = (JSON.parse(d.itemsJson) as { id?: string }[])
-          .map((i) => i.id ?? "")
-          .filter(Boolean);
-      } catch {
-        ids = selItems;
-      }
-    }
+    const pendingSet = new Set(reviewPending);
+    let ids = selItems.filter((x) => pendingSet.has(x));
+    if (all) { ids = [...reviewPending]; }
+    if (ids.length === 0) return;
     const origin = captureRecOrigin();
     const originDraftId = d.id;
     post<unknown>(`/api/meetings/${origin.meetingId}/record/approve`, {
@@ -3974,7 +4059,7 @@ const tabCount = (k: Tab): number | null => {
         void keyId;
         refresh("records", "record");
         void recReview.refetch();
-        notify(`Approved ${ids.length} item(s).`);
+        notify("Approved " + String(ids.length) + " decision" + (ids.length === 1 ? "." : "s."));
       })
       .catch((e) => {
         const live = liveSelRef.current;
@@ -3983,10 +4068,22 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const reviseRec = (amend: boolean) => {
-    if (!recOk || !canActMeeting) return;
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk) return;
+    if (amend ? !canAmendRecord : !canContributeReview) return;
+    const d = reviewDraft;
     if (!d) return;
     if (d.boardId !== boardId || d.meetingId !== meetingId) return;
+    // Stale typed editor: never submit older text with fresh guards. Keep
+    // the base revision/hash and require explicit reconcile or conflict;
+    // no old overwrite is disguised as fresh.
+    const base = revBaseRef.current;
+    if (base && base.id === d.id && revTextRev.current !== 0) {
+      const cur = { version: d.version, hash: d.hash ?? "", reviewToken: d.reviewToken ?? "", watermark: d.watermark ?? 0, revision: d.reviewRevision ?? 0 };
+      if (base.version !== cur.version || base.hash !== cur.hash || base.reviewToken !== cur.reviewToken || base.watermark !== cur.watermark || base.revision !== cur.revision) {
+        setReviewError({ key: `${boardId}:${meetingId}:${recId}:${canonicalUser()}:${fullIdentityToken()}`, message: "The whole-document editor predates a newer per-item change. Reload the editor from the current review or retype against the new authority; the older text was not submitted." });
+        return;
+      }
+    }
     let items: unknown = [];
     try {
       items = JSON.parse(revText);
@@ -4034,8 +4131,9 @@ const tabCount = (k: Tab): number | null => {
       });
   };
   const discardRec = () => {
-    if (!recOk || !canActMeeting || !recDetail.data) return Promise.resolve();
-    const d = recReview.data?.draft ?? recDetail.data;
+    if (!recOk || !canContributeReview) return Promise.resolve();
+    const d = reviewDraft;
+    if (!d) return Promise.resolve();
     if (d.boardId !== boardId || d.meetingId !== meetingId) return Promise.resolve();
     const origin = captureRecOrigin();
     return post<unknown>(`/api/records/${d.id}/discard`, guardOf(d))
@@ -8999,6 +9097,7 @@ const testModel = useMutation({
                     <div className="card" key={r.id}>
                       {" "}
                       <RecordVersionRow
+                        testId={"record-open-" + r.id}
                         version={r.version}
                         statusLabel={friendlyRecordStatus(r.status, r.decided).label}
                         tone={friendlyRecordStatus(r.status, r.decided).tone}
@@ -9013,7 +9112,7 @@ const testModel = useMutation({
                       {" "}
                       <h3>
                         {" "}
-                        Review version {recDetail.data.version}{" "}
+                        Review v{recDetail.data.version}{" "}
                       </h3>{" "}
                       <StatusChip
                         label={friendlyRecordStatus(recDetail.data.status, recDetail.data.decided).label}
@@ -9026,17 +9125,341 @@ const testModel = useMutation({
                         {" "}
                         Refresh review{" "}
                       </button>)}{" "}
-                      <RecordItemList
-                        itemsJson={recDetail.data.itemsJson}
-                        selectable={canApproveRecord}
-                        selected={selItems}
-                        onToggle={(key, checked) =>
-                          setSelItems(
-                            checked ? [...selItems, key] : selItems.filter((x) => x !== key),
-                          )
+                      {!!recReview.data && !recReview.isError && !showReviewError && (
+                        (() => {
+                          const d = authDraft as RecordDraft;
+                          const isGuest = !(recReview.data && ("stateValid" in (recReview.data as object)));
+                          const wm = (d as unknown as { watermark?: unknown }).watermark;
+                          const wmText = typeof wm === "number" ? String(wm) : "unknown";
+                          const stale = typeof wm === "number" && wm !== recReview.data.meetingWatermark;
+                          if (isGuest) {
+                            return (
+                              <p role="status">
+                                {" "}
+                                Review version {d.version} - reviewed input {wmText} - current input {recReview.data.meetingWatermark}{stale ? " - new input arrived" : ""}:{" "}
+                                {(recReview.data.approved ?? []).length} approved in this version. Pending and set-aside counts are withheld for read-only review.{" "}
+                              </p>
+                            );
+                          }
+                          return (
+                            <p role="status">
+                              {" "}
+                              Review version {d.version} - reviewed input {wmText} - current input {recReview.data.meetingWatermark}{stale ? " - new input arrived" : ""}:{" "}
+                              {(recReview.data.approved ?? []).length} approved - {(recReview.data.discarded ?? []).length} set aside -{" "}
+                              {(recReview.data.pending ?? []).length} waiting.{" "}
+                            </p>
+                          );
+                        })()
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && isActionableReview && (recReview.data.pending ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Decisions waiting for review</h4>{" "}
+                          <p>Approve, revise, or set aside each decision below. Approved decisions are kept as the record; set-aside decisions are preserved but stay out of the record.</p>{" "}
+                          <ol className="human-item-list">
+  {(recReview.data.pending ?? []).map((pid, idx) => {
+    const authItems = parseRecordItems(((authDraft as RecordDraft | undefined)?.itemsJson ?? ""));
+    const found = authItems.items.find((it) => it.key === pid);
+    const ptext = found ? found.text : "";
+    const tkey = editKey((authDraft as RecordDraft).id, pid);
+    const n = idx + 1;
+    const checked = selItems.indexOf(pid) >= 0;
+    return (
+      <li key={pid} className="human-item">
+        <div className="human-item-body">
+          {canApproveRecord && (
+          <label className="human-item-check">
+            <input type="checkbox" aria-label={"Select decision " + String(n)} checked={checked}
+              onChange={(e) => setSelItems(checked ? selItems.filter((x) => x !== pid) : [...selItems, pid])} />
+          </label>
+          )}
+          <span className="human-item-text">{ptext === "" ? "(decision text unavailable)" : ptext}</span>{" "}
+          {canApproveRecord && (
+            <button type="button" onClick={() => itemApprove(pid)} aria-label={"Approve decision " + String(n)}>
+              {" "}Approve decision {n}{" "}
+            </button>
+          )}{" "}
+          {canContributeReview && (
+            <button type="button" onClick={() => itemDiscard(pid)} aria-label={"Set aside decision " + String(n)}>
+              {" "}Set aside decision {n}{" "}
+            </button>
+          )}{" "}
+          {canContributeReview && (
+            <>
+              <label>
+                {" "}Revised text for decision {n}{" "}
+                <textarea aria-label={"Revised text for decision " + String(n)} className="human-editor-text"
+                  value={itemTexts[tkey] ?? ""} rows={2}
+                  onChange={(e) => { const v = e.target.value; itemTextRev.current[tkey] = (itemTextRev.current[tkey] ?? 0) + 1; setItemTexts((old) => ({ ...old, [tkey]: v })); }}
+                  placeholder="Write the revised decision" />{" "}
+              </label>{" "}
+              <button type="button" onClick={() => itemRevise(pid)} aria-label={"Revise decision " + String(n)}>
+                {" "}Revise decision {n}{" "}
+              </button>{" "}
+            </>
+          )}
+        </div>
+      </li>
+    );
+  })}
+</ol>{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.notes ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Working notes</h4>{" "}
+                          <p>Provisional notes from this meeting. Notes inform the review; only explicit approval decides the record.</p>{" "}
+                          {(recReview.data.notes ?? []).map((n) => (
+                            <div key={n.id} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{humanNoteTitle(n.title)}</span>{" "}
+                                <StatusChip label={n.kind === "secretary-note" ? "Secretary provisional note" : n.kind === "secretary-briefing" ? "Secretary briefing" : n.kind === "note" ? "Working note" : n.kind === "briefing" ? "Briefing" : n.kind} tone={n.kind === "secretary-note" || n.kind === "secretary-briefing" ? "progress" : "open"} />{" "}
+                                <p>{humanNoteBody(n.body) === "" ? "(no text)" : humanNoteBody(n.body)}</p>{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.evidence ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Supporting excerpts</h4>{" "}
+                          <p>Quoted material behind the decisions above. Withheld items are named but their text stays hidden until the source is readable again.</p>{" "}
+                          {(recReview.data.evidence ?? []).map((c, i) => (
+                            <div key={c.itemId + ":" + c.kind + ":" + String(i)} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{c.missing ? "Withheld excerpt" : humanEvidenceTitle(c.title, c.kind, c.version ?? null)}</span>{" "}
+                                <StatusChip label={c.kind === "source" ? "Source excerpt" : c.kind === "direction" ? "Adopted direction" : c.kind === "note" ? "Note" : c.kind === "record" ? "Approved record" : c.kind === "message" ? "Meeting message" : c.kind === "dossier" ? "Advisor profile" : "Reference"} tone={c.missing ? "muted" : c.currentEligible ? "done" : "progress"} />{" "}
+                                {c.missing ? (<p className="muted">No longer readable in this review.</p>) : (<p>{humanEvidenceExcerpt(c.excerpt, c.kind)}</p>)}{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (recReview.data.recentMessages ?? []).length > 0 && (
+                        <div className="card">
+                          {" "}
+                          <h4>Recent meeting input</h4>{" "}
+                          {(recReview.data.recentMessages ?? []).map((m) => (
+                            <div key={m.sequence} className="human-item">
+                              <div className="human-item-body">
+                                <span className="human-item-text">{m.advisorName ? m.advisorName : m.sender === "lead" ? "Meeting lead" : m.sender}</span>{" "}
+                                <p>{humanNoteBody(m.content) === "" ? "(no text)" : humanNoteBody(m.content)}</p>{" "}
+                              </div>
+                            </div>
+                          ))}{" "}
+                        </div>
+                      )}{" "}
+                      {!!recReview.data && !recReview.isError && !showReviewError && (
+                        <div className="card">
+                          {" "}
+                          <h4>Version history</h4>{" "}
+                          <p>
+                            {" "}
+                            Version {(authDraft as RecordDraft).version} · reviewed input {typeof (authDraft as unknown as { watermark?: unknown }).watermark === "number" ? (authDraft as unknown as { watermark: number }).watermark : "unknown (read-only review)"} · current input {recReview.data.meetingWatermark} ·{" "}
+                            {recReview.data.historyCount} recorded decisions.{" "}
+                          </p>{" "}
+                          {(recReview.data.predecessors ?? []).length > 0 && (
+                            <p>
+                              {" "}
+                              Earlier version{(recReview.data.predecessors ?? []).length === 1 ? "" : "s"}:{" "}
+                              {(recReview.data.predecessors ?? []).map((pp) => {
+                                const pv = linkedVersions[pp] ?? (recs.data ?? []).find((r) => r.id === pp)?.version;
+                                return pv === undefined || pv === -1 ? (
+                                  <span key={pp} className="muted">an earlier version (loading or unavailable)</span>
+                                ) : (
+                                  <button key={pp} type="button" onClick={() => setRecId(pp)}>
+                                    {" "}
+                                    Open version {pv}{" "}
+                                  </button>
+                                );
+                              })}{" "}
+                            </p>
+                          )}{" "}
+                          {(recReview.data.successors ?? []).length > 0 && (
+                            <p role="status">
+                              {" "}
+                              A newer version exists for this review. Continue here:{" "}
+                              {(recReview.data.successors ?? []).map((sp) => {
+                                const sv = linkedVersions[sp] ?? (recs.data ?? []).find((r) => r.id === sp)?.version;
+                                return sv === undefined || sv === -1 ? (
+                                  <span key={sp} className="muted">a newer version (loading or unavailable)</span>
+                                ) : (
+                                  <button key={sp} type="button" onClick={() => setRecId(sp)}>
+                                    {" "}
+                                    Open version {sv}{" "}
+                                  </button>
+                                );
+                              })}{" "}
+                            </p>
+                          )}{" "}
+                          {(recReview.data.lineageEffects ?? []).length > 0 && (
+                            <HumanDisclosure summary={"How this version carries earlier approvals (" + String((recReview.data.lineageEffects ?? []).length) + ")"}>
+                              <ul className="human-compare-list">
+                                {(recReview.data.lineageEffects ?? []).map((e) => (
+                                  <li key={e.id} className="human-item">
+                                    <span className="human-item-text">{e.text}</span>{" "}
+                                    <span className="muted">{e.status}, versions {e.fromVersion} to {e.toVersion}.</span>{" "}
+                                  </li>
+                                ))}
+                              </ul>
+                            </HumanDisclosure>
+                          )}{" "}
+                          {(recReview.data.effectiveIds ?? []).length > 0 && (
+                            <p className="muted">
+                              {" "}
+                              {(recReview.data.effectiveIds ?? []).length} decision{(recReview.data.effectiveIds ?? []).length === 1 ? " stands" : "s stand"} across the current line.{" "}
+                            </p>
+                          )}{" "}
+                        </div>
+                      )}{" "}
+                      {(() => {
+                        let hist: { seq?: unknown; actor?: unknown; action?: unknown; itemId?: unknown; oldText?: unknown; newText?: unknown }[] = [];
+                        try {
+                          const raw: unknown = JSON.parse((authDraft as RecordDraft)?.historyJson ?? "[]");
+                          if (Array.isArray(raw)) hist = raw.filter((e) => e !== null && typeof e === "object");
+                        } catch { hist = []; }
+                        if (hist.length === 0) return null;
+                        const shown = hist.slice(-30);
+                        return (
+                          <div className="card">
+                            {" "}
+                            <h4>Decision history</h4>{" "}
+                            <p>{hist.length} recorded decision{hist.length === 1 ? "" : "s"}{hist.length > shown.length ? ", newest " + String(shown.length) + " shown" : ""}.</p>{" "}
+                            <ol className="human-item-list">
+                              {shown.map((h, i) => {
+                                const nt = typeof h.newText === "string" ? h.newText : "";
+                                const ot = typeof h.oldText === "string" ? h.oldText : "";
+                                const hv = describeHistoryEntry(typeof h.action === "string" ? h.action : "", ot, nt);
+                                const who = typeof h.actor === "string" ? h.actor : "";
+                                const sq = typeof h.seq === "number" ? String(h.seq) : String(i);
+                                return (
+                                  <li key={sq + "-" + String(i)} className="human-item">
+                                    <div className="human-item-body">
+                                      <span className="human-item-text">{hv.headline}{hv.detail !== "" ? ": " + (hv.detail.length > 220 ? hv.detail.slice(0, 220) + "…" : hv.detail) : ""}</span>{" "}
+                                      {who !== "" && (<span className="muted">by {who}</span>)}{" "}
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ol>{" "}
+                          </div>
+                        );
+                      })()}{" "}
+                      {" "}
+                                            {(() => {
+                        const ad = authDraft as RecordDraft;
+                        const isGuest = !(recReview.data && ("stateValid" in (recReview.data as object)));
+                        const approvedSet = new Set(((recReview.data?.approved ?? []) as string[]));
+                        let hist: string[] = [];
+                        try {
+                          const parsed = parseRecordItems(ad.itemsJson ?? "[]");
+                          hist = parsed.items.filter((it) => approvedSet.has(it.key)).map((it) => it.text);
+                        } catch { hist = []; }
+                        if (hist.length === 0) {
+                          try {
+                            const gd = ad as unknown as { approvedItems?: { text?: unknown }[] };
+                            const src = gd.approvedItems ?? [];
+                            hist = src.map((e) => (typeof e.text === "string" ? e.text : "")).filter((s) => s !== "");
+                          } catch { hist = []; }
                         }
-                      />{" "}
-                      <div className="card">
+                        const effHeadId = (() => { try { const rr = recReview.data as unknown as { draft?: { effective?: { headId?: unknown; headVersion?: unknown } }; effectiveHeadId?: unknown; effectiveHeadVersion?: unknown }; const g = rr?.draft as unknown as { effective?: { headId?: unknown } } | undefined; const gh = (g && (g as { effective?: { headId?: unknown } }).effective?.headId) ?? (rr as { effectiveHeadId?: unknown }).effectiveHeadId; return typeof gh === "string" ? gh : (gh != null ? String(gh) : ""); } catch { return ""; } })();
+                        const effHeadVersion = (() => { try { const rr = recReview.data as unknown as { draft?: { effective?: { headVersion?: unknown } }; effectiveHeadVersion?: unknown }; const g = rr?.draft as unknown as { effective?: { headVersion?: unknown } } | undefined; const gv = (g && (g as { effective?: { headVersion?: unknown } }).effective?.headVersion) ?? (rr as { effectiveHeadVersion?: unknown }).effectiveHeadVersion; return typeof gv === "number" ? gv : 0; } catch { return 0; } })();
+                        void effHeadVersion;
+                        const isHead = effHeadId !== "" && String(ad.id) === effHeadId && !reviewSuperseded;
+                        const effects = ((recReview.data?.lineageEffects ?? []) as { id: string; text: string; status: string; fromVersion: number; toVersion: number }[]);
+                        let effGuest: { text: string; version: number }[] = [];
+                        try {
+                          const gd2 = ad as unknown as { effective?: { approvedItems?: { text?: unknown; approvedBy?: { version?: unknown } }[] } };
+                          effGuest = (gd2.effective?.approvedItems ?? []).map((e) => ({
+                            text: typeof e.text === "string" ? e.text : "",
+                            version: typeof e.approvedBy?.version === "number" ? (e.approvedBy.version as number) : 0,
+                          })).filter((e) => e.text !== "");
+                        } catch { effGuest = []; }
+                        const hasApprovedContent = hist.length > 0 || effects.length > 0 || effGuest.length > 0;
+                        if (isActionableReview && !(isHead && hasApprovedContent)) return null;
+                        if (hist.length === 0 && effects.length === 0 && effGuest.length === 0) return null;
+                        if (isHead && (reviewDecided || hasApprovedContent)) {
+                          const effAllText = isGuest ? effGuest.map((e) => e.text) : effects.map((e) => e.text);
+                          const all = effAllText.length > 0 ? effAllText : hist;
+                          if (all.length === 0) return null;
+                          return (
+                            <div className="card">
+                              {" "}
+                              <h4>Approved decisions (current record)</h4>{" "}
+                              <p>This version is the authoritative head. The text below is the current record.</p>{" "}
+                              <ol className="human-item-list">
+                                {(effAllText.length > 0 ? (isGuest ? effGuest.map((e) => ({ text: e.text, sub: e.version > 0 ? "approved in version " + String(e.version) + "." : "" })) : effects.map((e) => ({ text: e.text, sub: e.status + ", versions " + String(e.fromVersion) + " to " + String(e.toVersion) + "." }))) : all.map((tx) => ({ text: tx, sub: "" }))).map((row, k) => (
+                                  <li key={"ap-" + String(k)} className="human-item">
+                                    <div className="human-item-body">
+                                      <span className="human-item-text">{row.text === "" ? "(approved decision)" : row.text}</span>{" "}
+                                      {row.sub !== "" && (<span className="muted">{row.sub}</span>)}{" "}
+                                    </div>
+                                  </li>
+                                ))}
+                              </ol>{" "}
+                            </div>
+                          );
+                        }
+                        return (
+                          <>
+                            {hist.length > 0 && (
+                              <div className="card">
+                                {" "}
+                                <h4>Approved in this version (historical)</h4>{" "}
+                                <p>Historical approved text of version {ad.version}; it is not the current effective record.</p>{" "}
+                                <ol className="human-item-list">
+                                  {hist.map((tx, k) => (
+                                    <li key={"hap-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{tx === "" ? "(approved decision)" : tx}</span>{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>{" "}
+                              </div>
+                            )}
+                            <div className="card">
+                              {" "}
+                              <h4>Current effective record</h4>{" "}
+                              <p>Authoritative approved text across the line{isGuest ? "; pending counts are withheld for read-only review" : ""}.</p>{" "}
+                              {!isGuest && effects.length > 0 && (
+                                <ol className="human-item-list">
+                                  {effects.map((e, k) => (
+                                    <li key={"eff-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{e.text === "" ? "(approved decision)" : e.text}</span>{" "}
+                                        <span className="muted">{e.status}, versions {e.fromVersion} to {e.toVersion}.</span>{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>
+                              )}
+                              {isGuest && effGuest.length > 0 && (
+                                <ol className="human-item-list">
+                                  {effGuest.map((e, k) => (
+                                    <li key={"geff-" + String(k)} className="human-item">
+                                      <div className="human-item-body">
+                                        <span className="human-item-text">{e.text}</span>{" "}
+                                        {e.version > 0 && (<span className="muted">approved in version {e.version}.</span>)}{" "}
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>
+                              )}
+                              {!isGuest && effects.length === 0 && (
+                                <p className="muted">No approved decisions stand on the current line yet.</p>
+                              )}
+                              {isGuest && effGuest.length === 0 && (
+                                <p className="muted">No readable approved text is available for this review.</p>
+                              )}
+                            </div>
+                          </>
+                        );
+                      })()}{" "}
+
+<div className="card">
                         {" "}
                         <h3>Compare with another version</h3>{" "}
                         <label>
@@ -9049,7 +9472,7 @@ const testModel = useMutation({
                             {" "}
                             <option value="">— pick —</option>{" "}
                             {(recs.data ?? [])
-                              .filter((r) => r.id !== recDetail.data.id)
+                              .filter((r) => r.id !== (authDraft as RecordDraft).id)
                               .map((r) => (
                                 <option key={r.id} value={r.id}>
                                   {" "}
@@ -9062,11 +9485,11 @@ const testModel = useMutation({
                           (() => {
                             const other = (recs.data ?? []).find((r) => r.id === cmpVer);
                           if (!other) return null;
-                            const olderFirst = recDetail.data.version >= other.version;
+                            const olderFirst = (authDraft as RecordDraft).version >= other.version;
                             return (
                               <RecordComparison
-                                prevJson={olderFirst ? other.itemsJson : recDetail.data.itemsJson}
-                                curJson={olderFirst ? recDetail.data.itemsJson : other.itemsJson}
+                                prevJson={olderFirst ? other.itemsJson : (authDraft as RecordDraft).itemsJson}
+                                curJson={olderFirst ? (authDraft as RecordDraft).itemsJson : other.itemsJson}
                               />
                             );
                           })()
@@ -9076,11 +9499,11 @@ const testModel = useMutation({
                         {" "}
                         {canApproveRecord && (<button onClick={() => approveRec(false)}>
                           {" "}
-                          Approve selected{" "}
+                          Approve selected ({selItems.length}){" "}
                         </button>)}{" "}
-                        {canApproveRecord && (<button onClick={() => approveRec(true)}>
+                        {canApproveRecord && (<button onClick={() => approveAllFresh()}>
                           {" "}
-                          Approve all{" "}
+                          Approve all ({reviewPendingCount}){" "}
                         </button>)}{" "}
                         {!canApproveRecord && (<span className="muted">Approval requires a manage grant and a current valid review.</span>)}{" "}
                         {canActMeeting && (<button type="button" onClick={() => exportRecord("concise")}>
@@ -9094,19 +9517,74 @@ const testModel = useMutation({
                         </button>)}{" "}
                       </div>{" "}
                       <RecordItemEditor
-                        draftKey={recDetail.data.id + "-v" + recDetail.data.version}
+                        key={(authDraft as RecordDraft).id + "-v" + (authDraft as RecordDraft).version + "#g" + String(editorGen)}
+                        draftKey={(authDraft as RecordDraft).id + "-v" + (authDraft as RecordDraft).version}
+                        resetGen={editorGen}
                         initialJson={revText}
                         onChange={(json) => { try { revTextRev.current++; } catch { /* noop */ } setRevText(json); }}
                       />{" "}
-                      {canActMeeting && (<button onClick={() => reviseRec(false)}>
+                      {canContributeReview && (<button onClick={() => reviseRec(false)}>
                         {" "}
                         Request revision (new version){" "}
                       </button>)}{" "}
-                      {canApproveRecord && (<button onClick={() => reviseRec(true)}>
+                      {canAmendRecord && (<button onClick={() => reviseRec(true)}>
                         {" "}
                         Amend approved record{" "}
                       </button>)}{" "}
-                      {canActMeeting && (<button onClick={discardRec}>Discard draft</button>)}{" "}
+                      {canReloadEditor && (<button type="button" onClick={() => {
+                        const origin = captureRecOrigin();
+                        const revCap = revTextRev.current;
+                        const itemCap = { ...itemTextRev.current };
+                        if (!recOk || !canActMeeting) return;
+                        (async () => {
+                          try {
+                            // Single authoritative refresh source: one refetch with throwOnError.
+                            // The resolved snapshot is fully validated before any reset; no
+                            // second request follows, so a failed/ignored settlement can never
+                            // authorize clobbering dirty edits. New typing (whole-doc rev and
+                            // per-item child revs, both via onChange) wins over the held result.
+                            const res = await recReview.refetch({ throwOnError: true } as unknown as { throwOnError: boolean });
+                            if (!recOriginLive(origin)) return;
+                            const live = liveSelRef.current;
+                            if (live.boardId !== origin.boardId || live.meetingId !== origin.meetingId || live.recId !== origin.recId) return;
+                            const fresh = (res as unknown as { data?: RecordReview }).data ?? recReview.data;
+                            const fd = (fresh as RecordReview | undefined)?.draft as RecordDraft | undefined;
+                            if (!fresh || !fd || (fd as RecordDraft).id !== origin.recId) { noteReviewError(new Error("Refresh returned a different record; review unchanged."), origin); return; }
+                            if ((fd as RecordDraft).boardId !== origin.boardId || (fd as RecordDraft).meetingId !== origin.meetingId) { noteReviewError(new Error("Refresh returned another context; review unchanged."), origin); return; }
+                            if (typeof (fd as RecordDraft).version !== "number" || typeof (fd as RecordDraft).hash !== "string" || typeof (fd as RecordDraft).reviewToken !== "string" || typeof (fd as RecordDraft).watermark !== "number" || typeof (fd as RecordDraft).reviewRevision !== "number" || typeof (fd as RecordDraft).itemsJson !== "string") { noteReviewError(new Error("Refresh returned an incomplete review; review unchanged."), origin); return; }
+                            if (!Array.isArray((fresh as RecordReview).pending) || typeof (fresh as RecordReview).meetingWatermark !== "number") { noteReviewError(new Error("Refresh returned an incomplete review; review unchanged."), origin); return; }
+                            if (revTextRev.current !== revCap) return;
+                            try {
+                              const curKeys = Object.keys(itemTextRev.current);
+                              const capKeys = Object.keys(itemCap);
+                              if (curKeys.length !== capKeys.length) return;
+                              for (const k of curKeys) { if ((itemTextRev.current as Record<string, number>)[k] !== (itemCap as Record<string, number>)[k]) return; }
+                            } catch { return; }
+                            qc.setQueryData(["record-review", origin.recId], fresh);
+                            qc.setQueryData(["record", (fd as RecordDraft).id], fd);
+                            refresh("records", "record");
+                            if (!recOriginLive(origin)) return;
+                            if (revTextRev.current !== revCap) return;
+                            setRevText((fd as RecordDraft).itemsJson ?? "");
+                            revTextOwner.current = (fd as RecordDraft).id;
+                            revTextRev.current = 0;
+                            revBaseRef.current = { id: (fd as RecordDraft).id, version: (fd as RecordDraft).version, hash: (fd as RecordDraft).hash ?? "", reviewToken: (fd as RecordDraft).reviewToken ?? "", watermark: (fd as RecordDraft).watermark ?? 0, revision: (fd as RecordDraft).reviewRevision ?? 0 };
+                            setItemTexts({});
+                            try { itemTextRev.current = {}; } catch { /* noop */ }
+                            // Explicit reset remounts ALL child rows (rows, base keys, base
+                            // JSON, dirty flag, detail/metadata refs) to the validated review.
+                            setEditorGen((g) => g + 1);
+                            setReviewError(null);
+                          } catch (e) {
+                            if (!recOriginLive(origin)) return;
+                            noteReviewError(e, origin);
+                          }
+                        })();
+                      }}>
+                        {" "}
+                        Reload editor from current review{" "}
+                      </button>)}{" "}
+                      {canContributeReview && (<button onClick={discardRec}>Discard draft</button>)}{" "}
                     </div>
                   )}{" "}
                 </>
