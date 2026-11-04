@@ -165,14 +165,19 @@ public static class MeetingEndpoints
           }
           if (latestLeadAuto == null || latestLeadAuto.Sequence != expSeq.Value) throw new InvalidOperationException("brief-autoinit-lead");
           if (!string.Equals(latestLeadAuto.Content ?? "", expContent ?? "", StringComparison.Ordinal)) throw new InvalidOperationException("brief-autoinit-lead");
-          if (expGen.HasValue)
-          {
-            if (curP.Generation != expGen.Value) throw new InvalidOperationException("brief-autoinit-generation");
-          }
+          // Restore epoch first: a committed backup restore bumps both the
+          // restore identity AND meeting generations (Max+1), so checking
+          // generation first would mask the restore as a generic meeting change
+          // and leave the restore guard unreachable. Restore is the specific
+          // cause and keeps its own honest 409 category.
           if (expRestoreId.HasValue || expRestoreRev.HasValue)
           {
             if (expRestoreId.HasValue && s.RestoreEpochId != expRestoreId.Value) throw new InvalidOperationException("brief-autoinit-restore");
             if (expRestoreRev.HasValue && s.RestoreEpochRev != expRestoreRev.Value) throw new InvalidOperationException("brief-autoinit-restore");
+          }
+          if (expGen.HasValue)
+          {
+            if (curP.Generation != expGen.Value) throw new InvalidOperationException("brief-autoinit-generation");
           }
           if (string.IsNullOrWhiteSpace(curBriefAuto))
           {

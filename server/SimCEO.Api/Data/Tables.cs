@@ -544,7 +544,16 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
   {
     var b = Pg.Backend;
     if (b is null)
-      return (MessageList)_mem.GetOrAdd(id, k => new MessageList(null, k, factory(k)));
+    {
+      // Hardened for staged-replacement restores: _mem may hold a plain
+      // List<Message> snapshot entry (Capture/Restore round-trip). Never
+      // direct-cast; wrap plain lists into MessageList in place.
+      var live = _mem.GetOrAdd(id, k => new MessageList(null, k, factory(k)));
+      if (live is MessageList ml) return ml;
+      var wrapped = new MessageList(null, id, live);
+      _mem[id] = wrapped;
+      return wrapped;
+    }
     if (TryGetValue(id, out var existing) && existing is not null) return existing;
     return new MessageList(b, id, factory(id));
   }
@@ -588,9 +597,13 @@ public sealed class MessageTable : IEnumerable<KeyValuePair<Guid, List<Domain.Me
   }
   public void RestoreLive(Dictionary<Guid, List<Domain.Message>> snap)
   {
+    // Two-phase: fallible deep-clone first (live untouched on failure), then an
+    // infallible swap. Entries are stored as MessageList so GetOrAdd keeps its
+    // MessageList contract after every rollback/restore; plain lists would
+    // break the cast and surface as 500 on the next guarded write.
     var fresh = new Dictionary<Guid, List<Domain.Message>>(snap.Count);
     foreach (var kv in snap)
-      fresh[kv.Key] = kv.Value.Select(m => CloneMessage(m)).ToList();
+      fresh[kv.Key] = new MessageList(null, kv.Key, kv.Value.Select(m => CloneMessage(m)).ToList());
     _mem.Clear();
     foreach (var kv in fresh) _mem[kv.Key] = kv.Value;
   }
