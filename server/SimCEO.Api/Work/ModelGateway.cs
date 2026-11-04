@@ -182,7 +182,7 @@ public sealed class ModelGateway
   // floor so bounded effort still leaves room for the final answer.
   private static int EnsureOutputBudget(string purpose, int requested)
   {
-    var floor = ReasoningEffortFor(purpose) == "minimal" ? 512 : 2048;
+    var floor = purpose == "advisor-research" ? 4096 : ReasoningEffortFor(purpose) == "minimal" ? 512 : 2048;
     return Math.Clamp(Math.Max(requested, floor), 16, 16000);
   }
 
@@ -197,7 +197,7 @@ public sealed class ModelGateway
     "wizard-interview" => "Reply with JSON only, no other text.",
     "advisor-profile" => "Reply with a single JSON object only, no code fences or commentary.",
     "advisor-reply" => "If you add nothing, reply with exactly ABSTAIN.",
-    "advisor-research" => "Return concise factual claims only, one per line, as the final answer. Do not reply with progress commentary.",
+    "advisor-research" => "Return at most eight concise claims, one per line, in the requested evidence format, as the final answer. Use one or two supporting references per claim. Do not reply with progress commentary.",
     _ => "Return only the requested final answer. No progress commentary.",
   };
 
@@ -1150,7 +1150,9 @@ public sealed class ModelGateway
               "unknown", responseId0, null, basisG,
               "unknown: non-completed research; usage missing; searches " + (searchObservable ? searches.ToString() : "unobservable"), boardId, meetingId);
           }
-          throw new ProviderException(502, RedactedError(502));
+          throw new ProviderException(502, reason == "max_output_tokens"
+            ? "Research ran out of response space before finishing. Try a more focused description or try again."
+            : "The research provider did not finish its answer. Try again.");
         }
         if (!hasOutput)
         {

@@ -195,6 +195,7 @@ static class Probe
       string envelope = "{\"id\":\"resp-dup-1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50},\"output\":[{\"type\":\"web_search_call\",\"results\":[{\"url\":\"" + dupUrl2 + "\",\"title\":\"Alpha provider title\",\"snippet\":\"Alpha provider snippet about harbors and ports.\"}]},{\"type\":\"message\",\"content\":[{\"text\":\"research done\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"" + dupUrl2 + "\",\"title\":\"Beta hydrated title\"}]}]}]}";
       byte[] envelopeBytes = System.Text.Encoding.UTF8.GetBytes(envelope);
       var served = new TaskCompletionSource<bool>();
+      int requestedOutputBudget = 0;
       var listenTask = Task.Run(async () =>
       {
         try
@@ -202,7 +203,11 @@ static class Probe
           var ctx = await listener.GetContextAsync().ConfigureAwait(false);
           try
           {
-            using (var sr = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8)) { await sr.ReadToEndAsync().ConfigureAwait(false); }
+            using (var sr = new System.IO.StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8))
+            {
+              using var requestJson = System.Text.Json.JsonDocument.Parse(await sr.ReadToEndAsync().ConfigureAwait(false));
+              requestedOutputBudget = requestJson.RootElement.GetProperty("max_output_tokens").GetInt32();
+            }
             if (ctx.Request.HttpMethod == "POST" && (ctx.Request.Url?.AbsolutePath ?? "") == "/responses")
             {
               ctx.Response.StatusCode = 200;
@@ -229,6 +234,7 @@ static class Probe
         await served.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
         try { await listenTask.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); } catch { }
         Ok("dup-gw-citation-count", gr.Citations.Count == 2, "count=" + gr.Citations.Count);
+        Ok("research-output-has-reasoning-and-answer-room", requestedOutputBudget >= 4096 && requestedOutputBudget <= 16000, "budget=" + requestedOutputBudget);
         bool orderOk = gr.Citations.Count == 2 && string.Equals(gr.Citations[0].Url, dupUrl2, StringComparison.Ordinal) && string.Equals(gr.Citations[1].Url, dupUrl2, StringComparison.Ordinal);
         Ok("dup-gw-same-url-order", orderOk, "order wrong");
         bool provOk = gr.Citations.Count == 2 && !gr.Citations[0].Fetched && gr.Citations[0].Origin == "provider-search" && !string.IsNullOrWhiteSpace(gr.Citations[0].Excerpt);
