@@ -33,6 +33,8 @@ public static class SourceEndpoints
     SourceDoc? cur = null;
     try { cur = SourceGovernance.CurrentForFamily(s, d.BoardId, d.FamilyKey); } catch { }
     var secs = s.SourceSections.Values.Count(x => x.SourceId == d.Id);
+bool polAllows = true;
+try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllows = SourceGovernance.PolicyAllows(pb, d); } } catch { polAllows = false; }
     return new
     {
       d.Id, d.BoardId, d.FileName, d.ContentHash, d.Version,
@@ -42,7 +44,7 @@ public static class SourceEndpoints
       indexError = d.IndexError, indexCompletedAt = d.IndexCompletedAt,
       sectionCount = secs, isHead, currentId = cur?.Id,
       isCurrent = cur is not null && cur.Id == d.Id,
-      d.Scope, meetingId = d.MeetingId, d.ExtractionJson, d.CreatedAt,
+      d.Scope, meetingId = d.MeetingId, d.ExtractionJson, d.CreatedAt, policyAllows = polAllows,
     };
   }
 
@@ -75,6 +77,8 @@ public static class SourceEndpoints
     SourceDoc? cur = null;
     try { cur = SourceGovernance.CurrentForFamily(s, d.BoardId, d.FamilyKey); } catch { }
     var secs = s.SourceSections.Values.Count(x => x.SourceId == d.Id);
+bool polAllows = true;
+try { if (s.Boards.TryGetValue(d.BoardId, out var pb)) { if (pb != null) polAllows = SourceGovernance.PolicyAllows(pb, d); } } catch { polAllows = false; }
     return new
     {
       d.Id, d.BoardId, d.FileName, d.Version,
@@ -83,7 +87,7 @@ public static class SourceEndpoints
       indexState = d.IndexState, indexGeneration = d.IndexGeneration,
       indexError = d.IndexError,
       sectionCount = secs, isHead, isCurrent = cur is not null && cur.Id == d.Id, currentId = cur?.Id,
-      d.Scope, meetingId = d.MeetingId, d.CreatedAt,
+      d.Scope, meetingId = d.MeetingId, d.CreatedAt, policyAllows = polAllows,
     };
   }
 
@@ -388,7 +392,20 @@ public static class SourceEndpoints
       if (PeopleOps.Check(s, req, doc.BoardId, doc.MeetingId, "read") is { } deniedSrc9) return deniedSrc9;
       if (!IsBoardReader(s, req, doc.BoardId) && !IsSourceManager(s, req, doc.BoardId, doc.MeetingId)
         && (!IsApprovedVisible(doc) || !InGuestScope(s, req, doc))) return PeopleOps.Denied();
-      if (doc.Original is null) return Results.NotFound("original not retained");
+      if (!IsBoardReader(s, req, doc.BoardId))
+{
+if (!IsSourceManager(s, req, doc.BoardId, doc.MeetingId))
+{
+try
+{
+if (!s.Boards.TryGetValue(doc.BoardId, out var polBoard)) return Results.NotFound();
+if (polBoard == null) return Results.NotFound();
+if (!SourceGovernance.PolicyAllows(polBoard, doc)) return PeopleOps.Denied();
+}
+catch { return Results.Json(new { error = "Storage unavailable." }, statusCode: 503); }
+}
+}
+if (doc.Original is null) return Results.NotFound("original not retained");
       return Results.Bytes(doc.Original, "application/octet-stream", doc.FileName);
     });
 

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-const API = process.env.QA_API || "http://127.0.0.1:5107";
+const API = process.env.QA_API || "http://127.0.0.1:15340";
 const run = "p8e-" + Date.now().toString(36);
 let pass=0,fail=0; const bad=[];
 function ok(n,c,e){ if(c)pass++; else {fail++; bad.push(n+(e?" :: "+e:"")); console.log("  FAIL "+n+(e?" :: "+e:"")); } }
@@ -76,10 +76,19 @@ let sdl=await req("GET",`/api/sources/${sid}/download`,undefined,{Authorization:
 ok("expired-download-401",sdl.status===401,sdl.status+" "+sdl.text.slice(0,120));
 let ndl=await req("GET",`/api/sources/${sid}/download`,undefined,{});
 ok("anon-download-401",ndl.status===401,ndl.status+" "+ndl.text.slice(0,120));
-await req("POST",`/api/sources/${sid}/reject`,{},{...B(adminT)});
-let rdl=await req("GET",`/api/sources/${sid}/download`,undefined,{...B(guestT)});
-ok("revoked-dl-403",rdl.status===403,rdl.status+" "+rdl.text.slice(0,160));
+let rej=await req("POST","/api/sources/"+sid+"/reject",{},{...B(adminT)});
+ok("approved-reject-409",rej.status===409,rej.status+" "+rej.text.slice(0,160));
+let rdl=await req("GET","/api/sources/"+sid+"/download",undefined,{...B(guestT)});
+ok("approved-reject-no-change-200",rdl.status===200&&rdl.text==="hello source",rdl.status+" "+rdl.text.slice(0,160));
 // images: upload portrait as admin roster? skip heavy; test protected image 401 anon
+let gg=await req("GET","/api/boards/"+bid+"/grants",undefined,{...B(adminT)});
+ok("grant-list-ok",gg.status===200,gg.status+" "+gg.text.slice(0,120));
+let tg=(Array.isArray(gg.json)?gg.json:[]).find((x)=>(((x.userKey||x.UserKey)||"").toLowerCase()===guestE)&&((x.meetingId||x.MeetingId)===mid));
+ok("grant-found",!!tg,"missing");
+let del=await req("DELETE","/api/grants/"+(tg.id||tg.Id),undefined,{...B(adminT)});
+ok("grant-delete-204",del.status===204,del.status+" "+del.text.slice(0,160));
+let rdl2=await req("GET","/api/sources/"+sid+"/download",undefined,{...B(guestT)});
+ok("revoked-grant-dl-403",rdl2.status===403,rdl2.status+" "+rdl2.text.slice(0,160));
 let imgAnon=await req("GET",`/api/images/00000000-0000-0000-0000-000000000000`,undefined,{});
 ok("image-anon-404-or-401",imgAnon.status===401||imgAnon.status===404,imgAnon.status+" "+imgAnon.text.slice(0,120));
 // delayed old request after user change: logout guest, old token 401, new login works

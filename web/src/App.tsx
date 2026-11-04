@@ -551,7 +551,8 @@ const authedBlobUrl = async (u: string): Promise<{ url: string; epoch: number; t
   const myToken = currentToken();
   const myUser = currentUser();
   const ctrl = new AbortController();
-  try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl; } catch {}
+  try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = ctrl;
+    try { var arr = (((window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts) ?? []); arr.push(ctrl); (window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts = arr; } catch {} } catch {}
   const r = await fetch(u, { headers: withUser(), signal: ctrl.signal });
   // Blob transport joins the central 401 transition: an expired or revoked
   // session expires the app identity instead of failing silently.
@@ -1061,7 +1062,7 @@ function AuthPanel() {
         <div>
           <h4>My meetings</h4>
           {(mine.data ?? []).map((m) => (
-            <div key={m.id} className="row"><span>An assigned meeting</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button></div>
+            <div key={m.id} className="row"><span>An assigned meeting</span><button type="button" onClick={() => { try { window.location.hash = buildHash({ tab: "meet", board: m.boardId, meeting: m.meetingId, mtab: "chat", ctab: "context", rec: "" }); } catch {} }}>Open</button><button type="button" onClick={() => leave(m.meetingId)}>Leave</button><button type="button" onClick={() => { try { post<unknown>("/api/meetings/" + m.meetingId + "/join", {}); } catch {} }}>Rejoin</button></div>
           ))}
         </div>
       )}
@@ -1436,8 +1437,12 @@ export default function App() {
   // Central private-state purge: stop hub/media, drop ALL private caches and
   // selections, navigate to a safe view. Used by expiry, revocation, and leave.
   const purgePrivate = (why: string) => {
+    try { (window as unknown as { __simceoEpoch?: number }).__simceoEpoch = (((window as unknown as { __simceoEpoch?: number }).__simceoEpoch) ?? 0) + 1; } catch {}
     try { window.dispatchEvent(new CustomEvent("simceo-hub-stop")); } catch {}
-    try { profileOpRef.current++; } catch {}
+    try { try { for (const c of (((window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts) ?? [])) { try { c.abort(); } catch {} } } catch {}
+    try { (window as unknown as { __simceoAborts?: AbortController[] }).__simceoAborts = []; } catch {}
+    try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort = undefined; } catch {}
+    profileOpRef.current++; } catch {}
     try { setProfileReloading(false); } catch {}
     try { (window as unknown as { __simceoAbort?: AbortController }).__simceoAbort?.abort(); } catch {}
     try { for (const u of ((window as unknown as { __simceoBlobs?: string[] }).__simceoBlobs ?? [])) { try { URL.revokeObjectURL(u); } catch {} } } catch {}

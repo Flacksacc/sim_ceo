@@ -91,6 +91,10 @@ async function waitFor(fn, ms, label) {
   try { await g2.stop(); } catch {} try { await c2.stop(); } catch {}
   await req("POST", "/api/boards/" + bid + "/grants", { userKey: guestE, access: "discuss", meetingId: mid1 }, B(adminT));
   await req("POST", "/api/boards/" + bid + "/grants", { userKey: guestE, access: "discuss", meetingId: mid2 }, B(adminT));
+  const rj1 = await req("POST", "/api/meetings/" + mid1 + "/join", {}, B(guestT));
+  ok("regrant-explicit-join-mid1", rj1.status === 200, rj1.status + " " + rj1.text.slice(0,160));
+  const rj2 = await req("POST", "/api/meetings/" + mid2 + "/join", {}, B(guestT));
+  ok("regrant-explicit-join-mid2", rj2.status === 200, rj2.status + " " + rj2.text.slice(0,160));
   const multiMsgs = []; let multiClosed = false;
   const multi = mk(guestT);
   multi.on("message", (m) => multiMsgs.push(m)); multi.onclose(() => { multiClosed = true; });

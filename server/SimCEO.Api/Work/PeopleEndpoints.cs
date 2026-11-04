@@ -261,6 +261,18 @@ public static class PeopleOps
   }
 
   public static bool WasExplicitlyLeft(InMemoryStore s, Guid boardId, Guid meetingId, string user) { try { var m = s.Memberships.Values.FirstOrDefault(x => x.BoardId == boardId && x.MeetingId == meetingId && string.Equals(x.UserKey, user, StringComparison.OrdinalIgnoreCase)); return m is not null && !m.Active; } catch { return false; } }
+  public static bool HasIndependentAuthority(InMemoryStore s, Guid boardId, string user)
+  {
+    try
+    {
+      var u = (user ?? "").Trim();
+      if (string.IsNullOrWhiteSpace(u)) return false;
+      if (s.Boards.TryGetValue(boardId, out var bb) && bb != null && !string.IsNullOrWhiteSpace(bb.OwnerKey) && string.Equals(bb.OwnerKey, u, StringComparison.OrdinalIgnoreCase)) return true;
+      var adm = AdminEmail(s);
+      if (!string.IsNullOrWhiteSpace(adm) && string.Equals(adm, u, StringComparison.OrdinalIgnoreCase)) return true;
+      try { return s.Grants.Values.Any(g => g.BoardId == boardId && g.MeetingId == null && string.Equals(g.UserKey, u, StringComparison.OrdinalIgnoreCase)); } catch { return false; }
+    } catch { return false; }
+  }
   public static void RevokeLive(string userKey, Guid? boardId = null, Guid? meetingId = null)
   {
     try { SimCEO.Api.Hubs.BoardHub.RevokeUser(userKey, boardId, meetingId); } catch { }
@@ -305,10 +317,10 @@ public static class PeopleOps
         }
         if (existing != null && !existing.Active)
         {
-          if (!explicitJoin) throw new UnauthorizedAccessException("denied");
+          if (!explicitJoin) { if (HasIndependentAuthority(s, boardId, currentUser)) { result = existing; return; } throw new UnauthorizedAccessException("denied"); }
           existing.Active = true;
           existing.LeftAt = null;
-          existing.JoinedAt = AuthOps.UtcNow();
+          existing.JoinedAt = DateTime.UtcNow;
           s.Memberships[existing.Id] = existing;
           result = existing;
           return;
@@ -319,7 +331,7 @@ public static class PeopleOps
           MeetingId = meetingId,
           UserKey = currentUser,
           Active = true,
-          JoinedAt = AuthOps.UtcNow(),
+          JoinedAt = DateTime.UtcNow,
         };
         s.Memberships[nm.Id] = nm;
         result = nm;
@@ -370,7 +382,7 @@ public static class PeopleOps
           string sessEmail = "";
           try
           {
-            if (!string.IsNullOrEmpty(token) && s.Sessions.TryGetValue(token, out var sess) && sess.ExpiresAt > AuthOps.UtcNow())
+            if (!string.IsNullOrEmpty(token) && s.Sessions.TryGetValue(token, out var sess) && sess.ExpiresAt > DateTime.UtcNow)
             {
               sessOk = true;
               sessEmail = sess.Email ?? "";
@@ -405,10 +417,10 @@ public static class PeopleOps
         }
         if (existing != null && !existing.Active)
         {
-          if (!explicitJoin) throw new UnauthorizedAccessException("denied");
+          if (!explicitJoin) { if (HasIndependentAuthority(s, boardId, currentUser)) { result = existing; return; } throw new UnauthorizedAccessException("denied"); }
           existing.Active = true;
           existing.LeftAt = null;
-          existing.JoinedAt = AuthOps.UtcNow();
+          existing.JoinedAt = DateTime.UtcNow;
           s.Memberships[existing.Id] = existing;
           result = existing;
           return;
@@ -419,7 +431,7 @@ public static class PeopleOps
           MeetingId = meetingId,
           UserKey = currentUser,
           Active = true,
-          JoinedAt = AuthOps.UtcNow(),
+          JoinedAt = DateTime.UtcNow,
         };
         s.Memberships[nm.Id] = nm;
         result = nm;
@@ -806,10 +818,10 @@ public static class PeopleEndpoints
                 && string.Equals(m.UserKey, user, StringComparison.OrdinalIgnoreCase));
               if (exA is null)
               {
-                var nm = new Membership { BoardId = curA.BoardId, MeetingId = curA.MeetingId.Value, UserKey = user, Active = true, JoinedAt = AuthOps.UtcNow() };
+                var nm = new Membership { BoardId = curA.BoardId, MeetingId = curA.MeetingId.Value, UserKey = user, Active = true, JoinedAt = DateTime.UtcNow };
                 s.Memberships[nm.Id] = nm;
               }
-              else if (!exA.Active) { exA.Active = true; exA.LeftAt = null; exA.JoinedAt = AuthOps.UtcNow(); s.Memberships[exA.Id] = exA; }
+              else if (!exA.Active) { exA.Active = true; exA.LeftAt = null; exA.JoinedAt = DateTime.UtcNow; s.Memberships[exA.Id] = exA; }
             }
             PeopleOps.MarkEnforced(s, curA.BoardId);
             acceptedGrant = ng;

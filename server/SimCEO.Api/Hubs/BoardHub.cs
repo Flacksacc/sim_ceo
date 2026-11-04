@@ -56,7 +56,7 @@ public sealed class BoardHub : Hub
         try
         {
           if (RevokedTokens.ContainsKey(tok)) { expired.Add(kv.Key); continue; }
-          if (!store.Sessions.TryGetValue(tok, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) expired.Add(kv.Key);
+          if (!store.Sessions.TryGetValue(tok, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) expired.Add(kv.Key);
         }
         catch { }
       }
@@ -90,7 +90,7 @@ public sealed class BoardHub : Hub
       token = t;
       if (RevokedTokens.ContainsKey(t)) return false;
       var store = http.RequestServices.GetRequiredService<InMemoryStore>();
-      if (!store.Sessions.TryGetValue(t, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) return false;
+      if (!store.Sessions.TryGetValue(t, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) return false;
       email = sess.Email;
       return true;
     }
@@ -236,7 +236,14 @@ public sealed class BoardHub : Hub
       if (PeopleOps.IsSecure(store)) { try { Context.Abort(); } catch { } }
       throw new HubException("Access revoked or not granted for this scope.");
     }
-    await HubGate.WaitAsync();
+    string pinnedUser = preUser;
+string pinnedTok = preTok;
+Guid pinnedBoard = boardId0;
+Guid pinnedRestore = Guid.Empty;
+try { pinnedRestore = store.RestoreEpochId; } catch { }
+bool needCentralCleanup = false;
+string cleanupId = string.Empty;
+await HubGate.WaitAsync();
     try
     {
       string user = "";
@@ -262,26 +269,69 @@ public sealed class BoardHub : Hub
       var grp = $"meeting:{Canonical(mid)}";
       await Groups.AddToGroupAsync(Context.ConnectionId, grp);
       JoinedGroups.AddOrUpdate(Context.ConnectionId, new System.Collections.Generic.HashSet<string> { grp }, (k, s) => { lock (s) { s.Add(grp); } return s; });
-      bool stillOk = false;
+            bool stillOk = false;
       try
       {
-        if (!string.IsNullOrEmpty(tok) && RevokedTokens.ContainsKey(tok)) stillOk = false;
-        else stillOk = CanForUser(store, user, boardId0, mid, "read");
+        stillOk = Atomic.Run(store, () =>
+        {
+          if (!string.IsNullOrEmpty(tok))
+          {
+            if (RevokedTokens.ContainsKey(tok)) return false;
+            if (!store.Sessions.TryGetValue(tok, out var ss)) return false;
+            if (ss.ExpiresAt <= System.DateTime.UtcNow) return false;
+            if (!string.Equals(ss.Email, user, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.Equals(user, pinnedUser, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.Equals(tok, pinnedTok, StringComparison.Ordinal)) return false;
+          }
+          if (!store.Meetings.TryGetValue(mid, out var cm)) return false;
+          if (cm == null) return false;
+          if (cm.BoardId != pinnedBoard) return false;
+          if (store.RestoreEpochId != pinnedRestore) return false;
+          var mem = (Domain.Membership)null;
+foreach (var mm in store.Memberships.Values)
+{
+if (mm.BoardId != pinnedBoard) continue;
+if (mm.MeetingId != mid) continue;
+if (!string.Equals(mm.UserKey, user, StringComparison.OrdinalIgnoreCase)) continue;
+mem = mm;
+}
+          if (mem != null)
+          {
+            if (!mem.Active)
+            {
+              if (!PeopleOps.HasIndependentAuthority(store, pinnedBoard, user)) return false;
+            }
+          }
+          if (!CanForUser(store, user, pinnedBoard, mid, "read")) return false;
+          return true;
+        });
       }
       catch { stillOk = false; }
-      if (!stillOk)
+
+            if (!stillOk)
       {
-        try { await Groups.RemoveFromGroupAsync(Context.ConnectionId, grp); } catch { }
+        bool removedOk = false;
+        try { await Groups.RemoveFromGroupAsync(Context.ConnectionId, grp); removedOk = true; } catch { removedOk = false; }
         try
         {
-          if (JoinedGroups.TryGetValue(Context.ConnectionId, out var gs0)) { lock (gs0) { gs0.Remove(grp); } }
+          if (removedOk)
+          {
+            if (JoinedGroups.TryGetValue(Context.ConnectionId, out var gs0)) { lock (gs0) { gs0.Remove(grp); } }
+          }
         }
         catch { }
+        needCentralCleanup = true;
+        cleanupId = Context.ConnectionId;
         if (PeopleOps.IsSecure(store)) { try { Context.Abort(); } catch { } }
         throw new HubException("Access revoked or not granted for this scope.");
       }
     }
     finally { try { HubGate.Release(); } catch { } }
+    if (needCentralCleanup)
+    {
+      try { if (!string.IsNullOrEmpty(cleanupId)) RemoveConnection(cleanupId, new { revoked = true }); } catch { }
+    }
+
   }
 
   // Central removal: remove ALL tracked groups first, notify, abort the actual
@@ -418,7 +468,7 @@ public sealed class BoardHub : Hub
         if (!string.IsNullOrEmpty(token))
         {
           if (RevokedTokens.ContainsKey(token)) continue;
-          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) continue;
+          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) continue;
           var liveUser = sess.Email ?? "";
           if (!CanForUser(s, liveUser, mtg.BoardId, meetingId, need)) continue;
           ok = true;
@@ -472,7 +522,7 @@ public sealed class BoardHub : Hub
         if (!string.IsNullOrEmpty(token))
         {
           if (RevokedTokens.ContainsKey(token)) continue;
-          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= SimCEO.Api.AuthOps.UtcNow()) continue;
+          if (!s.Sessions.TryGetValue(token, out var sess) || sess.ExpiresAt <= System.DateTime.UtcNow) continue;
           var liveUser = sess.Email ?? "";
           if (!string.Equals(liveUser, userKey, System.StringComparison.OrdinalIgnoreCase)) continue;
           if (!CanForUser(s, liveUser, mtg.BoardId, meetingId, "read")) continue;

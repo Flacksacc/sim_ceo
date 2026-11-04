@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-const API = process.env.QA_API || "http://127.0.0.1:5107";
+const API = process.env.QA_API || "http://127.0.0.1:15340";
 const run = "p8-" + Date.now().toString(36) + "-" + Math.floor(Math.random()*1e6).toString(36);
 let pass=0, fail=0; const failures=[];
 function ok(name, cond, extra){ if(cond){pass++;} else {fail++; failures.push(name+(extra?" :: "+extra:"")); console.log("  FAIL "+name+(extra?" :: "+extra:"")); } }

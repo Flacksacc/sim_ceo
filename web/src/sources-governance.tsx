@@ -5,7 +5,7 @@ type GovSource = {
   approved: boolean; excluded: boolean; reviewState: string; origin: string;
   familyKey: string; indexState: string; indexGeneration: number; indexError: string;
   indexCompletedAt?: string | null; sectionCount: number; isHead: boolean;
-  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null;
+  isCurrent: boolean; currentId?: string | null; scope: string; meetingId?: string | null; policyAllows?: boolean;
   createdAt: string;
 };
 type ReviewGroup = {
@@ -56,6 +56,7 @@ export default function SourcesGovernance(props: { boardId: string; meetingId: s
   const allowedSet = new Set((allowedMeetings ?? []).map((m) => (m ?? "").toLowerCase()));
   function canDownloadRow(s: GovSource): { ok: boolean; why: string } {
     if (boardReadable) return { ok: true, why: "" };
+    if ((s as any).policyAllows === false) return { ok: false, why: "Blocked by current board policy (wiki-only or extension block)." };
     const approved = (s.reviewState ?? "").toLowerCase() === "approved" && !s.excluded;
     if (!approved) return { ok: false, why: "Available after approval (meeting guests see approved originals only)." };
     if ((s.scope ?? "board") !== "meeting") return { ok: false, why: "Board originals are available to board readers; meeting guests see metadata only." };

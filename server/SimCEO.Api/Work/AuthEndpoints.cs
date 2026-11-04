@@ -31,7 +31,7 @@ public static class AuthOps
   public static readonly TimeSpan SessionLifetime = TimeSpan.FromDays(14);
   // Code-only controlled clock for expiry verification (probe overrides in-process only).
   // Production default is real UTC; never set from HTTP, env, or persisted state.
-  public static Func<DateTime> UtcNow = () => DateTime.UtcNow;
+  /* Production clock is real UTC only; no mutable seam. */
   private const int MaxFailedLogins = 10;
   private static readonly TimeSpan ThrottleWindow = TimeSpan.FromMinutes(10);
 
@@ -75,7 +75,7 @@ public static class AuthOps
       {
         Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)),
         AccountId = acct.Id, Email = acct.Email,
-        ExpiresAt = UtcNow() + SessionLifetime,
+        ExpiresAt = DateTime.UtcNow + SessionLifetime,
       };
       s.Sessions[session.Token] = session;
       return (session, null, 200);
@@ -92,7 +92,7 @@ public static class AuthOps
     var token = auth.ToString()["Bearer ".Length..].Trim();
     try
     {
-      if (!s.Sessions.TryGetValue(token, out var session) || session.ExpiresAt <= UtcNow())
+      if (!s.Sessions.TryGetValue(token, out var session) || session.ExpiresAt <= DateTime.UtcNow)
         return false;
       email = session.Email;
       return true;
@@ -146,7 +146,7 @@ public static class AuthEndpoints
           {
             Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)),
             AccountId = acct.Id, Email = acct.Email,
-            ExpiresAt = AuthOps.UtcNow() + AuthOps.SessionLifetime,
+            ExpiresAt = DateTime.UtcNow + AuthOps.SessionLifetime,
           };
           s.Sessions[session.Token] = session;
           try { if (s.Accounts.Values.Count == 1) SimCEO.Api.Hubs.BoardHub.AbortAnonymous(); } catch { }
