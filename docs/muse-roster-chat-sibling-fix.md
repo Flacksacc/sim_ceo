@@ -25,14 +25,14 @@ Static sibling-key check PASS: one RosterChatPanel plus one CharacterEditor, dis
 
 Web build PASS: tsc noEmit plus vite, new bundle main-DNxcsLzz.js. Server build PASS: dotnet Release 0 errors.
 
-Diagnostic rerun on OWN fixed SPA: bare 1, exact 1, treeWalker 1, class 1, headings 1, totalDivs 56, inert healthy, single outerHTML prefix under same detail.
+Diagnostic rerun v2 on OWN fixed SPA asserts hard: bare 1, exact 1, treeWalker 1, class 1, headings 1, synth 0, scoped chats 1, scoped editors 1, Playwright 1 and 1, inert 1/1/0, native hooks intact; 2 completed app research polls then re-asserted identical 1s with no growth; single outerHTML prefix under same detail with editor sibling.
 
-Interactions PASS on OWN stack: initial 1, poll 6s 1, typing 1, send echoed 1, after-send 1, switch B 1 with total 1 and no crossover, switchback 1, nav back 1, zero duplicate-key warnings.
+Interactions v2 on OWN stack: trusted launch verified before mutations; initial 1 plus 1; typed chat draft and editor link survive completed polls; send asserts real POST 200 with answer plus scoped advisor bubble, completed lead turn, idle Send, zero alerts; A/B distinct markers with late held B POST 200 isolated from A; boards shows zero chats and editors; nav back 1 plus 1; zero duplicate-key warnings. Turns are per-mount while unsent drafts persist per roster and identity, so a remounted panel starts empty with no crossover.
 
 Portrait probe PASS: existing qa/advisor-presence-portrait.cjs fully green, including empty parent early return and retire-revoke cleanup.
 
 ## Limits
 
-OWN QA data only on OWN ports. Shared 15300 and 15302 untouched, human ports untouched, no PG, Docker, env, keys, or other worktrees touched. Owned fake, API, and browser contexts closed with bounded cleanup.
+OWN QA data only on OWN exact origins http://127.0.0.1:15380 and http://127.0.0.1:15382 with credentials refused and redirects rejected. Shared 15300 and 15302 untouched, human ports untouched, no PG, Docker, env, keys, or other worktrees touched. Every fetch and body read runs under the remaining overall budget with no floor after expiry, response bodies are consumed or cancelled, browser contexts are isolated to exact origins, and each cleanup step is independently bounded with failures reported before PASS. Owned fake, API, and browser contexts closed.
 
 No acceptance and no deploy claims. Primary verifies and decides release. Muse is sole code, test, and script author for the changes in this branch.
