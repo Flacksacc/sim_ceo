@@ -295,11 +295,63 @@ function humanKeyLabel(k: string): string {
 // layers fail human-safe (neutral fallback); ordinary prose stays intact.
 // Malformed/unresolved JSON-like content is tracked after EVERY decode step
 // and at the layer limit, not only when zero layers decoded.
+function decodeUnicodeEscapesForShape(s: string): string {
+  try {
+    return s.replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex as string, 16)));
+  } catch {
+    return s;
+  }
+}
+function hasJsonObjectPrefix(s: string): boolean {
+  const rest = s.slice(1).trimStart();
+  if (rest === "") return false;
+  const c = rest[0];
+  if (c === "}") return true;
+  return c === '"';
+}
+function hasJsonArrayPrefix(s: string): boolean {
+  const rest = s.slice(1).trimStart();
+  if (rest === "") return false;
+  const c = rest[0];
+  if (c === '"' || c === "{" || c === "[" || c === "]") return true;
+  if ((c >= "0" && c <= "9") || c === "-") return true;
+  if (rest.startsWith("true") || rest.startsWith("false") || rest.startsWith("null")) return true;
+  return false;
+}
+// Quoted-layer classifier: quoted protocol JSON wraps a JSON object/array
+// (including \uXXXX-escaped structural quotes/braces) while ordinary prose
+// such as a bare quoted label with no brace or bracket payload stays prose.
+// Only brace/bracket payloads with a valid JSON prefix count as JSON-like,
+// so prose is preserved and malformed protocol layers still fail safe.
+function isBareJsonLike(s: string): boolean {
+  const t = (s ?? "").trim();
+  if (t.startsWith("{")) return hasJsonObjectPrefix(t);
+  if (t.startsWith("[")) return hasJsonArrayPrefix(t);
+  return false;
+}
 function isQuotedJsonLike(s: string): boolean {
   const t = (s ?? "").trim();
-  if (!t.startsWith('"') || t.length < 2) return false;
-  const bs = String.fromCharCode(92);
-  return t.includes(bs + '"') || t.includes('":') || t.includes('{"') || t.includes('["');
+  if (t.length < 2 || t[0] !== '"') return false;
+  const norm = decodeUnicodeEscapesForShape(t);
+  const payload = norm.slice(1).trimStart();
+  if (payload === "") return false;
+  let unesc = payload;
+  try {
+    unesc = payload.replace(/\\(["\\/bfnrt])/g, "$1").trimStart();
+  } catch {
+    unesc = payload;
+  }
+  if (unesc === "") return false;
+  const head = unesc[0];
+  if (head === "{") return hasJsonObjectPrefix(unesc);
+  if (head === "[") return hasJsonArrayPrefix(unesc);
+  if (head === '"') {
+    const inner2 = unesc.slice(1).trimStart();
+    if (inner2.startsWith("{")) return hasJsonObjectPrefix(inner2);
+    if (inner2.startsWith("[")) return hasJsonArrayPrefix(inner2);
+    return false;
+  }
+  return false;
 }
 function unwrapQuotedLayers(s: string, maxLayers = 3): { text: string; layers: number; failedJsonLike: boolean } {
   let tt = (s ?? "").trim();
@@ -421,7 +473,7 @@ function tryParseJson(s: string): { ok: boolean; value: unknown; text: string; t
   const uw = unwrapQuotedLayers(s, 3);
   if (uw.failedJsonLike) return { ok: false, value: null, text: uw.text, truncated: true };
   const t = uw.text;
-  if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null, text: t, truncated: false };
+  if (!isBareJsonLike(t)) return { ok: false, value: null, text: t, truncated: false };
   try { return { ok: true, value: JSON.parse(t), text: t, truncated: false }; } catch { return { ok: false, value: null, text: t, truncated: true }; }
 }
 export function humanNoteTitle(title: string): string {
@@ -433,7 +485,7 @@ export function humanNoteTitle(title: string): string {
     if (hit !== "") return hit;
     return "(untitled note)";
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "(untitled note)";
@@ -451,7 +503,7 @@ export function humanNoteBody(body: string): string {
     const out = (hit === "" ? "Note detail is available in context." : hit) + warn;
     return out.trim();
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const out = (projectTruncated(parsed.text, 600, "Note detail is available in context.") + warn).trim();
     return out;
   }
@@ -471,7 +523,7 @@ export function humanEvidenceTitle(title: string, kind: string, version: number 
     const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
     return v !== "" ? "Approved record, version " + v : "Approved record";
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "Supporting excerpt";
@@ -493,7 +545,7 @@ export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
     const out = (hit === "" ? fallback : hit) + warn;
     return out.trim();
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const fallback = kind === "dossier" ? "Advisor profile detail is available on the roster." : "Supporting detail is available in context.";
     const out = (projectTruncated(parsed.text, 600, fallback) + warn).trim();
     return out;
