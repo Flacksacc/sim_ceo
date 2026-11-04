@@ -275,7 +275,7 @@ function shortJoin(parts: string[], cap: number): string {
 function valueToText(v: unknown): string {
   if (typeof v === "string") {
     const s = (v as string).trim();
-    if (s.startsWith("{") || s.startsWith("[") || s.startsWith('"')) return projectNestedString(s, 220);
+    if (looksLikeNestedPayload(s)) return projectNestedString(s, 220);
     return scrubIds(s);
   }
   if (typeof v === "number" || typeof v === "boolean") return String(v);
@@ -295,11 +295,108 @@ function humanKeyLabel(k: string): string {
 // layers fail human-safe (neutral fallback); ordinary prose stays intact.
 // Malformed/unresolved JSON-like content is tracked after EVERY decode step
 // and at the layer limit, not only when zero layers decoded.
+function decodeUnicodeEscapesForShape(s: string): string {
+  try {
+    return s.replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex as string, 16)));
+  } catch {
+    return s;
+  }
+}
+function hasJsonObjectPrefix(s: string): boolean {
+  const rest = s.slice(1).trimStart();
+  if (rest === "") return false;
+  const c = rest[0];
+  if (c === "}") return true;
+  if (c === '"') return true;
+  // Bare escaped shape (detection only): {\"key... counts as a quoted key prefix.
+  if (c === "\\" && rest.length > 1 && rest[1] === '"') return true;
+  return false;
+}
+function hasJsonArrayPrefix(s: string): boolean {
+  const rest = s.slice(1).trimStart();
+  if (rest === "") return false;
+  const c = rest[0];
+  if (c === '"' || c === "{" || c === "[" || c === "]") return true;
+  // Bare escaped shape (detection only): [\"a... counts as a quoted element prefix.
+  if (c === "\\" && rest.length > 1 && rest[1] === '"') return true;
+  if ((c >= "0" && c <= "9") || c === "-") return true;
+  if (rest.startsWith("true") || rest.startsWith("false") || rest.startsWith("null")) return true;
+  return false;
+}
+function isBracketLabelProse(s: string): boolean {
+  // Human bracket labels with trailing prose (e.g. "[2026] Budget review tomorrow."
+  // or "[note] remember to call finance") are ordinary prose, not JSON arrays.
+  // Valid JSON either ends at "]" or continues with JSON syntax. Trailing words
+  // after "]" with a simple label inside (no structural quotes/braces) is prose.
+  const t = (s ?? "").trim();
+  if (!t.startsWith("[")) return false;
+  const close = t.indexOf("]");
+  if (close < 0) return false;
+  const inner = t.slice(1, close);
+  if (inner.includes('"') || inner.includes("{") || inner.includes("[") || inner.includes("}")) return false;
+  const after = t.slice(close + 1);
+  if (after.trim() === "") return false;
+  if (/^\s*\S/.test(after)) return true;
+  return false;
+}
+// Quoted-layer classifier: quoted protocol JSON wraps a JSON object/array
+// (including \uXXXX-escaped structural quotes/braces) while ordinary prose
+// such as a bare quoted label with no brace or bracket payload stays prose.
+// Only brace/bracket payloads with a valid JSON prefix count as JSON-like,
+// so prose is preserved and malformed protocol layers still fail safe.
+function isBareJsonLike(s: string): boolean {
+  const t = (s ?? "").trim();
+  if (t === "") return false;
+  // Detection-only unicode normalization: bare \uXXXX structural shapes
+  // (e.g. {\\u0022reviewToken... or \\u007B...) count as JSON-like so they
+  // fail neutral instead of leaking protocol text. Human prose is preserved
+  // by callers (prose returns scrubbed text, never raw protocol).
+  const norm = decodeUnicodeEscapesForShape(t).trim();
+  const u = norm !== "" ? norm : t;
+  if (u.startsWith("{")) return hasJsonObjectPrefix(u);
+  if (u.startsWith("[")) {
+    if (isBracketLabelProse(u)) return false;
+    return hasJsonArrayPrefix(u);
+  }
+  return false;
+}
+function looksLikeNestedPayload(s: string): boolean {
+  // Consistent routing for nested projection (all callers): quoted strings,
+  // bare JSON shapes, and backslash-led structural shapes go through the
+  // safe projectNestedString path (prose preserved, protocol neutralized).
+  const t = (s ?? "").trim();
+  if (t === "") return false;
+  if (t.startsWith('"')) return true;
+  if (t.startsWith("{") || t.startsWith("[")) return true;
+  if (t.startsWith("\\")) return true;
+  if (isBareJsonLike(t)) return true;
+  const norm = decodeUnicodeEscapesForShape(t).trim();
+  if (norm !== t && (norm.startsWith("{") || norm.startsWith("[") || norm.startsWith('"'))) return true;
+  return false;
+}
 function isQuotedJsonLike(s: string): boolean {
   const t = (s ?? "").trim();
-  if (!t.startsWith('"') || t.length < 2) return false;
-  const bs = String.fromCharCode(92);
-  return t.includes(bs + '"') || t.includes('":') || t.includes('{"') || t.includes('["');
+  if (t.length < 2 || t[0] !== '"') return false;
+  const norm = decodeUnicodeEscapesForShape(t);
+  const payload = norm.slice(1).trimStart();
+  if (payload === "") return false;
+  let unesc = payload;
+  try {
+    unesc = payload.replace(/\\(["\\/bfnrt])/g, "$1").trimStart();
+  } catch {
+    unesc = payload;
+  }
+  if (unesc === "") return false;
+  const head = unesc[0];
+  if (head === "{") return hasJsonObjectPrefix(unesc);
+  if (head === "[") return hasJsonArrayPrefix(unesc);
+  if (head === '"') {
+    const inner2 = unesc.slice(1).trimStart();
+    if (inner2.startsWith("{")) return hasJsonObjectPrefix(inner2);
+    if (inner2.startsWith("[")) return hasJsonArrayPrefix(inner2);
+    return false;
+  }
+  return false;
 }
 function unwrapQuotedLayers(s: string, maxLayers = 3): { text: string; layers: number; failedJsonLike: boolean } {
   let tt = (s ?? "").trim();
@@ -317,7 +414,12 @@ function unwrapQuotedLayers(s: string, maxLayers = 3): { text: string; layers: n
     tt = (decoded as string).trim();
     layers += 1;
   }
-  if (!failedJsonLike && tt.startsWith('"') && isQuotedJsonLike(tt)) {
+  // Bounded depth: max 3 actual string decodes. After 3 successful decodes a
+  // still-quoted string is unresolved overdepth (6, 7, 12+ layers): do NOT emit
+  // encoded protocol and do NOT keep decoding; fail honest neutral instead.
+  if (!failedJsonLike && layers >= maxLayers && tt.startsWith('"')) {
+    failedJsonLike = true;
+  } else if (!failedJsonLike && tt.startsWith('"') && isQuotedJsonLike(tt)) {
     failedJsonLike = true;
   }
   return { text: tt, layers, failedJsonLike };
@@ -326,7 +428,9 @@ function projectNestedString(s: string, cap: number): string {
   const uw = unwrapQuotedLayers(s, 3);
   if (uw.failedJsonLike) return "";
   const tt = uw.text;
-  if (!(tt.startsWith("{") || tt.startsWith("["))) return scrubIds(tt).slice(0, cap);
+  // Consistency: bracket-label prose ([note]/[2026] + words) and other
+  // non-JSON shapes preserve human text; JSON-like shapes try projection.
+  if (!isBareJsonLike(tt)) return scrubIds(tt).slice(0, cap);
   try {
     const v: unknown = JSON.parse(tt);
     const hit = projectJson(v, cap, "");
@@ -337,19 +441,19 @@ function projectObject(o: Record<string, unknown>, cap: number): string {
   const bits: string[] = [];
   if (typeof o.question === "string" && o.question.trim() !== "") {
     const qt = (o.question as string).trim();
-    const qp = (qt.startsWith("{") || qt.startsWith("[") || qt.startsWith('"')) ? projectNestedString(qt, 160) : scrubIds(qt);
+    const qp = looksLikeNestedPayload(qt) ? projectNestedString(qt, 160) : scrubIds(qt);
     if (qp !== "") bits.push("Question: " + qp);
   }
   if (typeof o.title === "string" && (o.title as string).trim() !== "") {
     const tt2 = ((o.title as string).trim());
-    const tp = (tt2.startsWith("{") || tt2.startsWith("[") || tt2.startsWith('"')) ? projectNestedString(tt2, 160) : scrubIds(tt2);
+    const tp = looksLikeNestedPayload(tt2) ? projectNestedString(tt2, 160) : scrubIds(tt2);
     if (tp !== "") bits.push(tp);
   }
   for (const k of TEXT_FIELDS) {
     if (k === "question" || k === "title") continue;
     const v = o[k];
     if (typeof v === "string" && v.trim() !== "") {
-      const vv = (v.trim().startsWith("{") || v.trim().startsWith("[") || v.trim().startsWith('"')) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
+      const vv = looksLikeNestedPayload(v.trim()) ? projectNestedString(v.trim(), 160) : scrubIds(v.trim());
       if (vv === "") continue;
       const label = k === "text" || k === "body" || k === "content" || k === "excerpt" ? "" : humanKeyLabel(k) + ": ";
       bits.push(label + vv);
@@ -365,7 +469,7 @@ function projectJson(raw: unknown, cap: number, fallback: string): string {
   if (typeof raw === "string") {
     const t = (raw as string).trim();
     if (t === "") return fallback;
-    if (t.startsWith("{") || t.startsWith("[") || t.startsWith('"')) {
+    if (looksLikeNestedPayload(t)) {
       const hit = projectNestedString(t, cap);
       return hit !== "" ? hit : fallback;
     }
@@ -376,7 +480,7 @@ function projectJson(raw: unknown, cap: number, fallback: string): string {
     if (raw.length === 0) return fallback;
     const bits = raw.map((e) => {
       if (e === null || e === undefined) return "";
-      if (typeof e === "string") { const et = (e as string).trim(); if (et.startsWith("{") || et.startsWith("[") || et.startsWith('"')) return projectNestedString(et, 160); return scrubIds(et); }
+      if (typeof e === "string") { const et = (e as string).trim(); if (looksLikeNestedPayload(et)) return projectNestedString(et, 160); return scrubIds(et); }
       if (typeof e === "object" && !Array.isArray(e)) return projectObject(e as Record<string, unknown>, 160);
       return valueToText(e);
     }).filter((s) => s !== "");
@@ -397,7 +501,7 @@ function extractTruncatedFields(s: string, cap: number): string {
     try {
       const raw = m[2].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
       const rt = raw.trim();
-      if (rt.startsWith("{") || rt.startsWith("[") || rt.startsWith('"')) {
+      if (looksLikeNestedPayload(rt)) {
         const proj = projectNestedString(rt, 160);
         if (proj === "") continue;
         const label2 = m[1] === "text" || m[1] === "body" || m[1] === "content" || m[1] === "excerpt" ? "" : humanKeyLabel(m[1]) + ": ";
@@ -421,7 +525,7 @@ function tryParseJson(s: string): { ok: boolean; value: unknown; text: string; t
   const uw = unwrapQuotedLayers(s, 3);
   if (uw.failedJsonLike) return { ok: false, value: null, text: uw.text, truncated: true };
   const t = uw.text;
-  if (!(t.startsWith("{") || t.startsWith("["))) return { ok: false, value: null, text: t, truncated: false };
+  if (!isBareJsonLike(t)) return { ok: false, value: null, text: t, truncated: false };
   try { return { ok: true, value: JSON.parse(t), text: t, truncated: false }; } catch { return { ok: false, value: null, text: t, truncated: true }; }
 }
 export function humanNoteTitle(title: string): string {
@@ -433,7 +537,7 @@ export function humanNoteTitle(title: string): string {
     if (hit !== "") return hit;
     return "(untitled note)";
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "(untitled note)";
@@ -451,7 +555,7 @@ export function humanNoteBody(body: string): string {
     const out = (hit === "" ? "Note detail is available in context." : hit) + warn;
     return out.trim();
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const out = (projectTruncated(parsed.text, 600, "Note detail is available in context.") + warn).trim();
     return out;
   }
@@ -471,7 +575,7 @@ export function humanEvidenceTitle(title: string, kind: string, version: number 
     const v = m && m[1] ? m[1] : (version !== null && version !== undefined ? String(version) : "");
     return v !== "" ? "Approved record, version " + v : "Approved record";
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const hit = projectTruncated(parsed.text, 160, "");
     if (hit !== "") return hit;
     return "Supporting excerpt";
@@ -493,7 +597,7 @@ export function humanEvidenceExcerpt(excerpt: string, kind: string): string {
     const out = (hit === "" ? fallback : hit) + warn;
     return out.trim();
   }
-  if (parsed.truncated || parsed.text.startsWith("{") || parsed.text.startsWith("[")) {
+  if (parsed.truncated || isBareJsonLike(parsed.text)) {
     const fallback = kind === "dossier" ? "Advisor profile detail is available on the roster." : "Supporting detail is available in context.";
     const out = (projectTruncated(parsed.text, 600, fallback) + warn).trim();
     return out;
