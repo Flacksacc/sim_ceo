@@ -95,31 +95,49 @@ function consumeExpectedConsole(combined, txt, label) {
     if (!String(combined).includes(e.path)) continue;
     if (String(e.status) === 'ERR') {
       if (!/ERR_|Failed to load resource|net::ERR|aborted|abort/i.test(String(txt))) continue;
-      let correlated = false;
-      for (const sg of stubLog) {
-        if (sg.mode === 'abort' && sg.method === e.method && String(combined).includes(sg.path) && Math.abs(now - sg.at) < 30000 && Math.abs((e.at || 0) - sg.at) < 30000) { correlated = true; break; }
+      let stubIdx = -1;
+      for (let sx = 0; sx < stubLog.length; sx++) {
+        const sg = stubLog[sx];
+        if (sg.mode !== 'abort') continue;
+        if (sg.method !== e.method) continue;
+        if (String(sg.path) !== String(e.path)) continue;
+        if (String(sg.label || '__stub') !== String(e.label)) continue;
+        if ((sg.at || 0) < (e.at || 0)) continue;
+        if (now - (sg.at || 0) > 30000) continue;
+        stubIdx = sx; break;
       }
-      if (!correlated) {
-        for (const n of netLog) {
-          if (n.label === label && n.method === e.method && String(n.path) === String(e.path) && String(n.status) === 'ERR' && Math.abs((e.at || 0) - n.at) < 30000) { correlated = true; break; }
+      if (stubIdx >= 0) { stubLog.splice(stubIdx, 1); }
+      else {
+        let netIdx = -1;
+        for (let sx = 0; sx < netLog.length; sx++) {
+          const n = netLog[sx];
+          if (n.label !== label || n.method !== e.method) continue;
+          if (String(n.path) !== String(e.path)) continue;
+          if (String(n.status) !== 'ERR') continue;
+          if ((n.at || 0) < (e.at || 0)) continue;
+          if (Math.abs((e.at || 0) - n.at) > 30000) continue;
+          netIdx = sx; break;
         }
+        if (netIdx < 0) continue;
+        netLog.splice(netIdx, 1);
       }
-      if (!correlated) continue;
       expectedConsole.splice(i, 1);
       return true;
     } else {
       if (!String(txt).includes(String(e.status))) continue;
-      let correlated = false;
-      for (const n of netLog) {
+      let netIdx = -1;
+      for (let sx = 0; sx < netLog.length; sx++) {
+        const n = netLog[sx];
         if (n.label !== label) continue;
         if (n.method !== e.method) continue;
         if (String(n.status) !== String(e.status)) continue;
-        if (!(String(n.path) === String(e.path) || String(n.path).startsWith(String(e.path)) || String(e.path).startsWith(String(n.path)))) continue;
+        if (String(n.path) !== String(e.path)) continue;
+        if ((n.at || 0) < (e.at || 0)) continue;
         if (Math.abs((e.at || 0) - n.at) > 30000) continue;
-        correlated = true;
-        break;
+        netIdx = sx; break;
       }
-      if (!correlated) continue;
+      if (netIdx < 0) continue;
+      netLog.splice(netIdx, 1);
       expectedConsole.splice(i, 1);
       return true;
     }
@@ -127,6 +145,8 @@ function consumeExpectedConsole(combined, txt, label) {
   return false;
 }
 async function bodyHas(s) { return (await page.locator("body").innerText()).includes(s); }
+function innerHeadCard(pg) { return pg.locator('h4', { hasText: 'Approved decisions (current record)' }).locator('xpath=..'); }
+function innerEffectiveCard(pg) { return pg.locator('h4', { hasText: 'Current effective record' }).locator('xpath=..'); }
 async function shot(name) { await page.screenshot({ path: path.join(OUT, name + ".png") }); }
 async function approveCount() { return await page.locator("button").filter({ hasText: "Approve decision" }).count(); }
 async function reviseCount() { return await page.locator("button").filter({ hasText: "Revise decision" }).count(); }
@@ -222,7 +242,7 @@ async function main() {
       const u = new URL(req.url());
       try { const rqq = route.request(); if (rqq.isNavigationRequest && rqq.isNavigationRequest()) globalThis.__navAny = Date.now(); } catch {}
       try { const hr = globalThis.__holdReview; if (hr && hr.armed && u.pathname === ('/api/records/' + hr.id + '/review')) { hr.seen = true; await hr.gate; hr.settled = true; } } catch {}
-      try { const sr = globalThis.__stubReviewOnce; if (sr && u.pathname === ('/api/records/' + sr.id + '/review')) { globalThis.__stubReviewOnce = null; try { stubLog.push({ mode: sr.mode, id: sr.id, path: '/api/records/' + sr.id + '/review', method: req.method(), at: Date.now() }); } catch {} if (sr.mode === '403') { try { await route.fulfill({ status: 403, contentType: 'application/json', body: '{}' }); } catch {} return; } if (sr.mode === 'abort') { try { await route.abort(); } catch {} try { netLog.push({ method: req.method(), path: '/api/records/' + sr.id + '/review', status: 'ERR', label: '__stub', at: Date.now() }); } catch {} return; } } } catch {}
+      try { const sr = globalThis.__stubReviewOnce; if (sr && u.pathname === ('/api/records/' + sr.id + '/review')) { globalThis.__stubReviewOnce = null; try { stubLog.push({ mode: sr.mode, id: sr.id, path: '/api/records/' + sr.id + '/review', method: req.method(), label: sr.label || '__stub', at: Date.now() }); } catch {} if (sr.mode === '403') { try { await route.fulfill({ status: 403, contentType: 'application/json', body: '{}' }); } catch {} return; } if (sr.mode === 'abort') { try { await route.abort(); } catch {} try { netLog.push({ method: req.method(), path: '/api/records/' + sr.id + '/review', status: 'ERR', label: sr.label || '__stub', at: Date.now() }); } catch {} return; } } } catch {}
       try {
         const pj = globalThis.__stubReviewJson;
         if (pj && u.pathname === ('/api/records/' + pj.id + '/review')) { try { pj.seen = true; pj.hits = (pj.hits || 0) + 1; pj.lastAt = Date.now(); } catch {} try { stubLog.push({ mode: 'json', id: pj.id, path: '/api/records/' + pj.id + '/review', method: req.method(), at: Date.now() }); } catch {} try { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(pj.body) }); } catch {} return; }
@@ -704,7 +724,7 @@ async function main() {
   ok('reload-403-approve-guided', await bodyHas('Reload editor from current review'), 'per-item conflict did not guide to Reload');
 
   ok('reload-403-approve-no-write', (await canonState(rid, owner)) === canonDBefore, 'stale per-item approve mutated public state');
-  globalThis.__stubReviewOnce = { id: rid, mode: '403' };
+  globalThis.__stubReviewOnce = { id: rid, mode: '403', label: 'main' };
   expectConsoleError('GET', '/api/records/' + rid + '/review', 403, 'main');
   await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
@@ -718,10 +738,11 @@ async function main() {
     ok('reload-403-preserve-child', r2403 === 'Bears reload two STALE-403', 'actual R2 child edit lost on App 403: ' + r2403.slice(0, 80));
     ok('reload-403-preserve-child-detail', r2d403 === 'Bears stale detail 403 R2', 'actual R2 child detail lost on App 403: ' + r2d403.slice(0, 80));
     const __ordChk403 = await pendingOrdinals(rid, owner);
-    const __cR1 = await page.getByLabel('Revised text for decision ' + __ordChk403['R1']).first().inputValue().catch(() => '');
-    const __cR2 = await page.getByLabel('Revised text for decision ' + __ordChk403['R2']).first().inputValue().catch(() => '');
-    ok('reload-403-preserve-peritem-R1', __cR1 === 'Bears child R1 403', 'per-item R1 child lost on App 403: ' + String(__cR1).slice(0, 80));
-    ok('reload-403-preserve-peritem-R2', __cR2 === 'Bears child R2 403', 'per-item R2 child lost on App 403: ' + String(__cR2).slice(0, 80));
+    // App removes per-item revise inputs on review error, so hidden inputs
+    // cannot prove retained child state. Assert hidden here; retention is
+    // proven after Refresh recovery below on the same mount.
+    ok('reload-403-peritem-hidden-R1', (await page.getByLabel('Revised text for decision ' + __ordChk403['R1']).count()) === 0, 'per-item R1 input visible on App 403 error');
+    ok('reload-403-peritem-hidden-R2', (await page.getByLabel('Revised text for decision ' + __ordChk403['R2']).count()) === 0, 'per-item R2 input visible on App 403 error');
   }
   ok('reload-403-controls-hidden', (await allApproveControls()) === 0 && (await page.getByRole('button', { name: 'Request revision (new version)' }).count()) === 0, 'App failed-query must hide approval/submit controls');
   ok('reload-403-no-state-write', (await canonState(rid, owner)) === canonDBefore, 'App 403 mutated public state');
@@ -730,13 +751,38 @@ async function main() {
     ok('reload-403-unknown-retained', det403.text.includes('unknown-meta-R1-marker') && det403.text.includes('unknown-ref-R2-marker'), 'unknown metadata/refs lost on App 403');
   }
   ok('reload-403-editor-intact', (await editorBoxes.count()) >= 4, 'editor unmounted after App 403');
+  // Same-mounted recovery through the actual Refresh review button: Reload is
+  // gated on !recReview.isError, so Refresh is the only recovery path that
+  // keeps the mount and its typed state. refreshReview refetches on the same
+  // key without clearing per-item typing, so inputs reappear with retained
+  // values before the authoritative Reload reset.
+  await page.getByRole('button', { name: 'Refresh review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  {
+    const __ordRf403 = await pendingOrdinals(rid, owner);
+    const __rf403a = await page.getByLabel('Revised text for decision ' + __ordRf403['R1']).first().inputValue().catch(() => '');
+    const __rf403b = await page.getByLabel('Revised text for decision ' + __ordRf403['R2']).first().inputValue().catch(() => '');
+    ok('reload-403-refresh-restores-peritem-R1', __rf403a === 'Bears child R1 403', 'same-key refetch lost per-item R1 typing: ' + String(__rf403a).slice(0, 80));
+    ok('reload-403-refresh-restores-peritem-R2', __rf403b === 'Bears child R2 403', 'same-key refetch lost per-item R2 typing: ' + String(__rf403b).slice(0, 80));
+    ok('reload-403-refresh-keeps-stale', (await sval(editorBoxes.nth(0))) === 'Bears reload one STALE-403', 'Refresh clobbered stale whole text');
+  }
+  ok('reload-403-refresh-controls', (await allApproveControls()) > 0 || (await page.getByRole('button', { name: 'Request revision (new version)' }).count()) === 1, 'Refresh recovery did not restore controls');
+  ok('reload-403-refresh-no-write', (await canonState(rid, owner)) === canonDBefore, 'Refresh recovery mutated public state');
+  await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  {
+    ok('reload-403-reset-text', (await sval(editorBoxes.nth(0))) === 'Bears reload one external-403', 'Reload reset missed authority');
+    const __ordRs403 = await pendingOrdinals(rid, owner);
+    const __rs403 = await page.getByLabel('Revised text for decision ' + __ordRs403['R1']).first().inputValue().catch(() => '');
+    ok('reload-403-reset-peritem-cleared', __rs403 === '', 'Reload reset must clear per-item typing to authority, got: ' + String(__rs403).slice(0, 80));
+  }
   await page.reload({ waitUntil: 'domcontentloaded', timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), 'Bears reload one external-403', { timeout: T.poll });
   await page.waitForTimeout(800);
   {
     const r403 = await sval(editorBoxes.nth(0));
     ok('reload-remount-403-text', r403 === 'Bears reload one external-403', 'remount did not show latest authority: ' + r403.slice(0, 80));  }
-  globalThis.__stubReviewOnce = { id: rid, mode: 'abort' };
+  globalThis.__stubReviewOnce = { id: rid, mode: 'abort', label: 'main' };
   expectConsoleError('GET', '/api/records/' + rid + '/review', 'ERR', 'main');
   await editorBoxes.nth(0).fill('Bears reload one STALE-ABORT', { timeout: T.step });
   await editorBoxes.nth(1).fill('Bears stale detail abort', { timeout: T.step });
@@ -770,10 +816,11 @@ async function main() {
     ok('reload-abort-preserve-child', r2A === 'Bears reload two STALE-ABORT', 'actual R2 child edit lost on App transport failure: ' + r2A.slice(0, 80));
     ok('reload-abort-preserve-child-detail', r2dA === 'Bears stale detail abort R2', 'actual R2 child detail lost on App transport failure: ' + r2dA.slice(0, 80));
     const __ordChkAb = await pendingOrdinals(rid, owner);
-    const __cAb1 = await page.getByLabel('Revised text for decision ' + __ordChkAb['R1']).first().inputValue().catch(() => '');
-    const __cAb2 = await page.getByLabel('Revised text for decision ' + __ordChkAb['R2']).first().inputValue().catch(() => '');
-    ok('reload-abort-preserve-peritem-R1', __cAb1 === 'Bears child R1 abort', 'per-item R1 child lost on App abort: ' + String(__cAb1).slice(0, 80));
-    ok('reload-abort-preserve-peritem-R2', __cAb2 === 'Bears child R2 abort', 'per-item R2 child lost on App abort: ' + String(__cAb2).slice(0, 80));
+    // App removes per-item revise inputs on review error, so hidden inputs
+    // cannot prove retained child state. Assert hidden here; retention is
+    // proven after Refresh recovery below on the same mount.
+    ok('reload-abort-peritem-hidden-R1', (await page.getByLabel('Revised text for decision ' + __ordChkAb['R1']).count()) === 0, 'per-item R1 input visible on App abort error');
+    ok('reload-abort-peritem-hidden-R2', (await page.getByLabel('Revised text for decision ' + __ordChkAb['R2']).count()) === 0, 'per-item R2 input visible on App abort error');
   }
   ok('reload-abort-controls-hidden', (await allApproveControls()) === 0 && (await page.getByRole('button', { name: 'Request revision (new version)' }).count()) === 0, 'App failed-query must hide approval/submit controls');
   ok('reload-abort-no-state-write', (await canonState(rid, owner)) === canonAbortBefore, 'App transport failure mutated public state');
@@ -782,8 +829,24 @@ async function main() {
     ok('reload-abort-unknown-retained', detA.text.includes('unknown-meta-R1-marker') && detA.text.includes('unknown-ref-R2-marker'), 'unknown metadata/refs lost on App transport failure');
   }
   globalThis.__stubReviewOnce = null;
-  // SAME-KEY authoritative refetch explicitly on the same mounted editor (no remount, no fixture bypass).
-  // App hides Approve/Request-revision on failed query; a successful Reload clears the error and restores controls.
+  // SAME-KEY recovery through the actual Refresh review button on the same
+  // mounted editor (no remount, no fixture bypass). Reload is gated on
+  // !recReview.isError, so after the aborted review query Reload is hidden
+  // and Refresh is the reachable recovery path. refreshReview refetches on
+  // the same key without clearing per-item typing, so typed child state
+  // reappears before the authoritative Reload reset below.
+  await page.getByRole('button', { name: 'Refresh review' }).first().click({ timeout: T.step });
+  await page.waitForTimeout(1500);
+  {
+    const __ordRfAb = await pendingOrdinals(rid, owner);
+    const __rfAba = await page.getByLabel('Revised text for decision ' + __ordRfAb['R1']).first().inputValue().catch(() => '');
+    const __rfAbb = await page.getByLabel('Revised text for decision ' + __ordRfAb['R2']).first().inputValue().catch(() => '');
+    ok('reload-refresh-restores-peritem-R1', __rfAba === 'Bears child R1 abort', 'same-key refetch lost per-item R1 typing: ' + String(__rfAba).slice(0, 80));
+    ok('reload-refresh-restores-peritem-R2', __rfAbb === 'Bears child R2 abort', 'same-key refetch lost per-item R2 typing: ' + String(__rfAbb).slice(0, 80));
+    ok('reload-refresh-keeps-stale-text', (await sval(editorBoxes.nth(0))) === 'Bears reload one STALE-ABORT', 'Refresh clobbered stale whole text');
+  }
+  ok('reload-refresh-controls', (await allApproveControls()) > 0 || (await page.getByRole('button', { name: 'Request revision (new version)' }).count()) === 1, 'Refresh recovery did not restore controls');
+  ok('reload-refresh-no-write', (await canonState(rid, owner)) === canonAbortBefore, 'Refresh recovery mutated public state');
   await page.getByRole('button', { name: 'Reload editor from current review' }).first().click({ timeout: T.step });
   await page.waitForTimeout(1500);
   {
@@ -821,7 +884,7 @@ async function main() {
     const rnid = succR[0] || '';
     const rdet = rnid ? await api('GET', '/api/records/' + rnid, undefined, owner) : { status: 0, json: {}, text: '' };
     let rtexts = '';
-    let r1detOk = false; let rdetOk = false; let rrefsOk = false; let rrefsComplete = false; let runknownOk = false; let r1metaOk = false; let r2metaOk = false;
+    let r1detOk = false; let rdetOk = false; let rrefsOk = false; let rrefsComplete = false; let runknownOk = false; let r1metaOk = false; let r2metaOk = false; let r1textOk = false; let r2textOk = false; let rscopeOk = false;
     try {
       const arr = JSON.parse(rdet.json.itemsJson);
       rtexts = JSON.stringify(arr.map((e) => e.text));
@@ -832,6 +895,9 @@ async function main() {
       rrefsOk = Array.isArray(rf2.refs) && rf2.refs.some((x) => x.kind === 'message' && String(x.ref) === mid + ':' + String(mseq));
       rrefsComplete = Array.isArray(rf2.refs) && rf2.refs.length === 1 && rf2.refs[0].kind === 'message' && String(rf2.refs[0].ref) === mid + ':' + String(mseq) && String(rf2.refs[0].title) === 'known excerpt' && String(rf2.refs[0].customRef) === 'unknown-ref-R2-marker';
       r1metaOk = String(rf1.customMeta || '') === 'unknown-meta-R1-marker';
+      r1textOk = rf1.text === 'Bears reload one FINAL';
+      r2textOk = rf2.text === 'Bears reload two revised';
+      rscopeOk = rf1.scope === 'meeting';
       r2metaOk = String(rf2.customMeta || '') === 'unknown-meta-R2-marker';
       runknownOk = JSON.stringify(arr).includes('unknown-meta-R1-marker') && JSON.stringify(arr).includes('unknown-ref-R2-marker');
     } catch {}
@@ -840,6 +906,8 @@ async function main() {
     ok('reload-submit-complete-refs', rrefsComplete, 'successor must preserve complete R2 refs (kind/ref/title/customRef)');
     ok('reload-submit-complete-meta', r1metaOk && r2metaOk, 'successor must preserve complete customMeta for R1+R2');
     ok('reload-submit-unknown-retained', rdet.status === 200 && runknownOk && r1metaOk && r2metaOk, 'unknown metadata/refs lost on same-record submit');
+    ok('reload-submit-exact-texts', rdet.status === 200 && r1textOk && r2textOk, 'successor texts not exact FINAL/revised');
+    ok('reload-submit-scope-R1', rdet.status === 200 && rscopeOk, 'successor lost seeded R1 scope=meeting');
   }
   {
     const guestRev = await api('GET', '/api/records/' + rid + '/review', undefined, reader);
@@ -967,10 +1035,13 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   ok('ui-amend-pending-child-no-historical', !(await bodyHas('is not the current effective record')), 'pending-child ancestor mislabeled historical');
   ok('ui-amend-pending-child-card', await bodyHas('Approved decisions (current record)'), 'pending-child ancestor missing current-card heading');
   {
-    const __pc = await page.locator('.card', { hasText: 'Approved decisions (current record)' }).first().innerText().catch(() => '');
+    const __pcLoc = innerHeadCard(page);
+    const __pcCount = await __pcLoc.count();
+    ok('ui-amend-pending-child-card-single', __pcCount === 1, 'current inner card not exactly one: ' + String(__pcCount));
+    const __pc = __pcCount === 1 ? await __pcLoc.first().innerText() : '';
     ok('ui-amend-pending-child-card-alpha', __pc.includes('Bears inherit alpha'), 'current card missing alpha: ' + __pc.slice(0, 200));
     ok('ui-amend-pending-child-card-beta', __pc.includes('Bears inherit beta'), 'current card missing beta');
-    ok('ui-amend-pending-child-card-versions', __pc.includes('versions 1 to 1') || __pc.includes('version 1') || __pc.includes('Review v1') || (await bodyHas('Review v1')), 'current card missing approving versions');
+    ok('ui-amend-pending-child-card-versions', __pc.includes('versions 1 to 1'), 'current card missing exact approving versions 1 to 1: ' + __pc.slice(0, 200));
     ok('ui-amend-pending-child-excludes-replacement', !__pc.includes('Bears inherit alpha replaced'), 'current card leaks pending replacement text');
   }
   const amApV2 = await api("POST", "/api/records/" + amV2 + "/items/approve", await (async () => { const g = await api("GET", "/api/records/" + amV2, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark, itemId: amA }; })(), owner);
@@ -984,6 +1055,13 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + amV2, { waitUntil: "domcontentloaded", timeout: T.goto });
   await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Approved decisions (current record)", { timeout: T.poll });
   ok('ui-amend-v2-card-heading', await bodyHas('Approved decisions (current record)'), 'v2 missing current-card heading');
+  {
+    const __v2Loc = innerHeadCard(page);
+    const __v2Count = await __v2Loc.count();
+    ok('ui-amend-v2-card-single', __v2Count === 1, 'v2 current inner card not exactly one: ' + String(__v2Count));
+    const __v2 = __v2Count === 1 ? await __v2Loc.first().innerText() : '';
+    ok('ui-amend-v2-card-scoped', __v2.includes('Bears inherit alpha replaced') && __v2.includes('Bears inherit beta') && __v2.includes('replaced, versions 1 to 2'), 'v2 current card missing exact contents/versions: ' + __v2.slice(0, 240));
+  }
     ok("ui-amend-v2-current", await bodyHas("Bears inherit alpha replaced") && await bodyHas("Bears inherit beta") && await bodyHas("replaced, versions 1 to 2"), "amended v2 missing inherited+replaced with manager versions");
   ok("ui-amend-v2-not-guest-wording-as-manager", !(await bodyHas("approved in version 2")), "manager view must not use guest-only wording");
   ok("ui-amend-v2-inherited-B", await bodyHas("Bears inherit beta") && await bodyHas("inherited, versions 1 to 1"), "manager effective card lacks inherited B with approving version");
@@ -999,10 +1077,13 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
   ok("ui-partial-not-historical", !(await bodyHas("is not the current effective record")), "partial head mislabeled historical");
   ok("ui-partial-card-heading", await bodyHas("Approved decisions (current record)"), "partial head missing current-card heading");
   {
-    const __partCard = await page.locator('.card', { hasText: 'Approved decisions (current record)' }).first().innerText().catch(() => '');
-    ok("ui-partial-card-scoped", __partCard.includes("Bears partial UI approved"), "partial current card missing approved text");
+    const __partLoc = innerHeadCard(page);
+    const __partCount = await __partLoc.count();
+    ok("ui-partial-card-single", __partCount === 1, "partial current inner card not exactly one: " + String(__partCount));
+    const __partCard = __partCount === 1 ? await __partLoc.first().innerText() : '';
+    ok("ui-partial-card-scoped", __partCard.includes("Bears partial UI approved"), "partial current card missing approved text: " + __partCard.slice(0, 200));
     ok("ui-partial-card-excludes-pending", !__partCard.includes("Bears partial UI pending"), "partial current card leaks pending text");
-    ok("ui-partial-card-version", __partCard.includes("version 1") || __partCard.includes("versions 1") || (await bodyHas("Review v1")), "partial current card missing approving version");
+    ok("ui-partial-card-version", __partCard.includes("versions 1 to 1"), "partial current card missing exact approving versions 1 to 1: " + __partCard.slice(0, 200));
   }
   ctx2 = await browser.newContext();
   await ctx2.route("**/*", routeGuard);
@@ -1054,14 +1135,15 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     await p3.waitForTimeout(2000);
     const aBody = await p3.locator("body").innerText().catch(() => "");
     ok("guest-amend-current", aBody.includes("Bears inherit alpha replaced") && aBody.includes("Bears inherit beta"), "guest misses amended effective text");
-    ok("guest-amend-current-card", aBody.includes("Approved decisions (current record)") || aBody.includes("Current effective record"), "guest v2 missing current-card heading");
+    ok("guest-amend-current-card", aBody.includes("Approved decisions (current record)"), "guest v2 missing current-card heading");
     {
-      const __aCard = await p3.locator('.card', { hasText: 'Approved decisions (current record)' }).first().innerText().catch(() => '');
-      const __aEff = await p3.locator('.card', { hasText: 'Current effective record' }).first().innerText().catch(() => '');
-      const __aScope = (__aCard || '') + ' ' + (__aEff || '') + ' ' + aBody;
-      ok("guest-amend-current-scoped", __aScope.includes("Bears inherit alpha replaced") && __aScope.includes("Bears inherit beta"), "guest current card missing scoped contents");
+      const __aLoc = innerHeadCard(p3);
+      const __aCount = await __aLoc.count();
+      ok("guest-amend-current-card-single", __aCount === 1, "guest current inner card not exactly one: " + String(__aCount));
+      const __aCard = __aCount === 1 ? await __aLoc.first().innerText() : '';
+      ok("guest-amend-current-scoped", __aCard.includes("Bears inherit alpha replaced") && __aCard.includes("Bears inherit beta"), "guest current card missing scoped contents: " + __aCard.slice(0, 200));
+      ok("guest-amend-versions", __aCard.includes("approved in version 2") && __aCard.includes("approved in version 1"), "guest current card misses inherited approving versions: " + __aCard.slice(0, 200));
     }
-    ok("guest-amend-versions", aBody.includes("approved in version 2") && aBody.includes("approved in version 1"), "guest misses inherited approving versions");
     ok("guest-amend-no-historical-label", !aBody.includes("is not the current effective record"), "guest v2 mislabeled historical");
     ok("guest-amend-no-protocol", !aBody.includes("reviewToken") && !aBody.includes("evidenceSnapshot") && !aBody.includes("reviewRevision"), "guest sees protocol on amendment");
     await p3.goto(WEB + '#/records?board=' + bid + '&meeting=' + mid + '&rec=' + amBaseId, { waitUntil: 'domcontentloaded', timeout: T.goto });
@@ -1069,18 +1151,28 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     const hBody = await p3.locator('body').innerText().catch(() => '');
     ok('guest-amend-v1-historical', hBody.includes('Historical') && hBody.includes('Bears inherit alpha'), 'guest misses historical v1');
     ok('guest-amend-v1-effective', hBody.includes('Bears inherit alpha replaced') && hBody.includes('Bears inherit beta'), 'guest misses current effective on v1');
-    ok('guest-amend-v1-effective-versions', hBody.includes('approved in version'), 'guest v1 effective missing approving versions');
+    {
+      const __hEffLoc = innerEffectiveCard(p3);
+      const __hEffCount = await __hEffLoc.count();
+      ok('guest-amend-v1-effective-card-single', __hEffCount === 1, 'guest v1 effective inner card not exactly one: ' + String(__hEffCount));
+      const __hEff = __hEffCount === 1 ? await __hEffLoc.first().innerText() : '';
+      ok('guest-amend-v1-effective-versions', __hEff.includes('approved in version'), 'guest v1 effective card missing approving versions: ' + __hEff.slice(0, 200));
+    }
     await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + pid, { waitUntil: "domcontentloaded", timeout: T.goto });
     await p3.waitForTimeout(2000);
     const pBody = await p3.locator("body").innerText().catch(() => "");
     ok("guest-partial-current", pBody.includes("Bears partial UI approved"), "guest misses partial approved text");
-    ok("guest-partial-current-card", pBody.includes("Approved decisions (current record)") || pBody.includes("Current effective record"), "guest partial missing current-card heading");
+    ok("guest-partial-current-card", pBody.includes("Approved decisions (current record)"), "guest partial missing current-card heading");
     ok("guest-partial-hides-pending", !pBody.includes("Bears partial UI pending"), "guest sees withheld pending text");
-    ok("guest-partial-version", pBody.includes("approved in version 1"), "guest misses partial approving version");
+    // Approving-version identity is proven inside the exact current card below (no body fallback).
     ok("guest-partial-not-historical", !pBody.includes("is not the current effective record"), "guest partial mislabeled historical");
     {
-      const __pCard = await p3.locator('.card', { hasText: 'Approved decisions (current record)' }).first().innerText().catch(() => pBody);
-      ok("guest-partial-card-scoped", __pCard.includes("Bears partial UI approved") && !__pCard.includes("Bears partial UI pending"), "guest partial card must scope approved without pending");
+      const __pLoc = innerHeadCard(p3);
+      const __pCount = await __pLoc.count();
+      ok("guest-partial-card-single", __pCount === 1, "guest partial inner card not exactly one: " + String(__pCount));
+      const __pCard = __pCount === 1 ? await __pLoc.first().innerText() : '';
+      ok("guest-partial-card-scoped", __pCard.includes("Bears partial UI approved") && !__pCard.includes("Bears partial UI pending"), "guest partial card must scope approved without pending: " + __pCard.slice(0, 200));
+      ok("guest-partial-version", __pCard.includes("approved in version 1"), "guest partial card misses approving version 1: " + __pCard.slice(0, 200));
     }
     ok("guest-partial-no-protocol", !pBody.includes("reviewToken") && !pBody.includes("evidenceSnapshot") && !pBody.includes("reviewRevision"), "guest sees protocol on partial");
     const qA = crypto.randomUUID(); const qB = crypto.randomUUID();
@@ -1095,12 +1187,15 @@ const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U
     await p3.waitForTimeout(2000);
     const qBody = await p3.locator('body').innerText().catch(() => '');
     ok('guest-pending-child-current', qBody.includes('Bears guestmatrix alpha') && !qBody.includes('is not the current effective record'), 'guest pending-child ancestor mislabeled');
-    ok('guest-pending-child-card', qBody.includes('Approved decisions (current record)') || qBody.includes('Current effective record'), 'guest pending-child missing current-card heading');
+    ok('guest-pending-child-card', qBody.includes('Approved decisions (current record)'), 'guest pending-child missing current-card heading');
     {
-      const __qCard = await p3.locator('.card', { hasText: 'Approved decisions (current record)' }).first().innerText().catch(() => qBody);
-      ok('guest-pending-child-card-alpha', __qCard.includes('Bears guestmatrix alpha'), 'guest pending-child card missing alpha');
+      const __qLoc = innerHeadCard(p3);
+      const __qCount = await __qLoc.count();
+      ok('guest-pending-child-card-single', __qCount === 1, 'guest pending-child inner card not exactly one: ' + String(__qCount));
+      const __qCard = __qCount === 1 ? await __qLoc.first().innerText() : '';
+      ok('guest-pending-child-card-alpha', __qCard.includes('Bears guestmatrix alpha'), 'guest pending-child card missing alpha: ' + __qCard.slice(0, 200));
       ok('guest-pending-child-card-beta', __qCard.includes('Bears guestmatrix beta'), 'guest pending-child card missing beta');
-      ok('guest-pending-child-card-versions', __qCard.includes('approved in version 1') || qBody.includes('approved in version 1'), 'guest pending-child card missing approving versions');
+      ok('guest-pending-child-card-versions', __qCard.includes('approved in version 1'), 'guest pending-child card missing approving version 1: ' + __qCard.slice(0, 200));
       ok('guest-pending-child-excludes-replacement', !__qCard.includes('Bears guestmatrix alpha replaced') && !qBody.includes('Bears guestmatrix alpha replaced'), 'guest pending-child leaks pending replacement');
     }
 

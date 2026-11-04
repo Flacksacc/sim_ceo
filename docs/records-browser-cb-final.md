@@ -113,7 +113,77 @@ close static review. This change addresses the static findings only.
   Static fixes are presented for independent re-review, not as a self-closed
   runtime claim.
 
+## Follow-up — independent review 24f-51b (four confirmed P2s)
+
+Scope unchanged: sole author of the same two owned paths; no production,
+launcher, or other QA files touched. Frozen production and accepted
+formatter preserved. Traced actual App gates before editing QA:
+`refreshReview` (always rendered for actors, recovers via refetch + optional
+refresh POST) versus `canReloadEditor` (requires `recReview.data` and
+`!recReview.isError`, so Reload is hidden on a failed review query).
+
+### Finding 4 — exact request/error correlation
+
+- `consumeExpectedConsole` now requires exact path equality
+(`String(n.path) === String(e.path)`); the path-prefix alternatives were
+removed. Console text still gates on the URL substring plus the exact status.
+- Correlation is ordered: the network/stub entry must be at or after the
+expectation (`at >= e.at`, 30 s window), so earlier unrelated responses can
+no longer satisfy a later allowance.
+- Correlation is single-use: the matched `netLog`/`stubLog` entry is
+spliced on consumption, so one response cannot satisfy two allowances.
+- Abort-stub correlation carries context: `__stubReviewOnce` arms now set
+`label: 'main'`, routeGuard records it on `stubLog` (and on the abort
+`netLog ERR` entry), and matching requires exact path + method + label.
+
+### Finding 5 — hidden inputs, Refresh recovery, Reload reset, full successor
+
+- The 403/abort error blocks no longer read per-item `inputValue()` from
+hidden inputs. They assert the per-item revise inputs are hidden
+(`count() === 0`), keep whole-editor stale preservation, controls-hidden,
+no-state-write, unknown retained, and editor-intact checks.
+- Recovery uses the actual Refresh review button on the same mounted editor
+(no remount, no fixture bypass), because Reload is hidden while the review
+query is in error. After Refresh, the tests prove same-key refetch restores
+per-item typed state (`Bears child R1/R2 403|abort`), keeps stale whole
+text, restores controls, and writes no public state.
+- Reload then authoritatively resets: whole editor shows external authority
+(`external-403`/`external-abort`, both details, revised R2) and per-item
+typing is cleared to authority.
+- The same-record submit now asserts a full successor payload: exact R1/R2
+texts (`FINAL`/`revised`), both details exact, complete R2 refs
+(kind/ref/title/customRef, length 1), both `customMeta` exact, unknown
+markers retained, plus the seeded R1 `scope === 'meeting'`
+(`reload-submit-exact-texts`, `reload-submit-scope-R1`).
+
+### Finding 7 — exact current inner card, no outer/body fallback
+
+- New helpers `innerHeadCard(pg)` / `innerEffectiveCard(pg)` select the
+inner card through its direct-child `h4` (`h4` parent, `xpath=..`),
+so the enclosing Review card can no longer satisfy scoped assertions.
+- Every current-card check requires exactly one inner card
+(`*-card-single`) and reads content/version only from that card: no
+`Review v1` / body fallbacks, no body concatenation, no body-fallback
+catches.
+- Owner pending-child/partial/v2 require exact `versions 1 to 1` (or
+`replaced, versions 1 to 2` for v2) inside the card. Guest head views
+require the `Approved decisions (current record)` heading (rendered for
+guests too) with `approved in version N` subs inside the exact card; the
+`Current effective record` fallback was removed. Guest v1 effective
+versions are read from the exact effective inner card.
+
+### Preserved
+
+- Full R1 scope/metadata/refs and both details coverage, prior genuine
+oks/preflights (strengthened only), stateValid false/missing distinct-fetch
+matrix (Finding 6, untouched), chain/nav/viewport/redirect/console guards,
+and the bounded cooperative watchdog/cleanup (untouched).
+- Validation: `node --check` syntax only. No services, network, browser,
+processes, PG, Docker, providers, ports, `.env`, or human actions were
+used here; no fresh runtime is claimed. Combined fresh runtime remains
+primary-owned (cited above).
+
 ## Files
 
-- `qa/browser/records-phase5-onedoc-ui.cjs` (203 insertions, 65 deletions)
+- `qa/browser/records-phase5-onedoc-ui.cjs` (prior 203/65 plus this follow-up)
 - `docs/records-browser-cb-final.md` (this file)
