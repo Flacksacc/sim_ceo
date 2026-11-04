@@ -428,3 +428,62 @@ explicit reload reset, stale guards, hidden empty/invalid approval controls,
 guest/stranger restrictions, inherited approvals and long version chains.
 Full parity acceptance remains open, including final phase-specific
 persistence/audit gates and source governance, Wiki, guests, usage and jobs.
+
+## Advisor editing feedback: deployed November 4, 2026
+
+User requested advisor creation in the normal advisor detail panel, friendly
+instructions, unsaved-edit warnings when selecting another advisor, per-field
+research activity and paragraph fields that expand without inner scrolling.
+Delivered in tested candidate `2b04f7e`, merged as `2c04996`, with final header
+copy cleanup `f575217`. Creation now mounts exactly one inline editor; the
+modal is removed. Both creation briefs and existing profile edits warn before
+discarding changes; cancel preserves the text. Paragraphs and brief fields
+grow on edits, research hydration and width changes. Each paragraph displays
+its own research spinner, respecting reduced-motion settings. Creation/save
+instructions no longer discuss server metadata, board copies or approval.
+
+Research diagnosis used the actual saved Brandon response: the old prompt
+demonstrated `<S1|full-url>` and the provider emitted that literal combined
+form. The parser expected either an identifier or URL. The prompt now states
+the alternatives clearly. Compatibility parsing accepts the explicit URL only
+with the existing exact retrieved-quote checks; a known source identifier
+that disagrees with the URL is rejected. Actual saved-response replay now
+verifies one of eight claims without another provider call. Unsupported
+drafts remain honestly labeled as needing source review; filling paragraphs
+alone does not establish factual grounding.
+
+Verification: fresh API/frontend builds; 374 integrated browser/API checks,
+92 endpoint checks, 35 claim-mapper checks and 111 public-source security
+checks all passed. New interactions cover the three live paragraph indicators,
+inline placement, long text, narrow-width resizing, cancel/confirm behavior
+for both new and existing advisors, and no accidental save on discard.
+Evidence: `.tmp/primary-advisor-inline-integrated.log`,
+`.tmp/primary-advisor-inline-endpoint.log`,
+`.tmp/primary-advisor-inline-claims-final.log`,
+`.tmp/primary-advisor-inline-security.log`.
+
+Live Brandon research was rerun normally after deployment: supported=true,
+stage=done, three verified claims from one source. His saved ProfileJson is
+byte-identical. The research operation normally increments the entry version
+from 3 to 4; an initial verification incorrectly expected an unchanged
+version and its failed assertion is retained. The corrected companion proves
+the expected version increment and preserved paragraphs, without rerunning
+the provider: `.tmp/primary-advisor-inline-live-research-proof.json`.
+
+Final live image
+`sha256:48ef7eb371346f65a0146082fd1b89657e87ac8145162868708d9908bda246b2`
+is healthy on localhost:5173 with PostgreSQL ready. Latest fresh backup:
+`.tmp/update-20261104-144203-UTC-25be40fc`; rollback image:
+`simceo-essentials-app:rollback-20261104-144203-25be40fc`.
+The first deployment's backup also remains preserved. Actual live read-only
+checks in light/dark themes and at desktop/mobile widths passed with zero
+domain writes or page exceptions, retaining existing advisor profiles,
+memberships, approvals and portraits plus the intentional research refresh.
+Screenshots: `output/advisor-inline-review/2026-11-04`; final log:
+`.tmp/primary-advisor-inline-live-check-final.log`.
+
+Both deployment terminals completed successfully; isolated test services and
+browsers exited, with test ports verified closed. Only the user's app and
+database remain running. Primary implemented and reviewed this feedback
+directly; no Muse coding agents or new dedicated-agent review were used.
+The broader parity goal remains paused.
