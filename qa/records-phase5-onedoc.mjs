@@ -181,16 +181,22 @@ preflight("setup-note", wn.status === 201, String(wn.status));
   const u0 = await get("/api/usage?boardId=" + bid + "&meetingId=" + mid, ownerT);
   preflight("preflight-usage-ledger", u0.status === 200 && Array.isArray(u0.json), String(u0.status));
   globalThis.__usageBefore = u0.json.length;
+  const sp = await get("/api/spending", ownerT);
+  preflight("preflight-spending-policy", sp.status === 200 && sp.json && typeof sp.json.mode === "string", String(sp.status));
+  preflight("preflight-spending-cap", sp.json && ("monthlyCapUsd" in sp.json) && ("knownSpendUsd" in sp.json), JSON.stringify(sp.json).slice(0, 200));
+  preflight("preflight-spending-mode-value", sp.json && typeof sp.json.mode === "string", "mode=" + String(sp.json && sp.json.mode));
+  const ms = await get("/api/model/status", ownerT);
+  preflight("preflight-model-status", ms.status === 200 && ms.json && typeof ms.json.configured === "boolean", String(ms.status));
 }
 const wnNested = await post("/api/meetings/" + mid + "/notes", { title: "Bears nested note", body: JSON.stringify({ text: "visible nested wire decision", reviewToken: "internal" }), kind: "note" }, ownerT);
 preflight("setup-nested-note", wnNested.status === 201, String(wnNested.status));
 const wnDouble = await post("/api/meetings/" + mid + "/notes", { title: "Bears double-encoded note", body: JSON.stringify(JSON.stringify({ text: "visible double-encoded wire decision", reviewToken: "internal" })), kind: "note" }, ownerT);
 preflight("setup-double-note", wnDouble.status === 201, String(wnDouble.status));
 const sec = await post("/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE " + run, clientNonce: crypto.randomBytes(8).toString("hex") }, ownerT);
-ok("setup-secretary-note", sec.status === 200 && sec.json && sec.json.note, sec.status + " " + sec.text.slice(0, 300));
+preflight("setup-secretary-note", sec.status === 200 && sec.json && sec.json.note, sec.status + " " + sec.text.slice(0, 300));
 if (!(sec.json && sec.json.note)) { console.log("SECRETARY FAKE MISSING: point META_API_BASE at qa/records-phase5-fake.mjs; the plain fallback is not verified."); process.exit(1); }
 const secKind = camel(sec.json.note, "kind") || "";
-ok("setup-secretary-kind", secKind.indexOf("secretary") >= 0, secKind);
+preflight("setup-secretary-kind", secKind.indexOf("secretary") >= 0, secKind);
 {
   const fc = await fakeFetch("/__counts");
   preflight("fake-routing-chat", fc.status === 200 && fc.json && fc.json.chat > globalThis.__fakeChatBefore, "chat=" + JSON.stringify(fc.json));
@@ -215,11 +221,11 @@ ok("setup-secretary-kind", secKind.indexOf("secretary") >= 0, secKind);
   let nsecStatus = -1, nsecText = "";
   try { const r = await post("/api/meetings/" + nmid + "/secretary", { input: "Bears context with SECRETARY-NOTE " + run + "-nolead", clientNonce: crypto.randomBytes(8).toString("hex") }, ownerT); nsecStatus = r.status; nsecText = r.text; }
   catch (e) { nsecStatus = 0; nsecText = "TRANSPORT:" + String(e).slice(0, 120); }
-  ok("setup-gate-requires-lead", nsecStatus !== 200 && nsecStatus !== 0, String(nsecStatus) + " " + nsecText.slice(0, 160));
+  preflight("setup-gate-requires-lead", nsecStatus !== 200 && nsecStatus !== 0, String(nsecStatus) + " " + nsecText.slice(0, 160));
   const countsNeg1 = await fakeFetch("/__counts");
   preflight("setup-gate-counts-after", countsNeg1.status === 200 && countsNeg1.json && typeof countsNeg1.json.chat === "number", String(countsNeg1.status));
   const chatAfterNeg = countsNeg1.json.chat;
-  ok("setup-gate-no-provider-without-lead", chatAfterNeg === chatBeforeNeg, "chat=" + chatAfterNeg + " before=" + chatBeforeNeg);
+  preflight("setup-gate-no-provider-without-lead", chatAfterNeg === chatBeforeNeg, "chat=" + chatAfterNeg + " before=" + chatBeforeNeg);
 }
 const gidA = crypto.randomUUID();
 const gidB = crypto.randomUUID();

@@ -9195,25 +9195,45 @@ const testModel = useMutation({
                       {canReloadEditor && (<button type="button" onClick={() => {
                         const origin = captureRecOrigin();
                         const revCap = revTextRev.current;
+                        const itemCap = { ...itemTextRev.current };
                         if (!recOk || !canActMeeting) return;
                         (async () => {
                           try {
-                            const fresh = await get<RecordReview>("/api/records/" + origin.recId + "/review");
+                            // Single authoritative refresh source: one refetch with throwOnError.
+                            // The resolved snapshot is fully validated before any reset; no
+                            // second request follows, so a failed/ignored settlement can never
+                            // authorize clobbering dirty edits. New typing (whole-doc rev and
+                            // per-item child revs, both via onChange) wins over the held result.
+                            const res = await recReview.refetch({ throwOnError: true } as unknown as { throwOnError: boolean });
                             if (!recOriginLive(origin)) return;
                             const live = liveSelRef.current;
                             if (live.boardId !== origin.boardId || live.meetingId !== origin.meetingId || live.recId !== origin.recId) return;
-                            const fd = (fresh as RecordReview).draft as RecordDraft | undefined;
-                            if (!fd || (fd as RecordDraft).id !== origin.recId) { noteReviewError(new Error("Refresh returned a different record; review unchanged."), origin); return; }
+                            const fresh = (res as unknown as { data?: RecordReview }).data ?? recReview.data;
+                            const fd = (fresh as RecordReview | undefined)?.draft as RecordDraft | undefined;
+                            if (!fresh || !fd || (fd as RecordDraft).id !== origin.recId) { noteReviewError(new Error("Refresh returned a different record; review unchanged."), origin); return; }
+                            if ((fd as RecordDraft).boardId !== origin.boardId || (fd as RecordDraft).meetingId !== origin.meetingId) { noteReviewError(new Error("Refresh returned another context; review unchanged."), origin); return; }
+                            if (typeof (fd as RecordDraft).version !== "number" || typeof (fd as RecordDraft).hash !== "string" || typeof (fd as RecordDraft).reviewToken !== "string" || typeof (fd as RecordDraft).watermark !== "number" || typeof (fd as RecordDraft).reviewRevision !== "number" || typeof (fd as RecordDraft).itemsJson !== "string") { noteReviewError(new Error("Refresh returned an incomplete review; review unchanged."), origin); return; }
+                            if (!Array.isArray((fresh as RecordReview).pending) || typeof (fresh as RecordReview).meetingWatermark !== "number") { noteReviewError(new Error("Refresh returned an incomplete review; review unchanged."), origin); return; }
                             if (revTextRev.current !== revCap) return;
+                            try {
+                              const curKeys = Object.keys(itemTextRev.current);
+                              const capKeys = Object.keys(itemCap);
+                              if (curKeys.length !== capKeys.length) return;
+                              for (const k of curKeys) { if ((itemTextRev.current as Record<string, number>)[k] !== (itemCap as Record<string, number>)[k]) return; }
+                            } catch { return; }
+                            qc.setQueryData(["record-review", origin.recId], fresh);
                             qc.setQueryData(["record", (fd as RecordDraft).id], fd);
                             refresh("records", "record");
-                            try { await recReview.refetch(); } catch { /* keep staged snapshot; editor already fresh */ }
                             if (!recOriginLive(origin)) return;
                             if (revTextRev.current !== revCap) return;
                             setRevText((fd as RecordDraft).itemsJson ?? "");
                             revTextOwner.current = (fd as RecordDraft).id;
                             revTextRev.current = 0;
                             revBaseRef.current = { id: (fd as RecordDraft).id, version: (fd as RecordDraft).version, hash: (fd as RecordDraft).hash ?? "", reviewToken: (fd as RecordDraft).reviewToken ?? "", watermark: (fd as RecordDraft).watermark ?? 0, revision: (fd as RecordDraft).reviewRevision ?? 0 };
+                            setItemTexts({});
+                            try { itemTextRev.current = {}; } catch { /* noop */ }
+                            // Explicit reset remounts ALL child rows (rows, base keys, base
+                            // JSON, dirty flag, detail/metadata refs) to the validated review.
                             setEditorGen((g) => g + 1);
                             setReviewError(null);
                           } catch (e) {

@@ -293,26 +293,32 @@ function humanKeyLabel(k: string): string {
 // Bounded decode of JSON string layers (max 3). Unwraps extra quoted
 // string layers (double-encoded JSON) to plain JSON. Unknown or truncated
 // layers fail human-safe (neutral fallback); ordinary prose stays intact.
+// Malformed/unresolved JSON-like content is tracked after EVERY decode step
+// and at the layer limit, not only when zero layers decoded.
+function isQuotedJsonLike(s: string): boolean {
+  const t = (s ?? "").trim();
+  if (!t.startsWith('"') || t.length < 2) return false;
+  const bs = String.fromCharCode(92);
+  return t.includes(bs + '"') || t.includes('":') || t.includes('{"') || t.includes('["');
+}
 function unwrapQuotedLayers(s: string, maxLayers = 3): { text: string; layers: number; failedJsonLike: boolean } {
   let tt = (s ?? "").trim();
   let layers = 0;
+  let failedJsonLike = false;
   while (layers < maxLayers && tt.startsWith('"')) {
+    let decoded: unknown;
     try {
-      const decoded: unknown = JSON.parse(tt);
-      if (typeof decoded !== "string") break;
-      tt = (decoded as string).trim();
-      layers += 1;
+      decoded = JSON.parse(tt);
     } catch {
+      if (isQuotedJsonLike(tt)) failedJsonLike = true;
       break;
     }
+    if (typeof decoded !== "string") break;
+    tt = (decoded as string).trim();
+    layers += 1;
   }
-  let failedJsonLike = false;
-  if (layers === 0 && (s ?? "").trim().startsWith('"')) {
-    const orig = (s ?? "").trim();
-    const bs = String.fromCharCode(92);
-    if (orig.length > 1 && (orig.includes(bs + '"') || orig.includes('":') || orig.includes('{"'))) {
-      failedJsonLike = true;
-    }
+  if (!failedJsonLike && tt.startsWith('"') && isQuotedJsonLike(tt)) {
+    failedJsonLike = true;
   }
   return { text: tt, layers, failedJsonLike };
 }

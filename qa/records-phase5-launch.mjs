@@ -2,16 +2,21 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+const TOTAL_START = Date.now();
+const TOTAL_BUDGET_MS = 22 * 60 * 1000;
+function totalExpired() { return Date.now() - TOTAL_START > TOTAL_BUDGET_MS; }
+function checkTotal(phase) { if (totalExpired()) throw new Error("TOTAL deadline exceeded before " + phase); }
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const MAINTMP = path.dirname(ROOT);
 const API = "http://127.0.0.1:15320";
 const FAKE = "http://127.0.0.1:15322";
 const WEB = API;
-const INST = "muse-r597-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 5);
+const INST = "muse-r597-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex").slice(0, 4);
 const KEY = "qa-only-muse-r597";
-const PUB = path.join(ROOT, ".qa", "publish");
-const KEYRING = path.join(ROOT, ".qa", "keyring-muse-r597-" + Date.now().toString(36));
+const PUB = path.join(ROOT, ".qa", "publish-muse-" + INST);
+const KEYRING = path.join(ROOT, ".qa", "keyring-muse-r597-" + INST);
 const LOGP = (n) => path.join(MAINTMP, "muse-r597-" + INST + "-" + n + ".log");
 function refuse(m) { console.error("REFUSE " + m); process.exit(2); }
 function checkUrl(v, want, name) {
@@ -20,8 +25,8 @@ function checkUrl(v, want, name) {
   if (Number(u.port) !== want) refuse(name + " must be 127.0.0.1:" + want + " got " + v);
   if (u.search || u.hash || u.username || u.password) refuse(name + " no query/fragment/userinfo");
 }
-for (const bad of [":5080", ":5173", ":9333", ":15180"]) {
-  if (API.includes(bad) || FAKE.includes(bad) || WEB.includes(bad)) refuse("human port " + bad);
+for (const bad of [":5080", ":5173", ":9333", ":15180", ":15300", ":15302"]) {
+  if (API.includes(bad) || FAKE.includes(bad) || WEB.includes(bad)) refuse("human/shared port " + bad);
 }
 checkUrl(API, 15320, "QA_API"); checkUrl(FAKE, 15322, "QA_FAKE");
 if (process.env.USE_POSTGRES === "1") refuse("USE_POSTGRES must be 0");
@@ -47,28 +52,77 @@ async function fetchJson(url, opts) {
 }
 const children = [];
 let cleaned = false;
-function run(cmd, args, opts) {
-  const r = spawnSync(cmd, args, { ...(opts || {}) });
-  if (r.status !== 0) { console.error("BUILD FAIL " + cmd + " " + (args || []).join(" ")); process.exit(1); }
+let cleanupFailed = false;
+let cleanupPromise = null;
+function runBounded(cmd, args, opts, timeoutMs) {
+  const r = spawnSync(cmd, args, { ...(opts || {}), timeout: timeoutMs });
+  if (r.error && String((r.error && r.error.code) || "") === "ETIMEDOUT") throw new Error("BUILD TIMEOUT " + cmd + " " + (args || []).join(" "));
+  if (r.status !== 0) throw new Error("BUILD FAIL " + cmd + " " + (args || []).join(" ") + " status=" + r.status + " " + String(r.stderr || "").slice(0, 300));
   return r;
 }
 async function boundedWait(child, ms) {
-  if (!child || child.exitCode !== null) return;
-  await Promise.race([new Promise((res) => { try { child.once("exit", () => res(0)); } catch { res(0); } }), new Promise((res) => setTimeout(() => res(0), ms))]);
+  if (!child || child.exitCode !== null) return true;
+  const done = await Promise.race([new Promise((res) => { try { child.once("exit", () => res(true)); } catch { res(false); } }), new Promise((res) => setTimeout(() => res(false), ms))]);
+  return !!done;
 }
-async function cleanup() {
-  if (cleaned) return; cleaned = true;
-  for (const c of children) { try { if (c && c.exitCode === null) c.kill(); } catch {} }
-  for (const c of children) { try { await boundedWait(c, 5000); } catch {} }
-  try {
-    const b1 = await portBusy(15320); const b2 = await portBusy(15322);
-    if (b1 || b2) console.error("WARN ports still bound after cleanup");
-    else console.log("ports closed verified");
-  } catch {}
+function childEnv() {
+  const allowExact = new Set(["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "COMSPEC", "ComSpec", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "OS", "WINDIR", "PROGRAMFILES", "PROGRAMDATA", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]);
+  const allowPrefix = ["DOTNET_", "NUGET_", "NODE_", "NPM_", "PROGRAM"];
+  const denyRe = /API_KEY|SECRET|TOKEN|PASSWORD|OPENAI|ANTHROPIC|AZURE|GITHUB|META_|GOOGLE|AWS_|ASPNETCORE_|KESTREL_|DOTNET_URLS|PORT|URLS/i;
+  const out = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    const allowed = allowExact.has(k) || allowPrefix.some((p) => k.startsWith(p));
+    if (!allowed) continue;
+    if (denyRe.test(k)) continue;
+    out[k] = v;
+  }
+  out["PATH"] = process.env.PATH || process.env.Path || out["PATH"] || "";
+  out["SystemRoot"] = process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows";
+  out["SYSTEMROOT"] = out["SystemRoot"];
+  out["TEMP"] = process.env.TEMP || process.env.TMP || out["TEMP"] || "C:\\Windows\\Temp";
+  out["TMP"] = process.env.TMP || process.env.TEMP || out["TMP"] || "C:\\Windows\\Temp";
+  out["SIMCEO_INSTANCE"] = INST;
+  out["USE_POSTGRES"] = "0";
+  out["META_API_BASE"] = FAKE;
+  out["META_API_KEY"] = KEY;
+  out["WIKI_KEYRING_DIR"] = KEYRING;
+  out["ASPNETCORE_URLS"] = API;
+  out["QA_API"] = API;
+  out["QA_FAKE"] = FAKE;
+  out["QA_WEB"] = WEB;
+  out["SIMCEO_PROVENANCE"] = INST;
+  out["QA_PROVENANCE"] = INST;
+  return out;
+}
+function suiteEnv(extra) {
+  return { ...childEnv(), QA_API: API, QA_FAKE: FAKE, QA_WEB: WEB, SIMCEO_INSTANCE: INST, QA_PROVENANCE: INST, META_API_BASE: FAKE, META_API_KEY: KEY, QA_FAKE_BOOT: (proof && proof.boot) || "", ...(extra || {}) };
+}
+async function cleanupOnce() {
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    if (cleaned) return !cleanupFailed;
+    cleaned = true;
+    for (const c of children) { try { if (c && c.exitCode === null) c.kill(); } catch {} }
+    for (const c of children) {
+      try {
+        const exited = await boundedWait(c, 5000);
+        if (!exited && c && c.exitCode === null) { try { c.kill("SIGKILL"); } catch {} await boundedWait(c, 2000); }
+      } catch {}
+    }
+    try {
+      const b1 = await portBusy(15320); const b2 = await portBusy(15322);
+      if (b1 || b2) { console.error("FAIL ports still bound after cleanup 15320=" + b1 + " 15322=" + b2); cleanupFailed = true; return false; }
+      console.log("ports closed verified");
+      return !cleanupFailed;
+    } catch (e) { console.error("FAIL cleanup probe " + String(e).slice(0, 200)); cleanupFailed = true; return false; }
+  })();
+  return cleanupPromise;
 }
 async function prove() {
   const deadline = Date.now() + 90000;
   while (Date.now() < deadline) {
+    checkTotal("prove");
     try {
       const h = await fetchJson(API + "/health");
       const be = await fetchJson(API + "/api/backend");
@@ -84,40 +138,66 @@ async function prove() {
     } catch {}
     await new Promise((r) => setTimeout(r, 800));
   }
-  console.error("PROOF TIMEOUT api/fake provenance");
-  process.exit(2);
-}
-function suiteEnv(extra) {
-  return { ...process.env, QA_API: API, QA_FAKE: FAKE, QA_WEB: WEB, SIMCEO_INSTANCE: INST, QA_PROVENANCE: INST, META_API_BASE: FAKE, META_API_KEY: KEY, QA_FAKE_BOOT: proof.boot, ...(extra || {}) };
+  throw new Error("PROOF TIMEOUT api/fake provenance");
 }
 let proof = null;
+let exitCode = 0;
 async function main() {
-  console.log("LAUNCHER instance=" + INST);
+  console.log("LAUNCHER instance=" + INST + " totalStart=" + TOTAL_START);
+  checkTotal("preflight");
   if (await portBusy(15320)) refuse("API port busy");
   if (await portBusy(15322)) refuse("FAKE port busy");
+  let srcSha = "";
+  try { srcSha = String(spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, timeout: 15000 }).stdout || "").trim(); } catch {}
+  console.log("source sha=" + (srcSha || "unknown"));
+  try { fs.rmSync(PUB, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(KEYRING, { recursive: true, force: true }); } catch {}
+  fs.mkdirSync(PUB, { recursive: true });
+  fs.mkdirSync(KEYRING, { recursive: true });
+  console.log("fresh staging pub=" + PUB + " keyring=" + KEYRING);
   console.log("publish api...");
-  run("dotnet", ["publish", "server/SimCEO.Api/SimCEO.Api.csproj", "-c", "Release", "-o", ".qa/publish", "--nologo", "-v", "q"], { cwd: ROOT });
-  run("cmd.exe", ["/c", "npm", "--prefix", "web", "run", "build"], { cwd: ROOT });
+  checkTotal("build-api");
+  runBounded("dotnet", ["publish", "server/SimCEO.Api/SimCEO.Api.csproj", "-c", "Release", "-o", PUB, "--nologo", "-v", "q"], { cwd: ROOT }, 600000);
+  checkTotal("build-web");
+  runBounded("cmd.exe", ["/c", "npm", "--prefix", "web", "run", "build"], { cwd: ROOT }, 600000);
+  const dllP = path.join(PUB, "SimCEO.Api.dll");
+  if (!fs.existsSync(dllP)) throw new Error("missing artifact " + dllP);
+  console.log("artifact bytes=" + fs.statSync(dllP).size + " sha=" + (srcSha || "unknown"));
   fs.mkdirSync(path.join(PUB, "wwwroot"), { recursive: true });
   fs.cpSync(path.join(ROOT, "web", "dist"), path.join(PUB, "wwwroot"), { recursive: true, force: true });
-  fs.mkdirSync(KEYRING, { recursive: true });
   console.log("staged wwwroot from dist");
   const apiLog = fs.openSync(LOGP("api"), "a"); const fakeLog = fs.openSync(LOGP("fake"), "a");
-  const fakeProc = spawn("node", ["qa/records-phase5-fake.mjs", "--port", "15322"], { cwd: ROOT, windowsHide: true, stdio: ["ignore", fakeLog, fakeLog] });
+  const env = childEnv();
+  const fakeProc = spawn("node", ["qa/records-phase5-fake.mjs", "--port", "15322"], { cwd: ROOT, windowsHide: true, stdio: ["ignore", fakeLog, fakeLog], env });
+  if (!fakeProc.pid) throw new Error("fake spawn failed");
   children.push(fakeProc);
-  const apiProc = spawn("dotnet", [path.join(PUB, "SimCEO.Api.dll")], { cwd: PUB, windowsHide: true, stdio: ["ignore", apiLog, apiLog], env: { ...process.env, SIMCEO_INSTANCE: INST, USE_POSTGRES: "0", META_API_BASE: FAKE, META_API_KEY: KEY, WIKI_KEYRING_DIR: KEYRING, ASPNETCORE_URLS: API } });
+  const apiProc = spawn("dotnet", [dllP], { cwd: PUB, windowsHide: true, stdio: ["ignore", apiLog, apiLog], env });
+  if (!apiProc.pid) throw new Error("api spawn failed");
   children.push(apiProc);
-  console.log("fake pid=" + fakeProc.pid + " api pid=" + apiProc.pid);
+  console.log("fake pid=" + fakeProc.pid + " api pid=" + apiProc.pid + " src=" + (srcSha || "unknown").slice(0, 8) + " artifact=" + dllP);
   proof = await prove();
   console.log("proven owned api/fake boot=" + String(proof.boot).slice(0, 8) + " chatBefore=" + proof.chatBefore);
-  const httpR = spawnSync("node", ["qa/records-phase5-onedoc.mjs"], { cwd: ROOT, env: suiteEnv({}), stdio: "inherit" });
-  if (httpR.status !== 0) { console.error("HTTP suite failed status=" + httpR.status); await cleanup(); process.exit(httpR.status || 1); }
+  checkTotal("http-suite");
+  const httpR = spawnSync("node", ["qa/records-phase5-onedoc.mjs"], { cwd: ROOT, env: suiteEnv({}), stdio: "inherit", timeout: 480000 });
+  if (httpR.status !== 0) throw new Error("HTTP suite failed status=" + httpR.status);
   console.log("HTTP suite passed");
   fs.mkdirSync(path.join(ROOT, ".tmp", "records-phase5-shots"), { recursive: true });
-  const browserR = spawnSync("node", ["qa/browser/records-phase5-onedoc-ui.cjs"], { cwd: ROOT, env: suiteEnv({ QA_SHOTS: ".tmp/records-phase5-shots" }), stdio: "inherit" });
-  if (browserR.status !== 0) { console.error("browser suite failed status=" + browserR.status); await cleanup(); process.exit(browserR.status || 1); }
+  checkTotal("browser-suite");
+  const browserR = spawnSync("node", ["qa/browser/records-phase5-onedoc-ui.cjs"], { cwd: ROOT, env: suiteEnv({ QA_SHOTS: ".tmp/records-phase5-shots" }), stdio: "inherit", timeout: 900000 });
+  if (browserR.status !== 0) throw new Error("browser suite failed status=" + browserR.status);
   console.log("browser suite passed");
-  await cleanup();
-  console.log("LAUNCHER done instance=" + INST);
 }
-main().catch(async (e) => { console.error("LAUNCHER FATAL " + String((e && e.stack) || e).slice(0, 300)); try { await cleanup(); } catch {} process.exit(1); });
+try {
+  await main();
+} catch (e) {
+  console.error("LAUNCHER FAIL " + String((e && e.stack) || e).slice(0, 500));
+  exitCode = 1;
+  if (String((e && e.message) || "").startsWith("REFUSE") || String(e).includes("REFUSE")) exitCode = 2;
+  else if (totalExpired()) exitCode = 3;
+  else if (/BUILD|HTTP suite|browser suite|PROOF/.test(String((e && e.message) || ""))) exitCode = 1;
+} finally {
+  const ok = await cleanupOnce();
+  if (!ok) exitCode = 1;
+  console.log("LAUNCHER done instance=" + INST + " exit=" + exitCode);
+  process.exit(exitCode);
+}

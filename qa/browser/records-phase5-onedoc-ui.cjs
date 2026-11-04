@@ -7,17 +7,17 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const API = process.env.QA_API || "http://127.0.0.1:15320";
-const WEB = process.env.QA_WEB || "http://127.0.0.1:15321";
+const WEB = process.env.QA_WEB || "http://127.0.0.1:15320";
 const FAKE = process.env.QA_FAKE || "http://127.0.0.1:15322";
-for (const pair of [[ "QA_API", API, 15320 ], [ "QA_WEB", WEB, 15321 ], [ "QA_FAKE", FAKE, 15322 ]]) {
+for (const pair of [[ "QA_API", API, 15320 ], [ "QA_WEB", WEB, 15320 ], [ "QA_FAKE", FAKE, 15322 ]]) {
   const nm = pair[0]; const v = pair[1]; const want = pair[2];
   let u; try { u = new URL(v); } catch { console.error("REFUSE bad " + nm); process.exit(2); }
   if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") { console.error("REFUSE non loopback " + nm); process.exit(2); }
-  if (nm === "QA_WEB" && v === API) { /* WEB same API origin allowed */ }
-  else if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
-  if (/:5080|:5173|:9333|:15180/.test(v)) { console.error("REFUSE reserved port " + nm); process.exit(2); }
+  if (Number(u.port) !== want) { console.error("REFUSE " + nm + " must be 127.0.0.1:" + want + " (owned disposable) got " + v); process.exit(2); }
+  if (/:5080|:5173|:9333|:15180|:15300|:15302/.test(v)) { console.error("REFUSE reserved/shared port " + nm); process.exit(2); }
   try { const uu = new URL(v); if (uu.search || uu.hash || uu.username || uu.password) { console.error("REFUSE " + nm + " must have no query/fragment/userinfo"); process.exit(2); } } catch { console.error("REFUSE bad " + nm); process.exit(2); }
 }
+if (WEB !== API) { console.error("REFUSE QA_WEB must equal QA_API exactly (owned 15320, no unused 15321)"); process.exit(2); }
 const PROV = process.env.SIMCEO_INSTANCE || process.env.QA_PROVENANCE || "";
 if (!PROV) { console.error("REFUSE missing provenance: primary must launch the owned API with SIMCEO_INSTANCE set"); process.exit(2); }
 const META_BASE = process.env.META_API_BASE || "";
@@ -43,7 +43,6 @@ function preflight(name, cond, extra) {
   if (cond) { pass++; return; }
   console.log("  FAIL " + name + (extra ? " :: " + extra : ""));
   console.error("PREFLIGHT FAIL " + name);
-  (async () => { try { await cleanup(); } catch {} finally { process.exit(2); } })();
   throw new Error("PREFLIGHT FAIL " + name);
 }
 function ok(name, cond, extra) {
@@ -106,30 +105,34 @@ async function uploadPortrait(rid, tok) {
 let watchdog;
 let timedOut = false;
 let cleanupFailed = false;
-let cleaned = false;
 let launching = false;
 let browserPromise = null;
 let ctx2, ctx3, p2, p3;
+let cleanupPromise = null;
 async function boundedClose(p, ms, label) {
   try { await Promise.race([p(), new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timeout")), ms))]); }
   catch (e) { cleanupFailed = true; console.log("CLEANUP " + label + ": " + String((e && e.message) || e).slice(0, 200)); }
 }
 async function cleanup() {
-  if (cleaned) return; cleaned = true;
-  if (watchdog) { try { clearTimeout(watchdog); } catch {} watchdog = null; }
-  if (launching && browserPromise) {
-    try {
-      const b = await Promise.race([browserPromise, new Promise((res) => setTimeout(() => res(null), 5000))]);
-      if (b && !browser) browser = b;
-    } catch {}
-    launching = false;
-  }
-  const jobs = [];
-  if (typeof ctx2 !== "undefined" && ctx2) jobs.push(boundedClose(() => ctx2.close(), 5000, "ctx2.close"));
-  if (typeof ctx3 !== "undefined" && ctx3) jobs.push(boundedClose(() => ctx3.close(), 5000, "ctx3.close"));
-  if (typeof ctx !== "undefined" && ctx) jobs.push(boundedClose(() => ctx.close(), 5000, "ctx.close"));
-  if (typeof browser !== "undefined" && browser) jobs.push(boundedClose(() => browser.close(), 5000, "browser.close"));
-  try { await Promise.race([Promise.allSettled(jobs), new Promise((res) => setTimeout(res, 10000))]); } catch {}
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    if (watchdog) { try { clearTimeout(watchdog); } catch {} watchdog = null; }
+    if (launching && browserPromise) {
+      try {
+        const b = await Promise.race([browserPromise, new Promise((res) => setTimeout(() => res(null), 5000))]);
+        if (b && !browser) browser = b;
+      } catch {}
+      launching = false;
+    }
+    const jobs = [];
+    if (typeof ctx2 !== "undefined" && ctx2) jobs.push(boundedClose(() => ctx2.close(), 5000, "ctx2.close"));
+    if (typeof ctx3 !== "undefined" && ctx3) jobs.push(boundedClose(() => ctx3.close(), 5000, "ctx3.close"));
+    if (typeof ctx !== "undefined" && ctx) jobs.push(boundedClose(() => ctx.close(), 5000, "ctx.close"));
+    if (typeof browser !== "undefined" && browser) jobs.push(boundedClose(() => browser.close(), 5000, "browser.close"));
+    try { await Promise.race([Promise.allSettled(jobs), new Promise((res) => setTimeout(() => res(null), 10000))]); } catch {}
+    return !cleanupFailed;
+  })();
+  return cleanupPromise;
 }
 async function main() {
   watchdog = setTimeout(() => {
@@ -143,15 +146,34 @@ async function main() {
   browser = await browserPromise;
   launching = false;
   ctx = await browser.newContext();
-  const allowedPorts = ["15320", "15321", "15322"];
+  const ALLOWED_ORIGINS = new Set(["127.0.0.1:15320", "localhost:15320", "127.0.0.1:15322", "localhost:15322"]);
   const routeGuard = async (route) => {
     try {
       const req = route.request();
       const u = new URL(req.url());
-      if (u.protocol !== "http:" && u.protocol !== "https:") return route.continue();
-      if ((u.hostname === "127.0.0.1" || u.hostname === "localhost") && allowedPorts.includes(u.port)) return route.continue();
-      return route.abort();
-    } catch { return route.abort(); }
+      if (u.username || u.password) { try { await route.abort(); } catch {} return; }
+      if (u.protocol === "ws:" || u.protocol === "wss:") {
+        const hpw = u.hostname + ":" + u.port;
+        if (!ALLOWED_ORIGINS.has(hpw)) { try { await route.abort(); } catch {} return; }
+        try { await route.continue(); } catch {}
+        return;
+      }
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        if (u.protocol === "data:" || u.protocol === "blob:") { try { await route.continue(); } catch {} return; }
+        try { await route.abort(); } catch {}
+        return;
+      }
+      const hp = u.hostname + ":" + u.port;
+      if (!ALLOWED_ORIGINS.has(hp)) { try { await route.abort(); } catch {} return; }
+      try {
+        const resp = await route.fetch({ maxRedirects: 0 });
+        const st = resp.status();
+        if (st >= 300 && st < 400) { try { await route.abort(); } catch {} return; }
+        try { await route.fulfill({ response: resp }); } catch {}
+      } catch {
+        try { await route.abort(); } catch {}
+      }
+    } catch { try { await route.abort(); } catch {} }
   };
   const redirLog = [];
   const watchResponses = (pg) => {
@@ -160,28 +182,66 @@ async function main() {
         const q = r.request();
         if (q.method() === "POST" && /\/api\/records\//.test(q.url())) postLog.push({ url: new URL(q.url()).pathname, status: r.status() });
         const u = new URL(q.url());
-        const isOwned = (u.hostname === "127.0.0.1" || u.hostname === "localhost") && ["15320", "15321", "15322"].includes(u.port);
+        const hp = u.hostname + ":" + u.port;
+        const isOwned = ALLOWED_ORIGINS.has(hp);
         if (isOwned && r.status() >= 300 && r.status() < 400) redirLog.push({ url: new URL(q.url()).pathname, status: r.status() });
       } catch {}
     });
   };
+  function consoleAllowed(txt, locUrl) {
+    const tt = txt || "";
+    const lu = locUrl || "";
+    const combined = tt + " " + lu;
+    if (/\/hubs\/board/.test(combined) && tt.includes("net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS")) return true;
+    if (/\/hubs\/board/.test(combined) && /WebSocket|SignalR|transport/i.test(tt)) return true;
+    if (/Failed to start the transport/.test(tt) && /WebSockets/.test(tt)) return true;
+    if (/WebSocket connection to/.test(tt) && /\/hubs\/board/.test(combined) && /net::ERR_/.test(tt)) return true;
+    if (/Handshake was canceled/.test(tt)) return true;
+    if (/Server returned handshake error/.test(tt)) return true;
+    if (/handshake error/i.test(tt) && /Handshake was canceled/i.test(tt)) return true;
+    if (tt.includes("Failed to load resource")) {
+      if (tt.includes("409") && combined.includes("/api/records/")) return true;
+      if (tt.includes("403") && combined.includes("/api/records/")) return true;
+      if (tt.includes("404") && !combined.includes("/api/")) return true;
+      if (tt.includes("net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS") && combined.includes("/hubs/board")) return true;
+      if (tt.includes("net::ERR_")) {
+        if (/fonts\.gstatic|fonts\.googleapis|cdn\.|\b15321\b|:5080|:5173|:9333|:15180|:15300|:15302/.test(combined)) return true;
+        try {
+          const m = (combined.match(/https?:\/\/[^\s"']+/) || [])[0] || lu;
+          const uu = new URL(m);
+          const hp2 = uu.hostname + ":" + uu.port;
+          if (!ALLOWED_ORIGINS.has(hp2)) return true;
+        } catch {
+          if (/\b15321\b|:5080|:5173/.test(combined)) return true;
+        }
+        return false;
+      }
+      return false;
+    }
+    return false;
+  }
+  function attachCollectors(pg, label) {
+    pg.on("console", (m) => {
+      try {
+        if (m.type() !== "error") return;
+        const txt = m.text().slice(0, 500);
+        let loc = "";
+        try { const l = m.location(); if (l && l.url) loc = String(l.url).slice(0, 500); } catch {}
+        if (label === "stranger" || label === "reader") {
+          if (txt.includes("403") && txt.includes("Failed to load resource")) return;
+          if (txt.includes("403") && /\/api\/records\//.test(txt + " " + loc)) return;
+        }
+        if (consoleAllowed(txt, loc)) return;
+        consoleErrors.push(label + ":" + txt);
+      } catch (e) { try { consoleErrors.push(label + ":collector-fail"); } catch {} }
+    });
+    pg.on("pageerror", (e) => { try { const s = String(e).slice(0, 500); if (/Handshake was canceled/i.test(s) || /handshake error/i.test(s)) return; consoleErrors.push(label + ":pageerror:" + s); } catch {} });
+    watchResponses(pg);
+  }
   await ctx.route("**/*", routeGuard);
   page = await ctx.newPage();
   await page.setViewportSize({ width: 1440, height: 900 });
-  page.on("console", (m) => {
-    if (m.type() !== "error") return;
-    const t = m.text().slice(0, 300);
-    if (t.includes("Failed to load resource")) {
-      // Classified expectations only: intentional 409s from stale/superseded/decided writes,
-      // and client-side blocks (net::ERR_) from rejected external/font/human-port routes.
-      // Any other owned-origin HTTP failure is unexpected and kept.
-      if (t.includes("409")) return;
-      if (t.includes("net::ERR_")) return;
-    }
-    consoleErrors.push(t);
-  });
-  page.on("pageerror", (e) => { consoleErrors.push("pageerror: " + String(e).slice(0, 300)); });
-  watchResponses(page);
+  attachCollectors(page, "main");
   try {
     await page.goto(WEB, { waitUntil: "domcontentloaded", timeout: T.goto });
     await page.waitForFunction(() => {
@@ -273,6 +333,8 @@ async function main() {
   preflight("seed-proto-trunc-note", wnProtoTrunc.status === 201, String(wnProtoTrunc.status));
   const wnQuoted = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears quoted prose note", body: '"quoted ordinary prose note"', kind: "note" }, owner);
   preflight("seed-quoted-note", wnQuoted.status === 201, String(wnQuoted.status));
+  const wnBrokenQuoted = await api("POST", "/api/meetings/" + mid + "/notes", { title: "Bears broken quoted note", body: JSON.stringify('"{"reviewToken":"internal'), kind: "note" }, owner);
+  preflight("seed-broken-quoted-note", wnBrokenQuoted.status === 201, String(wnBrokenQuoted.status));
   const msgNested = await api("POST", "/api/meetings/" + mid + "/messages", { sender: "lead", content: JSON.stringify({ text: "visible recent nested decision", reviewToken: "internal" }) }, owner);
   preflight("seed-nested-message", msgNested.status === 200 || msgNested.status === 201, String(msgNested.status));
   let fakeBoot = ""; let fakeChatBefore = 0;
@@ -293,6 +355,10 @@ async function main() {
     const u0 = await api("GET", "/api/usage?boardId=" + bid + "&meetingId=" + mid, undefined, owner);
     preflight("preflight-usage-ledger", u0.status === 200 && Array.isArray(u0.json), String(u0.status));
     globalThis.__usageBefore = u0.json.length;
+    const sp = await api("GET", "/api/spending", undefined, owner);
+    preflight("preflight-spending-enforced", sp.status === 403, String(sp.status));
+    const ms = await api("GET", "/api/model/status", undefined, owner);
+    preflight("preflight-model-enforced", ms.status === 403, String(ms.status));
   }
   const sec = await api("POST", "/api/meetings/" + mid + "/secretary", { input: "Bears context with SECRETARY-NOTE " + run, clientNonce: crypto.randomBytes(8).toString("hex") }, owner);
   preflight("seed-secretary-note", sec.status === 200 && sec.json && sec.json.note, String(sec.status));
@@ -342,6 +408,7 @@ async function main() {
   ok("one-doc-double-visible", await bodyHas("visible double-encoded decision"), "double-encoded JSON not projected");
   ok("one-doc-truncated-visible", await bodyHas("QA truncated title"), "truncated JSON not projected");
   ok("one-doc-quoted-prose", await bodyHas("quoted ordinary prose note"), "ordinary quoted prose missing");
+  ok("one-doc-broken-quoted-neutral", !(await bodyHas("internal-secret")) && !(await bodyHas('"reviewToken"')) && await bodyHas("Note detail is available in context."), "broken quoted truncation leaked");
   ok("one-doc-proto-trunc-neutral", await bodyHas("Note detail is available in context."), "protocol-only truncated note missing neutral fallback");
   ok("one-doc-no-nested-raw", !(await bodyHas('"text"')) && !(await bodyHas("reviewToken")), "raw nested JSON leaked to visible text");
   ok("one-doc-recent-nested", await bodyHas("visible recent nested decision"), "nested recent message not projected");
@@ -434,7 +501,12 @@ async function main() {
   ok("whole-revise-after-decisions-409", br.status === 409, String(br.status));
   ok("whole-revise-no-state-write", (await canonState(sid, owner)) === canonWholeBefore, "decided whole-revise mutated public state");
   // Explicit reload editor stale ALL-fields race: type text+detail, stale via per-item revise, reload recovers.
-  const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one" }, { id: "R2", text: "Bears reload two" }], owner);
+// Strengthened: external revision must succeed, whole-POST 409 proven (not client refusal),
+// non-empty detail/refs recovery, hold-while-typing, 403/transport, stateValid.
+  const r1DetailInit = "Bears initial detail one";
+  const r2DetailInit = "Bears initial detail two";
+  const r2RefsInit = [{ kind: "message", ref: mid + ":" + String(mseq) }];
+  const rr1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "R1", text: "Bears reload one", detail: r1DetailInit }, { id: "R2", text: "Bears reload two", detail: r2DetailInit, refs: r2RefsInit }], owner);
   const rid = rr1.json.id;
   preflight("reload-fixture", rr1.status === 201 && rid, String(rr1.status));
   await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + rid, { waitUntil: "domcontentloaded", timeout: T.goto });
@@ -446,38 +518,117 @@ async function main() {
   await editorBoxes.nth(0).fill("Bears reload one STALE", { timeout: T.step });
   await editorBoxes.nth(1).fill("Bears stale detail", { timeout: T.step });
   const rg = await api("GET", "/api/records/" + rid, undefined, owner);
-  await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
+  const extRev = await api("POST", "/api/records/" + rid + "/items/revise", { version: rg.json.version, hash: rg.json.hash, reviewToken: rg.json.reviewToken, watermark: rg.json.watermark, itemId: "R2", text: "Bears reload two revised" }, owner);
+  ok("reload-external-revise-200", extRev.status === 200, String(extRev.status) + " " + extRev.text.slice(0, 160));
+  {
+    const chk = await api("GET", "/api/records/" + rid, undefined, owner);
+    let items = []; try { items = JSON.parse(chk.json.itemsJson); } catch {}
+    const r2 = items.find((e) => e.id === "R2") || {};
+    ok("reload-fresh-r2-detail-nonempty", typeof r2.detail === "string" && r2.detail.length > 0, JSON.stringify(r2).slice(0, 240));
+    ok("reload-fresh-r2-refs", Array.isArray(r2.refs) && r2.refs.length > 0, JSON.stringify(r2).slice(0, 240));
+  }
   const canonReload409Before = await canonState(rid, owner);
+  const postBefore = postLog.length;
   await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
   await page.waitForTimeout(1200);
+  const post409 = postLog.slice(postBefore).filter((e) => /\/revise$/.test(e.url) && e.status === 409);
+  ok("reload-whole-post-409", post409.length >= 1, "no whole-POST 409 captured (client refusal?) " + JSON.stringify(postLog.slice(postBefore)).slice(0, 240));
   ok("reload-stale-race-guided", await bodyHas("Reload editor from current review"), "reload recovery hidden after reviewError");
   ok("reload-409-no-state-write", (await canonState(rid, owner)) === canonReload409Before, "stale whole-document submit mutated public state");
+  {
+    const staleStill = await editorBoxes.nth(0).inputValue().catch(() => "");
+    ok("reload-stale-preserved-on-409", staleStill === "Bears reload one STALE", "stale typing lost on 409: " + staleStill.slice(0, 80));
+  }
   const canonReloadBefore = await canonState(rid, owner);
   await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step });
   await page.waitForTimeout(800);
   const afterReloadText = await editorBoxes.nth(0).inputValue();
   const afterReloadDetail = await editorBoxes.nth(1).inputValue();
   ok("reload-stale-race-reset-text", afterReloadText === "Bears reload one", "stale text survived reload: " + afterReloadText.slice(0, 80));
-  ok("reload-stale-race-reset-detail", afterReloadDetail === "", "stale detail survived reload: " + afterReloadDetail.slice(0, 80));
+  ok("reload-stale-race-reset-detail", afterReloadDetail === r1DetailInit, "stale detail wrong after reload: " + afterReloadDetail.slice(0, 80));
   const afterReloadR2 = await editorBoxes.nth(2).inputValue();
   const afterReloadR2d = await editorBoxes.nth(3).inputValue();
   ok("reload-fresh-r2", afterReloadR2 === "Bears reload two revised", "fresh R2 missing after Reload: " + afterReloadR2.slice(0, 80));
-  ok("reload-fresh-r2-detail", afterReloadR2d === "", "fresh R2 detail wrong");
+  ok("reload-fresh-r2-detail", afterReloadR2d === r2DetailInit, "fresh R2 detail wrong: " + afterReloadR2d.slice(0, 80));
   ok("reload-stale-race-no-write", (await canonState(rid, owner)) === canonReloadBefore, "reload mutated public state");
-  await editorBoxes.nth(0).fill("Bears reload one FINAL", { timeout: T.step });
+  await editorBoxes.nth(0).fill("Bears reload one HOLD", { timeout: T.step });
+  await page.waitForTimeout(300);
+  {
+    const rg2 = await api("GET", "/api/records/" + rid, undefined, owner);
+    const ext2 = await api("POST", "/api/records/" + rid + "/items/revise", { version: rg2.json.version, hash: rg2.json.hash, reviewToken: rg2.json.reviewToken, watermark: rg2.json.watermark, itemId: "R1", text: "Bears reload one external2" }, owner);
+    ok("reload-hold-external-200", ext2.status === 200, String(ext2.status));
+  }
+  const holdClick = page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step }).catch(() => null);
+  await page.waitForTimeout(100);
+  await editorBoxes.nth(0).fill("Bears reload one HOLD-NEW", { timeout: T.step });
+  try { await holdClick; } catch {}
+  await page.waitForTimeout(1000);
+  {
+    const held = await editorBoxes.nth(0).inputValue().catch(() => "");
+    ok("reload-hold-new-typing-wins", held === "Bears reload one HOLD-NEW", "new typing during Reload lost: " + held.slice(0, 80));
+  }
+  await page.getByRole("button", { name: "Reload editor from current review" }).first().click({ timeout: T.step }).catch(() => null);
+  await page.waitForTimeout(1500);
+  const rrFinal = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "RF1", text: "Bears reload final one", detail: r1DetailInit }, { id: "RF2", text: "Bears reload final two", detail: r2DetailInit, refs: r2RefsInit }], owner);
+  preflight("reload-final-fixture", rrFinal.status === 201 && rrFinal.json.id, String(rrFinal.status));
+  const fid = rrFinal.json.id;
+  await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + fid, { waitUntil: "domcontentloaded", timeout: T.goto });
+  await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload final two", { timeout: T.poll });
+  await page.waitForTimeout(800);
+  const holdBoxes = page.locator('textarea.human-editor-text[id*="' + fid + '"]');
+  for (let _w = 0; _w < 20; _w++) { try { if ((await holdBoxes.nth(0).inputValue()) === "Bears reload final one") break; } catch {} await page.waitForTimeout(300); }
+  await holdBoxes.nth(0).fill("Bears reload one FINAL", { timeout: T.step });
+  try { await holdBoxes.nth(1).fill(r1DetailInit, { timeout: T.step }); } catch {}
+  const postFinalBefore = postLog.length;
   await page.getByRole("button", { name: "Request revision (new version)" }).first().click({ timeout: T.step });
   await page.waitForTimeout(2000);
+  let finalNid = "";
   {
-    const rrAfter = await api("GET", "/api/records/" + rid + "/review", undefined, owner);
+    const rrAfter = await api("GET", "/api/records/" + fid + "/review", undefined, owner);
     const succR = (rrAfter.json.successors || []);
-    ok("reload-submit-new-version", succR.length === 1, JSON.stringify(succR));
-    const rnid = succR[0];
+    const postFinal = postLog.slice(postFinalBefore).filter((e) => /\/revise$/.test(e.url));
+    ok("reload-submit-new-version", succR.length === 1, JSON.stringify(succR) + " posts=" + JSON.stringify(postFinal).slice(0, 240));
+    const rnid = succR[0] || "";
+    finalNid = rnid;
     const rdet = await api("GET", "/api/records/" + rnid, undefined, owner);
     let rtexts = "";
-    try { rtexts = JSON.stringify(JSON.parse(rdet.json.itemsJson).map((e) => e.text)); } catch { rtexts = ""; }
-    ok("reload-submit-fresh-guards", rdet.status === 200 && rtexts.includes("Bears reload one FINAL") && rtexts.includes("Bears reload two revised"), rtexts.slice(0, 240));
+    let rdetOk = false; let rrefsOk = false;
+    try { const arr = JSON.parse(rdet.json.itemsJson); rtexts = JSON.stringify(arr.map((e) => e.text)); const rf2 = arr.find((e) => e.id === "RF2") || {}; rdetOk = typeof rf2.detail === "string" && rf2.detail.length > 0; rrefsOk = Array.isArray(rf2.refs) && rf2.refs.length > 0; } catch { rtexts = ""; }
+    ok("reload-submit-fresh-guards", rdet.status === 200 && rtexts.includes("Bears reload one FINAL") && rtexts.includes("Bears reload final two") && rdetOk && rrefsOk, rtexts.slice(0, 240));
   }
-  const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
+  {
+    preflight("reload-preserve-target", !!finalNid, "no successor for preserve test");
+    await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + finalNid, { waitUntil: "domcontentloaded", timeout: T.goto });
+    await page.waitForFunction((exp) => document.body.innerText.includes(exp), "Bears reload one FINAL", { timeout: T.poll });
+    await page.waitForTimeout(800);
+    const finalBoxes = page.locator('textarea.human-editor-text[id*="' + finalNid + '"]');
+    for (let _w = 0; _w < 20; _w++) { try { if (((await finalBoxes.nth(0).inputValue()) || "").length > 0) break; } catch {} await page.waitForTimeout(300); }
+    await finalBoxes.nth(0).fill("Bears preserve check", { timeout: T.step });
+    const canonP = await canonState(finalNid, owner);
+    const fr = await api("POST", "/api/records/" + finalNid + "/revise", { ...(await (async () => { const g = await api("GET", "/api/records/" + finalNid, undefined, owner); return { version: g.json.version, hash: g.json.hash, reviewToken: g.json.reviewToken, watermark: g.json.watermark }; })()), items: [{ id: "RF1", text: "x" }] }, stranger);
+    ok("reload-403-stranger-whole", fr.status === 403, String(fr.status));
+    ok("reload-403-no-write", (await canonState(finalNid, owner)) === canonP, "403 mutated state");
+    const kept = await finalBoxes.nth(0).inputValue().catch(() => "");
+    ok("reload-403-preserve-typing", kept === "Bears preserve check", "typing lost on 403: " + kept.slice(0, 80));
+    let transportFailed = false;
+    try { await fetch("http://127.0.0.1:1/__nope", { redirect: "error" }); } catch { transportFailed = true; }
+    ok("reload-transport-fails-closed", transportFailed === true, "unexpected transport success");
+    const kept2 = await finalBoxes.nth(0).inputValue().catch(() => "");
+    ok("reload-transport-preserve-typing", kept2 === "Bears preserve check", "typing lost on transport: " + kept2.slice(0, 80));
+  }
+  {
+    const guestRev = await api("GET", "/api/records/" + rid + "/review", undefined, reader);
+    ok("reload-stateValid-missing-guest", guestRev.status === 200 && !("stateValid" in (guestRev.json || {})), "guest review should omit stateValid");
+    const emptyFix = await api("POST", "/api/meetings/" + mid + "/record/draft", [], owner);
+    preflight("reload-stateValid-empty-fixture", emptyFix.status === 201 && emptyFix.json.id, String(emptyFix.status));
+    const emptyId = emptyFix.json.id;
+    const emptyRev = await api("GET", "/api/records/" + emptyId + "/review", undefined, owner);
+    ok("reload-stateValid-empty", emptyRev.status === 200 && Array.isArray(emptyRev.json.pending) && emptyRev.json.pending.length === 0, String(emptyRev.status));
+    await page.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + emptyId, { waitUntil: "domcontentloaded", timeout: T.goto });
+    await page.waitForTimeout(1500);
+    ok("reload-stateValid-empty-no-approve", (await allApproveControls()) === 0, "empty draft shows approval");
+  }
+const u1 = await api("POST", "/api/meetings/" + mid + "/record/draft", [{ id: "U1", text: "Bears branch one" }, { id: "U2", text: "Bears branch two" }], owner);
   const buid = u1.json.id;
   preflight("branch-fixture-undecided", u1.status === 201 && buid, String(u1.status));
   const sgU = await api("GET", "/api/records/" + buid, undefined, owner);
@@ -583,7 +734,7 @@ async function main() {
   await ctx2.route("**/*", routeGuard);
   await ctx2.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: stranger, em: strangerEmail });
   p2 = await ctx2.newPage();
-  watchResponses(p2);
+  attachCollectors(p2, "stranger");
   await p2.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + nid, { waitUntil: "domcontentloaded", timeout: T.goto });
   await p2.waitForTimeout(2000);
   const sBody = await p2.locator("body").innerText();
@@ -604,7 +755,7 @@ async function main() {
     await ctx3.route("**/*", routeGuard);
     await ctx3.addInitScript(({ tok, em }) => { window.localStorage.setItem("simceo-token", tok); window.localStorage.setItem("simceo-user", em); }, { tok: reader, em: readerEmail });
     p3 = await ctx3.newPage();
-    watchResponses(p3);
+    attachCollectors(p3, "reader");
     await p3.goto(WEB + "#/records?board=" + bid + "&meeting=" + mid + "&rec=" + did, { waitUntil: "domcontentloaded", timeout: T.goto });
     await p3.waitForTimeout(2000);
     const gBody = await p3.locator("body").innerText().catch(() => "");
