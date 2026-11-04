@@ -40,6 +40,8 @@ function skipLine(name, why) { skip++; console.log("  SKIP - " + name + " :: " +
 
 const run = "qi-" + Date.now().toString(36);
 const pageErrs = [];
+const absentProfileResponses = new Set();
+const consoleErrs = [];
 const nonGet = new Set();
 const hashOf = (page) => page.evaluate(() => window.location.hash);
 const noOverflow = (page) => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
@@ -58,8 +60,14 @@ async function main() {
     ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
     page.setDefaultTimeout(15000);
+    page.on("response", (r) => {
+      if (r.status() === 404 && r.request().method() === "GET" && r.url() === WEB + "/api/profile") {
+        absentProfileResponses.add(r.url());
+        console.log("EXPECTED-EMPTY-PROFILE GET /api/profile 404");
+      } else if (r.status() >= 400) pageErrs.push("HTTP " + r.status() + " " + new URL(r.url()).pathname);
+    });
     page.on("pageerror", (e) => pageErrs.push(String(e).split("\n")[0].slice(0, 120)));
-    page.on("console", (m) => { if (m.type() === "error") pageErrs.push("console: " + m.text().slice(0, 120)); });
+    page.on("console", (m) => { if (m.type() === "error") consoleErrs.push({ text: m.text(), url: m.location().url }); });
     page.on("request", (r) => {
       const m = r.method();
       if (m !== "GET" && m !== "HEAD" && m !== "OPTIONS") {
@@ -164,8 +172,8 @@ async function main() {
         ok("meeting-request-label", await page.getByRole("button", { name: "Request advisor responses", exact: true }).count() >= 1);
         ok("meeting-old-start-absent", await page.getByRole("button", { name: "Start meeting", exact: true }).count() === 0);
         ok("meeting-old-run-absent", await page.getByRole("button", { name: "Run discussion", exact: true }).count() === 0);
-        ok("meeting-helper-new", await page.getByText("Starts a new separate conversation.", { exact: true }).count() >= 1);
-        ok("meeting-helper-request", await page.getByText("Asks the advisors in the current meeting to respond.", { exact: true }).count() >= 1);
+        ok("meeting-helper-new", await page.getByText("New meeting starts a separate conversation. Creating one never asks the advisors anything.", { exact: true }).count() >= 1);
+        ok("meeting-helper-request", await page.getByText(/Asks the advisors in the current meeting/).count() >= 1);
         await page.screenshot({ path: path.join(SHOTDIR, "qi-meet-1440.png") });
       }
     }
@@ -182,7 +190,16 @@ async function main() {
     // ---------- Read-only + error report ----------
     console.log("non-get-requests=" + nonGet.size);
     ok("no-api-mutations", nonGet.size === 0);
+    // A missing account default is the endpoint's intentional empty state.
+    // Exempt only its confirmed GET 404 resource console message; retain all
+    // JavaScript exceptions and every other HTTP/console failure.
+    for (const e of consoleErrs) {
+      if (!(absentProfileResponses.has(e.url) && /^Failed to load resource: the server responded with a status of 404 \(Not Found\)$/.test(e.text))) {
+        pageErrs.push("console: " + e.text.slice(0, 120));
+      }
+    }
     console.log("page-errors=" + pageErrs.length);
+    for (const pageErr of pageErrs) console.log("PAGE-ERROR " + String(pageErr).slice(0, 400));
     ok("no-page-errors", pageErrs.length === 0);
 
     console.log("RESULT pass=" + pass + " fail=" + fail + " skip=" + skip);

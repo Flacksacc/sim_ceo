@@ -325,3 +325,53 @@ proof in this tree, actual whole-diff review, `advisor-integrated-qa` execution
 on primary-owned ports, roster/human reconciliation decisions, final audit.
 Phases 4-10 and the complete final audit remain open. No deployment performed
 by this join.
+
+## Superseding live milestone: 2026-11-04
+
+The essentials, advisor, meeting, Secretary and voice milestone is deployed at
+http://localhost:5173 and ready for human testing. This does not complete the
+full parity plan. Muse and background agents are stopped; subsequent fixes
+and verification were performed directly by the primary agent.
+
+Main application source matches tested candidate `0e85f89`; merges `b49cab6`
+and `658d46b` retain the implementation and real-provider proof tooling.
+Primary verification: integrated native-browser acceptance 362/0; endpoint
+92/0; public-evidence security 111/0; provenance/gateway 33/0; voice HTTP 521/0,
+browser 159/0, retention/cleanup 12/0; real-account voice privacy 25/0.
+Voice used simulated audio: physical microphone operation needs human testing.
+
+Real-provider v6 completed 62/62 structural checks, including research,
+explicit editable-paragraph save, roster chat and audition. Primary semantic
+review passed the sampled fictional-character scenario; it is not a new
+independent-agent review or a general quality guarantee. The original proof
+read claims from the wrong wrapper: the preserved persisted dossier companion
+shows eight claims, one verified and seven explicitly unverified. Original
+proof is preserved unchanged. Restart retained the exact roster/profile/input
+hashes. Failed v3-v5 evidence remains preserved separately.
+
+Live image `sha256:ceefb261642fd79711ddc745931f24169476c49bf4ad153483d9dfe07addf3d7`
+is healthy with PostgreSQL ready. Database container and both existing volumes
+were retained. Before/after counts match: boards 3, meetings 2, messages 8,
+roster 13, profiles 1, advisors 17, accounts 0. Backup is retained at
+`.tmp/update-20261104-133531-UTC-cf305c8c`; rollback image is
+`simceo-essentials-app:rollback-20261104-133531-cf305c8c`.
+
+Post-deployment read-only roster/browser checks: 19/0; profile/meeting/layout
+smoke: 25/0 with one explicit skip (no saved custom account-default profile in
+the sampled state). Both suites performed zero domain writes. The profile
+endpoint intentionally returns 404 for an absent account default; only that
+confirmed resource error is classified as expected by the smoke, with other
+HTTP, console and JavaScript errors still failing. Logs:
+`.tmp/primary-advisor-live-roster-readonly.log`,
+`.tmp/primary-advisor-live-smoke-final.log`,
+`.tmp/primary-direct-final-integrated.log`,
+`.tmp/primary-direct-advisor-real-v6-semantic-review.json`.
+
+Remaining broader work: Records completion, source-governance review and
+upgrade/concurrency proofs, guest persistence/restart proofs, Wiki fault and
+restart scenarios, usage integration, comprehensive lifecycle edge cases, and
+the final requirement-by-requirement phases 0-10 audit. Unmerged worktrees and
+their patches remain preserved. Only the live app and database are running;
+QA stacks are stopped. Human testing should now cover profile save/defaults,
+advisor research/editing and tone, board responses/progress, Secretary, and
+physical voice dictation.
