@@ -810,12 +810,24 @@ public static class RosterEndpoints
         var pend = profile.LastIndexOf("```");
         if (pnl >= 0 && pend > pnl) profile = profile.Substring(pnl + 1, pend - pnl - 1).Trim();
       }
+      var aiPool = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
+      foreach (var cite in dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
+        if (!string.IsNullOrWhiteSpace(cite.Excerpt) && !aiPool.ContainsKey(cite.Url)) aiPool[cite.Url] = (cite.Title ?? "", cite.Excerpt ?? "");
+      var aiSid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      var aiLines = dossier.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
+      var aiValidated = ClaimEvidenceMapper.MapAll(aiLines, aiPool, aiSid);
       var draftRefs = dossier.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)).Take(10)
         .Select(c => new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt }).ToList();
-      var draftClaims = dossier.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12)
-        .Select(line => new { angle = "dossier", text = line, sources = dossier.Citations.Take(3).Select(c => new { url = c.Url, title = c.Title }).ToList(), refs = draftRefs }).ToList<object>();
+      var draftClaims = new List<object>();
+      foreach (var vc in aiValidated)
+      {
+        if (vc.Verified)
+          draftClaims.Add(new { angle = "dossier", text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList<object>(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote }).ToList<object>() });
+        else
+          draftClaims.Add(new { angle = "dossier [unverified]", text = vc.Text, kind = vc.Kind, verified = false, sources = new List<object>(), refs = new List<object>() });
+      }
       foreach (var c in dossier.Citations.Take(6).Where(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-        draftClaims.Add(new { angle = "dossier [citation]", text = c.Excerpt, sources = new[] { new { url = c.Url, title = c.Title } }.ToList(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList() });
+        draftClaims.Add(new { angle = "dossier [citation]", text = c.Excerpt, kind = "citation", verified = false, sources = new[] { new { url = c.Url, title = c.Title } }.ToList<object>(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList<object>() });
       var entry = new RosterEntry
       {
         Id = Guid.NewGuid(), AccountId = accountId, OwnerKey = PeopleOps.UserOf(s, req), Type = AdvisorType.FictionalCharacter,
@@ -826,18 +838,18 @@ public static class RosterEndpoints
         {
           subject = name.Trim() + " (" + role.Trim() + ")",
           searched = dossier.SearchCalls,
-          supported = dossier.RanSearch && draftClaims.Count > 0 && dossier.Citations.Any(c => !string.IsNullOrWhiteSpace(c.Url) && !string.IsNullOrWhiteSpace(c.Excerpt)),
+          supported = aiValidated.Any(v => v.Verified),
           claims = draftClaims,
           responseIds = dossier.ResponseId is null ? new List<string>() : new List<string> { dossier.ResponseId },
           version = 1,
           evidenceRefs = draftRefs,
-          note = (dossier.RanSearch && dossier.Citations.Any(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-            ? "Snippet-level claims need cross-checking against independent sources before approval."
+          note = aiValidated.Any(v => v.Verified)
+            ? "Snippet-level claims need cross-checking against independent sources before approval. Only claims with validated per-claim quotes are marked verified; unverified notes carry no support refs."
             : "No completed grounded evidence: treat every claim above as unsupported, not verified research.",
         }),
-        ResearchedAt = DateTime.UtcNow,
+        ResearchedAt = aiValidated.Any(v => v.Verified) ? DateTime.UtcNow : null,
         ResearchRequested = true,
-        EvidenceCount = dossier.Citations.Count(c => !string.IsNullOrWhiteSpace(c.Url) && !string.IsNullOrWhiteSpace(c.Excerpt)),
+        EvidenceCount = aiValidated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
         Version = 1, UpdatedAt = DateTime.UtcNow,
       };
       var aiEntry = entry;

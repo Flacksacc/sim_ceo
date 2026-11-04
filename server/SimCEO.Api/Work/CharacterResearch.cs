@@ -225,16 +225,33 @@ public static class CharacterResearch
         // Step 2 (model call 1 of 2): single grounded dossier call.
         var focusTag = string.IsNullOrWhiteSpace(focus) ? "" : " Focus: " + focus.Trim() + ".";
         var bgTag = string.IsNullOrWhiteSpace(background) ? "" : " Owner background: " + background.Trim() + ".";
-        var fetchTag = fetchedExcerpts.Count == 0 ? ""
-          : " Fetched owner-link excerpts (treat as the only verified owner-link evidence): "
-            + string.Join(" | ", fetchedExcerpts.Take(5).Select(kv => "[" + kv.Key + "] " + kv.Value.Excerpt));
+        var sidMap = ClaimEvidenceMapper.BuildSidMap(reqUrls);
+        var fetchTag = "";
+        if (reqUrls.Count > 0)
+        {
+          var parts = new List<string>();
+          for (var si = 0; si < reqUrls.Count; si++)
+          {
+            var u = reqUrls[si];
+            var sid = "S" + (si + 1);
+            if (fetchedExcerpts.TryGetValue(u, out var fe) && !string.IsNullOrWhiteSpace(fe.Excerpt))
+              parts.Add("[" + sid + "] " + u + " :: \"" + fe.Excerpt + "\"");
+            else
+              parts.Add("[" + sid + "] " + u + " :: (fetch failed; do not cite as verified)");
+          }
+          fetchTag = " Owner sources (cite by SID or full URL; quotes must be exact whitespace-normalized substrings of the excerpt): "
+            + string.Join(" | ", parts.Take(5));
+        }
         ModelGateway.GroundedResult dossier;
         try
         {
           dossier = await gw.CompleteGroundedAsync(ModelPolicy.SparkStandard, "advisor-research",
             "Advisor dossier research. Subject: " + startSubject + "." + focusTag + bgTag
               + " Seed description: " + startDesc + "." + fetchTag
-              + " Return concise factual claims only, one per line; distinguish verified facts from interpretation.",
+              + " Web search is enabled; for web-discovered sources cite the full https URL plus the exact quote from the retrieved passage."
+              + " Return ONE claim per line in EXACT format: KIND | claim text || EVIDENCE: <S1|full-url> :: \"<exact supporting quote>\" [ ;; <S1|full-url> :: \"<exact quote>\" ]"
+              + " Where KIND is FACT (directly supported by the quoted passage) or INTERPRETATION (inference that still needs a quote showing its basis, or leave EVIDENCE empty when no source supports it)."
+              + " Rules: the exact quote must appear verbatim (whitespace-normalized) in that source's retrieved excerpt; do not invent URLs or quotes; do not copy the same source onto unrelated claims; leave EVIDENCE empty when no passage supports the claim. Do not use VERIFIED prefix; use KIND. Distinguish facts from interpretation via KIND only.",
             4000, 2048, ct, ownerOverride: PeopleOps.IsOwner(req));
         }
         catch (OperationCanceledException) { throw; }
@@ -248,26 +265,59 @@ public static class CharacterResearch
         var responseIds = new List<string>();
         if (g.ResponseId is not null) responseIds.Add(g.ResponseId);
         var citedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var citedExcerpts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var pool = new Dictionary<string, (string Title, string Excerpt)>(StringComparer.OrdinalIgnoreCase);
         foreach (var u in reqUrls) citedUrls.Add(u);
-        foreach (var kv in fetchedExcerpts) citedExcerpts[kv.Key] = kv.Value.Excerpt;
+        foreach (var kv in fetchedExcerpts)
+        {
+          pool[kv.Key] = (kv.Value.Title ?? "", kv.Value.Excerpt ?? "");
+        }
         foreach (var cite in g.Citations.Where(c => !string.IsNullOrWhiteSpace(c.Url)))
         {
           citedUrls.Add(cite.Url);
           if (!string.IsNullOrWhiteSpace(cite.Excerpt))
-            citedExcerpts[cite.Url] = cite.Excerpt;
+          {
+            if (pool.TryGetValue(cite.Url, out var existing))
+            {
+              if (string.IsNullOrWhiteSpace(existing.Excerpt))
+                pool[cite.Url] = (cite.Title ?? existing.Title ?? "", cite.Excerpt ?? "");
+            }
+            else pool[cite.Url] = (cite.Title ?? "", cite.Excerpt ?? "");
+          }
         }
-        var claimRefs = g.Citations.Take(3)
-          .Select(c => new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt }).ToList();
-        var n = 0;
-        foreach (var line in g.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12))
+        var rawLines = g.Text.Split((char)10, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(12).ToList();
+        try
         {
-          claims.Add(new { angle = "dossier", text = line, sources = g.Citations.Take(3).Select(c => new { url = c.Url, title = c.Title }).ToList(), refs = claimRefs });
-          n++;
-          if (n >= 12) break;
+          var needFetch = ClaimEvidenceMapper.CollectUnfetchedUrls(rawLines, pool, sidMap).Take(3).ToList();
+          if (needFetch.Count > 0)
+          {
+            ct.ThrowIfCancellationRequested();
+            var subject = (startName + " " + startDesc + " " + background + " " + focus).Trim();
+            if (subject.Length > 2000) subject = subject.Substring(0, 2000);
+            var synth = needFetch.Select(u => new ModelGateway.Citation(u, "", "")).ToList();
+            var webFetcher = new PublicEvidenceFetcher { MaxSubjectTokens = 24 };
+            var hydrated = await webFetcher.HydrateAsync(synth, subject, ct).ConfigureAwait(false);
+            foreach (var h in hydrated)
+            {
+              if (!string.IsNullOrWhiteSpace(h.Excerpt))
+                pool[h.Url] = (h.Title ?? "", h.Excerpt ?? "");
+            }
+          }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { }
+        var validated = ClaimEvidenceMapper.MapAll(rawLines, pool, sidMap);
+        var citedExcerpts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in pool)
+          if (!string.IsNullOrWhiteSpace(kv.Value.Excerpt)) citedExcerpts[kv.Key] = kv.Value.Excerpt;
+        foreach (var vc in validated)
+        {
+          if (vc.Verified)
+            claims.Add(new { angle = "dossier", text = vc.Text, kind = vc.Kind, verified = true, sources = vc.Refs.Select(r => new { url = r.Url, title = r.Title }).ToList(), refs = vc.Refs.Select(r => new { kind = "source", @ref = r.Url, url = r.Url, title = r.Title, excerpt = r.Quote }).ToList() });
+          else
+            claims.Add(new { angle = "dossier [unverified]", text = vc.Text, kind = vc.Kind, verified = false, sources = new List<object>(), refs = new List<object>() });
         }
         foreach (var c in g.Citations.Take(6).Where(c => !string.IsNullOrWhiteSpace(c.Excerpt)))
-          claims.Add(new { angle = "dossier [citation]", text = c.Excerpt, sources = new[] { new { url = c.Url, title = c.Title } }.ToList(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList() });
+          claims.Add(new { angle = "dossier [citation]", text = c.Excerpt, kind = "citation", verified = false, sources = new[] { new { url = c.Url, title = c.Title } }.ToList(), refs = new[] { new { kind = "source", @ref = c.Url, url = c.Url, title = c.Title, excerpt = c.Excerpt } }.ToList() });
 
         // Step 3 (model call 2 of 2): compile the 3 editable paragraphs,
         // refining the CURRENT saved behavior (explicit user edits win over
@@ -288,7 +338,11 @@ public static class CharacterResearch
           }
         }
         catch (JsonException) { }
-        var compileInput = BuildCompileInput(focus, startName, startDesc, background, currentBehavior, g.Text);
+        var groundedDossier = validated.Count == 0 ? "(no verified grounded claims; compile from the owner seed and explicit limits only; do not invent grounding)"
+          : string.Join("\n", validated.Where(v => v.Verified).Select(v => v.Kind.ToUpperInvariant() + " | " + v.Text + " || EVIDENCE: " + string.Join(" ;; ", v.Refs.Select(r => r.Url + " :: \"" + r.Quote + "\""))));
+        if (validated.All(v => !v.Verified))
+          groundedDossier = "(no verified grounded claims; compile from the owner seed and explicit limits only; do not invent grounding) \n" + groundedDossier;
+        var compileInput = BuildCompileInput(focus, startName, startDesc, background, currentBehavior, groundedDossier);
         if (compileInput is null)
         {
           return FailTerminal(s, req, id, capturedJob, resPin,
@@ -318,7 +372,7 @@ public static class CharacterResearch
             new { subject = startSubject, searched = g.RanSearch ? 1 : 0, claims, responseIds, version = baseVersion });
         }
         object outcome;
-        bool grounded = citedExcerpts.Count > 0;
+        bool grounded = validated.Any(v => v.Verified && v.Refs.Count > 0);
         lock (s.SetupLock)
         {
           if (!s.Roster.TryGetValue(id, out var cur) || cur.Archived)
@@ -408,7 +462,7 @@ public static class CharacterResearch
               // and the evidence count stays zero, so approval correctly
               // requires a grounded run while the draft remains editable.
               fresh.ResearchedAt = grounded ? DateTime.UtcNow : null;
-              fresh.EvidenceCount = grounded ? citedExcerpts.Count : 0;
+              fresh.EvidenceCount = grounded ? validated.Where(v => v.Verified).SelectMany(v => v.Refs.Select(r => r.Url)).Distinct(StringComparer.OrdinalIgnoreCase).Count() : 0;
               // Grounded research with real evidence completes a recovered placeholder
               // (explicit "recovered" tag removed by the owner's own research run;
               // unsupported dossiers keep the tag and stay blocked).
@@ -556,7 +610,12 @@ public static class CharacterResearch
   // description/background and current saved behavior (both persisted
   // elsewhere) yield oldest/last first with explicit markers. Only an absurd
   // dossier that alone exceeds the budget fails explicitly.
-  private static string? BuildCompileInput(string focus, string name, string desc, string background, string currentBehavior, string dossier)
+  // Research status labels and citation metadata belong in the research
+  // summary only: operational paragraphs must read as natural character
+  // voice (conditional agree/disagree, blunt/formal by circumstance) and
+  // express uncertainty plainly, without mandatory VERIFIED/INTERPRETATION/QA
+  // labels, bracket markers, URLs, or source IDs in every answer.
+  public static string? BuildCompileInput(string focus, string name, string desc, string background, string currentBehavior, string dossier)
   {
     var budget = ModelGateway.UserCharBudget("advisor-compile", ContextBudget.BidTokens);
     var head = "COMPILE-CHARACTER-PARAGRAPHS. Focus: " + focus + ". Compile the researched character \"" + name
@@ -567,8 +626,13 @@ public static class CharacterResearch
       + " Rules: (1) When to contribute: expertise, useful questions, participation/abstention criteria. "
       + "(2) How to reason: character-based perspective, methods, evidence requirements, when to agree/disagree/challenge, limits. "
       + "(3) How to respond: character-based context-sensitive expression; when blunt, diplomatic, formal, detailed or brief. "
-      + "Tone comes from THIS character and circumstance, never a generic fixed tone. Mark grounded facts vs interpretation honestly.";
-    var dossierPart = " Dossier (grounded evidence, required - compile ONLY from this and the seed): " + dossier;
+      + "Tone comes from THIS character and circumstance, never a generic fixed tone. "
+      + "Research status labels (VERIFIED/INTERPRETATION/FACT/KIND) and citation markers, URLs, source IDs, and QA-persona phrasing belong in the research summary ONLY; "
+      + "do NOT copy uppercase labels, bracket markers, URLs, source IDs, or QA wording into operational paragraphs unless the owner seed itself contains that wording. "
+      + "Express uncertainty plainly in character voice (conditional language, missing evidence) without mandatory labels in every answer. "
+      + "State the fictional identity honestly; never claim real employment, degrees, licenses, endorsements, or real detective authority. "
+      + "Compile ONLY from the verified grounded claims below plus the owner seed and explicit limits; ignore unverified notes for behavior.";
+    var dossierPart = " Verified grounded claims (only these plus the seed may inform behavior; unverified notes excluded): " + dossier + " Explicit limits: never invent real-world credentials, employment, degrees, licenses, or endorsements; abstain where evidence is missing or the topic is outside the seed.";
     if (head.Length + dossierPart.Length > budget) return null;
     var room = budget - head.Length - dossierPart.Length;
     var seedPart = " Seed description: " + (desc ?? "");
