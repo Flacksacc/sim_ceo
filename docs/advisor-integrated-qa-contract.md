@@ -2,9 +2,9 @@
 
 Companion to `qa/advisor-integrated-qa.mjs`. Read this before executing.
 No App/server changes were made for this QA; only this QA file + this doc exist.
-Corrected revision addressing every concrete finding of the be958dc review.
+Closure revision addressing all 21 findings of the 3207f49 review (frontend 16b0411 in .tmp/advisor-release, server dbb698c; both read-only, no production edits).
 This author never executed the script (node --check only); primary executes it
-against the actual compiled combined app. No runtime claims are made here.
+against the actual compiled combined app. No runtime claims are made here. Exit 0=PASS, 1=FAIL (assertion), 2=FATAL/setup (no raw JSON or tokens in logs; redacted summaries only).
 
 ## What primary provides (not this author)
 
@@ -12,12 +12,8 @@ against the actual compiled combined app. No runtime claims are made here.
 - Running stack at `QA_WEB=http://127.0.0.1:15300` (compiled web/ copied as the
   published API wwwroot, fake-backed) or `:15180` (owned compiled Docker, real
   provider, needs `ALLOW_LIVE_PROVIDER=1`).
-- Fake prompt log at `QA_FAKE=http://127.0.0.1:15302` (standard
-  `qa/fake-provider.mjs`: `GET /__log`, full-prompt capture,
-  `COMPILE-CHARACTER-PARAGRAPHS` / `YOUR TURN` / `Reply with exactly YES or NO`
-  markers, `QA-SLEEP-*` pacing). Required on the 15300 path. The script NEVER
-  issues a global prompt-log DELETE: it captures a baseline timestamp at setup
-  and filters all prompt assertions to `t >= baseline` plus owned run markers.
+- Fake prompt log at `QA_FAKE=http://127.0.0.1:15302` (dedicated
+  `qa/advisor-integrated-fake.mjs`: deterministic `COMPILE-CHARACTER-PARAGRAPHS` echoing the researched name, `YOUR TURN`/bid pacing, structured secretary JSON echoing the owned run marker, `QA-SLEEP-*` pacing; reuses research/chat schema from `qa/fake-provider.mjs` and secretary schema from `qa/secretary-fake.mjs`). Required in native 15300 mode; live 15180 mode has no prompt log (explicit UNPROVED path, fails closed). The script NEVER issues a global prompt-log DELETE: it captures a baseline timestamp at setup and filters all prompt assertions to `t >= baseline` plus owned run markers. Mode is selected explicitly by `ALLOW_LIVE_PROVIDER` (`native` vs `live`), never by log availability.
 
 ## Assumed UI contracts (verified in source, not invented)
 
@@ -26,8 +22,7 @@ against the actual compiled combined app. No runtime claims are made here.
   roster seeds and fresh-collection readbacks.
 - Rail navigation: `nav.rail` buttons by exact name — Boards, Roster,
   Board Advisors, Meetings, Sources, Records, People, Activity, Settings,
-  Profile, Help (route convention `#/seg`, board context kept, as in
-  `qa/navigation.cjs`). All eleven are visited; no skipped destinations.
+  Profile, Help. Board-scoped destinations (`advisors,meet,sources,records,people,activity`) require `?board=<ownedBoardA>` (App filters them board-free, `App.tsx:641-648,5731`); board-free tabs use `#/seg`. Hash arrival + board context + rendered section/entity are asserted per destination; back/forward assert exact hashes with board context. All eleven are visited; no skipped destinations.
 - Creation: rail button `+ Create new Advisor` opens
   `div.modal[role=dialog][aria-label="Create advisor"]` containing
   `section[aria-label="Create advisor"]` with `#cc-name`, `#cc-description`,
@@ -59,39 +54,31 @@ against the actual compiled combined app. No runtime claims are made here.
   Statuses `Sending message...` / `Requesting advisor responses...` /
   `Responses complete.` Exactly one `[aria-label="Meeting and advisor
   controls"]` area and one `.composer-bar`.
-- Search: labelled textbox `Search messages` (role textbox, never `searchbox`),
-  positioned above Messages. Settings: EXACT `Meeting settings` button opening
-  `section[aria-label="Meeting settings"]` with `Decisions & evidence` inside;
-  native Escape dismissal (cancel path). A global `/settings/i` first-match is
-  forbidden (it can hit navigation Settings and leave the composer).
-- Presence rail: `section.meet-participants` /
-  `ul.mp-rail[aria-label="Participant activity"]` / `li.mp-seat.act-<state>`
-  with `.mp-name` (lead name, boardRole per advisor, `Secretary`), `.mp-badge`
-  (`Not in this meeting` for excluded), `img[alt="Portrait of <name>"]` per
-  accepted portrait, `is-sec` Secretary seat. The rail shows boardRole, so
-  seat assertions use boardRole, never roster entry names.
-- Activity: RAW backend states (`awaiting-selection`,
-  `awaiting-publication`, ...) validated against the raw contract;
-  rendered rail `act-*` classes validated against the mapped UI vocabulary
-  (`waiting-for-selection`, `waiting-for-publication`, ...); mapping
-  cross-checked per state. Raw and mapped are never mixed.
-- Secretary: `secretary:`-prefixed composer input creates exactly one new
-  request correlated by Question/InputText run marker (`completed` + `noteId`);
-  single-request readback proves persisted provisional `secretary-note` /
-  `secretary-briefing` body containing the marker; `GET notes?kind=direction`
-  must show zero non-provisional direction notes (no decision).
-- Rerun proof: CURRENT canonical markers (fresh collection) correlated to the
-  same fake `responses` prompt as the owned advisor contribution (boardRole,
-  roster name, or advisor id) with zero stale-marker leak. Live mode has no
+- Search: `ConversationSearchField` input `Search messages` directly above `.chatscroll[aria-label="Conversation messages"]` (`conversation-controls.tsx`, `App.tsx:8151-8152`); position is proven against the chatscroll, never a standalone Messages heading. Settings: EXACT `Meeting settings` button opening native `dialog.conv-settings` + `section[aria-label="Meeting settings"]` with visible `Decisions & evidence`; open state (`isVisible` + `dialog.open`) is required before Escape, and actual dismissal after. A global `/settings/i` first-match is forbidden.
+- Presence rail: `section.meet-participants` / `ul.mp-rail[aria-label="Participant activity"]` / `li.mp-seat.act-<state>` with `.mp-name` (overridden board lead `Board Own <run>` on board A per `App.tsx:4486`, boardRole per advisor, `Secretary`), seat-local `.mp-badge` (`Not in this meeting` only on the excluded Tide Watcher seat), `img[alt="Portrait of <name>"]` per accepted portrait with distinct PNG bytes and lazy-load wait, `is-sec` Secretary seat. Exactly 4 seats are required; extra/duplicate seats fail. The rail shows boardRole, so seat assertions use boardRole, never roster entry names.
+- Activity: RAW backend states validated against the raw contract only; rendered `act-*` classes against the mapped UI vocabulary (`meeting-activity.ts` map, `meeting-participants.tsx` labels); mapping cross-checked per state. A working raw state for the owned participant plus its corresponding rendered badge are both required (not just eventual publication). Error/bid-decline/abstain/no-responder scenarios are exercised via dedicated short meetings (`QA-ABSTAIN`/`QA-NO`/`QA-REPLYERR`/excluded).
+- Secretary: `secretary:`-prefixed composer input creates exactly one new request correlated by Question/InputText run marker (`completed` + `noteId`); the integrated fake returns structured JSON echoing the marker (standard fake returns plain text and cannot satisfy `Secretary.cs`); single-request readback proves persisted provisional `secretary-note`/`secretary-briefing` body containing the marker; the tray (`Secretary provisional notes`) is opened and the exact note/request verified; `GET notes?kind=direction` shape is validated with a provisional positive control, then zero non-provisional direction notes proves no decision.
+- Rerun proof: CURRENT canonical markers (fresh collection) correlated to the exact owned `YOUR TURN` contribution prompt on the `chat` path (advisor bids/replies use `CompleteAsync` -> `/chat/completions`, `Endpoints.cs:1343,1430`, `ModelGateway.cs:748`; `responses` is research only), requiring current markers plus no stale-marker leak, plus the rerun actually publishing its expected contribution. Live mode has no
   prompt log: reported as explicit `promptlog-live-unproved` (fails closed),
   never a generic-nonempty pass.
 - Roster chat: REAL `RosterChatPanel` UI (`div[data-roster-chat]`, `Chat with
   this advisor`, board-free note, `Message <advisor>` box, `Send`, `[role=log]`
   reply), stateless against meeting messages.
-- Profile tab fields were matched by label/placeholder with
-  name/background/familiar/simpler/communication patterns (App lead-form
-  labels verified) and FAIL loudly naming the assumption if absent. Frontend
-  mount WIP is reported, not worked around.
+- Profile tab fields use stable scoped `getByRole(textbox, /^<Label>(?:\\s|$)/)` inside
+  `section[aria-label="Profile"]` (verified in `web/src/App.tsx` lead form; exact `getByLabel` stops matching after fill because textarea child text joins the accessible name):
+  `Name`, `Background`, `Subjects already familiar`,
+  `Subjects needing simpler explanation`, `Communication preferences`, saved
+  via the exact scoped `Save profile` button. Before filling, the script
+  awaits real UI/response barriers: the Profile section + heading mounted,
+  the lookup-settled status (`No saved profile yet.` or
+  `Saved profile loaded.`), and the scoped Name box present AND enabled
+  (fields stay disabled until the current profile is confirmed). Each field
+  must match exactly once, be enabled, and read back the filled value; any
+  failure captures an artifact (scoped DOM snippet + recent failed-response /
+  page-error summary, screenshot to the OS temp dir, no token or private
+  values) and FAILs loudly naming the assumption. Frontend mount WIP is
+  reported with that artifact, never worked around via HTTP-only profile
+  writes or generic first-match fills. Stable scoped `getByRole(textbox, prefix)` is used because textarea child text becomes part of the accessible label after fill (exact `getByLabel` stops matching); single fill + immediate readback proves the value (the App preserves typed values, no refill loops claiming reverts).
 
 ## Verified HTTP contracts used
 
@@ -117,16 +104,13 @@ against the actual compiled combined app. No runtime claims are made here.
 
 ## Budgets / honesty rules
 
-- Research bounded 185s, run bounded 150s, overall 420s ENFORCED (overrun
-  throws into `finally` cleanup; the browser context always closes; a single
-  `process.exit` runs only after cleanup).
+- Research bounded 185s, run bounded 150s, overall 420s ENFORCED via shared deadline (`DEADLINE_MS` = start+420s-30s reserve; `assertDeadline` before sleeps/waits/requests; overrun throws into `finally` cleanup; intervals cleared and outstanding `AbortController` requests bound by `REQ_TIMEOUT`; the browser context always closes; a single `process.exit` runs only after cleanup). `waitForFunction` uses `(fn, undefined, {timeout})` (3-arg form); the 150s run and 90s secretary limits are real timeouts.
 - Real provider/unsupported research is an honest FAIL, never forced approval.
 - No `page.route` stubs, no forced-approval, no datastore hacks, no global
   cleanup/backup/restore/reconcile/reset, no private-key reads, no token or
   raw JSON in logs. Failed setup aborts (throws to cleanup, exit 2), never
   cascades false-pass.
-- Expected 404s (pre-save `/api/profile` absence) are narrowly classified;
-  all other page errors / failed responses fail the run.
+- Expected 404s are narrowly scoped to PRE-SAVE `/api/profile` absence only (`profileSavedAt===0`); any later 404 is unexplained. Transport `requestfailed` events are tracked and fail the run. Failed setup/prerequisites abort immediately (throw to cleanup, exit 2), never cascade.
 - Live `:15180` mode: prompt-log proof is an explicit UNPROVED failure, and
   the dossier grounding falls back to fetched-evidence proof only; both are
   labeled as such in output.
